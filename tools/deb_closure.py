@@ -45,6 +45,7 @@ from pathlib import Path, PurePosixPath
 
 from tools.build_stage_tar import build_stage_tar, extract_deb
 from tools.overlay_guard import build_base_soname_index, parse_solib, scan_overlay_violations
+from tools.safe_tar import inspect_tar_members
 
 
 # --------------------------------------------------------------------------- #
@@ -320,6 +321,72 @@ def _soname_of(fname: str, full: Path) -> str | None:
     return None
 
 
+def _mergedusr_aliases(rel: str):
+    """Yield a path plus its merged-usr counterpart(s).
+
+    Debian merged-usr makes ``/lib`` -> ``/usr/lib`` (also bin/sbin/lib64), so a
+    base file at ``usr/lib/aarch64-linux-gnu/libc.so.6`` and a freshly-extracted
+    .deb file at ``lib/aarch64-linux-gnu/libc.so.6`` are the SAME file. Treat both
+    spellings as equivalent for subtraction — otherwise libc6 & friends leak into
+    the overlay and would shadow the base runtime.
+    """
+    yield rel
+    for top in ("lib", "bin", "sbin", "lib64"):
+        if rel.startswith(f"usr/{top}/"):
+            yield rel[len("usr/"):]
+        elif rel.startswith(f"{top}/"):
+            yield f"usr/{rel}"
+
+
+def base_path_set(base: str | Path) -> set[str]:
+    """Every rootfs-relative file/symlink path the base already provides, expanded
+    with merged-usr aliases.
+
+    Used to subtract base-duplicate payload (charset converters, libc runtime,
+    data, configs, unversioned helpers) that ``drop_base_sonames`` leaves behind —
+    so the overlay carries only what is genuinely NEW. The base wins for any path
+    it already owns, under either the ``/lib`` or ``/usr/lib`` spelling.
+    """
+    base_path = Path(base)
+    raw: set[str] = set()
+    if base_path.is_dir():
+        base_path = base_path.resolve()
+        for dirpath, _dirs, files in os.walk(base_path):
+            for fname in files:
+                raw.add((Path(dirpath) / fname).relative_to(base_path).as_posix())
+    else:
+        raw = {m.name for m in inspect_tar_members(base_path) if m.kind != "dir"}
+    out: set[str] = set()
+    for rel in raw:
+        out.update(_mergedusr_aliases(rel))
+    return out
+
+
+def drop_base_paths(merged_root: str | Path, base_paths: set[str]) -> list[str]:
+    """Delete every merged-root FILE whose rootfs-relative path the base already
+    provides (path-level subtraction, complementing the SONAME-level one).
+
+    Leaves files at paths NOT in the base — i.e. the package's genuinely new
+    payload. Returns the sorted list of removed paths (deterministic).
+    """
+    root = Path(merged_root)
+    removed: list[str] = []
+    if not root.is_dir():
+        return removed
+    for dirpath, _dirs, files in os.walk(root):
+        for fname in files:
+            full = Path(dirpath) / fname
+            rel = full.relative_to(root).as_posix()
+            if rel in base_paths:
+                try:
+                    full.unlink()
+                except OSError:
+                    continue
+                removed.append(rel)
+    removed.sort()
+    return removed
+
+
 # --------------------------------------------------------------------------- #
 # Build path (network)
 # --------------------------------------------------------------------------- #
@@ -438,7 +505,12 @@ def build_overlay(
         except Exception as exc:
             unsupported.append(f"{name} (extract failed: {exc})")
 
-    skipped_base = drop_base_sonames(merged_root, base_sonames)
+    # Subtract what the base already provides: SONAME-frozen libraries first
+    # (downgrade protection), then any remaining base-duplicate path (gconv, data,
+    # configs) — leaving only the package's genuinely new payload.
+    skipped_sonames = drop_base_sonames(merged_root, base_sonames)
+    skipped_paths = drop_base_paths(merged_root, base_path_set(base))
+    skipped_base = sorted(set(skipped_sonames) | set(skipped_paths))
 
     result = build_stage_tar(merged_root, out_tar)
 
