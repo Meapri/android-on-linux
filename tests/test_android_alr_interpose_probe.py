@@ -25,7 +25,7 @@ def test_main_activity_reports_procfs_interpose_mechanism_gate():
     assert "ALR PROCFS INTERPOSE MECHANISM: " in text
     assert "alr procfs interpose passed=" in text
     assert "ALR procfs interpose mechanism probe:" in text
-    assert "build: 0.4.114-android-gimp-ahb-present-v114" in text
+    assert "build: 0.4.115-android-gpu-native-m1m2-v115" in text
 
 
 def test_execution_backend_docs_require_procfs_interpose_mechanism():

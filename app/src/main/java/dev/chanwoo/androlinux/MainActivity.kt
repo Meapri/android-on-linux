@@ -310,6 +310,18 @@ class MainActivity : Activity() {
         val alrAhbZeroCopyPassed =
             alrAhbZeroCopyProbe.lineStartingWith("ALR AHB ZEROCOPY HARDWARE SAMPLE:") ==
                 "ALR AHB ZEROCOPY HARDWARE SAMPLE: PASS"
+        // GPU-native app track (Phase 4): M1 decodes a real shader+VBO+texture+draw
+        // op stream on Mali; M2 carries the same stream through the SPSC command
+        // ring then decodes it. Proves the GLES marshalling layer that lets a guest
+        // drive the real GPU (the path a future libGLESv2 shim feeds).
+        val alrGpuDrawProbe = nativeAlrGpuDrawProbe()
+        val alrGpuDrawPassed =
+            alrGpuDrawProbe.lineStartingWith("ALR GPU DRAW HARDWARE RENDER:") ==
+                "ALR GPU DRAW HARDWARE RENDER: PASS"
+        val alrGpuRingProbe = nativeAlrGpuRingProbe()
+        val alrGpuRingPassed =
+            alrGpuRingProbe.lineStartingWith("ALR GPU RING HARDWARE RENDER:") ==
+                "ALR GPU RING HARDWARE RENDER: PASS"
         val hostGpuProbe = nativeHostGpuProbe()
         val hostVulkanProbe = nativeHostVulkanProbe()
         val requestedPermissions = requestedPermissionNames()
@@ -479,7 +491,7 @@ class MainActivity : Activity() {
             alrSeccompPathTrapProbe.lineStartingWith("alr sc PATH_MEDIATION_VIABLE=")
                 .substringAfter("PATH_MEDIATION_VIABLE=", "") == "yes"
 
-        val executionSummary = "build: 0.4.114-android-gimp-ahb-present-v114" +
+        val executionSummary = "build: 0.4.115-android-gpu-native-m1m2-v115" +
             "\nexecution summary" +
             "\nROOTFS EXECUTION: ${if (rootfsExecutionPassed) "PASS" else "FAIL"}" +
             "\nSHELL SCRIPT EXECUTION: ${if (shellScriptExecutionPassed) "PASS" else "FAIL"}" +
@@ -522,6 +534,8 @@ class MainActivity : Activity() {
             "\nALR GPU PASSTHROUGH BOUNDARY: ${if (gpuPassthroughBoundaryViable) "VIABLE" else "MARGINAL"} (shmem-ring ${gpuBoundaryShmemCmdsPerFrame} cmds/60fps-frame, inproc ${gpuBoundaryInprocCmdsPerFrame})" +
             "\nALR GPU MARSHALLING HARDWARE RENDER: ${if (alrGpuMarshallingPassed) "PASS" else "FAIL"}" +
             "\nALR AHB ZEROCOPY HARDWARE SAMPLE: ${if (alrAhbZeroCopyPassed) "PASS" else "FAIL"}" +
+            "\nALR GPU DRAW HARDWARE RENDER (shader+VBO+texture+draw on Mali): ${if (alrGpuDrawPassed) "PASS" else "FAIL"}" +
+            "\nALR GPU RING HARDWARE RENDER (op stream via SPSC ring -> Mali): ${if (alrGpuRingPassed) "PASS" else "FAIL"}" +
             "\nHOST GPU EGL/GLES EXECUTION: ${if (hostGpuHardwareCandidate) "PASS" else "FAIL"}" +
             "\nANDROID HOST VULKAN PROBE EXECUTION: ${if (hostVulkanHardwareCandidate) "PASS" else "FAIL"}" +
             "\nANDROID HOST VULKAN SURFACE PROBE EXECUTION: PENDING_SURFACE_CALLBACK" +
@@ -819,6 +833,10 @@ class MainActivity : Activity() {
             "\n$alrGpuMarshallingProbe" +
             "\n\nALR AHardwareBuffer zero-copy display probe (AHB -> EGLImage -> external-OES):" +
             "\n$alrAhbZeroCopyProbe" +
+            "\n\nALR GPU-native draw probe (shader+VBO+texture+draw decoded on Mali):" +
+            "\n$alrGpuDrawProbe" +
+            "\n\nALR GPU-native ring probe (op stream via SPSC command ring -> Mali):" +
+            "\n$alrGpuRingProbe" +
             "\n\nAndroid host GPU probe:" +
             "\n$hostGpuProbe" +
             "\n\nAndroid host Vulkan probe:" +
@@ -1598,6 +1616,10 @@ class MainActivity : Activity() {
     private external fun nativeAlrGpuMarshallingProbe(): String
 
     private external fun nativeAlrAhbZeroCopyProbe(): String
+
+    private external fun nativeAlrGpuDrawProbe(): String
+
+    private external fun nativeAlrGpuRingProbe(): String
 
     private external fun nativeHostGpuProbe(): String
 

@@ -53,7 +53,8 @@ inline std::vector<uint8_t> build_triangle_stream(int fbw, int fbh) {
     Encoder e;
 
     // Virtual IDs (the guest would allocate these monotonically; here we pick them).
-    const uint32_t VS = 1, FS = 2, PROG = 1, VBO = 1, TEX = 1;
+    // Prefixed to avoid clashing with system macros (x86 <sys/reg.h> #defines FS).
+    const uint32_t vVS = 1, vFS = 2, vPROG = 1, vVBO = 1, vTEX = 1;
 
     const char* vsrc =
         "attribute vec2 aPos; attribute vec2 aUv; varying vec2 vUv;"
@@ -64,18 +65,18 @@ inline std::vector<uint8_t> build_triangle_stream(int fbw, int fbh) {
         "void main(){ gl_FragColor = texture2D(uTex, vUv); }";
 
     // --- shaders + program ---
-    e.u8(OP_CREATE_SHADER); e.u32(VS); e.u32(GL_VERTEX_SHADER);
-    e.u8(OP_SHADER_SOURCE); e.u32(VS); e.str(vsrc);
-    e.u8(OP_COMPILE_SHADER); e.u32(VS);
-    e.u8(OP_CREATE_SHADER); e.u32(FS); e.u32(GL_FRAGMENT_SHADER);
-    e.u8(OP_SHADER_SOURCE); e.u32(FS); e.str(fsrc);
-    e.u8(OP_COMPILE_SHADER); e.u32(FS);
-    e.u8(OP_CREATE_PROGRAM); e.u32(PROG);
-    e.u8(OP_ATTACH_SHADER); e.u32(PROG); e.u32(VS);
-    e.u8(OP_ATTACH_SHADER); e.u32(PROG); e.u32(FS);
-    e.u8(OP_BIND_ATTRIB_LOCATION); e.u32(PROG); e.u32(0); e.str("aPos");
-    e.u8(OP_BIND_ATTRIB_LOCATION); e.u32(PROG); e.u32(1); e.str("aUv");
-    e.u8(OP_LINK_PROGRAM); e.u32(PROG);
+    e.u8(OP_CREATE_SHADER); e.u32(vVS); e.u32(GL_VERTEX_SHADER);
+    e.u8(OP_SHADER_SOURCE); e.u32(vVS); e.str(vsrc);
+    e.u8(OP_COMPILE_SHADER); e.u32(vVS);
+    e.u8(OP_CREATE_SHADER); e.u32(vFS); e.u32(GL_FRAGMENT_SHADER);
+    e.u8(OP_SHADER_SOURCE); e.u32(vFS); e.str(fsrc);
+    e.u8(OP_COMPILE_SHADER); e.u32(vFS);
+    e.u8(OP_CREATE_PROGRAM); e.u32(vPROG);
+    e.u8(OP_ATTACH_SHADER); e.u32(vPROG); e.u32(vVS);
+    e.u8(OP_ATTACH_SHADER); e.u32(vPROG); e.u32(vFS);
+    e.u8(OP_BIND_ATTRIB_LOCATION); e.u32(vPROG); e.u32(0); e.str("aPos");
+    e.u8(OP_BIND_ATTRIB_LOCATION); e.u32(vPROG); e.u32(1); e.str("aUv");
+    e.u8(OP_LINK_PROGRAM); e.u32(vPROG);
 
     // --- VBO: 3 vertices, each (posx,posy,u,v) as float ---
     const float verts[] = {
@@ -84,8 +85,8 @@ inline std::vector<uint8_t> build_triangle_stream(int fbw, int fbh) {
          0.6f, -0.6f, 1.0f, 0.0f,
          0.0f,  0.6f, 0.5f, 1.0f,
     };
-    e.u8(OP_GEN_BUFFER); e.u32(VBO);
-    e.u8(OP_BIND_BUFFER); e.u32(GL_ARRAY_BUFFER); e.u32(VBO);
+    e.u8(OP_GEN_BUFFER); e.u32(vVBO);
+    e.u8(OP_BIND_BUFFER); e.u32(GL_ARRAY_BUFFER); e.u32(vVBO);
     e.u8(OP_BUFFER_DATA); e.u32(GL_ARRAY_BUFFER);
     e.blob(verts, sizeof(verts)); e.u32(GL_STATIC_DRAW);
 
@@ -94,9 +95,9 @@ inline std::vector<uint8_t> build_triangle_stream(int fbw, int fbh) {
         0, 220, 0, 255,  0, 220, 0, 255,
         0, 220, 0, 255,  0, 220, 0, 255,
     };
-    e.u8(OP_GEN_TEXTURE); e.u32(TEX);
+    e.u8(OP_GEN_TEXTURE); e.u32(vTEX);
     e.u8(OP_ACTIVE_TEXTURE); e.u32(GL_TEXTURE0);
-    e.u8(OP_BIND_TEXTURE); e.u32(GL_TEXTURE_2D); e.u32(TEX);
+    e.u8(OP_BIND_TEXTURE); e.u32(GL_TEXTURE_2D); e.u32(vTEX);
     e.u8(OP_TEX_PARAMETERI); e.u32(GL_TEXTURE_2D); e.u32(GL_TEXTURE_MIN_FILTER); e.i32(GL_NEAREST);
     e.u8(OP_TEX_PARAMETERI); e.u32(GL_TEXTURE_2D); e.u32(GL_TEXTURE_MAG_FILTER); e.i32(GL_NEAREST);
     e.u8(OP_TEX_IMAGE_2D); e.u32(GL_TEXTURE_2D); e.i32(0); e.u32(GL_RGBA);
@@ -107,11 +108,11 @@ inline std::vector<uint8_t> build_triangle_stream(int fbw, int fbh) {
     e.u8(OP_VIEWPORT); e.i32(0); e.i32(0); e.i32(fbw); e.i32(fbh);
     e.u8(OP_CLEARCOLOR); e.f32(0.10f); e.f32(0.10f); e.f32(0.40f); e.f32(1.0f);
     e.u8(OP_CLEAR);
-    e.u8(OP_USE_PROGRAM); e.u32(PROG);
+    e.u8(OP_USE_PROGRAM); e.u32(vPROG);
     const float identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
-    e.u8(OP_UNIFORM_MATRIX4FV); e.u32(PROG); e.str("uMVP");
+    e.u8(OP_UNIFORM_MATRIX4FV); e.u32(vPROG); e.str("uMVP");
     for (float f : identity) e.f32(f);
-    e.u8(OP_UNIFORM1I); e.u32(PROG); e.str("uTex"); e.i32(0);
+    e.u8(OP_UNIFORM1I); e.u32(vPROG); e.str("uTex"); e.i32(0);
     e.u8(OP_ENABLE_VAA); e.u32(0);
     e.u8(OP_VERTEX_ATTRIB_POINTER); e.u32(0); e.i32(2); e.u32(GL_FLOAT);
     e.u8(0); e.i32(4 * sizeof(float)); e.u32(0);                 // aPos: offset 0

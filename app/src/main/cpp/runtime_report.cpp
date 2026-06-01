@@ -73,6 +73,11 @@
 #include "alr_wayland/alr_compositor.hpp"
 #endif
 
+// GPU-native app track (Phase 4): host-side GLES command-stream decoder + probes.
+// Header-only and self-contained (owns its own EGL pbuffer context), so it adds no
+// link deps beyond EGL/GLESv2 (already linked).
+#include "alr_gpu/alr_gpu_probe.hpp"
+
 namespace {
 
 std::string jstring_to_string(JNIEnv* env, jstring value) {
@@ -4732,6 +4737,30 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeAlrAhbZeroCopyProbe(
     // Mirror to logcat (tag alr_loader) so the AHB zero-copy verdict is observable
     // off-device without scraping the 1px report view.
     __android_log_print(ANDROID_LOG_INFO, "alr_loader", "ahb-zerocopy:\n%s", report.c_str());
+    return env->NewStringUTF(report.c_str());
+}
+
+// GPU-native app track M1: decode a hand-built shader+VBO+texture+draw op stream
+// on the real Mali GPU and pixel-verify (proves the marshalling decoder runs real
+// GLES, not just clear/scissor). Mirrors to logcat (tag alr_loader).
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeAlrGpuDrawProbe(
+    JNIEnv* env,
+    jobject /* thiz */) {
+    const auto report = alr::gpu::run_draw_probe();
+    __android_log_print(ANDROID_LOG_INFO, "alr_loader", "gpu-draw:\n%s", report.c_str());
+    return env->NewStringUTF(report.c_str());
+}
+
+// GPU-native app track M2: push the same op stream through the SPSC command ring,
+// drain it host-side, decode on Mali, pixel-verify (proves the ring transport +
+// decoder together). Mirrors to logcat (tag alr_loader).
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeAlrGpuRingProbe(
+    JNIEnv* env,
+    jobject /* thiz */) {
+    const auto report = alr::gpu::run_ring_draw_probe();
+    __android_log_print(ANDROID_LOG_INFO, "alr_loader", "gpu-ring:\n%s", report.c_str());
     return env->NewStringUTF(report.c_str());
 }
 
