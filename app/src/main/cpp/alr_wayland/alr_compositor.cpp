@@ -278,6 +278,13 @@ std::vector<InjectEvent> g_inject_queue;  // guarded by g_inject_mutex
 struct GpuSubmit { void* ahb = nullptr; int32_t w = 0, h = 0; uint64_t serial = 0; };
 std::mutex g_gpu_mutex;
 std::vector<GpuSubmit> g_gpu_queue;  // guarded by g_gpu_mutex
+// §5-C fullscreen fallback: a GPU AHB with no Wayland toplevel to bind to (a headless /
+// fullscreen GPU app like glmark2). Presented fullscreen when no other surface covers
+// the screen. Compositor-thread-only (set in drain_gpu_queue, read in present_composited).
+void* g_fullscreen_gpu_ahb = nullptr;
+int32_t g_fullscreen_gpu_w = 0;
+int32_t g_fullscreen_gpu_h = 0;
+uint64_t g_fullscreen_gpu_serial = 0;
 
 // M4: real-modifier state derived from injected key events so wl_keyboard.modifiers
 // tells the client which mods are held (Shift/Ctrl/Alt/Super/AltGr) + Caps lock —
@@ -828,6 +835,22 @@ void present_composited() {
             pq.z = z++;
             snap.push_back(pq);
         }
+    }
+
+    // §5-C fullscreen fallback: present a GPU AHB that has no toplevel to bind to (a
+    // fullscreen GPU app) when nothing else covers the screen.
+    if (snap.empty() && g_fullscreen_gpu_ahb && g_fullscreen_gpu_w > 0 &&
+        g_fullscreen_gpu_h > 0) {
+        PresentSurface ps;
+        ps.pixels = nullptr;
+        ps.ahb = g_fullscreen_gpu_ahb;
+        ps.width = g_fullscreen_gpu_w;
+        ps.height = g_fullscreen_gpu_h;
+        ps.dst_x = 0; ps.dst_y = 0; ps.dst_w = out_w; ps.dst_h = out_h;
+        ps.surface_key = 0;
+        ps.content_serial = g_fullscreen_gpu_serial;
+        ps.z = 0;
+        snap.push_back(ps);
     }
 
     if (comp->config().present_list) {
@@ -1878,9 +1901,22 @@ void Compositor::drain_gpu_queue() {
             AHardwareBuffer_release(static_cast<AHardwareBuffer*>(local[i].ahb));
     GpuSubmit& last = local.back();
     SurfaceState* tgt = zorder_top();
-    if (!tgt) {  // no surface to bind to yet -> drop (release) the frame
-        if (last.ahb) AHardwareBuffer_release(static_cast<AHardwareBuffer*>(last.ahb));
+    if (!tgt) {
+        // No Wayland toplevel to bind to (a headless / fullscreen GPU app, e.g.
+        // glmark2): keep the newest AHB for a fullscreen present instead of dropping.
+        if (g_fullscreen_gpu_ahb && g_fullscreen_gpu_ahb != last.ahb)
+            AHardwareBuffer_release(static_cast<AHardwareBuffer*>(g_fullscreen_gpu_ahb));
+        g_fullscreen_gpu_ahb = last.ahb;
+        g_fullscreen_gpu_w = last.w;
+        g_fullscreen_gpu_h = last.h;
+        g_fullscreen_gpu_serial = last.serial;
+        g_scene_dirty = true;
         return;
+    }
+    // A real toplevel exists now -> drop any stale fullscreen GPU buffer.
+    if (g_fullscreen_gpu_ahb) {
+        AHardwareBuffer_release(static_cast<AHardwareBuffer*>(g_fullscreen_gpu_ahb));
+        g_fullscreen_gpu_ahb = nullptr;
     }
     // Contract (alr_present_source.hpp): release the previously-held buffer when the
     // next one binds, so at most one AHB is retained per GPU surface.
