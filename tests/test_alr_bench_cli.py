@@ -95,6 +95,14 @@ def test_no_subcommand_prints_help_returns_2():
     assert main([]) == 2
 
 
+def test_cp_status_prints_dashboard(capsys):
+    # Default --dir resolves to the repo's docs/evidence regardless of cwd.
+    assert main(["cp-status"]) == 0
+    out = capsys.readouterr().out
+    assert "Checkpoint" in out
+    assert "CP-1" in out
+
+
 _VERIFY_REPORT = (
     "build: 0.4.127-x\n"
     + "\n".join(f"gimp-probe guest={g} exit={e}" for g, e in _PASSING_PROBES)
