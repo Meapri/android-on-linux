@@ -329,6 +329,14 @@ class MainActivity : Activity() {
         val alrGpuFboPassed =
             alrGpuFboProbe.lineStartingWith("ALR GPU AHB RENDER (guest draw landed in AHB, direct read):") ==
                 "ALR GPU AHB RENDER (guest draw landed in AHB, direct read): PASS"
+        // M4 LIVE INTEGRATION keystone: producer thread streams the guest op stream
+        // through the SPSC ring; the host executor thread (own Mali GLES2 ctx + AHB-FBO)
+        // drains+decodes+presents 8 frames, synced by req_seq/reply_seq. Proves the live
+        // ring -> executor -> AHB loop on Mali (only the loader fork remains after this).
+        val alrGpuLiveProbe = nativeAlrGpuLiveProbe()
+        val alrGpuLivePassed =
+            alrGpuLiveProbe.lineStartingWith("ALR GPU LIVE INTEGRATION:") ==
+                "ALR GPU LIVE INTEGRATION: PASS"
         val hostGpuProbe = nativeHostGpuProbe()
         val hostVulkanProbe = nativeHostVulkanProbe()
         val requestedPermissions = requestedPermissionNames()
@@ -498,7 +506,7 @@ class MainActivity : Activity() {
             alrSeccompPathTrapProbe.lineStartingWith("alr sc PATH_MEDIATION_VIABLE=")
                 .substringAfter("PATH_MEDIATION_VIABLE=", "") == "yes"
 
-        val executionSummary = "build: 0.4.117-android-gpu-native-ahb-render-v117" +
+        val executionSummary = "build: 0.4.118-android-gpu-native-live-v118" +
             "\nexecution summary" +
             "\nROOTFS EXECUTION: ${if (rootfsExecutionPassed) "PASS" else "FAIL"}" +
             "\nSHELL SCRIPT EXECUTION: ${if (shellScriptExecutionPassed) "PASS" else "FAIL"}" +
@@ -544,6 +552,7 @@ class MainActivity : Activity() {
             "\nALR GPU DRAW HARDWARE RENDER (shader+VBO+texture+draw on Mali): ${if (alrGpuDrawPassed) "PASS" else "FAIL"}" +
             "\nALR GPU RING HARDWARE RENDER (op stream via SPSC ring -> Mali): ${if (alrGpuRingPassed) "PASS" else "FAIL"}" +
             "\nALR GPU AHB RENDER (guest draw -> AHB render target, direct read): ${if (alrGpuFboPassed) "PASS" else "FAIL"}" +
+            "\nALR GPU LIVE INTEGRATION (guest -> ring -> host executor -> AHB present, 8 frames on Mali): ${if (alrGpuLivePassed) "PASS" else "FAIL"}" +
             "\nHOST GPU EGL/GLES EXECUTION: ${if (hostGpuHardwareCandidate) "PASS" else "FAIL"}" +
             "\nANDROID HOST VULKAN PROBE EXECUTION: ${if (hostVulkanHardwareCandidate) "PASS" else "FAIL"}" +
             "\nANDROID HOST VULKAN SURFACE PROBE EXECUTION: PENDING_SURFACE_CALLBACK" +
@@ -1632,6 +1641,8 @@ class MainActivity : Activity() {
     private external fun nativeAlrGpuRingProbe(): String
 
     private external fun nativeAlrGpuFboProbe(): String
+
+    private external fun nativeAlrGpuLiveProbe(): String
 
     private external fun nativeHostGpuProbe(): String
 

@@ -29,4 +29,4 @@ def test_main_activity_reports_gpu_marshalling_gate():
     assert "ALR GPU MARSHALLING HARDWARE RENDER: " in text
     assert "alrGpuMarshallingPassed" in text
     assert "ALR GPU command-marshalling probe" in text
-    assert "build: 0.4.117-android-gpu-native-ahb-render-v117" in text
+    assert "build: 0.4.118-android-gpu-native-live-v118" in text

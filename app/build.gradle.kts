@@ -41,8 +41,8 @@ android {
         applicationId = "dev.chanwoo.androlinux"
         minSdk = 26
         targetSdk = 35
-        versionCode = 117
-        versionName = "0.4.117-android-gpu-native-ahb-render-v117"
+        versionCode = 118
+        versionName = "0.4.118-android-gpu-native-live-v118"
         ndkVersion = "27.2.12479018"
 
         externalNativeBuild {

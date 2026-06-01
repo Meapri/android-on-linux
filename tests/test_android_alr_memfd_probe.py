@@ -28,7 +28,7 @@ def test_main_activity_reports_memfd_native_exec_gate():
     assert 'lineStartingWith("ALR MEMFD EXECVEAT W^X-SAFE EXECUTION:")' in text
     assert "ALR MEMFD W^X-SAFE NATIVE EXEC: " in text
     assert "ALR memfd W^X-safe native exec probe:" in text
-    assert "build: 0.4.117-android-gpu-native-ahb-render-v117" in text
+    assert "build: 0.4.118-android-gpu-native-live-v118" in text
 
 
 def test_execution_backend_docs_describe_memfd_attempt():

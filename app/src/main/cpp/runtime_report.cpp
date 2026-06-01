@@ -79,6 +79,11 @@
 // AHB-backed render-target probe (guest draws -> AHB -> zero-copy sample).
 #include "alr_gpu/alr_gpu_probe.hpp"
 #include "alr_gpu/alr_gpu_fbo.hpp"
+// alr_gpu_host_service.hpp adds the M4 LIVE-INTEGRATION backbone: a host executor
+// thread owning the Mali GLES2 ctx + AHB-FBO, fed by a guest over the SPSC ring,
+// presenting per frame (req_seq/reply_seq handshake). run_live_integration_probe()
+// is the in-process two-thread device self-test of that whole loop.
+#include "alr_gpu/alr_gpu_host_service.hpp"
 
 namespace {
 
@@ -4775,6 +4780,20 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeAlrGpuFboProbe(
     jobject /* thiz */) {
     const auto report = alr::gpu::run_fbo_present_probe();
     __android_log_print(ANDROID_LOG_INFO, "alr_loader", "gpu-fbo:\n%s", report.c_str());
+    return env->NewStringUTF(report.c_str());
+}
+
+// M4 LIVE INTEGRATION: in-process two-thread keystone — a producer pushes the
+// guest op stream through the SPSC ring while the host GpuExecutorService thread
+// (own Mali GLES2 ctx + AHB-FBO) drains, decodes per frame, and presents, synced
+// by the req_seq/reply_seq handshake. Proves the live ring->executor->AHB loop on
+// Mali without the loader fork (that fork is the only remaining step after this).
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeAlrGpuLiveProbe(
+    JNIEnv* env,
+    jobject /* thiz */) {
+    const auto report = alr::gpu::run_live_integration_probe();
+    __android_log_print(ANDROID_LOG_INFO, "alr_loader", "gpu-live:\n%s", report.c_str());
     return env->NewStringUTF(report.c_str());
 }
 

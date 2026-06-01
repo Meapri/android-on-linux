@@ -24,7 +24,7 @@ def test_main_activity_reports_android_packaged_trampoline_continue_gate():
     assert "ALR PACKAGED TRAMPOLINE CONTINUE EXECUTION:" in text
     assert "alr packaged trampoline continue passed=" in text
     assert "ALR packaged trampoline continue probe:" in text
-    assert "build: 0.4.117-android-gpu-native-ahb-render-v117" in text
+    assert "build: 0.4.118-android-gpu-native-live-v118" in text
 
 
 def test_execution_backend_docs_require_android_packaged_trampoline_probe():
