@@ -4365,6 +4365,11 @@ struct WaylandPresenter {
         bool use_ahb = false;         // this surface is on the zero-copy path
         uint64_t content_serial = 0;
         bool seen = false;
+        // §5-C zero-copy import of a WS-2-OWNED AHB (distinct from `ahb` above, which
+        // the presenter allocates for the shm-opt path). We own ext_image (the
+        // EGLImage view) but must NEVER release ext_ahb — WS-2 owns that buffer.
+        void* ext_image = nullptr;            // EGLImageKHR over the WS-2 AHB
+        AHardwareBuffer* ext_ahb = nullptr;   // WS-2 AHB, last imported (NOT owned)
     };
     std::map<uint64_t, CachedTex> tex_cache;
     std::mutex present_mutex;            // serialize present() vs present_list()
@@ -4373,6 +4378,10 @@ struct WaylandPresenter {
     bool ahb_ready = false;             // all extensions + procs present
     GLuint ext_program = 0;             // samplerExternalOES program (for AHB path)
     GLint ext_a_pos = -1, ext_a_uv = -1, ext_u_tex = -1;
+    // §5-C GPU path: a second external-OES program sampling .rgba (WS-2 renders its
+    // AHB as R8G8B8A8_UNORM = RGBA in memory, vs the shm AHB which is BGRA -> .bgra).
+    GLuint ext_program_rgba = 0;
+    GLint ext_rgba_a_pos = -1, ext_rgba_a_uv = -1, ext_rgba_u_tex = -1;
     PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC p_get_native_buf = nullptr;
     PFNEGLCREATEIMAGEKHRPROC p_create_image = nullptr;
     PFNEGLDESTROYIMAGEKHRPROC p_destroy_image = nullptr;
@@ -4519,6 +4528,29 @@ struct WaylandPresenter {
         ext_a_pos = glGetAttribLocation(ext_program, "aPos");
         ext_a_uv = glGetAttribLocation(ext_program, "aUv");
         ext_u_tex = glGetUniformLocation(ext_program, "uTex");
+        // §5-C GPU-path program: identical, but samples .rgba (WS-2 AHB is RGBA, not
+        // the shm BGRA). Non-fatal if it fails — the GPU branch just won't engage.
+        const char* fsrc_rgba =
+            "#extension GL_OES_EGL_image_external : require\n"
+            "precision mediump float; varying vec2 vUv;"
+            "uniform samplerExternalOES uTex;"
+            "void main(){ gl_FragColor = texture2D(uTex, vUv).rgba; }";
+        GLuint vs2 = compile(GL_VERTEX_SHADER, vsrc);
+        GLuint fs2 = compile(GL_FRAGMENT_SHADER, fsrc_rgba);
+        if (vs2 != 0 && fs2 != 0) {
+            ext_program_rgba = glCreateProgram();
+            glAttachShader(ext_program_rgba, vs2);
+            glAttachShader(ext_program_rgba, fs2);
+            glLinkProgram(ext_program_rgba);
+            GLint l2 = 0;
+            glGetProgramiv(ext_program_rgba, GL_LINK_STATUS, &l2);
+            if (!l2) { glDeleteProgram(ext_program_rgba); ext_program_rgba = 0; }
+            else {
+                ext_rgba_a_pos = glGetAttribLocation(ext_program_rgba, "aPos");
+                ext_rgba_a_uv = glGetAttribLocation(ext_program_rgba, "aUv");
+                ext_rgba_u_tex = glGetUniformLocation(ext_program_rgba, "uTex");
+            }
+        }
         ahb_ready = true;
     }
 
@@ -4593,6 +4625,44 @@ struct WaylandPresenter {
         ct.image = nullptr;
         if (ct.ahb) { AHardwareBuffer_release(ct.ahb); ct.ahb = nullptr; }
         ct.ahb_w = ct.ahb_h = 0;
+    }
+
+    // §5-C zero-copy: import a WS-2-OWNED AHB as an external-OES texture. No allocate,
+    // no CPU lock/memcpy, and we NEVER release the AHB (WS-2 owns it). Re-imports only
+    // when the AHB pointer changes; if WS-2 re-renders into the SAME AHB the EGLImage
+    // view samples the new content with no re-import.
+    bool import_external_ahb(CachedTex& ct, AHardwareBuffer* extahb) {
+        if (!ahb_ready || extahb == nullptr) return false;
+        if (ct.ext_ahb == extahb && ct.ext_tex != 0 && ct.ext_image != nullptr)
+            return true;  // same buffer already imported -> reuse
+        if (ct.ext_image != nullptr && p_destroy_image) {
+            p_destroy_image(display, static_cast<EGLImageKHR>(ct.ext_image));
+            ct.ext_image = nullptr;
+        }
+        EGLClientBuffer cb = p_get_native_buf(extahb);
+        const EGLint attribs[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
+        EGLImageKHR img = cb ? p_create_image(display, EGL_NO_CONTEXT,
+                                              EGL_NATIVE_BUFFER_ANDROID, cb, attribs)
+                             : EGL_NO_IMAGE_KHR;
+        if (img == EGL_NO_IMAGE_KHR) return false;
+        ct.ext_image = img;
+        ct.ext_ahb = extahb;
+        if (ct.ext_tex == 0) glGenTextures(1, &ct.ext_tex);
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, ct.ext_tex);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        p_image_target_tex(GL_TEXTURE_EXTERNAL_OES, static_cast<GLeglImageOES>(ct.ext_image));
+        return true;
+    }
+
+    // Free the EGLImage view over a WS-2 AHB (NOT the AHB — WS-2 owns it).
+    void ext_image_release(CachedTex& ct) {
+        if (ct.ext_image != nullptr && p_destroy_image)
+            p_destroy_image(display, static_cast<EGLImageKHR>(ct.ext_image));
+        ct.ext_image = nullptr;
+        ct.ext_ahb = nullptr;
     }
 
     // Upload a tightly-packed (stride==w*4) BGRA-in-memory buffer into `tex`.
@@ -4692,16 +4762,31 @@ struct WaylandPresenter {
 
         // `surfaces` is already ordered bottom->top by the compositor; paint as-is.
         for (const alr::wayland::PresentSurface& s : surfaces) {
-            if (s.pixels == nullptr || s.width <= 0 || s.height <= 0) continue;
+            if ((s.pixels == nullptr && s.ahb == nullptr) ||
+                s.width <= 0 || s.height <= 0) continue;
             CachedTex& ct = tex_cache[s.surface_key];
+            ct.seen = true;  // mark before any no-draw skip so it isn't reaped
             const bool content_changed = (ct.content_serial != s.content_serial);
 
-            // M2 zero-copy path: try to upload into a per-surface AHardwareBuffer and
-            // sample it via external-OES (no glTexImage2D GPU transfer). On content
-            // change we memcpy into the AHB; otherwise the existing AHB import is
-            // reused. Falls back to the sampler2D/glTexImage2D path on any failure.
+            // §5-C GPU zero-copy: the surface carries a WS-2-rendered AHB. Import it
+            // directly (no allocate / lock / memcpy) and sample via the .rgba
+            // external-OES program (WS-2 AHB is R8G8B8A8_UNORM). Highest precedence.
+            bool drawn_via_gpu = false;
+            if (s.ahb != nullptr && ahb_ready && ext_program_rgba != 0) {
+                if (import_external_ahb(ct, static_cast<AHardwareBuffer*>(s.ahb))) {
+                    if (content_changed) { ++ahb_uploads; ct.content_serial = s.content_serial; }
+                    glUseProgram(ext_program_rgba);
+                    glUniform1i(ext_rgba_u_tex, 0);
+                    glBindTexture(GL_TEXTURE_EXTERNAL_OES, ct.ext_tex);
+                    drawn_via_gpu = true;
+                }
+            }
+
+            // Shm zero-copy path: memcpy committed pixels into a presenter-owned AHB
+            // and sample via external-OES (.bgra). On content change we memcpy into the
+            // AHB; otherwise the existing import is reused.
             bool drawn_via_ahb = false;
-            if (ahb_ready) {
+            if (!drawn_via_gpu && s.pixels != nullptr && ahb_ready) {
                 if (content_changed) {
                     if (ahb_upload(ct, s.width, s.height, s.pixels)) {
                         ++ahb_uploads;
@@ -4716,7 +4801,8 @@ struct WaylandPresenter {
                 }
             }
 
-            if (!drawn_via_ahb) {
+            if (!drawn_via_gpu && !drawn_via_ahb) {
+                if (s.pixels == nullptr) continue;  // GPU import failed + no shm pixels
                 // Fallback: sampler2D + glTexImage2D (CPU->GPU upload on change).
                 if (ct.tex == 0) {
                     glGenTextures(1, &ct.tex);
@@ -4736,16 +4822,16 @@ struct WaylandPresenter {
                     glBindTexture(GL_TEXTURE_2D, ct.tex);
                 }
             }
-            ct.seen = true;
-            // Placement rect (output px, top-left origin, +Y down) -> NDC. NDC y is
-            // bottom-up, so flip: top of the rect -> larger NDC y.
+            // Placement rect (output px, top-left origin, +Y down) -> NDC (bottom-up).
             const float x0 = (static_cast<float>(s.dst_x) / ref_w) * 2.0f - 1.0f;
             const float x1 = (static_cast<float>(s.dst_x + s.dst_w) / ref_w) * 2.0f - 1.0f;
             const float y_top    = 1.0f - (static_cast<float>(s.dst_y) / ref_h) * 2.0f;
             const float y_bottom = 1.0f - (static_cast<float>(s.dst_y + s.dst_h) / ref_h) * 2.0f;
-            // Use the active program's attribute locations (AHB external-OES program
-            // vs sampler2D program). draw_quad_ndc_attr(...,x0,y0,x1,y1): y0=bottom.
-            if (drawn_via_ahb) {
+            // draw_quad_ndc_attr(...,x0,y0,x1,y1): y0=bottom. The WS-2 GPU AHB is GL
+            // bottom-up but reads top-left as a texture -> SAME V-flip as the shm path.
+            if (drawn_via_gpu) {
+                draw_quad_ndc_attr(ext_rgba_a_pos, ext_rgba_a_uv, x0, y_bottom, x1, y_top);
+            } else if (drawn_via_ahb) {
                 draw_quad_ndc_attr(ext_a_pos, ext_a_uv, x0, y_bottom, x1, y_top);
             } else {
                 draw_quad_ndc_attr(a_pos, a_uv, x0, y_bottom, x1, y_top);
@@ -4758,6 +4844,7 @@ struct WaylandPresenter {
                 if (it->second.tex != 0) glDeleteTextures(1, &it->second.tex);
                 if (it->second.ext_tex != 0) glDeleteTextures(1, &it->second.ext_tex);
                 ahb_release(it->second);
+                ext_image_release(it->second);  // §5-C: free the WS-2 AHB EGLImage view (not the AHB)
                 it = tex_cache.erase(it);
             } else {
                 ++it;

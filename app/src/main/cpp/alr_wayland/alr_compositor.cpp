@@ -23,8 +23,11 @@
 // logcat ("client bound: wl_compositor", "surface committed shm ...", etc.).
 
 #include "alr_wayland/alr_compositor.hpp"
+#include "alr_wayland/alr_present_source.hpp"  // §5-C GPU present contract
+#include "alr_wayland/alr_xkb_keymap_us.h"     // embedded self-contained XKB keymap
 
 #include <android/log.h>
+#include <android/hardware_buffer.h>  // M2 §5-C: AHardwareBuffer_acquire/release
 
 #include <atomic>
 #include <algorithm>
@@ -39,9 +42,12 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <linux/memfd.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/timerfd.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -109,6 +115,13 @@ struct SurfaceState {
     std::string title;            // last set_title (used as a dialog heuristic)
     bool is_popup = false;
     bool had_explicit_null_attach = false;  // client did attach(null) this cycle
+    // --- §5-C GPU present: a WS-2-rendered AHardwareBuffer bound to this surface for
+    // zero-copy import by the presenter. Acquired in alr_wayland_submit_gpu_frame,
+    // released when the next GPU frame for this surface binds. null => CPU/shm only.
+    void* gpu_ahb = nullptr;   // AHardwareBuffer* (compositor holds one acquire ref)
+    int32_t gpu_w = 0;
+    int32_t gpu_h = 0;
+    uint64_t gpu_serial = 0;
 };
 
 }  // namespace
@@ -186,6 +199,7 @@ private:
     void teardown();
     void reactor();
     void drain_input_queue();  // compositor thread: queue -> wl input protocol
+    void drain_gpu_queue();    // compositor thread: bind submitted AHB frames (§5-C)
     bool register_globals();
     bool make_socket();
 
@@ -251,6 +265,12 @@ struct InjectEvent {
 };
 std::mutex g_inject_mutex;
 std::vector<InjectEvent> g_inject_queue;  // guarded by g_inject_mutex
+
+// §5-C GPU frame submissions from the WS-2 executor thread, drained on the
+// compositor thread (drain_gpu_queue), mirroring the input queue above.
+struct GpuSubmit { void* ahb = nullptr; int32_t w = 0, h = 0; uint64_t serial = 0; };
+std::mutex g_gpu_mutex;
+std::vector<GpuSubmit> g_gpu_queue;  // guarded by g_gpu_mutex
 std::vector<struct wl_resource*> g_pointers;
 std::vector<struct wl_resource*> g_keyboards;
 std::vector<struct wl_resource*> g_touches;
@@ -384,6 +404,18 @@ void surface_commit(struct wl_client*, struct wl_resource* resource) {
                     s->mapped = true;
                     if (s->xdg_toplevel) {
                         zorder_raise(s);  // most-recently-mapped on top
+                        // P0-1: a new toplevel steals focus while the previous one is
+                        // still ALIVE (e.g. a GIMP dialog opening) -> send the old
+                        // surface wl_keyboard.leave first, or it keeps believing it
+                        // holds the keyboard (stuck modifiers / IME to the wrong
+                        // window). Destroy paths intentionally send no leave (gone).
+                        if (g_keyboard_entered && g_focus_surface &&
+                            g_focus_surface != s->surface) {
+                            for (auto* k : g_keyboards)
+                                wl_keyboard_send_leave(
+                                    k, wl_display_next_serial(comp->display()),
+                                    g_focus_surface);
+                        }
                         g_focus_surface = s->surface;
                         g_pointer_entered = false;
                         g_keyboard_entered = false;
@@ -413,6 +445,12 @@ void surface_commit(struct wl_client*, struct wl_resource* resource) {
         s->mapped = false;
         zorder_remove(s);
         if (g_focus_surface == s->surface) {
+            // P0-1: s is unmapped but still ALIVE -> release the keyboard from it.
+            if (g_keyboard_entered) {
+                for (auto* k : g_keyboards)
+                    wl_keyboard_send_leave(
+                        k, wl_display_next_serial(comp->display()), s->surface);
+            }
             g_focus_surface = nullptr;
             g_pointer_entered = false;
             g_keyboard_entered = false;
@@ -678,10 +716,15 @@ void present_composited() {
 
     for (SurfaceState* s : g_zorder) {
         if (!s) continue;  // defensive: never deref a stray/stale z-order entry
-        if (!s->mapped || s->pixels.empty() || s->buf_w <= 0 || s->buf_h <= 0) continue;
+        // A surface presents if it has shm pixels OR a §5-C GPU buffer. drain_gpu_queue
+        // sets buf_w/buf_h from the AHB dims for a GPU-only surface, so the placement
+        // below works for both; the presenter prefers ps.ahb (zero-copy) over ps.pixels.
+        if (!s->mapped || (s->pixels.empty() && s->gpu_ahb == nullptr) ||
+            s->buf_w <= 0 || s->buf_h <= 0) continue;
         const Rect r = place_toplevel(s, out_w, out_h);
         PresentSurface ps;
-        ps.pixels = s->pixels.data();
+        ps.pixels = s->pixels.empty() ? nullptr : s->pixels.data();
+        ps.ahb = s->gpu_ahb;  // §5-C: non-null => presenter imports zero-copy
         ps.width = s->buf_w;
         ps.height = s->buf_h;
         ps.dst_x = r.x; ps.dst_y = r.y; ps.dst_w = r.w; ps.dst_h = r.h;
@@ -1168,6 +1211,37 @@ void seat_get_pointer(struct wl_client* client, struct wl_resource* resource,
     g_pointers.push_back(p);
     ALR_WL_LOGI("wl_seat.get_pointer bound (now %zu)", g_pointers.size());
 }
+// Build a sealed memfd holding the embedded self-contained XKB_V1 keymap so guest
+// clients (GDK/libxkbcommon) compile it directly via xkb_keymap_new_from_string
+// and never look for rootfs /usr/share/X11/xkb data (absent -> XKB-338 -> NULL
+// keymap -> SEGV). Returns fd (>=0) and sets *out_size to text+NUL length, else -1.
+int make_xkb_keymap_fd(size_t* out_size) {
+    const size_t size = sizeof(kUsXkbKeymapV1);  // includes trailing NUL
+    int fd = static_cast<int>(::syscall(__NR_memfd_create, "alr-xkb-keymap",
+                                        MFD_CLOEXEC | MFD_ALLOW_SEALING));
+    if (fd < 0) {
+        ALR_WL_LOGE("memfd_create(keymap) failed: %s", std::strerror(errno));
+        return -1;
+    }
+    if (::ftruncate(fd, static_cast<off_t>(size)) != 0) {
+        ALR_WL_LOGE("ftruncate(keymap) failed: %s", std::strerror(errno));
+        ::close(fd);
+        return -1;
+    }
+    void* map = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) {
+        ALR_WL_LOGE("mmap(keymap) failed: %s", std::strerror(errno));
+        ::close(fd);
+        return -1;
+    }
+    std::memcpy(map, kUsXkbKeymapV1, size);
+    ::munmap(map, size);
+    // Seal so the client can MAP_PRIVATE it safely (wl_keyboard v7+). Best-effort.
+    ::fcntl(fd, F_ADD_SEALS,
+            F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL);
+    *out_size = size;
+    return fd;
+}
 void seat_get_keyboard(struct wl_client* client, struct wl_resource* resource,
                        uint32_t id) {
     struct wl_resource* k = wl_resource_create(
@@ -1175,12 +1249,23 @@ void seat_get_keyboard(struct wl_client* client, struct wl_resource* resource,
     if (!k) { wl_client_post_no_memory(client); return; }
     wl_resource_set_implementation(k, &kKeyboardImpl, nullptr, keyboard_destroyed);
     g_keyboards.push_back(k);
-    // NO_KEYMAP: the client uses its own default keymap (a self-contained server
-    // keymap needs xkb data the PoC rootfs lacks). A valid fd is still sent.
-    int devnull = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
-    wl_keyboard_send_keymap(k, WL_KEYBOARD_KEYMAP_FORMAT_NO_KEYMAP,
-                            devnull >= 0 ? devnull : 0, 0);
-    if (devnull >= 0) ::close(devnull);
+    // Send a self-contained XKB_V1 keymap (alr_xkb_keymap_us.h): the guest compiles
+    // it directly and never needs rootfs /usr/share/X11/xkb data (absent here ->
+    // was XKB-338 -> NULL keymap -> SEGV in GTK/GIMP/foot). NO_KEYMAP fallback only
+    // if the memfd can't be built.
+    size_t km_size = 0;
+    int km_fd = make_xkb_keymap_fd(&km_size);
+    if (km_fd >= 0) {
+        wl_keyboard_send_keymap(k, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, km_fd,
+                                static_cast<uint32_t>(km_size));
+        ::close(km_fd);  // libwayland dups the fd during marshalling
+        ALR_WL_LOGI("wl_keyboard.keymap sent XKB_V1 (%zu bytes)", km_size);
+    } else {
+        int devnull = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+        wl_keyboard_send_keymap(k, WL_KEYBOARD_KEYMAP_FORMAT_NO_KEYMAP,
+                                devnull >= 0 ? devnull : 0, 0);
+        if (devnull >= 0) ::close(devnull);
+    }
     if (wl_resource_get_version(k) >= WL_KEYBOARD_REPEAT_INFO_SINCE_VERSION) {
         wl_keyboard_send_repeat_info(k, 25, 600);
     }
@@ -1628,6 +1713,40 @@ void Compositor::drain_input_queue() {
     wl_display_flush_clients(display_);
 }
 
+// §5-C: bind the newest submitted GPU frame (AHardwareBuffer) to the top toplevel
+// for zero-copy present. Compositor thread only (reactor wakeup). Single-GPU-surface
+// bring-up: newest frame wins; superseded/older frames in the batch are released.
+void Compositor::drain_gpu_queue() {
+    std::vector<GpuSubmit> local;
+    {
+        std::lock_guard<std::mutex> lk(g_gpu_mutex);
+        local.swap(g_gpu_queue);
+    }
+    if (local.empty()) return;
+    for (std::size_t i = 0; i + 1 < local.size(); ++i)
+        if (local[i].ahb)
+            AHardwareBuffer_release(static_cast<AHardwareBuffer*>(local[i].ahb));
+    GpuSubmit& last = local.back();
+    SurfaceState* tgt = zorder_top();
+    if (!tgt) {  // no surface to bind to yet -> drop (release) the frame
+        if (last.ahb) AHardwareBuffer_release(static_cast<AHardwareBuffer*>(last.ahb));
+        return;
+    }
+    // Contract (alr_present_source.hpp): release the previously-held buffer when the
+    // next one binds, so at most one AHB is retained per GPU surface.
+    if (tgt->gpu_ahb && tgt->gpu_ahb != last.ahb)
+        AHardwareBuffer_release(static_cast<AHardwareBuffer*>(tgt->gpu_ahb));
+    tgt->gpu_ahb = last.ahb;
+    tgt->gpu_w = last.w;
+    tgt->gpu_h = last.h;
+    tgt->gpu_serial = last.serial;
+    // Drive sizing/placement for a GPU-only surface (no shm buffer was committed).
+    if (tgt->buf_w <= 0) tgt->buf_w = last.w;
+    if (tgt->buf_h <= 0) tgt->buf_h = last.h;
+    tgt->content_serial = static_cast<uint64_t>(wl_display_next_serial(display_));
+    g_scene_dirty = true;  // present on the next frame-timer tick
+}
+
 void Compositor::reactor() {
     ALR_WL_LOGI("compositor reactor entering epoll loop (loop_fd=%d)", loop_fd_);
     constexpr int kMaxEvents = 8;
@@ -1647,6 +1766,7 @@ void Compositor::reactor() {
                 ssize_t r = ::read(wakeup_fd_, &v, sizeof(v));
                 (void)r;  // drain; loop condition handles stop
                 drain_input_queue();  // deliver any injected input events
+                drain_gpu_queue();    // bind any submitted §5-C GPU (AHB) frames
             } else if (events[i].data.fd == frame_timer_fd_) {
                 uint64_t v = 0;
                 ssize_t r = ::read(frame_timer_fd_, &v, sizeof(v));
@@ -1808,6 +1928,37 @@ int alr_wayland_inject_selftest(double x, double y) {
     alr_wayland_inject_key(kKeyA, 1);
     alr_wayland_inject_key(kKeyA, 0);
     return 7;
+}
+
+// ---------------------------------------------------------------------------
+// §5-C PresentSource — GPU/AHB present entry (see alr_present_source.hpp).
+// M2 Phase A (compositor half): acquire the AHB + queue it; drain_gpu_queue (on the
+// compositor thread) binds it to the top toplevel and marks the scene dirty, so
+// present_composited emits it as a §5-C PresentSurface (ps.ahb). The presenter's
+// zero-copy EGLImage import (A4, runtime_report.cpp WaylandPresenter) lights it on
+// screen; until that lands, alr_wayland_gpu_present_ready() stays false so WS-2
+// keeps its direct present. Callable from the WS-2 executor thread.
+// ---------------------------------------------------------------------------
+void alr_wayland_submit_gpu_frame(void* ahardware_buffer, int32_t width,
+                                  int32_t height, uint64_t serial) {
+    if (!ahardware_buffer || width <= 0 || height <= 0) return;
+    // Hold a ref across the thread handoff; drain_gpu_queue releases it when the
+    // next frame binds (or drops it if there is no surface yet).
+    AHardwareBuffer_acquire(static_cast<AHardwareBuffer*>(ahardware_buffer));
+    {
+        std::lock_guard<std::mutex> lk(g_gpu_mutex);
+        g_gpu_queue.push_back({ahardware_buffer, width, height, serial});
+    }
+    Compositor* c = instance();
+    if (c) c->wake();
+}
+
+bool alr_wayland_gpu_present_ready() {
+    // A4 landed: the presenter imports the submitted AHB zero-copy (external-OES,
+    // .rgba, V-flipped) and composites it through present_list, so WS-2 may drive the
+    // GPU present path. (Per-device EGL/GL extension availability is still checked
+    // presenter-side; a device lacking them silently keeps the CPU paths.)
+    return true;
 }
 
 // ===========================================================================
