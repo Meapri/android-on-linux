@@ -32,6 +32,7 @@
 #include "alr_shim_internal.h"
 #include "alr_shim_env.h"
 
+#include <stdlib.h>  /* getenv, atoi (eglQuerySurface drawable size) */
 #include <string.h>
 
 /* ---- Opaque, non-NULL local sentinels. Their addresses are stable for the
@@ -252,6 +253,15 @@ __eglMustCastToProperFunctionPointerType eglGetProcAddress(const char *procname)
         { "eglDestroyContext",        (void*)eglDestroyContext },
         { "eglDestroySurface",        (void*)eglDestroySurface },
         { "eglTerminate",             (void*)eglTerminate },
+        { "eglQuerySurface",          (void*)eglQuerySurface },
+        { "eglQueryContext",          (void*)eglQueryContext },
+        { "eglQueryAPI",              (void*)eglQueryAPI },
+        { "eglWaitClient",            (void*)eglWaitClient },
+        { "eglWaitGL",                (void*)eglWaitGL },
+        { "eglWaitNative",            (void*)eglWaitNative },
+        { "eglReleaseThread",         (void*)eglReleaseThread },
+        { "eglSurfaceAttrib",         (void*)eglSurfaceAttrib },
+        { "eglGetConfigs",            (void*)eglGetConfigs },
     };
     for (size_t i = 0; i < sizeof(tbl)/sizeof(tbl[0]); ++i) {
         if (strcmp(procname, tbl[i].n) == 0)
@@ -291,6 +301,78 @@ EGLBoolean eglDestroySurface(EGLDisplay dpy, EGLSurface surface) {
 
 EGLBoolean eglTerminate(EGLDisplay dpy) {
     if (dpy != ALR_EGL_DISPLAY) { egl_set_error(EGL_BAD_PARAMETER); return EGL_FALSE; }
+    egl_set_error(EGL_SUCCESS);
+    return EGL_TRUE;
+}
+
+/* [LOCAL] surface/context lifecycle queries a GLES app makes (glmark2 dlsym set).
+ * All local — the host owns the real surface/context; these report consistent values. */
+
+/* The drawable is the host AHB render target; report ITS size so the guest sets a
+ * matching glViewport. The loader passes ALR_GPU_FB_W/H (= executor AHB size); default
+ * 1280x720 (WS-1 gcfg) if unset. */
+EGLBoolean eglQuerySurface(EGLDisplay dpy, EGLSurface surface, EGLint attribute, EGLint *value) {
+    if (dpy != ALR_EGL_DISPLAY || surface != ALR_EGL_SURFACE || !value) {
+        egl_set_error(EGL_BAD_PARAMETER); return EGL_FALSE;
+    }
+    int fb_w = 1280, fb_h = 720;
+    const char* ew = getenv(ALR_ENV_FB_W);
+    const char* eh = getenv(ALR_ENV_FB_H);
+    if (ew && *ew) { int v = atoi(ew); if (v > 0) fb_w = v; }
+    if (eh && *eh) { int v = atoi(eh); if (v > 0) fb_h = v; }
+    switch (attribute) {
+        case EGL_WIDTH:         *value = fb_w; break;
+        case EGL_HEIGHT:        *value = fb_h; break;
+        case EGL_RENDER_BUFFER: *value = EGL_BACK_BUFFER; break;
+        case EGL_CONFIG_ID:     *value = 1; break;
+        default:                *value = 0; break;
+    }
+    egl_set_error(EGL_SUCCESS);
+    return EGL_TRUE;
+}
+
+EGLBoolean eglQueryContext(EGLDisplay dpy, EGLContext ctx, EGLint attribute, EGLint *value) {
+    if (dpy != ALR_EGL_DISPLAY || ctx != ALR_EGL_CONTEXT || !value) {
+        egl_set_error(EGL_BAD_PARAMETER); return EGL_FALSE;
+    }
+    switch (attribute) {
+        case EGL_CONTEXT_CLIENT_TYPE:    *value = EGL_OPENGL_ES_API; break;
+        case EGL_CONTEXT_CLIENT_VERSION: *value = 2; break;
+        case EGL_RENDER_BUFFER:          *value = EGL_BACK_BUFFER; break;
+        case EGL_CONFIG_ID:              *value = 1; break;
+        default:                         *value = 0; break;
+    }
+    egl_set_error(EGL_SUCCESS);
+    return EGL_TRUE;
+}
+
+/* glmark2 calls eglBindAPI(EGL_OPENGL_ES_API) then may verify via eglQueryAPI. */
+EGLenum eglQueryAPI(void) { return EGL_OPENGL_ES_API; }
+
+/* Sync barriers: the shim's only real sync is eglSwapBuffers (per-frame), so these
+ * are no-ops that succeed. */
+EGLBoolean eglWaitClient(void) { egl_set_error(EGL_SUCCESS); return EGL_TRUE; }
+EGLBoolean eglWaitGL(void) { egl_set_error(EGL_SUCCESS); return EGL_TRUE; }
+EGLBoolean eglWaitNative(EGLint engine) { (void)engine; egl_set_error(EGL_SUCCESS); return EGL_TRUE; }
+EGLBoolean eglReleaseThread(void) { egl_set_error(EGL_SUCCESS); return EGL_TRUE; }
+
+/* Accept + ignore surface attributes (e.g. EGL_SWAP_BEHAVIOR) — host owns the surface. */
+EGLBoolean eglSurfaceAttrib(EGLDisplay dpy, EGLSurface surface, EGLint attribute, EGLint value) {
+    (void)attribute; (void)value;
+    if (dpy != ALR_EGL_DISPLAY || surface != ALR_EGL_SURFACE) {
+        egl_set_error(EGL_BAD_PARAMETER); return EGL_FALSE;
+    }
+    egl_set_error(EGL_SUCCESS);
+    return EGL_TRUE;
+}
+
+/* Enumerate configs — same single canned config as eglChooseConfig. configs==NULL is a
+ * count query (EGL semantics). */
+EGLBoolean eglGetConfigs(EGLDisplay dpy, EGLConfig *configs, EGLint config_size, EGLint *num_config) {
+    if (dpy != ALR_EGL_DISPLAY || !num_config) { egl_set_error(EGL_BAD_PARAMETER); return EGL_FALSE; }
+    if (configs == NULL) { *num_config = 1; }
+    else if (config_size > 0) { configs[0] = ALR_EGL_CONFIG; *num_config = 1; }
+    else { *num_config = 0; }
     egl_set_error(EGL_SUCCESS);
     return EGL_TRUE;
 }
