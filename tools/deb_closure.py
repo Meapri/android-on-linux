@@ -48,6 +48,13 @@ from tools.overlay_guard import build_base_soname_index, parse_solib, scan_overl
 from tools.safe_tar import inspect_tar_members
 
 
+def _urlopen_ua(url):
+    """urlopen with an apt-like User-Agent — ports.ubuntu.com 403s the default
+    Python-urllib UA. Used as the default opener for all mirror fetches."""
+    req = urllib.request.Request(url, headers={"User-Agent": "Debian APT-HTTP/1.3 (ALR deb_closure)"})
+    return urllib.request.urlopen(req)
+
+
 # --------------------------------------------------------------------------- #
 # Packages index parsing
 # --------------------------------------------------------------------------- #
@@ -472,17 +479,29 @@ class OverlayBuild:
 
 
 def fetch_packages_index(
-    mirror: str, suite: str, arch: str, *, opener=urllib.request.urlopen
+    mirror: str, suite: str, arch: str, *, components=("main",), opener=_urlopen_ua
 ) -> str:
-    """Download + gunzip ``dists/<suite>/main/binary-<arch>/Packages.gz`` to text."""
-    url = f"{mirror.rstrip('/')}/dists/{suite}/main/binary-{arch}/Packages.gz"
-    with opener(url) as resp:
-        blob = resp.read()
-    return gzip.decompress(blob).decode("utf-8", "replace")
+    """Download + gunzip the Packages index for each component and concatenate.
+
+    Debian arm64: ``deb.debian.org/debian`` suite ``bookworm`` component ``main``.
+    Ubuntu arm64 (the ALR base is Ubuntu noble): ``ports.ubuntu.com/ubuntu-ports``
+    suite ``noble`` components ``("main", "universe")`` — Ubuntu splits libraries
+    across main/universe, so fetching only ``main`` misses many deps. Stanzas from
+    all components are concatenated (parse_packages handles the merge; first wins).
+    """
+    if isinstance(components, str):
+        components = (components,)
+    parts: list[str] = []
+    for comp in components:
+        url = f"{mirror.rstrip('/')}/dists/{suite}/{comp}/binary-{arch}/Packages.gz"
+        with opener(url) as resp:
+            blob = resp.read()
+        parts.append(gzip.decompress(blob).decode("utf-8", "replace"))
+    return "\n\n".join(parts)
 
 
 def _download_deb(
-    mirror: str, filename: str, cache_dir: Path, *, opener=urllib.request.urlopen
+    mirror: str, filename: str, cache_dir: Path, *, opener=_urlopen_ua
 ) -> Path:
     """Download ``mirror/<Filename>`` into cache_dir (skip if already cached)."""
     dest = cache_dir / PurePosixPath(filename).name
@@ -505,9 +524,10 @@ def build_overlay(
     mirror: str = "http://deb.debian.org/debian",
     suite: str = "bookworm",
     arch: str = "arm64",
+    components=("main",),
     cache_dir: str | Path | None = None,
     prune=DEFAULT_PRUNE_PREFIXES,
-    opener=urllib.request.urlopen,
+    opener=_urlopen_ua,
 ) -> dict:
     """Resolve, download, base-subtract and flatten an overlay for ``targets``.
 
@@ -526,7 +546,7 @@ def build_overlay(
     cache = Path(cache_dir) if cache_dir is not None else Path(tempfile.mkdtemp(prefix="deb-closure-"))
     cache.mkdir(parents=True, exist_ok=True)
 
-    text = fetch_packages_index(mirror, suite, arch, opener=opener)
+    text = fetch_packages_index(mirror, suite, arch, components=components, opener=opener)
     index = parse_packages(text)
     provides_map = build_provides_map(index)
 
@@ -659,10 +679,11 @@ def build_minimal_overlay(
     mirror: str = "http://deb.debian.org/debian",
     suite: str = "bookworm",
     arch: str = "arm64",
+    components=("main",),
     cache_dir: str | Path | None = None,
     prune=DEFAULT_PRUNE_PREFIXES,
     keep_prefixes=(),
-    opener=urllib.request.urlopen,
+    opener=_urlopen_ua,
 ) -> dict:
     """DT_NEEDED-MINIMAL overlay: keep the leaf package's own files + ONLY the shared
     libs reachable from them via DT_NEEDED (transitively) that the base does NOT
@@ -678,7 +699,7 @@ def build_minimal_overlay(
 
     cache = Path(cache_dir) if cache_dir is not None else Path(tempfile.mkdtemp(prefix="deb-closure-"))
     cache.mkdir(parents=True, exist_ok=True)
-    index = parse_packages(fetch_packages_index(mirror, suite, arch, opener=opener))
+    index = parse_packages(fetch_packages_index(mirror, suite, arch, components=components, opener=opener))
     provides_map = build_provides_map(index)
     log: list[str] = []
     closure = resolve_closure(list(leaf_pkgs), index, provides_map=provides_map, log=log)
@@ -989,6 +1010,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--suite", default="bookworm", help="suite (default: %(default)s)")
     parser.add_argument("--arch", default="arm64", help="architecture (default: %(default)s)")
+    parser.add_argument(
+        "--component", action="append", dest="components",
+        help="repository component (repeatable; default main). The ALR base is "
+        "Ubuntu noble → use --mirror http://ports.ubuntu.com/ubuntu-ports "
+        "--suite noble --component main --component universe",
+    )
     parser.add_argument("--cache", help="package/index cache directory")
     parser.add_argument(
         "--minimal",
@@ -1005,10 +1032,13 @@ def main(argv: list[str] | None = None) -> int:
     if not args.packages or not args.base or not args.out:
         parser.error("--package, --base and --out are required (or use --selftest)")
 
+    components = tuple(args.components) if args.components else ("main",)
+
     if args.minimal:
         m = build_minimal_overlay(
             args.packages, args.base, args.out,
-            mirror=args.mirror, suite=args.suite, arch=args.arch, cache_dir=args.cache,
+            mirror=args.mirror, suite=args.suite, arch=args.arch,
+            components=components, cache_dir=args.cache,
         )
         print(f"wrote {m['out_tar']} (DT_NEEDED-minimal)")
         print(f"  files:            {m['file_count']}")
@@ -1030,6 +1060,7 @@ def main(argv: list[str] | None = None) -> int:
         mirror=args.mirror,
         suite=args.suite,
         arch=args.arch,
+        components=components,
         cache_dir=args.cache,
     )
 
