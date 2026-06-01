@@ -1,0 +1,31 @@
+# =============================================================================
+# WS-5 host CI gate
+#
+# This workflow runs ONLY the host-runnable pytest suite (probe/contract tests
+# that need no Android device). It is the automated half of milestone M5 in the
+# 5-session orchestration plan (docs/research/orchestration-5session-plan.md).
+#
+# IMPORTANT: On-device tests are a MANUAL gate. They require a physical Android
+# device (shared hardware) and are NEVER run in CI. Device evidence is recorded
+# by hand per the orchestration plan's M5 milestone; this CI does not and must
+# not attempt adb, APK install, or any device interaction.
+# =============================================================================
+name: WS-5 host tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  host-tests:
+    name: Host pytest suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Run host pytest suite
+        run: uvx pytest tests/ -q
