@@ -84,6 +84,28 @@ def test_gpu_software_renderer_fails_even_when_fast():
     assert main(["gpu", "--alr-score", "2000", "--mali-score", "1000", "--alr-renderer", "llvmpipe"]) == 1
 
 
+def test_gpu_from_report_pass(tmp_path):
+    # Captured glmark2 logs → ratio directly (the path for a CP-2 device drain).
+    alr = tmp_path / "alr.txt"
+    alr.write_text("glmark2 Score: 900\nGL_RENDERER: Mali-G615\n", encoding="utf-8")
+    mali = tmp_path / "mali.txt"
+    mali.write_text("glmark2 Score: 1000\nGL_RENDERER: Mali-G615\n", encoding="utf-8")
+    assert main(["gpu", "--alr-report", str(alr), "--mali-report", str(mali)]) == 0
+
+
+def test_gpu_from_report_software_fails(tmp_path):
+    alr = tmp_path / "alr.txt"
+    alr.write_text("glmark2 Score: 2000\nGL_RENDERER: llvmpipe\n", encoding="utf-8")
+    mali = tmp_path / "mali.txt"
+    mali.write_text("glmark2 Score: 1000\nGL_RENDERER: Mali-G615\n", encoding="utf-8")
+    # ratio 2.0 but software renderer → software gate FAIL.
+    assert main(["gpu", "--alr-report", str(alr), "--mali-report", str(mali)]) == 1
+
+
+def test_gpu_no_inputs_returns_2():
+    assert main(["gpu"]) == 2
+
+
 def test_index_default_dir_lists_corpus(capsys):
     # Default --dir resolves to the repo's docs/evidence regardless of cwd.
     assert main(["index"]) == 0
