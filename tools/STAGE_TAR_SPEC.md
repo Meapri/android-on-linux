@@ -199,10 +199,22 @@ Built, base-subtracted + pruned, guard-clean (device-pending):
 | `sdl2-stage.tar` | 586 | ~31 MB | libSDL2 + audio/wayland deps; no core-lib shadow |
 | `netsurf-stage.tar` | 9083 | ~195 MB | still large — full Depends pulls perl + Adwaita + ICU |
 
-**Finding:** for a *practical* netsurf overlay, the full `Depends` closure is too
-broad (~195 MB). The right next step is a **curated package list** (leaf + only the
-libs its binary's `DT_NEEDED` actually requires that the base lacks) rather than the
-conservative transitive `Depends`. `deb_closure`'s `prune=` is tunable per build.
+**Resolved — DT_NEEDED-minimal closure (`--minimal`):** the full `Depends` closure
+is too broad (netsurf ~195 MB: perl via ca-certificates, full Adwaita, ICU). The fix
+is `deb_closure.build_minimal_overlay` / `--minimal`: keep the **leaf package's own
+files** (binaries + plugins + data) + only the libs **reachable via DT_NEEDED** from
+them (transitively) that the base lacks; drop the rest. Uses `tools/elf_needed.py`
+(pure-Python ELF DT_NEEDED/DT_SONAME reader, no pyelftools). A need the base already
+provides stops the walk (base ships it + its deps); dlopen'd toolkit modules survive
+because they live in the base (gdk-pixbuf/pango) or the leaf package (Qt's qtwayland
+plugin) — use `keep_prefixes=` to force-keep extra data dirs.
+
+| overlay | mode | files | size | note |
+|---|---|---|---|---|
+| `netsurf-gtk` | full Depends | 9083 | ~195 MB | perl + Adwaita + ICU bloat |
+| `netsurf-gtk` | **`--minimal`** | **9** | **~7.1 MB** | netsurf bin + libcurl/libjpeg/libldap/liblber/libpthread; missing_soname=NONE, guard-clean, CONFORMANT (27× smaller) |
+
+Build: `python -m tools.deb_closure --minimal --package netsurf-gtk --base <base.tar> --out /tmp/netsurf-stage.tar`.
 
 ## 8. (a) GUI-stability — C.UTF-8 locale (root cause found + fixed)
 

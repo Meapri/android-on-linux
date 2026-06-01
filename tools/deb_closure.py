@@ -591,6 +591,202 @@ def build_overlay(
     return build.as_dict()
 
 
+def reachable_overlay_libs(start_rels, needed_fn, soname_path: dict, base_sonames: set, elf_rels: set):
+    """BFS the DT_NEEDED graph from ``start_rels`` (leaf ELF rel-paths).
+
+    ``needed_fn(rel) -> iterable[soname]`` gives a file's DT_NEEDED. A need the BASE
+    already provides stops the walk (the base ships it + its own transitive deps). A
+    need provided by the overlay (``soname_path``) is kept and recursed into if it is
+    itself an ELF (``elf_rels``). Returns (keep_rels:set, missing_sonames:set). Pure /
+    offline-testable — no filesystem or ELF parsing of its own.
+    """
+    from collections import deque
+
+    keep: set[str] = set()
+    missing: set[str] = set()
+    queue = deque(start_rels)
+    seen = set(queue)
+    while queue:
+        rel = queue.popleft()
+        for need in needed_fn(rel):
+            if need in base_sonames:
+                continue
+            tgt = soname_path.get(need)
+            if tgt is None:
+                missing.add(need)
+                continue
+            keep.add(tgt)
+            if tgt in elf_rels and tgt not in seen:
+                seen.add(tgt)
+                queue.append(tgt)
+    return keep, missing
+
+
+def _leaf_file_paths(leaf_pkgs, index, mirror, cache: Path, opener) -> set[str]:
+    """Extract each leaf .deb on its own and return the set of rootfs-rel paths it
+    installs (binaries + plugins + data) — these are kept ENTIRELY in a minimal build."""
+    import shutil
+
+    paths: set[str] = set()
+    for name in leaf_pkgs:
+        fields = index.get(name, {})
+        filename = fields.get("Filename")
+        if not filename:
+            continue
+        try:
+            deb = _download_deb(mirror, filename, cache, opener=opener)
+        except Exception:
+            continue
+        leaf_root = cache / f"_leaf_{name.replace('/', '_').replace(':', '_')}"
+        if leaf_root.exists():
+            shutil.rmtree(leaf_root)
+        leaf_root.mkdir(parents=True)
+        try:
+            extract_deb(deb, leaf_root)
+        except Exception:
+            continue
+        for dirpath, _dirs, files in os.walk(leaf_root):
+            for fname in files:
+                paths.add((Path(dirpath) / fname).relative_to(leaf_root).as_posix())
+    return paths
+
+
+def build_minimal_overlay(
+    leaf_pkgs: list[str],
+    base: str | Path,
+    out_tar: str | Path,
+    *,
+    mirror: str = "http://deb.debian.org/debian",
+    suite: str = "bookworm",
+    arch: str = "arm64",
+    cache_dir: str | Path | None = None,
+    prune=DEFAULT_PRUNE_PREFIXES,
+    keep_prefixes=(),
+    opener=urllib.request.urlopen,
+) -> dict:
+    """DT_NEEDED-MINIMAL overlay: keep the leaf package's own files + ONLY the shared
+    libs reachable from them via DT_NEEDED (transitively) that the base does NOT
+    provide. Drops the rest of the conservative Debian Depends closure (perl pulled
+    via ca-certificates, unused ICU, full icon themes, …) that bloats a full build.
+
+    GTK/Qt runtime modules that are dlopen'd (not DT_NEEDED) live either in the base
+    (gdk-pixbuf loaders, pango modules) or in the leaf package itself (Qt's qtwayland
+    platform plugin) — the leaf's own files are kept entirely, so those survive. Use
+    ``keep_prefixes`` to force-keep extra data dirs if a toolkit needs them.
+    """
+    from tools.elf_needed import read_elf_dynamic  # lazy: parser may post-date this import
+
+    cache = Path(cache_dir) if cache_dir is not None else Path(tempfile.mkdtemp(prefix="deb-closure-"))
+    cache.mkdir(parents=True, exist_ok=True)
+    index = parse_packages(fetch_packages_index(mirror, suite, arch, opener=opener))
+    provides_map = build_provides_map(index)
+    log: list[str] = []
+    closure = resolve_closure(list(leaf_pkgs), index, provides_map=provides_map, log=log)
+
+    import shutil
+
+    unsupported: list[str] = []
+    merged_root = cache / "_merged_root"
+    if merged_root.exists():
+        shutil.rmtree(merged_root)
+    merged_root.mkdir(parents=True)
+    for name in closure:
+        fields = index.get(name, {})
+        filename = fields.get("Filename")
+        if not filename:
+            unsupported.append(f"{name} (no Filename)")
+            continue
+        try:
+            deb = _download_deb(mirror, filename, cache, opener=opener)
+        except Exception as exc:
+            unsupported.append(f"{name} (download failed: {exc})")
+            continue
+        try:
+            extract_deb(deb, merged_root)
+        except NotImplementedError:
+            unsupported.append(f"{name} (zstd .deb)")
+        except Exception as exc:
+            unsupported.append(f"{name} (extract failed: {exc})")
+
+    leaf_files = _leaf_file_paths(leaf_pkgs, index, mirror, cache, opener)
+
+    # Map each SONAME provided by the overlay to its REAL file (skip symlinks; the
+    # flat name is synthesized by build_stage_tar). Record which rel paths are ELF.
+    soname_path: dict[str, str] = {}
+    elf_rel: set[str] = set()
+    for dirpath, _dirs, files in os.walk(merged_root):
+        for fname in files:
+            full = Path(dirpath) / fname
+            if full.is_symlink():
+                continue
+            rel = full.relative_to(merged_root).as_posix()
+            lib = parse_solib(fname)
+            if lib is not None:
+                soname_path.setdefault(lib.soname, rel)
+            try:
+                ed = read_elf_dynamic(full)
+            except OSError:
+                continue
+            if ed.is_elf:
+                elf_rel.add(rel)
+                if ed.soname:
+                    soname_path.setdefault(ed.soname, rel)
+
+    base_sonames = base_soname_set(base)
+
+    def _needed(rel: str):
+        try:
+            return read_elf_dynamic(merged_root / rel).needed
+        except OSError:
+            return ()
+
+    keep, missing_soname = reachable_overlay_libs(
+        [rel for rel in leaf_files if rel in elf_rel],
+        _needed,
+        soname_path,
+        base_sonames,
+        elf_rel,
+    )
+
+    keep_set = set(leaf_files) | keep
+    kp = tuple(p.rstrip("/") + "/" for p in keep_prefixes)
+    dropped: list[str] = []
+    for dirpath, _dirs, files in os.walk(merged_root):
+        for fname in files:
+            full = Path(dirpath) / fname
+            rel = full.relative_to(merged_root).as_posix()
+            if rel in keep_set or (kp and rel.startswith(kp)):
+                continue
+            try:
+                full.unlink()
+            except OSError:
+                continue
+            dropped.append(rel)
+
+    skipped_sonames = drop_base_sonames(merged_root, base_sonames)
+    skipped_paths = drop_base_paths(merged_root, base_path_set(base))
+    skipped_base = sorted(set(skipped_sonames) | set(skipped_paths))
+    pruned = prune_paths(merged_root, prune)
+
+    result = build_stage_tar(merged_root, out_tar)
+    violations = scan_overlay_violations(base, out_tar)
+
+    return {
+        "closure": list(closure),
+        "leaf_files": len(leaf_files),
+        "reachable_libs": sorted(keep),
+        "missing_soname": sorted(missing_soname),
+        "dropped_unreachable": len(dropped),
+        "skipped_base": len(skipped_base),
+        "pruned": len(pruned),
+        "unsupported": unsupported,
+        "out_tar": result.out_tar,
+        "sidecar": result.sidecar,
+        "file_count": result.file_count,
+        "violations": [v.render() for v in violations],
+    }
+
+
 # --------------------------------------------------------------------------- #
 # CLI + selftest
 # --------------------------------------------------------------------------- #
@@ -748,6 +944,27 @@ def _selftest() -> int:
         check("prune KEPT the app binary", (root / "usr/bin/app").exists())
         check("prune KEPT libwebp", (libdir / "libwebp.so.7.1.0").exists())
 
+    # --- reachable_overlay_libs (DT_NEEDED minimal closure, pure/offline) ----
+    # leaf links libA (overlay) + libgtk (base, stops); libA links libB (overlay);
+    # libC is an unrelated overlay lib (unreachable) -> must be dropped.
+    soname_path = {"libA.so.1": "lib/libA", "libB.so.1": "lib/libB", "libC.so.1": "lib/libC"}
+    needed = {
+        "bin/leaf": ["libA.so.1", "libgtk-3.so.0"],
+        "lib/libA": ["libB.so.1"],
+        "lib/libB": [],
+        "lib/libC": ["libB.so.1"],
+    }
+    keep, missing = reachable_overlay_libs(
+        ["bin/leaf"], lambda r: needed.get(r, []), soname_path,
+        {"libgtk-3.so.0"}, set(needed),
+    )
+    check("reachable keeps DT_NEEDED-linked overlay libs (A,B)", keep == {"lib/libA", "lib/libB"})
+    check("reachable DROPS unreachable overlay lib (C)", "lib/libC" not in keep)
+    check("reachable: base-provided need does not appear / no missing", missing == set())
+    k2, m2 = reachable_overlay_libs(["bin/leaf"], lambda r: ["libZ.so.9"] if r == "bin/leaf" else [],
+                                    soname_path, set(), {"bin/leaf"})
+    check("reachable reports unresolved soname as missing", m2 == {"libZ.so.9"} and k2 == set())
+
     print(f"\nselftest: {'ALL PASS' if failures == 0 else str(failures) + ' FAILED'}")
     return 1 if failures else 0
 
@@ -773,6 +990,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--suite", default="bookworm", help="suite (default: %(default)s)")
     parser.add_argument("--arch", default="arm64", help="architecture (default: %(default)s)")
     parser.add_argument("--cache", help="package/index cache directory")
+    parser.add_argument(
+        "--minimal",
+        action="store_true",
+        help="DT_NEEDED-minimal: keep only the libs the leaf package actually links "
+        "(transitively) that the base lacks — drops perl/ICU/icon-theme bloat",
+    )
     parser.add_argument("--selftest", action="store_true", help="run built-in OFFLINE tests")
     args = parser.parse_args(argv)
 
@@ -781,6 +1004,24 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.packages or not args.base or not args.out:
         parser.error("--package, --base and --out are required (or use --selftest)")
+
+    if args.minimal:
+        m = build_minimal_overlay(
+            args.packages, args.base, args.out,
+            mirror=args.mirror, suite=args.suite, arch=args.arch, cache_dir=args.cache,
+        )
+        print(f"wrote {m['out_tar']} (DT_NEEDED-minimal)")
+        print(f"  files:            {m['file_count']}")
+        print(f"  leaf files:       {m['leaf_files']}")
+        print(f"  reachable libs:   {len(m['reachable_libs'])}")
+        print(f"  dropped unreached:{m['dropped_unreachable']}")
+        print(f"  pruned:           {m['pruned']}")
+        if m["missing_soname"]:
+            print(f"  MISSING sonames:  {m['missing_soname']}")
+        if m["unsupported"]:
+            print(f"  unsupported pkgs: {len(m['unsupported'])}")
+        print("  overlay_guard: " + ("OK" if not m["violations"] else f"{len(m['violations'])} violations"))
+        return 0 if not m["violations"] else 1
 
     result = build_overlay(
         args.packages,
