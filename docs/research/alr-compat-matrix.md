@@ -4,7 +4,7 @@
 > 도는지의 앱×결과 표. **device evidence가 있는 행만 USABLE/RUNS/RENDERS로 표기**한다.
 > host-only/예정은 WIRED/PENDING. 이 표는 WS-5가 유지하며, 새 device evidence가 추가될 때마다 갱신.
 
-작성 baseline: HEAD `0df74dc` (v124) + 통합 트리 v126 미커밋. 디바이스 `R5KL20B6S3X` (SM-X236N, Mali-G615, Android 16).
+작성 baseline: HEAD `0df74dc` (v124) → 통합 트리 v127 (CP-1 landed). 디바이스 `R5KL20B6S3X` (SM-X236N, Mali-G615, Android 16).
 
 ## 상태 범례
 - **USABLE** — device에서 사람이 실제로 조작 가능(입력 포함).
@@ -32,7 +32,7 @@
 |----|------|------|----------|------|
 | GIMP 3.0 | GTK3 | **USABLE** (터치로 File>New>캔버스>브러시) | v111-gimp-fully-usable-drawing | cairo SW 렌더 → wl_shm 합성 |
 | gtk3 데모 창 | GTK3 | RENDERS | v89-gtk3-renders, v90-real-gtk3-window | |
-| gtk3-widget-factory | GTK3 | WIRED | (v126 launch wiring) | device 렌더 확인 pending |
+| gtk3-widget-factory | GTK3 | RENDERS | (v127 CP-1) | guest-GUI XKB keymap SIGSEGV 수정 후 렌더 |
 | foot | (terminal) | WIRED | (v126 launch wiring) | stage tar 준비 |
 | Qt5/Qt6 (qtwayland) | Qt | PENDING | — | WS-4 M2 |
 | SDL2 | SDL | PENDING | — | WS-4 M2 / WS-2 M4 |
@@ -55,8 +55,9 @@
 ## 디스플레이/입력 (L3)
 | 항목 | 결과 | Evidence | 비고 |
 |------|------|----------|------|
-| 해상도/주사율 device-exact (1200×1920@90Hz) | WIRED (v126) | — | device 검증 finalizing (CP-1) |
+| 해상도/주사율 device-exact (1200×1920@90Hz) | RENDERS | v126/v127 | wl_output geometry device-exact |
 | 입력 (touch/pointer/key) | USABLE (GIMP 경로) | v86-input-injection, v111 | IME/wl_seat 갭은 WS-3 M4 |
+| guest-GUI XKB 키맵 | 수정됨 (SIGSEGV fix) | v127 CP-1 | `XKB_CONFIG_ROOT`를 rootfs-absolute 경로로 설정 |
 | `zwp_linux_dmabuf` zero-copy present | PENDING | — | WS-3 M2 / CP-4 |
 
 ## 미지원 (현재 불가)

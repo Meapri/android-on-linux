@@ -49,6 +49,19 @@ class GuestProbe:
 
 
 @dataclass(frozen=True)
+class WlOutput:
+    """Compositor `client bound: wl_output vN (WxH px, WxH mm, scale=S, dpi=D)`."""
+
+    version: int | None = None
+    width_px: int | None = None
+    height_px: int | None = None
+    width_mm: int | None = None
+    height_mm: int | None = None
+    scale: int | None = None
+    dpi: float | None = None
+
+
+@dataclass(frozen=True)
 class ParsedReport:
     build_stamp: str | None
     guest_exec: GuestExec | None
@@ -59,6 +72,8 @@ class ParsedReport:
     perf_harness_pass: bool | None
     guest_probes: tuple[GuestProbe, ...] = field(default_factory=tuple)
     raw: str = ""
+    alr_markers: dict[str, str] = field(default_factory=dict)
+    wl_output: "WlOutput | None" = None
 
 
 _BUILD = re.compile(r"^build:\s*(\S+)", re.MULTILINE)
@@ -80,6 +95,14 @@ _GPU_SOCKET = re.compile(r"alr gpu boundary socket per-cmd ns/op=(\d+)")
 _GPU_SHMEM = re.compile(r"alr gpu boundary shmem-ring ns/op=(\d+)")
 _PERF_HARNESS = re.compile(r"ALR PERF HARNESS:\s*(\S+)")
 _GIMP_PROBE = re.compile(r"gimp-probe guest=(\S+)\s+exit=(\d+)")
+# Generic device marker: `ALR <name>: <status>`. Names may carry spaces/parens
+# but no internal colon (the first colon ends the name). Future-proofs the parser
+# against the growing list of `ALR <name>: PASS` markers runtime_report.cpp emits.
+_ALR_MARKER = re.compile(r"^(ALR [^:]+):\s*(.+?)\s*$", re.MULTILINE)
+_WL_OUTPUT = re.compile(
+    r"client bound: wl_output v(\d+) "
+    r"\((\d+)x(\d+) px, (\d+)x(\d+) mm, scale=(\d+), dpi=([\d.]+)\)"
+)
 
 
 def _int(pat: re.Pattern[str], text: str, group: int = 1) -> int | None:
@@ -140,6 +163,23 @@ def parse_report(text: str) -> ParsedReport:
         GuestProbe(guest=g, exit_code=int(e)) for g, e in _GIMP_PROBE.findall(text)
     )
 
+    alr_markers = {
+        name.strip(): status for name, status in _ALR_MARKER.findall(text)
+    }
+
+    wl_output: WlOutput | None = None
+    m_wl = _WL_OUTPUT.search(text)
+    if m_wl is not None:
+        wl_output = WlOutput(
+            version=int(m_wl.group(1)),
+            width_px=int(m_wl.group(2)),
+            height_px=int(m_wl.group(3)),
+            width_mm=int(m_wl.group(4)),
+            height_mm=int(m_wl.group(5)),
+            scale=int(m_wl.group(6)),
+            dpi=float(m_wl.group(7)),
+        )
+
     return ParsedReport(
         build_stamp=build.group(1) if build else None,
         guest_exec=guest_exec,
@@ -150,4 +190,6 @@ def parse_report(text: str) -> ParsedReport:
         perf_harness_pass=(m_perf.group(1) == "PASS") if m_perf else None,
         guest_probes=probes,
         raw=text,
+        alr_markers=alr_markers,
+        wl_output=wl_output,
     )
