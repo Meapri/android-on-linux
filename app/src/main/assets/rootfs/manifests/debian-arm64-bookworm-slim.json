@@ -1,0 +1,20 @@
+{
+  "name": "debian-arm64",
+  "version": "bookworm-slim-2026-05-gui-gpu-v35",
+  "description": "Tiny PoC rootfs with TCP loopback guest GPU bridge client, multi-frame clear-color stream, GLES shim smoke, clean extraction schema, dpkg-split smoke, apt/dpkg bundle, and static-glibc test binaries (/bin/mt-test, /bin/fileio-test, /bin/alr-ls) Wayland GUI test clients (wl_shm, pixman, input, interactive) and a full GTK3 library closure + service files with /bin/alr-gtk3-test. Includes GIMP 3.0.2 (full library closure, GTK3 GUI) and an in-process LD_PRELOAD path interposer at /usr/lib/androlinux/libalr_interpose.so for fast rootfs path mediation.",
+  "assets": [
+    {
+      "path": "tiny-rootfs.tar",
+      "sha256": "7adc9444061df78e9966570bbf49e5df161275389979015542774d6db8f17796",
+      "size_bytes": 252743680
+    }
+  ],
+  "unsupported_features": [
+    "systemd",
+    "docker",
+    "real_chroot",
+    "real_bind_mounts",
+    "kernel_modules",
+    "privileged_device_nodes"
+  ]
+}

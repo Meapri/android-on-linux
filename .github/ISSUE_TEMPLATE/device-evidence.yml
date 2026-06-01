@@ -1,0 +1,64 @@
+name: Device evidence
+description: Record Android device, APK, backend, and GPU smoke evidence.
+title: "[Evidence] "
+labels:
+  - workstream:device-evidence
+  - needs-device
+body:
+  - type: input
+    id: device
+    attributes:
+      label: Device
+      placeholder: "Samsung SM-F721N, Lenovo TB373FU, emulator, etc."
+    validations:
+      required: true
+  - type: input
+    id: android_version
+    attributes:
+      label: Android version / SDK
+      placeholder: "Android 15 / SDK 35"
+    validations:
+      required: true
+  - type: input
+    id: apk
+    attributes:
+      label: APK build
+      placeholder: "versionName, commit, APK path"
+    validations:
+      required: true
+  - type: textarea
+    id: backend_results
+    attributes:
+      label: Backend results
+      placeholder: |
+        PROOT BACKEND EXECUTION: PASS
+        OPTIONAL LOW-OVERHEAD BACKEND AVAILABLE: SKIP
+        ALR RUNTIME LAUNCHER AVAILABLE: PASS
+    validations:
+      required: true
+  - type: textarea
+    id: graphics_results
+    attributes:
+      label: Graphics results
+      placeholder: |
+        HOST GPU EGL/GLES EXECUTION: PASS
+        GUEST GUI GPU SURFACE EXECUTION: PASS
+        surface frames dropped=0
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs, screenshots, and evidence paths
+      placeholder: |
+        docs/evidence/YYYY-MM-DD-device-smoke.md
+        adb logcat excerpt:
+    validations:
+      required: false
+  - type: textarea
+    id: blockers
+    attributes:
+      label: Blockers / known failures
+      placeholder: "KNOWN_FAIL:<reason> or none"
+    validations:
+      required: false

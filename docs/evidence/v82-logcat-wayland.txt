@@ -1,0 +1,13 @@
+--------- beginning of main
+05-31 23:52:16.936 32281 32506 I alr_wayland: wayland socket bound: /data/user/0/dev.chanwoo.androlinux/cache/alr-xdg/wayland-0
+05-31 23:52:16.936 32281 32506 I alr_wayland: ALR WAYLAND COMPOSITOR: started socket=/data/user/0/dev.chanwoo.androlinux/cache/alr-xdg/wayland-0 globals=wl_compositor,wl_shm,wl_seat,wl_output,xdg_wm_base
+05-31 23:52:16.936 32281 32506 I alr_wayland: compositor reactor entering epoll loop (loop_fd=134)
+05-31 23:52:16.949 32281 32506 I alr_wayland: client bound: wl_compositor v4
+05-31 23:52:16.949 32281 32506 I alr_wayland: client bound: xdg_wm_base v2
+05-31 23:52:16.949 32281 32506 I alr_wayland: wl_compositor.create_surface id=3
+05-31 23:52:16.949 32281 32506 I alr_wayland: xdg_wm_base.get_xdg_surface id=7
+05-31 23:52:16.949 32281 32506 I alr_wayland: client mapped xdg_toplevel id=8
+05-31 23:52:16.949 32281 32506 I alr_wayland: sent initial xdg configure w=1920 h=239 serial=1
+05-31 23:52:16.949 32281 32506 I alr_wayland: xdg_toplevel.set_title "alr-wl-test"
+05-31 23:52:16.950 32281 32506 I alr_wayland: xdg_surface.ack_configure serial=1
+05-31 23:52:16.974 32281 32506 I alr_wayland: surface committed shm: 256x256 stride=1024 fmt=1

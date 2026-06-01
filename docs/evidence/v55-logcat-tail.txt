@@ -1,0 +1,505 @@
+--------- beginning of main
+05-31 19:25:11.364  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.364  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.385  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:11.385  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.385  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.405  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:11.405  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.405  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.410  1266  1568 I hwcomposer: [HWC] (0)fire a callback of refresh to SF[4]  
+05-31 19:25:11.424  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:11.424  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.424  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.430  1336  1336 I BufferQueueProducer: [FramebufferSurface](this:0xb400007d03d1f7f8,id:-1,api:1,p:1336,c:1336) queueBuffer: fps=0.77 dur=1303.26 max=1303.26 min=1303.26
+05-31 19:25:11.446  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:11.446  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.446  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.465  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:11.465  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.465  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.485  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:11.485  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.486  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.505  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:11.505  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.505  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.524  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:11.524  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.524  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.544  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:11.544  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.544  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.565  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:11.565  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.565  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.584  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:11.585  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.585  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.605  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:11.606  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.606  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.624  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:11.625  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.625  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.645  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:11.646  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.646  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.664  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:11.664  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.665  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.685  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:11.685  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.685  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.705  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:11.706  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.706  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.725  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:11.725  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.725  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.745  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:11.745  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.745  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.765  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:11.766  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.766  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.785  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:11.786  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.786  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.789  3482  3646 E frs     : Failed to open /sys/kernel/thermal/frs_nl_id: No such file or directory
+05-31 19:25:11.790  3482  3646 I frs     : read netlink id fail, reason:No such file or directory
+05-31 19:25:11.805  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:11.805  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.806  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.825  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:11.826  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.826  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.845  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:11.846  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.846  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+--------- beginning of system
+05-31 19:25:11.862   825   825 D io_stats: !@   8,32 r 3622021 118852512 w 2086322 40078192 d 193487 121909392 f 145462 778002 iot 948804 0 th 0 0 0 pt 0 inp 0 0 55037.544
+05-31 19:25:11.864  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:11.865  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.865  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.875  4368  4368 D BoundBrokerSvc: onRebind: Intent { act=com.google.android.gms.libs.gmscorelogger.service.START dat=chimera-action:/... xflg=0x4 cmp=com.google.android.gms/.chimera.PersistentDirectBootAwareApiService }
+05-31 19:25:11.884  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:11.884  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.885  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.904  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:11.905  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.905  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.922  1912  2029 D PowerManagerService: UserActivityStateListenerState: 0
+05-31 19:25:11.925  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:11.925  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.926  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.944  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:11.945  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.945  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.945  1336  1630 D SurfaceFlinger: setDesiredMode 4627039422300187648 {mode={fps=60.00 Hz, modePtr={id=1, vsyncRate=60.00 Hz, peakRefreshRate=60.00 Hz}}, emitEvent=false, force=false}
+05-31 19:25:11.946  1336  1630 D SurfaceFlinger: MtkOverrideDuration: update vsync 60
+05-31 19:25:11.947  1336  1630 D SurfaceFlinger: MtkOverrideDuration: reset override duration
+05-31 19:25:11.947  1336  1630 I PowerHalWrapper: updateFps(): 60
+05-31 19:25:11.952  1912  2155 D ActivityManager: freezing 13413 com.android.chrome:privileged_process0
+05-31 19:25:11.953  1336  1738 I SurfaceFlinger: Current= 90, Period= 60, hwcPeriod= 90
+05-31 19:25:11.953  1336  1738 I SurfaceFlinger: Current= 90, Period= 60, Distance= 2
+05-31 19:25:11.953  1336  1336 I SurfaceFlinger: Idle - choose 60.00 Hz
+05-31 19:25:11.954  1336  1336 D SurfaceFlinger: initiateModeChange 4627039422300187648 {mode={fps=60.00 Hz, modePtr={id=1, vsyncRate=60.00 Hz, peakRefreshRate=60.00 Hz}}, emitEvent=false, force=false}
+05-31 19:25:11.954  1336  1336 I SurfaceFlinger: [4627039422300187648] ActiveConfigToHWC, ID : 1
+05-31 19:25:11.954  1266  1577 I hwcomposer: [HWCDisplay] (0) setActiveConfigWithConstraints config:1  
+05-31 19:25:11.954  1266  1577 I hwcomposer: [HWCDisplay] setActiveConfigWithConstraints(), now 55037636881739, diff 1190692, estimated_applied_time 11111111 queued_size:0  
+05-31 19:25:11.954  1266  1577 I hwcomposer: [HWCDisplay] Current VRR MODE is 1 | config=1  
+05-31 19:25:11.954  1266  1577 I hwcomposer: [DPY] HFR match - Display config: 1, base: 1, try: 0  
+05-31 19:25:11.963  1336  1336 I PowerHalWrapper: updateFps(): 60
+05-31 19:25:11.963  1336  1336 D SurfaceFlinger: finalizeDisplayModeChange: display size = 1
+05-31 19:25:11.963  1336  1336 I PowerHalWrapper: mEnableMultiDisplayMode enable=0 fps=60
+05-31 19:25:11.963  1336  1336 I mtkpower_client: PowerHal_Wrap_EnableMultiDisplayMode, enable:0 fps:60 CurMultiDisplayMode:-1
+05-31 19:25:11.963  1266  1656 I hwcomposer: [HWCDisplay] updateAppliedConfigState: applied config complete[idx:4153, config:1]  
+05-31 19:25:11.963  1336  1336 I PowerHalWrapper: updateFps(): 60
+05-31 19:25:11.964  1336  1738 I SurfaceFlinger: Current= 90, Period= 60, hwcPeriod= 60
+05-31 19:25:11.964  1336  1738 I SurfaceFlinger: Current= 90, Period= 60, Distance= 91
+05-31 19:25:11.965  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:11.965  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.966  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.980  1336  1739 I SurfaceFlinger: Current= 90, Period= 60, hwcPeriod= 60
+05-31 19:25:11.980  1336  1739 I SurfaceFlinger: Current= 90, Period= 60, Distance= 61
+05-31 19:25:11.984  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:11.984  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:11.985  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.004  3034  4007 D SatelliteController: isInCarrierRoamingNbIotNtn: satellite is disabled
+05-31 19:25:12.004  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.004  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.004  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.007  3034  4007 D SatelliteController: getCarrierRoamingNtnConnectType: Falling back to global carrier config connect type: 0
+05-31 19:25:12.009  3034  4007 D SatelliteController: updateLastNotifiedCarrierRoamingNtnSignalStrengthAndNotify(1)
+05-31 19:25:12.009  3034  4007 D SatelliteController: updateLastNotifiedCarrierRoamingNtnSignalStrengthAndNotify(1) lastNotifiedSignalStrength level: 0
+05-31 19:25:12.009  3034  4007 D SatelliteController: updateLastNotifiedCarrierRoamingNtnSignalStrengthAndNotify(1) currSignalStrength level: 0
+05-31 19:25:12.024  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.024  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.024  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.044  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.045  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.045  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.066  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.066  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.066  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.075  1441  1495 E md_thermal: interval=40 temp: 36700 34200 30300 31100
+05-31 19:25:12.084  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.084  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.084  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.104  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.105  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.105  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.110  1266  1568 I hwcomposer: [HWC] (0)fire a callback of refresh to SF[4]  
+05-31 19:25:12.126  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.126  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.126  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.145  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.146  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.146  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.165  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.165  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.165  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.184  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.185  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.185  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.205  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.205  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.205  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.225  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.225  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.226  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.245  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.246  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.246  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.264  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.265  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.265  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.285  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.285  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.285  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.305  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.305  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.305  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.309  1912  1968 E Watchdog: !@Sync: 1834 heap(MB): 108 / 109 FD: 1177 Threads: 510 [2026-05-31 19:25:12.309]
+05-31 19:25:12.325  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.325  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.325  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.331 29631 29631 D SemCscFeature: Encoded
+05-31 19:25:12.344  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.344  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.344  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.349 29631 29631 W AccessibilityNodeInfoDumper: Fetch time: 15ms
+05-31 19:25:12.350  1912  2866 V AccessibilityManagerService: onUserStateChangedLocked for userId: 0, forceUpdate: false
+05-31 19:25:12.350  1912  2866 D SettingsProvider: PUT_ret(/secure/accessibility_enabled), callingPackage:android
+05-31 19:25:12.351  1912  2866 D MagnificationConnectionManager: requestConnection :false mConnectionState : 3
+05-31 19:25:12.351  1912  2866 W MagnificationConnectionManager: requestConnection duplicated request: connect=false, mConnectionState=DISCONNECTED
+05-31 19:25:12.351  1912  2866 D AccessibilityManagerService: restoreCurrentUserForTestAutomationIfNeededLocked(): ignoring because device doesn't support visible background users
+05-31 19:25:12.351  1912  2866 V WindowManager: Computed rotation=ROTATION_90 (1) for display id=0 based on lastOrientation=SCREEN_ORIENTATION_UNSPECIFIED (-1) and oldRotation=ROTATION_90 (1), caller=com.android.server.wm.WindowManagerService.updateRotationUnchecked:82 com.android.server.wm.WindowManagerService.freezeDisplayRotation:134 com.android.server.wm.WindowManagerService.freezeRotation:2 android.view.IWindowManager$Stub.onTransact:3767 com.android.server.wm.WindowManagerService.onTransact:1 android.os.Binder.execTransactInternal:1509 
+05-31 19:25:12.352 29631 29641 W libbinder.IPCThreadState: call to talkWithDriver in joinThreadPool returned error: -9 (Bad file descriptor), FD: -1
+05-31 19:25:12.352 29631 29645 W libbinder.IPCThreadState: call to talkWithDriver in joinThreadPool returned error: -9 (Bad file descriptor), FD: -1
+05-31 19:25:12.352 29631 29631 D AndroidRuntime: Shutting down VM
+05-31 19:25:12.352 29631 29643 W libbinder.IPCThreadState: call to talkWithDriver in joinThreadPool returned error: -9 (Bad file descriptor), FD: -1
+05-31 19:25:12.353  1912  1912 D BatterySaverPolicy: accessibility changed to false, updating policy.
+05-31 19:25:12.353  1336  1630 D SurfaceFlinger: setDesiredMode 4627039422300187648 {mode={fps=90.00 Hz, modePtr={id=0, vsyncRate=90.00 Hz, peakRefreshRate=90.00 Hz}}, emitEvent=false, force=false}
+05-31 19:25:12.353  1336  1630 D SurfaceFlinger: MtkOverrideDuration: update vsync 90
+05-31 19:25:12.353  1336  1630 D SurfaceFlinger: MtkOverrideDuration: reset override duration
+05-31 19:25:12.353  1336  1630 I PowerHalWrapper: updateFps(): 90
+05-31 19:25:12.356  1912  3474 W WindowManager: Cannot find window which accessibility connection is added to
+05-31 19:25:12.357  3074 27393 I HoneySpace.GlobalSettingDataSourceImpl: Setting accessibility_enabled changed to 0
+05-31 19:25:12.359  1336  1738 I SurfaceFlinger: Current= 60, Period= 90, hwcPeriod= 60
+05-31 19:25:12.359  1336  1738 I SurfaceFlinger: Current= 60, Period= 90, Distance= 3
+05-31 19:25:12.361  1912  3474 W WindowManager: Cannot find window which accessibility connection is added to
+05-31 19:25:12.362  1912  3474 W WindowManager: Cannot find window which accessibility connection is added to
+05-31 19:25:12.362  3074  3074 I HoneySpace.TaskbarView@6231628: updateTaskbarViewTalkback enabled = false
+05-31 19:25:12.363  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.364  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.364  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.365  1336  1336 I SurfaceFlinger: [LayerHierarchy{RequestedLayerState{WindowToken{8286ddd type=2032 android.os.Binder@bf9ddb4}#5052 z=1} no children}] reparent to OffscreenRoot
+05-31 19:25:12.365  1336  1336 I SurfaceFlinger: [LayerHierarchy{RequestedLayerState{WindowToken{8286ddd type=2032 android.os.Binder@bf9ddb4}#5052 z=1} no children}] RelativeParent to null
+05-31 19:25:12.366  1336  1336 I SurfaceFlinger: onHandleDestroyed: layerId=5052, name=WindowToken{8286ddd type=2032 android.os.Binder@bf9ddb4}#5052
+05-31 19:25:12.366  1336  1336 I SurfaceFlinger: id=5052 Removed WindowToken{8286ddd type=2032 android.os.Binder@bf9ddb4}#5052 (149)
+05-31 19:25:12.366  1336  1336 I SurfaceFlinger: No layers with votes - choose 90.00 Hz
+05-31 19:25:12.366  1336  1336 D SurfaceFlinger: initiateModeChange 4627039422300187648 {mode={fps=90.00 Hz, modePtr={id=0, vsyncRate=90.00 Hz, peakRefreshRate=90.00 Hz}}, emitEvent=false, force=false}
+05-31 19:25:12.366  1336  1336 I SurfaceFlinger: [4627039422300187648] ActiveConfigToHWC, ID : 0
+05-31 19:25:12.366  1266  1577 I hwcomposer: [HWCDisplay] (0) setActiveConfigWithConstraints config:0  
+05-31 19:25:12.366  1266  1577 I hwcomposer: [HWCDisplay] setActiveConfigWithConstraints(), now 55038048952893, diff 502539, estimated_applied_time 16666667 queued_size:0  
+05-31 19:25:12.366  1266  1577 I hwcomposer: [HWCDisplay] Current VRR MODE is 1 | config=0  
+05-31 19:25:12.366  1266  1577 I hwcomposer: [DPY] HFR match - Display config: 0, base: 0, try: 0  
+05-31 19:25:12.367  1266  1577 I hwcomposer: [HWCDisplay] [Display_0 (type:1, mode:2)] fps:5.726255,dur:1047.81,max:526.08,min:7.24  
+05-31 19:25:12.371  2999  3406 I ScanController: onScanResult to scannerId: 10- eventType=0x0, addressType=1, address=XX:XX:XX:XX:C4:C5, primaryPhy=1, secondaryPhy=1, advertisingSid=0x2, txPower=127, rssi=-38, periodicAdvInt=0x0
+05-31 19:25:12.376  1336  1739 I SurfaceFlinger: Current= 60, Period= 90, hwcPeriod= 90
+05-31 19:25:12.376  1336  1739 I SurfaceFlinger: Current= 60, Period= 90, Distance= 60
+05-31 19:25:12.376  1266  1656 I hwcomposer: [HWCDisplay] updateAppliedConfigState: applied config complete[idx:4154, config:0]  
+05-31 19:25:12.382  1336  1336 I PowerHalWrapper: updateFps(): 90
+05-31 19:25:12.382  1336  1336 D SurfaceFlinger: finalizeDisplayModeChange: display size = 1
+05-31 19:25:12.382  1336  1336 I PowerHalWrapper: mEnableMultiDisplayMode enable=0 fps=90
+05-31 19:25:12.382  1336  1336 I mtkpower_client: PowerHal_Wrap_EnableMultiDisplayMode, enable:0 fps:90 CurMultiDisplayMode:-1
+05-31 19:25:12.382  1336  1336 I SurfaceFlinger: destroyed WindowToken{8286ddd type=2032 android.os.Binder@bf9ddb4}#5052
+05-31 19:25:12.383  1336  1336 I SurfaceFlinger: id=5052 Destroyed WindowToken{8286ddd type=2032 android.os.Binder@bf9ddb4}#5052
+05-31 19:25:12.383  1336  1336 I PowerHalWrapper: updateFps(): 90
+05-31 19:25:12.384  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.385  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.385  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.387  1336  1738 I SurfaceFlinger: Current= 60, Period= 90, hwcPeriod= 90
+05-31 19:25:12.387  1336  1738 I SurfaceFlinger: Current= 60, Period= 90, Distance= 90
+05-31 19:25:12.404  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.405  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.405  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.425  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.425  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.426  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.435  2999  3406 I ScanController: onScanResult to scannerId: 10- eventType=0x10, addressType=1, address=XX:XX:XX:XX:3E:D5, primaryPhy=1, secondaryPhy=0, advertisingSid=0xff, txPower=127, rssi=-43, periodicAdvInt=0x0
+05-31 19:25:12.444  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.445  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.445  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.465  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.465  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.465  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.485  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.485  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.486  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.493  2999  3406 I ScanController: onScanResult to scannerId: 10- eventType=0x10, addressType=1, address=XX:XX:XX:XX:96:F5, primaryPhy=1, secondaryPhy=0, advertisingSid=0xff, txPower=127, rssi=-93, periodicAdvInt=0x0
+05-31 19:25:12.502  1266  1568 I hwcomposer: [HWC] (0)fire a callback of refresh to SF[4]  
+05-31 19:25:12.505  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.505  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.505  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.510  1336  1336 I BufferQueueProducer: [FramebufferSurface](this:0xb400007d03d1f7f8,id:-1,api:1,p:1336,c:1336) queueBuffer: fps=1.85 dur=1080.40 max=691.50 min=388.90
+05-31 19:25:12.524  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.525  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.525  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.544  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.545  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.545  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.564  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.564  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.564  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.583  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.583  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.583  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.595  2999  3406 I ScanController: onScanResult to scannerId: 10- eventType=0x10, addressType=1, address=XX:XX:XX:XX:96:F5, primaryPhy=1, secondaryPhy=0, advertisingSid=0xff, txPower=127, rssi=-98, periodicAdvInt=0x0
+05-31 19:25:12.604  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.605  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.605  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.624  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.625  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.625  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.645  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.645  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.646  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.664  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.664  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.664  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.684  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.684  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.684  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.704  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.705  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.705  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.725  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.725  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.726  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.745  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.746  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.746  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.764  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.764  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.765  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.785  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.785  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.785  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.805  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.805  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.806  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.825  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.825  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.826  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.845  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.846  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.846  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.865  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.866  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.866  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.886  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.886  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.886  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.905  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.906  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.906  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.925  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.926  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.926  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.946  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.946  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.946  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.964  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.964  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.964  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.966  1336  1630 D SurfaceFlinger: setDesiredMode 4627039422300187648 {mode={fps=60.00 Hz, modePtr={id=1, vsyncRate=60.00 Hz, peakRefreshRate=60.00 Hz}}, emitEvent=false, force=false}
+05-31 19:25:12.967  1336  1630 D SurfaceFlinger: MtkOverrideDuration: update vsync 60
+05-31 19:25:12.967  1336  1630 D SurfaceFlinger: MtkOverrideDuration: reset override duration
+05-31 19:25:12.967  1336  1630 I PowerHalWrapper: updateFps(): 60
+05-31 19:25:12.968  1336  1336 I SurfaceFlinger: Idle - choose 60.00 Hz
+05-31 19:25:12.969  1336  1336 D SurfaceFlinger: initiateModeChange 4627039422300187648 {mode={fps=60.00 Hz, modePtr={id=1, vsyncRate=60.00 Hz, peakRefreshRate=60.00 Hz}}, emitEvent=false, force=false}
+05-31 19:25:12.969  1336  1336 I SurfaceFlinger: [4627039422300187648] ActiveConfigToHWC, ID : 1
+05-31 19:25:12.969  1266  1577 I hwcomposer: [HWCDisplay] (0) setActiveConfigWithConstraints config:1  
+05-31 19:25:12.969  1266  1577 I hwcomposer: [HWCDisplay] setActiveConfigWithConstraints(), now 55038651730124, diff 919154, estimated_applied_time 11111111 queued_size:0  
+05-31 19:25:12.969  1266  1577 I hwcomposer: [HWCDisplay] Current VRR MODE is 1 | config=1  
+05-31 19:25:12.969  1266  1577 I hwcomposer: [DPY] HFR match - Display config: 1, base: 1, try: 0  
+05-31 19:25:12.973  1336  1738 I SurfaceFlinger: Current= 90, Period= 60, hwcPeriod= 90
+05-31 19:25:12.973  1336  1738 I SurfaceFlinger: Current= 90, Period= 60, Distance= 2
+05-31 19:25:12.982  1336  1336 I PowerHalWrapper: updateFps(): 60
+05-31 19:25:12.982  1336  1336 D SurfaceFlinger: finalizeDisplayModeChange: display size = 1
+05-31 19:25:12.982  1336  1336 I PowerHalWrapper: mEnableMultiDisplayMode enable=0 fps=60
+05-31 19:25:12.982  1336  1336 I mtkpower_client: PowerHal_Wrap_EnableMultiDisplayMode, enable:0 fps:60 CurMultiDisplayMode:-1
+05-31 19:25:12.982  1336  1336 I PowerHalWrapper: updateFps(): 60
+05-31 19:25:12.983  1336  1738 I SurfaceFlinger: Current= 90, Period= 60, hwcPeriod= 60
+05-31 19:25:12.983  1336  1738 I SurfaceFlinger: Current= 90, Period= 60, Distance= 91
+05-31 19:25:12.983  1266  1656 I hwcomposer: [HWCDisplay] updateAppliedConfigState: applied config complete[idx:4155, config:1]  
+05-31 19:25:12.985  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:12.986  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:12.986  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.000  1336  1738 I SurfaceFlinger: Current= 90, Period= 60, hwcPeriod= 60
+05-31 19:25:13.000  1336  1738 I SurfaceFlinger: Current= 90, Period= 60, Distance= 60
+05-31 19:25:13.005  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.005  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.006  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.025  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.026  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.026  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.045  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.046  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.046  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.065  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.066  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.066  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.085  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.085  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.085  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.104  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.105  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.105  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.125  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.125  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.126  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.130  1266  1568 I hwcomposer: [HWC] (0)fire a callback of refresh to SF[4]  
+05-31 19:25:13.145  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.145  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.146  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.165  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.165  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.166  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.184  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.184  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.185  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.186 29631 29631 W RefBase : RefBase: Explicit destruction, weak count = 0 (in 0x74e4bed0d8). Use sp<> to manage this object. Note - if weak count is 0, this leaks mRefs (weakref_impl).
+05-31 19:25:13.191 29631 29631 D RefBase :   #00 pc 00000000000787c0  /apex/com.android.runtime/lib64/bionic/libc.so (__cxa_finalize+224) (BuildId: 35000611873814752ab76a465de5cdae)
+05-31 19:25:13.191 29631 29631 D RefBase :   #01 pc 000000000007dc74  /apex/com.android.runtime/lib64/bionic/libc.so (exit+36) (BuildId: 35000611873814752ab76a465de5cdae)
+05-31 19:25:13.191 29631 29631 D RefBase :   #02 pc 000000000006b12c  /apex/com.android.runtime/lib64/bionic/libc.so (__libc_init+124) (BuildId: 35000611873814752ab76a465de5cdae)
+05-31 19:25:13.204  4368 29611 I NearbyMediums: Found Fast Ble Advertisements :
+05-31 19:25:13.204  4368 29611 I NearbyMediums: BleAdvertisement { version=2, socketVersion=2, isFast=true, serviceIdHash=null, data=[ 0x23 0x47 0x37 0x38 0x33 0x11 0x16 0xb0 0x95 0x1b 0x04 0xce 0xfd 0x68 0xf5 0x89 0x59 0x28 0x07 0x21 0x68 0x22 0xdf ], deviceToken=[ 0x37 0x38 ], rxAdvertisement=null } : 8 times.
+05-31 19:25:13.204  4368 29611 I NearbyMediums: BleAdvertisement { version=2, socketVersion=2, isFast=true, serviceIdHash=null, data=[ 0x23 0x4f 0x38 0x45 0x34 0x11 0x32 0xb1 0x53 0x10 0xf3 0xde 0x32 0x04 0xbd 0xa3 0xda 0x3b 0x0a 0x1a 0xb4 0x0c 0xdd ], deviceToken=[ 0xe7 0x74 ], rxAdvertisement=null } : 8 times.
+05-31 19:25:13.204  4368 29611 I NearbyMediums: Total 16 fast advertisements from 2 unique advertisers.
+05-31 19:25:13.204  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.205  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.205  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.205  4368 29611 I NearbyMediums: Current Tracked Scanning Clients are : {NearbyConnections.EnvironmentMonitor, NearbySharing, NearbyConnections.TxAdvertisement}
+05-31 19:25:13.224  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.225  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.225  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.246  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.246  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.246  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.266  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.266  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.267  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.269  2729  2731 D WifiHAL : WifiRequest::create vendor command to iface 50, vendor_id=0x1a11, subcmd=0x1200, res=0
+05-31 19:25:13.278  2729  2731 I WifiHAL : LLS RSP: data=0xb40000717e3cd050, len=3988
+05-31 19:25:13.279  2729  2731 I WifiHAL : LLS check_data_sanity: 1819: current_radio_stat->num_channels=38
+05-31 19:25:13.279  2729  2731 I WifiHAL : LLS check_data_sanity: 1819: current_radio_stat->num_channels=0
+05-31 19:25:13.279  2729  2731 I WifiHAL : LLS check_data_sanity: confirmed_size=3988, len=3988
+05-31 19:25:13.284  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.284  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.284  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.291  1912  3957 D SemWifiUsabilityStatsMonitor: onWifiUsabilityStats - seqNum 3117, isSameBssidAndFreq true
+05-31 19:25:13.304  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.304  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.304  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.324  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.325  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.325  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.345  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.345  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.345  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.365  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.365  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.365  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.385  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.385  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.386  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.405  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.405  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.405  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.425  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.425  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.425  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.434 29652 29652 W libbinder.BackendUnifiedServiceManager: Thread Pool max thread count is 0. Cannot cache binder as linkToDeath cannot be implemented. serviceName: SurfaceFlingerAIDL
+05-31 19:25:13.434 29652 29652 W libbinder.BpBinder: Linking to death on android.gui.ISurfaceComposer but there are no threads (yet?) listening to incoming transactions. See ProcessState::startThreadPool and ProcessState::setThreadPoolMaxThreadCount. Generally you should setup the binder threadpool before other initialization steps.
+05-31 19:25:13.435 29652 29652 W libbinder.BackendUnifiedServiceManager: Thread Pool max thread count is 0. Cannot cache binder as linkToDeath cannot be implemented. serviceName: edmnativehelper
+05-31 19:25:13.435  1912  3709 I EDMNativeHelperService: isScreenCaptureEnabled
+05-31 19:25:13.435  1912  3709 D RestrictionPolicy: isScreenCaptureEnabled : ret=true userId=0
+05-31 19:25:13.435 29652 29652 W libbinder.ProcessState: Extra binder thread started, but 0 threads requested. Do not use *startThreadPool when zero threads are requested.
+05-31 19:25:13.435 29652 29652 I SurfaceComposerClient: captureDisplay:Display-4627039422300187648
+05-31 19:25:13.436  1336  1738 I SurfaceFlinger: Capture layer list: 	 Background for 71fee84 SurfaceView[dev.chanwoo.androlinux/dev.chanwoo.androlinux.MainActivity]@0#5015(preserveDisplayColors:0)
+05-31 19:25:13.436  1336  1738 I SurfaceFlinger: Capture layer list: 	 71fee84 SurfaceView[dev.chanwoo.androlinux/dev.chanwoo.androlinux.MainActivity]@0(BLAST)#5014(preserveDisplayColors:0)
+05-31 19:25:13.436  1336  1738 I SurfaceFlinger: Capture layer list: 	 dev.chanwoo.androlinux/dev.chanwoo.androlinux.MainActivity$_28034#5011(preserveDisplayColors:0)
+05-31 19:25:13.436  1336  1738 I SurfaceFlinger: Capture layer list: 	 Caption of Task=74#1759(preserveDisplayColors:0)
+05-31 19:25:13.436  1336  1738 I SurfaceFlinger: Capture layer list: 	 StatusBar$_2770#105(preserveDisplayColors:0)
+05-31 19:25:13.436  1336  1738 I SurfaceFlinger: Capture layer list: 	 Handle Input Layer of task 110$_2770#5002(preserveDisplayColors:0)
+05-31 19:25:13.436  1336  1738 I SurfaceFlinger: Capture layer list: 	 com.sec.android.app.launcher/com.samsung.app.honeyspace.edge.edgepanel.app.CocktailBarService$_3074#4767(preserveDisplayColors:0)
+05-31 19:25:13.436  1336  1738 I SurfaceFlinger: Capture layer list: 	 TaskbarWindow$_3074#3784(preserveDisplayColors:0)
+05-31 19:25:13.443  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.443  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.444  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.465  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.465  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.465  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.470 29652 29652 I DMABUFHEAPS: Using DMA-BUF heap named: mtk_mm
+05-31 19:25:13.470 29652 29652 I DMABUFHEAPS: Using DMA-BUF heap named: mtk_mm-uncached
+05-31 19:25:13.470 29652 29652 I DMABUFHEAPS: Using DMA-BUF heap named: mtk_svp_page-uncached
+05-31 19:25:13.470 29652 29652 I DMABUFHEAPS: Using DMA-BUF heap named: mtk_prot_region
+05-31 19:25:13.470 29652 29652 I DMABUFHEAPS: Using DMA-BUF heap named: mtk_wfd_page-uncached
+05-31 19:25:13.484  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.485  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.485  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.504  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.505  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.505  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.525  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.525  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.525  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.544  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.545  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.545  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.565  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.565  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.565  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.585  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.585  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.585  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.605  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.605  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.605  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.622 29652 29652 W RefBase : RefBase: Explicit destruction, weak count = 0 (in 0x76893ff0d8). Use sp<> to manage this object. Note - if weak count is 0, this leaks mRefs (weakref_impl).
+05-31 19:25:13.624  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.625  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.625  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.627 29652 29652 D RefBase :   #00 pc 00000000000787c0  /apex/com.android.runtime/lib64/bionic/libc.so (__cxa_finalize+224) (BuildId: 35000611873814752ab76a465de5cdae)
+05-31 19:25:13.627 29652 29652 D RefBase :   #01 pc 000000000007dc74  /apex/com.android.runtime/lib64/bionic/libc.so (exit+36) (BuildId: 35000611873814752ab76a465de5cdae)
+05-31 19:25:13.627 29652 29652 D RefBase :   #02 pc 000000000006b12c  /apex/com.android.runtime/lib64/bionic/libc.so (__libc_init+124) (BuildId: 35000611873814752ab76a465de5cdae)
+05-31 19:25:13.645  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.645  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.645  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.665  1260 22313 D AudioALSAHardware: -mAudioALSAHardware(0xb400007a799d44f0)
+05-31 19:25:13.665  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0
+05-31 19:25:13.665  1260 22313 D AudioALSAStreamManager: getMode(), mAudioMode = 0

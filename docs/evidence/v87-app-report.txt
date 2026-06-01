@@ -1,0 +1,1656 @@
+build: 0.4.87-android-pacing-interactive-v87
+execution summary
+ROOTFS EXECUTION: PASS
+SHELL SCRIPT EXECUTION: PASS
+SHELL -C EXECUTION: PASS
+GLIBC DYNAMIC EXECUTION: PASS
+DISTRO USERLAND EXECUTION: PASS
+CLEAN GUEST ENVIRONMENT: PASS
+IDENTITY NSS EXECUTION: PASS
+DPKG VERSION EXECUTION: PASS
+DPKG ARCH EXECUTION: PASS
+DPKG QUERY EXECUTION: PASS
+DPKG SPLIT EXECUTION: PASS
+APT VERSION EXECUTION: PASS
+APT-GET VERSION EXECUTION: PASS
+APT-CACHE VERSION EXECUTION: PASS
+APT-CONFIG VERSION EXECUTION: PASS
+DPKG LOCAL INSTALL EXECUTION: FAIL
+INSTALLED PACKAGE EXECUTION: FAIL
+ALR PACKAGED TRAMPOLINE CONTINUE EXECUTION: PASS
+ALR PROCFS VIRTUALIZATION PLAN: PASS
+ALR WX-SAFE EXEC STRATEGY: PASS
+ALR PERF HARNESS: PASS
+ALR PERF PROOT VS ALR DEVICE COMPARISON: PENDING_DEVICE
+ALR PROCFS INTERPOSE MECHANISM: PASS
+ALR MEMFD W^X-SAFE NATIVE EXEC: FAIL
+ALR EXECMEM ANON RX NATIVE EXEC: PASS
+ALR NATIVE LOADER MECHANISM (freestanding): PASS
+ALR NATIVE LOADER GUEST EXEC (glibc static): PASS
+ALR NATIVE LOADER GUEST EXEC (glibc threads+fork): PASS
+ALR SECCOMP PATH-MEDIATION (seccomp-trace rootfs path rewrite): VIABLE
+ALR WAYLAND SOCKET TRANSPORT (named AF_UNIX host↔guest): VIABLE
+ALR LOADER PATH-MEDIATION REAL FILE READ (glibc opens /etc via rootfs): PASS
+ALR NATIVE LOADER GUEST EXEC (glibc DYNAMIC via in-process ld.so): PASS
+ALR REAL DEBIAN PROGRAM (/usr/bin/env, dynamic coreutils): PASS
+ALR REAL DEBIAN PROGRAM (/usr/bin/id, libselinux+rootfs /etc): PASS
+ALR REAL SHELL COMMAND (/bin/dash -c 'echo …', argv passing): PASS
+ALR WRITE-PATH MEDIATION (dash writes+reads /tmp in rootfs): PASS
+ALR GPU PASSTHROUGH BOUNDARY: VIABLE (shmem-ring 108932 cmds/60fps-frame, inproc 1666666)
+ALR GPU MARSHALLING HARDWARE RENDER: PASS
+HOST GPU EGL/GLES EXECUTION: PASS
+ANDROID HOST VULKAN PROBE EXECUTION: PASS
+ANDROID HOST VULKAN SURFACE PROBE EXECUTION: PASS after Surface callback
+ANDROID HOST VULKAN SURFACE EXECUTION: PASS after Surface callback
+HOST GPU SURFACE EXECUTION: PASS after Surface callback
+GUEST GPU BRIDGE COMMAND EXECUTION: PASS
+GUEST GPU IPC BRIDGE EXECUTION: PASS
+GUEST GLES SHIM SMOKE EXECUTION: PASS
+GUEST GPU MULTI-FRAME SURFACE EXECUTION: PASS after Surface callback
+GUEST WAYLAND GUI GPU BRIDGE EXECUTION: PASS
+GUEST X11 GUI GPU BRIDGE EXECUTION: PASS
+GUEST GUI GPU SURFACE EXECUTION: PASS after Surface callback
+ANDROID PERMISSION MODEL: PASS
+identity numeric root=true
+identity named root=true
+identity proot mode=raw -r
+guest env leaked android vars=false
+rootfs verified=true extracted=true
+rootfs /bin/hello exists=true executable=true bytes=537664
+rootfs /bin/sh exists=true executable=true bytes=1914704
+rootfs /bin/cat exists=true executable=true bytes=1914704
+rootfs /bin/script-hello exists=true executable=true bytes=46
+rootfs /bin/glibc-hello exists=true executable=true bytes=67496
+rootfs glibc loader exists=true executable=true bytes=203968
+rootfs libc exists=true executable=true bytes=1722920
+rootfs /bin/dash exists=true executable=true bytes=133608
+rootfs /usr/bin/env exists=true executable=true bytes=68368
+rootfs /etc/passwd exists=true bytes=91
+rootfs /etc/group exists=true bytes=27
+rootfs /etc/nsswitch.conf exists=true bytes=74
+rootfs /usr/bin/id exists=true executable=true bytes=67952
+rootfs libselinux exists=true executable=false bytes=198800
+rootfs libpcre2 exists=true executable=false bytes=592328
+rootfs libnss_files exists=true executable=true bytes=67440
+rootfs /usr/bin/dpkg exists=true executable=true bytes=330192
+rootfs libmd exists=true executable=false bytes=67584
+rootfs /etc/dpkg/dpkg.cfg exists=true bytes=446
+rootfs /etc/dpkg/dpkg.cfg.d exists=true
+rootfs stale needrestart dpkg cfg exists=false
+rootfs androlinux minimal dpkg cfg exists=true
+rootfs /usr/bin/dpkg-query exists=true executable=true bytes=199016
+rootfs /usr/share/dpkg/cputable exists=true bytes=2062
+rootfs /usr/share/dpkg/tupletable exists=true bytes=2729
+rootfs /usr/bin/apt exists=true executable=true bytes=67752
+rootfs /usr/bin/apt-get exists=true executable=true bytes=67840
+rootfs /usr/bin/apt-cache exists=true executable=true bytes=133440
+rootfs /usr/bin/apt-config exists=true executable=true bytes=67760
+rootfs libapt-pkg exists=true executable=true bytes=1905160
+rootfs libapt-private exists=true executable=true bytes=395440
+rootfs apt http method exists=true executable=true bytes=198912
+rootfs apt lists partial exists=true
+rootfs local deb exists=true bytes=832
+rootfs /usr/bin/dpkg-deb exists=true executable=true bytes=199104
+rootfs installed alr smoke exists=false executable=false bytes=0
+rootfs dpkg status exists=true bytes=0
+rootfs /dev/null placeholder exists=true bytes=0
+rootfs dpkg triggers File exists=true bytes=0
+rootfs dpkg triggers Unincorp exists=true bytes=0
+rootfs helper rm exists=true executable=true bytes=67944
+rootfs helper tar exists=true executable=true bytes=472584
+rootfs helper diff exists=true executable=true bytes=133424
+rootfs helper ldconfig exists=true executable=true bytes=387
+rootfs helper ldconfig.real exists=true executable=true bytes=865840
+rootfs helper start-stop-daemon exists=true executable=true bytes=68888
+rootfs /usr/bin/dpkg-split exists=true executable=true bytes=133416
+rootfs /usr/bin/alr-gpu-client exists=true executable=true bytes=537664
+rootfs /usr/bin/alr-gles-shim-smoke exists=true executable=true bytes=67496
+rootfs /usr/lib/androlinux/libalr_gles_shim.so exists=true executable=true bytes=67440
+rootfs /usr/bin/alr-wayland-gpu-client exists=true executable=true bytes=706896
+rootfs /usr/bin/alr-x11-gpu-client exists=true executable=true bytes=706896
+proot guest gpu client exit=0
+proot guest gpu client stdout=alr guest gpu client ok
+ALR_GPU_BRIDGE_PROTOCOL clear-color-v2
+ALR_GPU_FRAME_COUNT 3
+ALR_GPU_CLEAR 0.78 0.12 0.95 guest-frame-0001
+ALR_GPU_CLEAR 0.12 0.78 0.28 guest-frame-0002
+ALR_GPU_CLEAR 0.08 0.18 0.92 guest-frame-0003
+ALR_GPU_IPC_CLIENT skipped reason=no-port
+proot guest gpu client stderr=
+guest gpu stdout commands parsed=3
+guest gpu ipc host=127.0.0.1
+guest gpu ipc port=37047
+guest gpu ipc expected frames=3
+guest gpu ipc received frames=3
+guest gpu ipc dropped frames=0
+guest gpu ipc lossless=true
+guest gpu ipc raw=ALR_GPU_IPC_HELLO clear-color-v2 frames=3|ALR_GPU_CLEAR 0.78 0.12 0.95 guest-frame-0001|ALR_GPU_CLEAR 0.12 0.78 0.28 guest-frame-0002|ALR_GPU_CLEAR 0.08 0.18 0.92 guest-frame-0003|ALR_GPU_IPC_END
+guest gpu ipc error=none
+proot guest gpu ipc client exit=0
+proot guest gpu ipc client stdout=alr guest gpu client ok
+ALR_GPU_BRIDGE_PROTOCOL clear-color-v2
+ALR_GPU_FRAME_COUNT 3
+ALR_GPU_CLEAR 0.78 0.12 0.95 guest-frame-0001
+ALR_GPU_CLEAR 0.12 0.78 0.28 guest-frame-0002
+ALR_GPU_CLEAR 0.08 0.18 0.92 guest-frame-0003
+ALR_GPU_IPC_CLIENT ok sent=3 transport=tcp-loopback
+proot guest gpu ipc client stderr=
+proot guest gles shim smoke exit=0
+proot guest gles shim smoke stdout=alr guest gles shim smoke ok
+ALR_GLES_SHIM_LOAD ok version=alr-gles-shim clear-color-v1
+ALR_GLES_SHIM_COMMAND ALR_GPU_CLEAR 0.32 0.44 0.88 shim-frame-0001
+ALR_GLES_SHIM_SUBMIT rc=0
+proot guest gles shim smoke stderr=
+guest gles shim command parsed=true
+proot guest wayland gui client exit=0
+proot guest wayland gui client stdout=alr-wayland-gpu-client ok
+ALR_GUI_PROTOCOL WAYLAND compositor-bridge-v1
+ALR_GUI_FRAME_COUNT 4
+ALR_GUI_FRAME WAYLAND seq=1 0.90 0.18 0.22 WAYLAND-window-0001
+ALR_GPU_CLEAR 0.90 0.18 0.22 WAYLAND-window-0001
+ALR_GUI_FRAME WAYLAND seq=2 0.12 0.72 0.36 WAYLAND-window-0002
+ALR_GPU_CLEAR 0.12 0.72 0.36 WAYLAND-window-0002
+ALR_GUI_FRAME WAYLAND seq=3 0.16 0.30 0.92 WAYLAND-window-0003
+ALR_GPU_CLEAR 0.16 0.30 0.92 WAYLAND-window-0003
+ALR_GUI_FRAME WAYLAND seq=4 0.94 0.72 0.16 WAYLAND-window-0004
+ALR_GPU_CLEAR 0.94 0.72 0.16 WAYLAND-window-0004
+ALR_GUI_IPC_CLIENT skipped reason=no-port
+proot guest x11 gui client exit=0
+proot guest x11 gui client stdout=alr-x11-gpu-client ok
+ALR_GUI_PROTOCOL X11 compositor-bridge-v1
+ALR_GUI_FRAME_COUNT 4
+ALR_GUI_FRAME X11 seq=1 0.90 0.18 0.22 X11-window-0001
+ALR_GPU_CLEAR 0.90 0.18 0.22 X11-window-0001
+ALR_GUI_FRAME X11 seq=2 0.12 0.72 0.36 X11-window-0002
+ALR_GPU_CLEAR 0.12 0.72 0.36 X11-window-0002
+ALR_GUI_FRAME X11 seq=3 0.16 0.30 0.92 X11-window-0003
+ALR_GPU_CLEAR 0.16 0.30 0.92 X11-window-0003
+ALR_GUI_FRAME X11 seq=4 0.94 0.72 0.16 X11-window-0004
+ALR_GPU_CLEAR 0.94 0.72 0.16 X11-window-0004
+ALR_GUI_IPC_CLIENT skipped reason=no-port
+guest wayland gui ipc expected frames=4
+guest wayland gui ipc received frames=4
+guest wayland gui ipc lossless=true
+guest wayland gui ipc seq gaps=0
+guest wayland gui ipc duplicate seq=0
+guest wayland gui ipc out of order=false
+guest wayland gui ipc raw=ALR_GUI_IPC_HELLO protocol=WAYLAND frames=4 client=alr-wayland-gpu-client|ALR_GUI_FRAME WAYLAND seq=1 0.90 0.18 0.22 WAYLAND-window-0001|ALR_GPU_CLEAR 0.90 0.18 0.22 WAYLAND-window-0001|ALR_GUI_FRAME WAYLAND seq=2 0.12 0.72 0.36 WAYLAND-window-0002|ALR_GPU_CLEAR 0.12 0.72 0.36 WAYLAND-window-0002|ALR_GUI_FRAME WAYLAND seq=3 0.16 0.30 0.92 WAYLAND-window-0003|ALR_GPU_CLEAR 0.16 0.30 0.92 WAYLAND-window-0003|ALR_GUI_FRAME WAYLAND seq=4 0.94 0.72 0.16 WAYLAND-window-0004
+guest wayland gui ipc error=none
+guest x11 gui ipc expected frames=4
+guest x11 gui ipc received frames=4
+guest x11 gui ipc lossless=true
+guest x11 gui ipc seq gaps=0
+guest x11 gui ipc duplicate seq=0
+guest x11 gui ipc out of order=false
+guest x11 gui ipc raw=ALR_GUI_IPC_HELLO protocol=X11 frames=4 client=alr-x11-gpu-client|ALR_GUI_FRAME X11 seq=1 0.90 0.18 0.22 X11-window-0001|ALR_GPU_CLEAR 0.90 0.18 0.22 X11-window-0001|ALR_GUI_FRAME X11 seq=2 0.12 0.72 0.36 X11-window-0002|ALR_GPU_CLEAR 0.12 0.72 0.36 X11-window-0002|ALR_GUI_FRAME X11 seq=3 0.16 0.30 0.92 X11-window-0003|ALR_GPU_CLEAR 0.16 0.30 0.92 X11-window-0003|ALR_GUI_FRAME X11 seq=4 0.94 0.72 0.16 X11-window-0004
+guest x11 gui ipc error=none
+surface gpu command source frames=8
+proot dpkg-split --version exit=0
+proot dpkg-split --version stdout=Debian 'dpkg-split' package split/join tool; version 1.22.6 (arm64).
+This is free software; see the GNU General Public License version 2 or
+later for copying conditions. There is NO warranty.
+proot dpkg-split --version stderr=
+native smoke exit=0
+native smoke stdout=alr-test-command ok arg1=smoke
+alr packaged trampoline continue passed=true
+alr packaged trampoline continue summary=ALR PACKAGED TRAMPOLINE CONTINUE EXECUTION: PASS
+alr procfs virtualization passed=true
+alr procfs self exe guest view=/bin/hello
+alr procfs self exe host truth=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_runtime_trampoline.so
+alr procfs mounts host leak tokens=0
+alr wx-safe exec passed=true
+alr wx-safe primary method=memfd-execveat
+alr wx-safe entrypoint packaged=ALR WX-SAFE ENTRYPOINT IS PACKAGED: PASS
+alr wx-safe direct rootfs exec rejected=ALR WX-SAFE DIRECT ROOTFS EXEC REJECTED: PASS
+alr perf harness ran=true
+alr perf alr xlate ns/op=4327.125
+alr perf syscall getppid ns/op=218.753
+alr perf xlate cost in syscall units=19.781
+alr procfs interpose passed=true
+alr procfs interpose self exe target=/bin/hello
+alr procfs interpose mounts no host leak=ALR INTERPOSE MOUNTS NO HOST LEAK: PASS
+alr memfd w^x-safe native exec passed=false
+alr memfd create=ALR MEMFD CREATE: PASS
+alr memfd flag=plain
+alr memfd child exit=127
+alr memfd child stderr=EXECVEAT_ERRNO=13
+alr syscall sandbox blocked count=0
+alr syscall execveat=ALLOWED errno=9
+alr syscall symlink=
+alr syscall symlinkat=ALLOWED errno=2
+alr syscall mknodat=ALLOWED errno=2
+alr execmem anon rx native exec passed=true
+alr execmem mprotect rx=ALLOWED
+alr execmem child signal=0
+alr execmem diag=MPROTECT_OK calling;CALL_RET=42
+alr gpu boundary inproc ns/op=10
+alr gpu boundary socket ns/op=32822
+alr gpu boundary shmem-ring ns/op=153
+alr gpu passthrough boundary viable=true
+alr native loader guest exec passed=true
+alr native loader map=ALR NATIVE LOADER MAP: PASS
+alr native loader reached=jumped-to-entry
+alr native loader child=0 signal=0
+alr native loader diag=STATIC;PROG:IREL=0x0000000000000005 MAPPED;SIGRESET;E@0x0000000000400680 code=0xd280001dd503201f P@0x0000000000400040 p0=0x0000000500000001 sp@0x00000078de28fad0 argc=0x0000000000000001 JUMPING;PFLT_OK;
+proot --version exit=0
+linker64 proot --version exit=0
+proot hello quiet exit=0
+proot hello quiet stdout=hello from static arm64 rootfs
+proot hello quiet stderr=
+proot script exit=0
+proot script stdout=hello from shell script rootfs
+proot script stderr=
+proot shell -c exit=0
+proot shell -c stdout=shell-c ok
+hello from static arm64 rootfs
+NAME="AndroLinux Tiny Rootfs"
+ID=androlinux-tiny
+proot shell -c stderr=
+proot glibc exit=0
+proot glibc stdout=hello from dynamic glibc rootfs
+glibc version=2.39
+proot glibc stderr=
+proot dash exit=0
+proot dash stdout=dash-c ok
+ALR_ROOTFS=/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64
+LD_LIBRARY_PATH=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64
+GLIBC_TUNABLES=glibc.pthread.rseq=0
+HOME=/root
+PROOT_VERBOSE=-1
+TMPDIR=/tmp
+PROOT_NO_SECCOMP=1
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ALR_PROGRAM=/bin/dash
+PWD=/
+PROOT_LOADER=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libproot-loader.so
+PROOT_TMP_DIR=/data/user/0/dev.chanwoo.androlinux/cache/proot-tmp
+proot dash stderr=
+proot id exit=0
+proot id stdout=uid=0(root) gid=0(root) groups=0(root),3003,9997,20326,50326
+proot id stderr=
+proot dpkg --version exit=0
+proot dpkg --version stdout=Debian 'dpkg' package management program version 1.22.6 (arm64).
+This is free software; see the GNU General Public License version 2 or
+later for copying conditions. There is NO warranty.
+proot dpkg --version stderr=
+proot dpkg --print-architecture exit=0
+proot dpkg --print-architecture stdout=arm64
+proot dpkg --print-architecture stderr=
+proot dpkg-query --version exit=0
+proot dpkg-query --version stdout=Debian dpkg-query package management program query tool version 1.22.6 (arm64).
+This is free software; see the GNU General Public License version 2 or
+later for copying conditions. There is NO warranty.
+proot dpkg-query --version stderr=
+proot apt --version exit=0
+proot apt --version stdout=apt 2.8.3 (arm64)
+proot apt --version stderr=
+proot apt-get --version exit=0
+proot apt-get --version stdout=apt 2.8.3 (arm64)
+Supported modules:
+*Ver: Standard .deb
+ Pkg:  Debian APT solver interface (Priority -1000)
+ Pkg:  Debian APT planner interface (Priority -1000)
+*Pkg:  Debian dpkg interface (Priority 20)
+ S.L: 'deb' Debian binary tree
+ S.L: 'deb-src' Debian source tree
+ Idx: EDSP scenario file
+ Idx: EIPP scenario file
+ Idx: Debian Source Index
+ Idx: Debian Package Index
+ Idx: Debian Translation Index
+ Idx: Debian dpkg status file
+ Idx: Debian deb file
+ Idx: Debian dsc file
+ Idx: Debian control file
+proot apt-get --version stderr=
+proot apt-cache --version exit=0
+proot apt-cache --version stdout=apt 2.8.3 (arm64)
+proot apt-cache --version stderr=
+proot apt-config --version exit=0
+proot apt-config --version stdout=apt 2.8.3 (arm64)
+proot apt-config --version stderr=
+proot dpkg -i local deb exit=2
+proot dpkg -i local deb stdout=
+proot dpkg -i local deb stderr=dpkg (subprocess): unable to execute split package reassembly (dpkg-split): Function not implemented
+dpkg: error processing archive /var/cache/apt/archives/alr-smoke_1.0_arm64.deb (--install):
+ subprocess dpkg-split returned error exit status 2
+dpkg: error: error creating new backup file '/var/lib/dpkg/status-old': Function not implemented
+proot installed package smoke exit=1
+proot installed package smoke stdout=
+proot installed package smoke stderr=proot error: '/usr/local/bin/alr-package-smoke' not found (root = /data/data/dev.chanwoo.androlinux/files/rootfs/debian-arm64, cwd = /, $PATH=(null))
+fatal error: see `libalr_proot.so --help`.
+probe dlopen talloc=dlopen libtalloc.so=ok version=2.4
+probe dlopen proot=dlopen libalr_proot.so=ok
+proot loader=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libproot-loader.so
+proot tmp=/data/user/0/dev.chanwoo.androlinux/cache/proot-tmp
+proot verbose=-1
+host gpu renderer=gl renderer=Mali-G615 MC2
+host gpu vendor=gl vendor=ARM
+host gpu software renderer=host gpu software renderer=false
+host gpu hardware candidate=host gpu hardware candidate=true
+host vulkan device=host vulkan device=Mali-G615 MC2
+host vulkan device type=host vulkan device type=integrated-gpu
+host vulkan api version=host vulkan api version=1.3.247
+host vulkan android surface extension=host vulkan android surface extension=true
+host vulkan software renderer=host vulkan software renderer=false
+host vulkan hardware candidate=host vulkan hardware candidate=true
+permission INTERNET declared=true
+permission ACCESS_NETWORK_STATE declared=true
+permission broad storage declared=false
+permission runtime dangerous requested=false
+
+--- verbose report ---
+AndroLinux Runtime Lab
+
+package: dev.chanwoo.androlinux
+nativeLibraryDir: /data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64
+loader executable: /data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr-loader.so
+app files dir: /data/user/0/dev.chanwoo.androlinux/files
+rootfs dir: /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64
+program: /bin/hello
+execution backend: proot
+can execute: yes
+backend reason: packaged PRoot backend validated for static arm64 ELF smoke execution inside app-private rootfs
+ALR RUNTIME LAUNCHER AVAILABLE: PASS
+ALR RUNTIME CONFIG BUILD: PASS
+ALR RUNTIME DIRECT APP-DATA EXEC POLICY: PASS
+ALR HOOK LOAD: PASS
+ALR HOOK CONFIG BUILD: PASS
+ALR INTERPOSER LOAD: PASS
+ALR INTERPOSER CONFIG BUILD: PASS
+ALR CONFIG SERIALIZE: PASS
+ALR CONFIG PARSE: PASS
+ALR EXEC RESOLVE: PASS
+ALR EXEC CLASSIFY: PASS
+ALR EXEC STRATEGY: plan-only
+alr exec guest path=/bin/hello
+alr exec host path=/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/bin/hello
+alr exec kind=elf
+ALR LAUNCH ATTEMPT: SKIP
+ALR LAUNCH MODE: policy-preflight
+ALR LOW-OVERHEAD RUNTIME HELLO EXECUTION: SKIP
+ALR ELF LOAD PLAN: PASS
+ALR ELF STATIC HELLO CANDIDATE: PASS
+alr elf class=elf64
+alr elf machine=aarch64
+alr elf type=exec
+alr elf status=static-executable
+alr elf entry=0x400680
+alr elf min vaddr=0x400000
+alr elf max vaddr=0x496d70
+alr elf interp=none
+alr elf load segments=2
+ALR TRAMPOLINE AVAILABLE: PASS
+ALR TRAMPOLINE CONFIG HANDOFF: PASS
+ALR TRAMPOLINE POLICY PREFLIGHT: PASS
+ALR STATIC HELLO VIA TRAMPOLINE: SKIP
+alr trampoline path=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_runtime_trampoline.so
+alr trampoline exit=not-run
+alr trampoline stdout=
+alr trampoline stderr=
+ALR EXEC CONTINUITY PLAN: PASS
+ALR EXECVE CHILD CONTINUITY PLAN: PASS
+ALR EXECVP PATH LOOKUP PLAN: SKIP
+ALR POSIX_SPAWN CHILD PLAN: SKIP
+ALR EXEC CONTINUITY TRAMPOLINE: PASS
+ALR EXEC CONTINUITY CONFIG HANDOFF: PASS
+alr exec continuation kind=execve
+alr exec continuation path lookup=false
+alr exec continuation target guest path=/bin/hello
+alr exec continuation host path diagnostic=/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/bin/hello
+alr exec continuation argv count=6
+alr exec continuation argv0=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_runtime_trampoline.so
+alr exec continuation env overrides=6
+alr launch exit=-1
+alr launch stdout=
+alr launch stderr=
+alr launch error=direct rootfs host exec disabled by ALR policy
+alr runtime launcher path=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_runtime_launcher.so
+alr runtime hook path=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_runtime_hook.so
+alr runtime interposer path=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_runtime_interposer.so
+alr runtime trampoline path=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_runtime_trampoline.so
+alr runtime bridge path=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_runtime_bridge.so
+alr runtime config source=env-skeleton
+alr runtime config format=alr-config-v1
+alr runtime config bytes=1618
+alr runtime config checksum=66aaef0f00df2969
+alr runtime guest execution=not-claimed
+LOW-OVERHEAD BACKEND PROBE FRAMEWORK: PASS
+OPTIONAL RUNTIME BACKEND AVAILABLE: SKIP
+optional runtime backend source=none
+optional runtime backend name=none
+optional runtime backend path=none
+optional runtime backend executable=no
+optional runtime backend reason=no optional external runtime backend configured
+
+Runtime policy: rootfs files stay in app-private writable storage; execution enters through packaged native backends.
+
+loader argv:
+  /data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr-loader.so
+  --rootfs
+  /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64
+  --program
+  /bin/hello
+
+loader env:
+  ALR_ROOTFS=/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64
+  ALR_PROGRAM=/bin/hello
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+proot argv:
+  /data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_proot.so
+  -R
+  /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64
+  -w
+  /
+  /bin/hello
+
+proot env:
+  ALR_ROOTFS=/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64
+  ALR_PROGRAM=/bin/hello
+  PROOT_LOADER=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libproot-loader.so
+  PROOT_TMP_DIR=/data/user/0/dev.chanwoo.androlinux/cache/proot-tmp
+  PROOT_NO_SECCOMP=1
+  PROOT_VERBOSE=-1
+  LD_LIBRARY_PATH=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+alr runtime argv:
+  /data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_runtime_launcher.so
+  --rootfs
+  /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64
+  --cwd
+  /
+  --program
+  /bin/hello
+  --dry-run
+
+alr runtime env:
+  ALR_ROOTFS=/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64
+  ALR_PROGRAM=/bin/hello
+  ALR_BACKEND=alr-runtime
+  ALR_HOOK_PATH=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_runtime_hook.so
+  ALR_INTERPOSER_PATH=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_runtime_interposer.so
+  ALR_BRIDGE_PATH=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_runtime_bridge.so
+  ALR_CONFIG_FORMAT=alr-config-v1
+  ALR_FAKE_ROOT=0
+  ALR_TRACE_PATH=0
+  ALR_TRACE_EXEC=0
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+rootfs install dir: /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64
+rootfs marker: /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/.alr-installed-bookworm-slim-2026-05-gui-gpu-v40
+rootfs status: debian-arm64/tiny-rootfs.tar verified=true extracted=true
+rootfs staged archive: /data/user/0/dev.chanwoo.androlinux/files/rootfs/.downloads/debian-arm64/bookworm-slim-2026-05-gui-gpu-v35/tiny-rootfs.tar
+rootfs extracted dir: /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64
+rootfs marker=/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/.alr-installed-bookworm-slim-2026-05-gui-gpu-v35
+
+next executable backend: android-native-test-command
+packaged command: /data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_test_command.so
+native command exit=0
+native command stdout=alr-test-command ok arg1=smoke
+native command stderr=
+
+native library probe:
+
+dlopen libtalloc.so=ok version=2.4
+dlopen libalr_proot.so=ok
+dlopen libproot-loader.so=fail: dlopen failed: "/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libproot-loader.so" has unexpected e_type: 2
+dlopen libalr_runtime_launcher.so=ok
+dlopen libalr_runtime_hook.so=ok
+dlopen libalr_runtime_interposer.so=ok
+
+ALR packaged trampoline continue probe:
+ALR PACKAGED TRAMPOLINE CONTINUE PROBE: android-native-exec
+ALR EXEC CONTINUITY PLAN: PASS
+ALR EXECVE CHILD CONTINUITY PLAN: PASS
+ALR EXECVP PATH LOOKUP PLAN: SKIP
+ALR POSIX_SPAWN CHILD PLAN: SKIP
+ALR EXEC CONTINUITY TRAMPOLINE: PASS
+ALR EXEC CONTINUITY CONFIG HANDOFF: PASS
+alr exec continuation kind=execve
+alr exec continuation path lookup=false
+alr exec continuation target guest path=/bin/hello
+alr exec continuation host path diagnostic=/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/bin/hello
+alr exec continuation argv count=7
+alr exec continuation argv0=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_runtime_trampoline.so
+alr exec continuation env overrides=6
+ALR PACKAGED TRAMPOLINE CONTINUE EXECUTION: PASS
+alr packaged trampoline continue exit=0
+alr packaged trampoline continue path=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_runtime_trampoline.so
+alr packaged trampoline continue stdout=ALR TRAMPOLINE CONTINUE EXEC: PASS
+ALR TRAMPOLINE CONTINUE CONFIG: PASS
+ALR TRAMPOLINE CONTINUE CHECKSUM: PASS
+ALR TRAMPOLINE CONTINUE KIND: PASS
+alr trampoline continue mode=dry-run
+alr trampoline continue kind=execve
+alr trampoline continue target guest=/bin/hello
+alr trampoline continue argv target=/bin/hello
+alr trampoline continue extra argc=1
+alr trampoline continue rootfs=/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64
+alr packaged trampoline continue stderr=
+
+ALR procfs virtualization plan probe:
+ALR PROCFS VIRTUALIZATION PROBE: android-native-plan
+ALR PROCFS PLAN: PASS
+ALR PROCFS SELF EXE PLAN: PASS
+ALR PROCFS SELF STATUS FAKEROOT PLAN: PASS
+ALR PROCFS MOUNTS PLAN: PASS
+ALR PROCFS HOST LEAK GUARD: PASS
+alr procfs self exe guest view=/bin/hello
+alr procfs self exe host truth=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_runtime_trampoline.so
+alr procfs self exe requires virtualization=true
+alr procfs self exe interpose paths=/proc/self/exe,/proc/<pid>/exe
+alr procfs self exe interpose syscalls=readlink,readlinkat,openat
+alr procfs self status name=hello
+alr procfs self status uid=10326
+alr procfs self status gid=10326
+alr procfs self status fakeroot=false
+alr procfs mounts entries=6
+alr procfs mounts has guest root=true
+alr procfs mounts has proc=true
+alr procfs mounts host leak tokens=0
+alr procfs mount[0]=alr_rootfs / overlay rw,relatime
+alr procfs mount[1]=proc /proc proc rw,nosuid,nodev,noexec,relatime
+alr procfs mount[2]=sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime
+alr procfs mount[3]=tmpfs /tmp tmpfs rw,nosuid,nodev,relatime
+alr procfs mount[4]=devpts /dev/pts devpts rw,nosuid,noexec,relatime
+alr procfs mount[5]=tmpfs /dev/shm tmpfs rw,nosuid,nodev,relatime
+
+ALR W^X-safe exec strategy probe:
+ALR WX-SAFE EXEC PROBE: android-native-plan
+ALR WX-SAFE EXEC STRATEGY: PASS
+ALR WX-SAFE ENTRYPOINT IS PACKAGED: PASS
+ALR WX-SAFE DIRECT ROOTFS EXEC REJECTED: PASS
+ALR WX-SAFE FILE-BACKED MMAP EXEC REJECTED: PASS
+ALR WX-SAFE PROOT BASELINE AVAILABLE: PASS
+alr wx entrypoint=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_runtime_trampoline.so
+alr wx target rootfs host path diagnostic=/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/bin/hello
+alr wx primary method=memfd-execveat
+alr wx fallback chain=memfd-execveat,anon-mmap-loader,proot-baseline
+alr wx method[0]=memfd-execveat device-selinux-check=true leans-on=execute on the anonymous memfd/tmpfs label for the app domain
+alr wx method[1]=anon-mmap-loader device-selinux-check=true leans-on=execmem for the app domain
+alr wx method[2]=proot-baseline device-selinux-check=false leans-on=none (ptrace-mediated, no native exec page is created)
+alr wx rejected[0]=direct-rootfs-execve reason=execve() needs execute permission on /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/bin/hello which is an app_data_file; W^X denies it for targetSdk>=29
+alr wx rejected[1]=file-backed-mmap-exec reason=mmap PROT_EXEC of /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/bin/hello needs file execute permission, also denied under W^X
+
+ALR PRoot-vs-ALR perf comparison probe:
+ALR PERF PROBE: android-native-measure
+ALR PERF HARNESS: PASS
+ALR PERF ALR PATH XLATE MEASURED: PASS
+ALR PERF SYSCALL ROUNDTRIP MEASURED: PASS
+ALR PERF PROOT PTRACE DEVICE BASELINE: PENDING_DEVICE
+ALR PERF PROOT VS ALR DEVICE COMPARISON: PENDING_DEVICE
+alr perf iterations=100000
+alr perf alr xlate total ns=432712538
+alr perf alr xlate ns/op=4327.125
+alr perf syscall getppid total ns=21875308
+alr perf syscall getppid ns/op=218.753
+alr perf xlate cost in syscall units=19.781
+alr perf interpretation=both PRoot and ALR pay the path-translation cost; ALR's win is avoiding PRoot's per-syscall ptrace stops, so the real delta is PENDING_DEVICE
+alr perf optimization target=reduce ALR path-translation allocations on the hot path
+alr perf note=PRoot ptrace per-syscall overhead is device/kernel specific and must be measured on-device
+
+ALR procfs interpose mechanism probe:
+ALR INTERPOSE PROBE: android-native-mechanism
+ALR INTERPOSE SELF EXE VIRTUALIZED: PASS
+ALR INTERPOSE MOUNTS VIRTUALIZED: PASS
+ALR INTERPOSE SELF EXE NO HOST PROC: PASS
+ALR INTERPOSE MOUNTS NO HOST LEAK: PASS
+alr interpose self exe target=/bin/hello
+alr interpose mounts bytes=291
+--- self exe ---
+ALR INTERPOSE RESOLVE: PASS
+ALR INTERPOSE KIND: proc-self-exe
+ALR INTERPOSE VIRTUALIZED: PASS
+alr interpose guest path=/proc/self/exe
+alr interpose host path=synthetic
+alr interpose synthetic link target=/bin/hello
+--- mounts ---
+ALR INTERPOSE RESOLVE: PASS
+ALR INTERPOSE KIND: proc-mounts
+ALR INTERPOSE VIRTUALIZED: PASS
+alr interpose guest path=/proc/mounts
+alr interpose host path=synthetic
+alr interpose synthetic content bytes=291
+
+ALR memfd W^X-safe native exec probe:
+ALR MEMFD EXEC PROBE: android-native-attempt
+alr memfd guest source=/bin/hello
+alr memfd bytes=537664
+ALR MEMFD CREATE: PASS
+alr memfd flag=plain
+ALR MEMFD EXECVEAT W^X-SAFE EXECUTION: FAIL
+alr memfd child exit=127
+alr memfd child stdout=
+alr memfd child stderr=EXECVEAT_ERRNO=13
+
+ALR syscall sandbox capability probe:
+ALR SYSCALL SANDBOX PROBE: PASS
+alr syscall execveat=ALLOWED errno=9
+alr syscall symlinkat=ALLOWED errno=2
+alr syscall linkat=ALLOWED errno=2
+alr syscall mknodat=ALLOWED errno=2
+alr syscall statx=ALLOWED errno=2
+alr syscall clone3=ALLOWED errno=22
+alr syscall unshare=ALLOWED errno=0
+alr syscall blocked count=0
+
+ALR seccomp path-mediation probe (rootfs path rewrite via seccomp-trace):
+ALR SECCOMP PATH-TRAP PROBE: PASS
+alr sc real_path=/data/user/0/dev.chanwoo.androlinux/files/alr-sc-real.txt
+alr sc decoy_path=/data/user/0/dev.chanwoo.androlinux/files/alr-sc-decoy-DOES-NOT-EXIST.txt
+alr sc rewrite_fits=yes
+alr sc filter_install=OK
+alr sc seccomp_trace_events=1
+alr sc observed_guest_path=/data/user/0/dev.chanwoo.androlinux/files/alr-sc-decoy-DOES-NOT-EXIST.txt
+alr sc trapped_decoy_match=yes
+alr sc path_rewrites=1
+alr sc mem_diag=mem_rw=ok/2 mem_ro=ok/2 rd=255/22 wr=58/22 
+alr sc child_exit=0
+alr sc child_diag=FILTER_OK how=seccomp;OPEN_OK content=ALR_REWRITE_OK;
+alr sc PATH_MEDIATION_VIABLE=yes
+
+ALR Wayland unix-socket transport probe (named AF_UNIX host↔forked guest):
+ALR UNIX SOCKET TRANSPORT PROBE: PASS
+alr us socket_path=/data/user/0/dev.chanwoo.androlinux/files/alr-wl-test.sock
+alr us bind=OK errno=0
+alr us listen=OK
+alr us accept=OK
+alr us byte_exchange=OK
+alr us guest_connect_exit=0
+alr us WAYLAND_TRANSPORT_VIABLE=yes
+
+ALR execmem anon RX native exec probe:
+ALR EXECMEM PROBE: android-native-attempt
+ALR EXECMEM ANON RX EXECUTION: PASS
+alr execmem mprotect rx=ALLOWED
+alr execmem child exit=0
+alr execmem child signal=0
+alr execmem diag=MPROTECT_OK calling;CALL_RET=42
+
+ALR native ELF loader self-test (freestanding mechanism proof):
+ALR NATIVE LOADER SELFTEST: android-native-attempt
+ALR NATIVE LOADER SELFTEST EXEC: PASS
+alr native loader selftest bytes=132
+alr native loader selftest child exit=42 signal=0
+alr native loader mt passed=true
+alr native loader mt threads=1
+alr native loader mt emulated=3 nums=99,99,99
+alr native loader mt stdout=main ok
+
+ALR native ELF loader multi-process (threads+fork) probe:
+ALR NATIVE LOADER PROBE: android-native-attempt
+alr native loader guest=/bin/mt-test
+alr native loader argc=1
+alr native loader bytes=710032
+ALR NATIVE LOADER PARSE: PASS
+alr native loader elf type=ET_EXEC
+alr native loader entry=0x238a80
+alr native loader phnum=9
+ALR NATIVE LOADER MAP: PASS
+ALR NATIVE LOADER LINK MODE: STATIC
+ALR NATIVE LOADER INTERP MAP: SKIP
+ALR NATIVE LOADER GUEST EXEC: PASS
+alr native loader reached=jumped-to-entry
+alr native loader child exit=0 signal=0
+alr native loader fault signo=0 pc=0x0 addr=0x0 lr=0x0 x0=0x0 x8=0x0 syscall=-1
+alr native loader guest threads spawned=1
+alr native loader path-mediation traps=1 rewrites=0
+alr native loader seccomp-emulated syscalls=3 nums=99,99,99
+alr native loader diag=STATIC;PROG:IREL=0x0000000000000007 MAPPED;SIGRESET;E@0x0000000000238a80 code=0xd280001dd503201f P@0x0000000000200040 p0=0x0000000400000006 sp@0x00000078de28fad0 argc=0x0000000000000001 JUMPING;PFLT_OK;
+alr native loader guest stdout=main ok
+thread ok
+child ok
+alr native loader fileio mediated=true
+
+ALR native ELF loader path-mediation real-file-read probe (fileio-test):
+ALR NATIVE LOADER PROBE: android-native-attempt
+alr native loader guest=/bin/fileio-test
+alr native loader argc=1
+alr native loader bytes=645976
+ALR NATIVE LOADER PARSE: PASS
+alr native loader elf type=ET_EXEC
+alr native loader entry=0x236100
+alr native loader phnum=9
+ALR NATIVE LOADER MAP: PASS
+ALR NATIVE LOADER LINK MODE: STATIC
+ALR NATIVE LOADER INTERP MAP: SKIP
+ALR NATIVE LOADER GUEST EXEC: PASS
+alr native loader reached=jumped-to-entry
+alr native loader child exit=0 signal=0
+alr native loader fault signo=0 pc=0x0 addr=0x0 lr=0x0 x0=0x0 x8=0x0 syscall=-1
+alr native loader guest threads spawned=0
+alr native loader path-mediation traps=4 rewrites=2
+alr native loader first path rewrite=/etc/alr-probe.txt=>/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/etc/alr-probe.txt
+alr native loader seccomp-emulated syscalls=1 nums=99
+alr native loader diag=STATIC;PROG:IREL=0x0000000000000007 MAPPED;SIGRESET;E@0x0000000000236100 code=0xd280001dd503201f P@0x0000000000200040 p0=0x0000000400000006 sp@0x00000078de28fad0 argc=0x0000000000000001 JUMPING;PFLT_OK;
+alr native loader guest stdout=fileio: alr-rootfs-ok
+
+dirent: group
+dirent: apt
+dirent: nsswitch.conf
+alr native loader dyn passed=true
+
+ALR native ELF loader DYNAMIC (in-process ld.so handoff) probe (dynhello):
+ALR NATIVE LOADER PROBE: android-native-attempt
+alr native loader guest=/bin/dynhello
+alr native loader argc=1
+alr native loader bytes=6336
+ALR NATIVE LOADER PARSE: PASS
+alr native loader elf type=ET_DYN(static-PIE)
+alr native loader entry=0x10500
+alr native loader phnum=11
+ALR NATIVE LOADER MAP: PASS
+ALR NATIVE LOADER LINK MODE: DYNAMIC(interp-handoff)
+ALR NATIVE LOADER INTERP MAP: PASS
+ALR NATIVE LOADER GUEST EXEC: PASS
+alr native loader reached=jumped-to-entry
+alr native loader child exit=0 signal=0
+alr native loader fault signo=0 pc=0x0 addr=0x0 lr=0x0 x0=0x0 x8=0x0 syscall=-1
+alr native loader guest threads spawned=0
+alr native loader path-mediation traps=2 rewrites=1
+alr native loader first path rewrite=/etc/ld.so.preload=>/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/etc/ld.so.preload
+alr native loader seccomp-emulated syscalls=1 nums=99
+alr native loader diag=DYN;INTERP_READ=0x0000000000031cc0 PROG:IREL=0x0000000000000000 INTERP:IREL=0x0000000000000000 MAPPED;SIGRESET;E@0x0000007b9a174a40 code=0xd280001dd503201f P@0x0000007b9a4ed040 p0=0x0000000400000006 sp@0x00000078de28fad0 argc=0x0000000000000001 BASE=0x0000007b9a15a000 PROGE=0x0000007b9a4fd500 PROGB=0x0000007b9a4ed000 INTRE@0x0000007b9a174a40 JUMPING;PFLT_OK;
+alr native loader guest stdout=alr-dyn-ok
+
+ALR real Debian program probe (/usr/bin/env):
+ALR NATIVE LOADER PROBE: android-native-attempt
+alr native loader guest=/usr/bin/env
+alr native loader argc=1
+alr native loader bytes=68368
+ALR NATIVE LOADER PARSE: PASS
+alr native loader elf type=ET_DYN(static-PIE)
+alr native loader entry=0x3080
+alr native loader phnum=9
+ALR NATIVE LOADER MAP: PASS
+ALR NATIVE LOADER LINK MODE: DYNAMIC(interp-handoff)
+ALR NATIVE LOADER INTERP MAP: PASS
+ALR NATIVE LOADER GUEST EXEC: PASS
+alr native loader reached=jumped-to-entry
+alr native loader child exit=0 signal=0
+alr native loader fault signo=0 pc=0x0 addr=0x0 lr=0x0 x0=0x0 x8=0x0 syscall=-1
+alr native loader guest threads spawned=0
+alr native loader path-mediation traps=7 rewrites=6
+alr native loader first path rewrite=/etc/ld.so.preload=>/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/etc/ld.so.preload
+alr native loader seccomp-emulated syscalls=1 nums=99
+alr native loader diag=DYN;INTERP_READ=0x0000000000031cc0 PROG:IREL=0x0000000000000000 INTERP:IREL=0x0000000000000000 MAPPED;SIGRESET;E@0x0000007b9a174a40 code=0xd280001dd503201f P@0x0000007b9a4b9040 p0=0x0000000400000006 sp@0x00000078de28fad0 argc=0x0000000000000001 BASE=0x0000007b9a15a000 PROGE=0x0000007b9a4bc080 PROGB=0x0000007b9a4b9000 INTRE@0x0000007b9a174a40 JUMPING;PFLT_OK;
+alr native loader guest stdout=GLIBC_TUNABLES=glibc.pthread.rseq=0
+LD_LIBRARY_PATH=/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/lib/aarch64-linux-gnu:/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/lib:/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/usr/lib/aarch64-linux-gnu:/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/usr/lib
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+HOME=/root
+TERM=xterm-256color
+XDG_RUNTIME_DIR=/data/user/0/dev.chanwoo.androlinux/cache/alr-xdg
+WAYLAND_DISPLAY=wayland-0
+GDK_BACKEND=wayland
+SDL_VIDEODRIVER=wayland
+GDK_RENDERING=cairo
+GSETTINGS_BACKEND=memory
+LC_ALL=C.UTF-8
+LANG=C.UTF-8
+XDG_DATA_DIRS=/usr/local/share:/usr/share
+XDG_CONFIG_HOME=/root/.config
+FONTCONFIG_PATH=/etc/fonts
+GDK_PIXBUF_MODULE_FILE=/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders.cache
+
+ALR real Debian program probe (/usr/bin/id):
+ALR NATIVE LOADER PROBE: android-native-attempt
+alr native loader guest=/usr/bin/id
+alr native loader argc=1
+alr native loader bytes=67952
+ALR NATIVE LOADER PARSE: PASS
+alr native loader elf type=ET_DYN(static-PIE)
+alr native loader entry=0x2680
+alr native loader phnum=9
+ALR NATIVE LOADER MAP: PASS
+ALR NATIVE LOADER LINK MODE: DYNAMIC(interp-handoff)
+ALR NATIVE LOADER INTERP MAP: PASS
+ALR NATIVE LOADER GUEST EXEC: PASS
+alr native loader reached=jumped-to-entry
+alr native loader child exit=0 signal=0
+alr native loader fault signo=0 pc=0x0 addr=0x0 lr=0x0 x0=0x0 x8=0x0 syscall=-1
+alr native loader guest threads spawned=0
+alr native loader path-mediation traps=28 rewrites=23
+alr native loader first path rewrite=/etc/ld.so.preload=>/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/etc/ld.so.preload
+alr native loader seccomp-emulated syscalls=1 nums=99
+alr native loader diag=DYN;INTERP_READ=0x0000000000031cc0 PROG:IREL=0x0000000000000000 INTERP:IREL=0x0000000000000000 MAPPED;SIGRESET;E@0x0000007b9a174a40 code=0xd280001dd503201f P@0x0000007b9a4b9040 p0=0x0000000400000006 sp@0x00000078de28fad0 argc=0x0000000000000001 BASE=0x0000007b9a15a000 PROGE=0x0000007b9a4bb680 PROGB=0x0000007b9a4b9000 INTRE@0x0000007b9a174a40 JUMPING;PFLT_OK;
+alr native loader guest stdout=uid=10326 gid=10326 groups=10326,3003,9997,20326,50326
+
+ALR real shell command probe (/bin/dash -c 'echo alr-shell-ok'):
+ALR NATIVE LOADER PROBE: android-native-attempt
+alr native loader guest=/bin/dash
+alr native loader argc=3
+alr native loader bytes=133608
+ALR NATIVE LOADER PARSE: PASS
+alr native loader elf type=ET_DYN(static-PIE)
+alr native loader entry=0x4480
+alr native loader phnum=9
+ALR NATIVE LOADER MAP: PASS
+ALR NATIVE LOADER LINK MODE: DYNAMIC(interp-handoff)
+ALR NATIVE LOADER INTERP MAP: PASS
+ALR NATIVE LOADER GUEST EXEC: PASS
+alr native loader reached=jumped-to-entry
+alr native loader child exit=0 signal=0
+alr native loader fault signo=0 pc=0x0 addr=0x0 lr=0x0 x0=0x0 x8=0x0 syscall=-1
+alr native loader guest threads spawned=0
+alr native loader path-mediation traps=2 rewrites=1
+alr native loader first path rewrite=/etc/ld.so.preload=>/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/etc/ld.so.preload
+alr native loader seccomp-emulated syscalls=1 nums=99
+alr native loader diag=DYN;INTERP_READ=0x0000000000031cc0 PROG:IREL=0x0000000000000000 INTERP:IREL=0x0000000000000000 MAPPED;SIGRESET;E@0x0000007b99d3aa40 code=0xd280001dd503201f P@0x0000007b9a4eb040 p0=0x0000000400000006 sp@0x00000078de28fab0 argc=0x0000000000000003 BASE=0x0000007b99d20000 PROGE=0x0000007b9a4ef480 PROGB=0x0000007b9a4eb000 INTRE@0x0000007b99d3aa40 JUMPING;PFLT_OK;
+alr native loader guest stdout=alr-shell-ok
+
+ALR write-path mediation probe (dash writes+reads /tmp in rootfs):
+ALR NATIVE LOADER PROBE: android-native-attempt
+alr native loader guest=/bin/dash
+alr native loader argc=3
+alr native loader bytes=133608
+ALR NATIVE LOADER PARSE: PASS
+alr native loader elf type=ET_DYN(static-PIE)
+alr native loader entry=0x4480
+alr native loader phnum=9
+ALR NATIVE LOADER MAP: PASS
+ALR NATIVE LOADER LINK MODE: DYNAMIC(interp-handoff)
+ALR NATIVE LOADER INTERP MAP: PASS
+ALR NATIVE LOADER GUEST EXEC: PASS
+alr native loader reached=jumped-to-entry
+alr native loader child exit=0 signal=0
+alr native loader fault signo=0 pc=0x0 addr=0x0 lr=0x0 x0=0x0 x8=0x0 syscall=-1
+alr native loader guest threads spawned=0
+alr native loader path-mediation traps=4 rewrites=3
+alr native loader first path rewrite=/etc/ld.so.preload=>/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/etc/ld.so.preload
+alr native loader seccomp-emulated syscalls=1 nums=99
+alr native loader diag=DYN;INTERP_READ=0x0000000000031cc0 PROG:IREL=0x0000000000000000 INTERP:IREL=0x0000000000000000 MAPPED;SIGRESET;E@0x0000007b99d3aa40 code=0xd280001dd503201f P@0x0000007b9a4eb040 p0=0x0000000400000006 sp@0x00000078de28fa80 argc=0x0000000000000003 BASE=0x0000007b99d20000 PROGE=0x0000007b9a4ef480 PROGB=0x0000007b9a4eb000 INTRE@0x0000007b99d3aa40 JUMPING;PFLT_OK;
+alr native loader guest stdout=got:wp-ok
+
+ALR native ELF loader (anon-mmap-loader) probe:
+ALR NATIVE LOADER PROBE: android-native-attempt
+alr native loader guest=/bin/hello
+alr native loader argc=1
+alr native loader bytes=537664
+ALR NATIVE LOADER PARSE: PASS
+alr native loader elf type=ET_EXEC
+alr native loader entry=0x400680
+alr native loader phnum=6
+ALR NATIVE LOADER MAP: PASS
+ALR NATIVE LOADER LINK MODE: STATIC
+ALR NATIVE LOADER INTERP MAP: SKIP
+ALR NATIVE LOADER GUEST EXEC: PASS
+alr native loader reached=jumped-to-entry
+alr native loader child exit=0 signal=0
+alr native loader fault signo=0 pc=0x0 addr=0x0 lr=0x0 x0=0x0 x8=0x0 syscall=-1
+alr native loader guest threads spawned=0
+alr native loader path-mediation traps=1 rewrites=0
+alr native loader seccomp-emulated syscalls=1 nums=99
+alr native loader diag=STATIC;PROG:IREL=0x0000000000000005 MAPPED;SIGRESET;E@0x0000000000400680 code=0xd280001dd503201f P@0x0000000000400040 p0=0x0000000500000001 sp@0x00000078de28fad0 argc=0x0000000000000001 JUMPING;PFLT_OK;
+alr native loader guest stdout=hello from static arm64 rootfs
+
+ALR guest->host GPU boundary cost probe:
+ALR GPU BOUNDARY PROBE: PASS
+alr gpu boundary inproc dispatch ns/op=10
+alr gpu boundary inproc cmds per 60fps frame=1666666
+alr gpu boundary socket per-cmd ns/op=32822
+alr gpu boundary socket cmds per 60fps frame=507
+alr gpu boundary shmem-ring ns/op=153
+alr gpu boundary shmem-ring cmds per 60fps frame=108932
+alr gpu boundary note=in-process and shared-ring per-cmd costs gate GPU passthrough feasibility; naive socket-per-cmd does not scale to draw-call-heavy frames
+
+ALR GPU command-marshalling probe (guest GLES stream -> host GPU):
+ALR GPU MARSHALLING PROBE: android-egl-gles
+ALR GPU MARSHALLING DECODE+EXECUTE: PASS
+ALR GPU MARSHALLING HARDWARE RENDER: PASS
+alr gpu marshalling stream bytes=73
+alr gpu marshalling commands decoded=8
+alr gpu marshalling renderer=Mali-G615 MC2
+alr gpu marshalling center pixel=229,77,26
+alr gpu marshalling corner pixel=26,51,178
+alr gpu marshalling gl error=0x0
+alr gpu marshalling software renderer=false
+
+Android host GPU probe:
+host gpu probe=android-egl-gles-pbuffer
+egl initialize=ok version=1.5
+egl choose config=ok count=1
+egl pbuffer surface=ok size=16x16
+egl context=ok api=gles2
+egl make current=ok
+gl vendor=ARM
+gl renderer=Mali-G615 MC2
+gl version=OpenGL ES 3.2 v1.r44p1-01eac0.ed1fb6cfc1040479b92ddf50a952e57c
+gl shading language=OpenGL ES GLSL ES 3.20
+gl clear error=0x0
+host gpu software renderer=false
+host gpu hardware candidate=true
+
+Android host Vulkan probe:
+host vulkan probe=android-vulkan-instance-device
+vulkan instance extensions count=14
+host vulkan surface extension=true
+host vulkan android surface extension=true
+vulkan create instance=ok
+vulkan physical devices count=1
+host vulkan device=Mali-G615 MC2
+host vulkan device type=integrated-gpu
+host vulkan api version=1.3.247
+host vulkan driver version=184553472
+host vulkan vendor id=0x13b5
+host vulkan device id=0xb8a31030
+host vulkan software renderer=false
+host vulkan hardware candidate=true
+
+proot backend candidate: packaged native executable
+proot actual env:
+  GLIBC_TUNABLES=glibc.pthread.rseq=0
+  HOME=/root
+  LD_LIBRARY_PATH=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  PROOT_LOADER=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libproot-loader.so
+  PROOT_NO_SECCOMP=1
+  PROOT_TMP_DIR=/data/user/0/dev.chanwoo.androlinux/cache/proot-tmp
+  PROOT_VERBOSE=-1
+  TMPDIR=/tmp
+proot candidate exit=0
+proot candidate stdout=_____ _____              ___
+|  __ \  __ \_____  _____|   |_
+|   __/     /  _  \/  _  \    _|
+|__|  |__|__\_____/\_____/\____| 5.1.0
+
+built-in accelerators: process_vm = yes, seccomp_filter = yes
+
+Visit http://proot.me for help, bug reports, suggestions, patchs, ...
+Copyright (C) 2015 STMicroelectronics, licensed under GPL v2 or later.
+proot candidate stderr=
+
+diagnostic note: libproot-loader.so is a PRoot loader executable, not a dlopen-able shared library; libtalloc.so is a dependency, not a standalone command. Direct crash probes are skipped in the default success report.
+
+proot --version command=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_proot.so
+proot --version exit=0
+proot --version stdout=_____ _____              ___
+|  __ \  __ \_____  _____|   |_
+|   __/     /  _  \/  _  \    _|
+|__|  |__|__\_____/\_____/\____| 5.1.0
+
+built-in accelerators: process_vm = yes, seccomp_filter = yes
+
+Visit http://proot.me for help, bug reports, suggestions, patchs, ...
+Copyright (C) 2015 STMicroelectronics, licensed under GPL v2 or later.
+proot --version stderr=
+
+proot -V command=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_proot.so
+proot -V exit=0
+proot -V stdout=_____ _____              ___
+|  __ \  __ \_____  _____|   |_
+|   __/     /  _  \/  _  \    _|
+|__|  |__|__\_____/\_____/\____| 5.1.0
+
+built-in accelerators: process_vm = yes, seccomp_filter = yes
+
+Visit http://proot.me for help, bug reports, suggestions, patchs, ...
+Copyright (C) 2015 STMicroelectronics, licensed under GPL v2 or later.
+proot -V stderr=
+
+proot --help command=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_proot.so
+proot --help exit=0
+proot --help stdout=proot 5.1.0: chroot, mount --bind, and binfmt_misc without privilege/setup.
+
+Usage:
+  proot [option] ... [command]
+
+
+Regular options:
+  -r *path*, --rootfs=*path*
+	Use *path* as the new guest root file-system, default is /.
+
+	The specified path typically contains a Linux distribution where
+	all new programs will be confined.  The default rootfs is /
+	when none is specified, this makes sense when the bind mechanism
+	is used to relocate host files and directories, see the -b
+	option and the Examples section for details.
+	
+	It is recommended to use the -R or -S options instead.
+
+  -b *path*, --bind=*path*, -m *path*, --mount=*path*
+	Make the content of *path* accessible in the guest rootfs.
+
+	This option makes any file or directory of the host rootfs
+	accessible in the confined environment just as if it were part of
+	the guest rootfs.  By default the host path is bound to the same
+	path in the guest rootfs but users can specify any other location
+	with the syntax: -b *host_path*:*guest_location*.  If the
+	guest location is a symbolic link, it is dereferenced to ensure
+	the new content is accessible through all the symbolic links that
+	point to the overlaid content.  In most cases this default
+	behavior shouldn't be a problem, although it is possible to
+	explicitly not dereference the guest location by appending it the
+	! character: -b *host_path*:*guest_location!*.
+
+  -q *command*, --qemu=*command*
+	Execute guest programs through QEMU as specified by *command*.
+
+	Each time a guest program is going to be executed, PRoot inserts
+	the QEMU user-mode command in front of the initial request.
+	That way, guest programs actually run on a virtual guest CPU
+	emulated by QEMU user-mode.  The native execution of host programs
+	is still effective and the whole host rootfs is bound to
+	/host-rootfs in the guest environment.
+
+  -w *path*, --pwd=*path*, --cwd=*path*
+	Set the initial working directory to *path*.
+
+	Some programs expect to be launched from a given directory but do
+	not perform any chdir by themselves.  This option avoids the
+	need for running a shell and then entering the directory manually.
+
+  --kill-on-exit
+	Kill all processes on command exit.
+
+	When the executed command leaves orphean or detached processes
+	around, proot waits until all processes possibly terminate. This option forces
+	the immediate termination of all tracee processes when the main command exits.
+
+  -v *value*, --verbose=*value*
+	Set the level of debug information to *value*.
+
+	The higher the integer value is, the more detailed debug
+	information is printed to the standard error stream.  A negative
+	value makes PRoot quiet except on fatal errors.
+
+  -V, --version, --about
+	Print version, copyright, license and contact, then exit.
+
+  -h, --help, --usage
+	Print the version and the command-line usage, then exit.
+
+
+Extension options:
+  -k *string*, --kernel-release=*string*
+	Make current kernel appear as kernel release *string*.
+
+	If a program is run on a kernel older than the one expected by its
+	GNU C library, the following error is reported: "FATAL: kernel too
+	old".  To be able to run such programs, PRoot can emulate some of
+	the features that are available in the kernel release specified by
+	*string* but that are missing in the current kernel.
+
+  -0, --root-id
+	Make current user appear as "root" and fake its privileges.
+
+	Some programs will refuse to work if they are not run with "root"
+	privileges, even if there is no technical reason for that.  This
+	is typically the case with package managers.  This option allows
+	users to bypass this kind of limitation by faking the user/group
+	identity, and by faking the success of some operations like
+	changing the ownership of files, changing the root directory to
+	/, ...  Note that this option is quite limited compared to
+	fakeroot.
+
+  -i *string*, --change-id=*string*
+	Make current user and group appear as *string* "uid:gid".
+
+	This option makes the current user and group appear as uid and
+	gid.  Likewise, files actually owned by the current user and
+	group appear as if they were owned by uid and gid instead.
+	Note that the -0 option is the same as -i 0:0.
+
+  --link2symlink, -l
+	Replace hard links with symlinks, pretending they are really hardlinks
+
+	Emulates hard links with symbolic links when SELinux policies
+	do not allow hard links.
+
+  --sysvipc
+	Handle System V IPC syscalls in proot
+
+	Handles System V IPC syscalls (shmget, semget, msgget, etc.)
+	syscalls inside proot. IPC is handled inside proot and launching 2 proot instances
+	will lead to 2 different IPC Namespaces
+
+  --ashmem-memfd
+	Emulate memfd_create support through ashmem and simulate fstat.st_size for ashmem
+
+  -H
+	Hide files and directories starting with '.proot.' .
+
+  -p
+	Modify bindings to protected ports to use a higher port number.
+
+  -L
+	Correct the size returned from lstat for symbolic links.
+
+
+Alias options:
+  -R *path*
+	Alias: -r *path* + a couple of recommended -b.
+
+	Programs isolated in *path*, a guest rootfs, might still need to
+	access information about the host system, as it is illustrated in
+	the Examples section of the manual.  These host information
+	are typically: user/group definition, network setup, run-time
+	information, users' files, ...  On all Linux distributions, they
+	all lie in a couple of host files and directories that are
+	automatically bound by this option:
+	
+	    * /etc/host.conf
+	    * /etc/hosts
+	    * /etc/hosts.equiv
+	    * /etc/mtab
+	    * /etc/netgroup
+	    * /etc/networks
+	    * /etc/passwd
+	    * /etc/group
+	    * /etc/nsswitch.conf
+	    * /etc/resolv.conf
+	    * /etc/localtime
+	    * /dev/
+	    * /sys/
+	    * /proc/
+	    * /tmp/
+	    * /run/
+	    * /var/run/dbus/system_bus_socket
+	    * $HOME
+
+  -S *path*
+	Alias: -0 -r *path* + a couple of recommended -b.
+
+	This option is useful to safely create and install packages into
+	the guest rootfs.  It is similar to the -R option expect it
+	enables the -0 option and binds only the following minimal set
+	of paths to avoid unexpected changes on host files:
+	
+	    * /etc/host.conf
+	    * /etc/hosts
+	    * /etc/nsswitch.conf
+	    * /etc/resolv.conf
+	    * /dev/
+	    * /sys/
+	    * /proc/
+	    * /tmp/
+	    * /run/shm
+	    * $HOME
+
+Visit http://proot.me for help, bug reports, suggestions, patchs, ...
+Copyright (C) 2015 STMicroelectronics, licensed under GPL v2 or later.
+proot --help stderr=
+
+proot no-env --version command=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_proot.so
+proot no-env --version exit=0
+proot no-env --version stdout=_____ _____              ___
+|  __ \  __ \_____  _____|   |_
+|   __/     /  _  \/  _  \    _|
+|__|  |__|__\_____/\_____/\____| 5.1.0
+
+built-in accelerators: process_vm = yes, seccomp_filter = yes
+
+Visit http://proot.me for help, bug reports, suggestions, patchs, ...
+Copyright (C) 2015 STMicroelectronics, licensed under GPL v2 or later.
+proot no-env --version stderr=
+
+linker64 proot --version command=/system/bin/linker64
+linker64 proot --version exit=0
+linker64 proot --version stdout=_____ _____              ___
+|  __ \  __ \_____  _____|   |_
+|   __/     /  _  \/  _  \    _|
+|__|  |__|__\_____/\_____/\____| 5.1.0
+
+built-in accelerators: process_vm = yes, seccomp_filter = yes
+
+Visit http://proot.me for help, bug reports, suggestions, patchs, ...
+Copyright (C) 2015 STMicroelectronics, licensed under GPL v2 or later.
+linker64 proot --version stderr=
+
+proot hello quiet command=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_proot.so
+proot hello quiet exit=0
+proot hello quiet stdout=hello from static arm64 rootfs
+proot hello quiet stderr=
+
+proot script command=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_proot.so
+proot script exit=0
+proot script stdout=hello from shell script rootfs
+proot script stderr=
+
+proot shell -c command=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_proot.so
+proot shell -c exit=0
+proot shell -c stdout=shell-c ok
+hello from static arm64 rootfs
+NAME="AndroLinux Tiny Rootfs"
+ID=androlinux-tiny
+proot shell -c stderr=
+
+proot glibc command=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_proot.so
+proot glibc exit=0
+proot glibc stdout=hello from dynamic glibc rootfs
+glibc version=2.39
+proot glibc stderr=
+
+proot dash command=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_proot.so
+proot dash exit=0
+proot dash stdout=dash-c ok
+ALR_ROOTFS=/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64
+LD_LIBRARY_PATH=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64
+GLIBC_TUNABLES=glibc.pthread.rseq=0
+HOME=/root
+PROOT_VERBOSE=-1
+TMPDIR=/tmp
+PROOT_NO_SECCOMP=1
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ALR_PROGRAM=/bin/dash
+PWD=/
+PROOT_LOADER=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libproot-loader.so
+PROOT_TMP_DIR=/data/user/0/dev.chanwoo.androlinux/cache/proot-tmp
+proot dash stderr=
+
+proot id command=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_proot.so
+proot id exit=0
+proot id stdout=uid=0(root) gid=0(root) groups=0(root),3003,9997,20326,50326
+proot id stderr=
+
+proot dpkg --version command=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_proot.so
+proot dpkg --version exit=0
+proot dpkg --version stdout=Debian 'dpkg' package management program version 1.22.6 (arm64).
+This is free software; see the GNU General Public License version 2 or
+later for copying conditions. There is NO warranty.
+proot dpkg --version stderr=
+
+proot dpkg --print-architecture command=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_proot.so
+proot dpkg --print-architecture exit=0
+proot dpkg --print-architecture stdout=arm64
+proot dpkg --print-architecture stderr=
+
+proot dpkg-query --version command=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_proot.so
+proot dpkg-query --version exit=0
+proot dpkg-query --version stdout=Debian dpkg-query package management program query tool version 1.22.6 (arm64).
+This is free software; see the GNU General Public License version 2 or
+later for copying conditions. There is NO warranty.
+proot dpkg-query --version stderr=
+
+proot dpkg-split --version command=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_proot.so
+proot dpkg-split --version exit=0
+proot dpkg-split --version stdout=Debian 'dpkg-split' package split/join tool; version 1.22.6 (arm64).
+This is free software; see the GNU General Public License version 2 or
+later for copying conditions. There is NO warranty.
+proot dpkg-split --version stderr=
+
+proot apt --version command=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_proot.so
+proot apt --version exit=0
+proot apt --version stdout=apt 2.8.3 (arm64)
+proot apt --version stderr=
+
+proot apt-get --version command=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_proot.so
+proot apt-get --version exit=0
+proot apt-get --version stdout=apt 2.8.3 (arm64)
+Supported modules:
+*Ver: Standard .deb
+ Pkg:  Debian APT solver interface (Priority -1000)
+ Pkg:  Debian APT planner interface (Priority -1000)
+*Pkg:  Debian dpkg interface (Priority 20)
+ S.L: 'deb' Debian binary tree
+ S.L: 'deb-src' Debian source tree
+ Idx: EDSP scenario file
+ Idx: EIPP scenario file
+ Idx: Debian Source Index
+ Idx: Debian Package Index
+ Idx: Debian Translation Index
+ Idx: Debian dpkg status file
+ Idx: Debian deb file
+ Idx: Debian dsc file
+ Idx: Debian control file
+proot apt-get --version stderr=
+
+proot apt-cache --version command=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_proot.so
+proot apt-cache --version exit=0
+proot apt-cache --version stdout=apt 2.8.3 (arm64)
+proot apt-cache --version stderr=
+
+proot apt-config --version command=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_proot.so
+proot apt-config --version exit=0
+proot apt-config --version stdout=apt 2.8.3 (arm64)
+proot apt-config --version stderr=
+
+proot dpkg -i local deb command=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_proot.so
+proot dpkg -i local deb exit=2
+proot dpkg -i local deb stdout=
+proot dpkg -i local deb stderr=dpkg (subprocess): unable to execute split package reassembly (dpkg-split): Function not implemented
+dpkg: error processing archive /var/cache/apt/archives/alr-smoke_1.0_arm64.deb (--install):
+ subprocess dpkg-split returned error exit status 2
+dpkg: error: error creating new backup file '/var/lib/dpkg/status-old': Function not implemented
+
+proot installed package smoke command=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_proot.so
+proot installed package smoke exit=1
+proot installed package smoke stdout=
+proot installed package smoke stderr=proot error: '/usr/local/bin/alr-package-smoke' not found (root = /data/data/dev.chanwoo.androlinux/files/rootfs/debian-arm64, cwd = /, $PATH=(null))
+fatal error: see `libalr_proot.so --help`.
+
+proot guest gpu client command=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_proot.so
+proot guest gpu client exit=0
+proot guest gpu client stdout=alr guest gpu client ok
+ALR_GPU_BRIDGE_PROTOCOL clear-color-v2
+ALR_GPU_FRAME_COUNT 3
+ALR_GPU_CLEAR 0.78 0.12 0.95 guest-frame-0001
+ALR_GPU_CLEAR 0.12 0.78 0.28 guest-frame-0002
+ALR_GPU_CLEAR 0.08 0.18 0.92 guest-frame-0003
+ALR_GPU_IPC_CLIENT skipped reason=no-port
+proot guest gpu client stderr=
+
+proot guest gpu ipc client command=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_proot.so
+proot guest gpu ipc client exit=0
+proot guest gpu ipc client stdout=alr guest gpu client ok
+ALR_GPU_BRIDGE_PROTOCOL clear-color-v2
+ALR_GPU_FRAME_COUNT 3
+ALR_GPU_CLEAR 0.78 0.12 0.95 guest-frame-0001
+ALR_GPU_CLEAR 0.12 0.78 0.28 guest-frame-0002
+ALR_GPU_CLEAR 0.08 0.18 0.92 guest-frame-0003
+ALR_GPU_IPC_CLIENT ok sent=3 transport=tcp-loopback
+proot guest gpu ipc client stderr=
+
+proot guest gles shim smoke command=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_proot.so
+proot guest gles shim smoke exit=0
+proot guest gles shim smoke stdout=alr guest gles shim smoke ok
+ALR_GLES_SHIM_LOAD ok version=alr-gles-shim clear-color-v1
+ALR_GLES_SHIM_COMMAND ALR_GPU_CLEAR 0.32 0.44 0.88 shim-frame-0001
+ALR_GLES_SHIM_SUBMIT rc=0
+proot guest gles shim smoke stderr=
+
+proot guest wayland gui client command=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_proot.so
+proot guest wayland gui client exit=0
+proot guest wayland gui client stdout=alr-wayland-gpu-client ok
+ALR_GUI_PROTOCOL WAYLAND compositor-bridge-v1
+ALR_GUI_FRAME_COUNT 4
+ALR_GUI_FRAME WAYLAND seq=1 0.90 0.18 0.22 WAYLAND-window-0001
+ALR_GPU_CLEAR 0.90 0.18 0.22 WAYLAND-window-0001
+ALR_GUI_FRAME WAYLAND seq=2 0.12 0.72 0.36 WAYLAND-window-0002
+ALR_GPU_CLEAR 0.12 0.72 0.36 WAYLAND-window-0002
+ALR_GUI_FRAME WAYLAND seq=3 0.16 0.30 0.92 WAYLAND-window-0003
+ALR_GPU_CLEAR 0.16 0.30 0.92 WAYLAND-window-0003
+ALR_GUI_FRAME WAYLAND seq=4 0.94 0.72 0.16 WAYLAND-window-0004
+ALR_GPU_CLEAR 0.94 0.72 0.16 WAYLAND-window-0004
+ALR_GUI_IPC_CLIENT skipped reason=no-port
+proot guest wayland gui client stderr=
+
+proot guest x11 gui client command=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_proot.so
+proot guest x11 gui client exit=0
+proot guest x11 gui client stdout=alr-x11-gpu-client ok
+ALR_GUI_PROTOCOL X11 compositor-bridge-v1
+ALR_GUI_FRAME_COUNT 4
+ALR_GUI_FRAME X11 seq=1 0.90 0.18 0.22 X11-window-0001
+ALR_GPU_CLEAR 0.90 0.18 0.22 X11-window-0001
+ALR_GUI_FRAME X11 seq=2 0.12 0.72 0.36 X11-window-0002
+ALR_GPU_CLEAR 0.12 0.72 0.36 X11-window-0002
+ALR_GUI_FRAME X11 seq=3 0.16 0.30 0.92 X11-window-0003
+ALR_GPU_CLEAR 0.16 0.30 0.92 X11-window-0003
+ALR_GUI_FRAME X11 seq=4 0.94 0.72 0.16 X11-window-0004
+ALR_GPU_CLEAR 0.94 0.72 0.16 X11-window-0004
+ALR_GUI_IPC_CLIENT skipped reason=no-port
+proot guest x11 gui client stderr=
+
+proot guest wayland gui ipc client command=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_proot.so
+proot guest wayland gui ipc client exit=0
+proot guest wayland gui ipc client stdout=alr-wayland-gpu-client ok
+ALR_GUI_PROTOCOL WAYLAND compositor-bridge-v1
+ALR_GUI_FRAME_COUNT 4
+ALR_GUI_FRAME WAYLAND seq=1 0.90 0.18 0.22 WAYLAND-window-0001
+ALR_GPU_CLEAR 0.90 0.18 0.22 WAYLAND-window-0001
+ALR_GUI_FRAME WAYLAND seq=2 0.12 0.72 0.36 WAYLAND-window-0002
+ALR_GPU_CLEAR 0.12 0.72 0.36 WAYLAND-window-0002
+ALR_GUI_FRAME WAYLAND seq=3 0.16 0.30 0.92 WAYLAND-window-0003
+ALR_GPU_CLEAR 0.16 0.30 0.92 WAYLAND-window-0003
+ALR_GUI_FRAME WAYLAND seq=4 0.94 0.72 0.16 WAYLAND-window-0004
+ALR_GPU_CLEAR 0.94 0.72 0.16 WAYLAND-window-0004
+ALR_GUI_IPC_ACK ALR_GUI_IPC_ACK protocol=WAYLAND received=4 expected=4 lossless=true
+proot guest wayland gui ipc client stderr=
+
+proot guest x11 gui ipc client command=/data/app/~~1dLhg0WTjsK3zn23YseuOQ==/dev.chanwoo.androlinux-9t1IKRmfN2RV42XlWimW0A==/lib/arm64/libalr_proot.so
+proot guest x11 gui ipc client exit=0
+proot guest x11 gui ipc client stdout=alr-x11-gpu-client ok
+ALR_GUI_PROTOCOL X11 compositor-bridge-v1
+ALR_GUI_FRAME_COUNT 4
+ALR_GUI_FRAME X11 seq=1 0.90 0.18 0.22 X11-window-0001
+ALR_GPU_CLEAR 0.90 0.18 0.22 X11-window-0001
+ALR_GUI_FRAME X11 seq=2 0.12 0.72 0.36 X11-window-0002
+ALR_GPU_CLEAR 0.12 0.72 0.36 X11-window-0002
+ALR_GUI_FRAME X11 seq=3 0.16 0.30 0.92 X11-window-0003
+ALR_GPU_CLEAR 0.16 0.30 0.92 X11-window-0003
+ALR_GUI_FRAME X11 seq=4 0.94 0.72 0.16 X11-window-0004
+ALR_GPU_CLEAR 0.94 0.72 0.16 X11-window-0004
+ALR_GUI_IPC_ACK ALR_GUI_IPC_ACK protocol=X11 received=4 expected=4 lossless=true
+proot guest x11 gui ipc client stderr=
+
+proot hello verbose on failure skipped=quiet rootfs execution passed
+
+--- Android host Vulkan surface probe ---
+host vulkan surface probe=android-vulkan-surface-capabilities
+vulkan surface window=ok width=1920 height=239
+host vulkan surface extension=true
+host vulkan android surface extension=true
+vulkan create surface probe instance=ok
+vulkan create android surface=ok
+vulkan surface physical devices count=1
+host vulkan surface device=Mali-G615 MC2
+host vulkan surface device type=integrated-gpu
+host vulkan surface queue family index=0
+host vulkan surface formats count=5
+host vulkan surface present modes count=4
+host vulkan surface current extent=1920x239
+host vulkan surface min images=6
+host vulkan surface max images=80
+host vulkan surface software renderer=false
+host vulkan surface supported=true
+host vulkan surface hardware candidate=true
+
+--- Android host Vulkan surface renderer ---
+host vulkan surface renderer=android-vulkan-swapchain-clear-present
+vulkan surface frame stream protocol=gui-compositor-clear-color-vulkan-v1
+vulkan surface requested frames=8
+vulkan surface window=ok width=1920 height=239
+vulkan renderer surface extension=true
+vulkan renderer android surface extension=true
+vulkan create renderer instance=ok
+vulkan renderer create android surface=ok
+vulkan renderer physical devices count=1
+vulkan renderer device=Mali-G615 MC2
+vulkan renderer device type=integrated-gpu
+vulkan renderer queue family index=0
+vulkan renderer surface formats count=5
+vulkan renderer present modes count=4
+vulkan renderer surface format=r8g8b8a8-unorm
+vulkan renderer present mode=mailbox
+vulkan renderer software renderer=false
+vulkan renderer create device=ok
+vulkan renderer swapchain extent=1920x239
+vulkan renderer swapchain image count=7
+vulkan create swapchain=ok
+vulkan swapchain images count=7
+vulkan image views count=7
+vulkan create render pass=ok
+vulkan framebuffers count=7
+vulkan command buffer=ok
+vulkan surface frame 1 tag=WAYLAND-seq1-WAYLAND-window-0001 image=0 color=0.9,0.18,0.22 acquire=VK_SUCCESS present=VK_SUCCESS wait=VK_SUCCESS
+vulkan surface frame 2 tag=WAYLAND-seq2-WAYLAND-window-0002 image=1 color=0.12,0.72,0.36 acquire=VK_SUCCESS present=VK_SUCCESS wait=VK_SUCCESS
+vulkan surface frame 3 tag=WAYLAND-seq3-WAYLAND-window-0003 image=2 color=0.16,0.3,0.92 acquire=VK_SUCCESS present=VK_SUCCESS wait=VK_SUCCESS
+vulkan surface frame 4 tag=WAYLAND-seq4-WAYLAND-window-0004 image=3 color=0.94,0.72,0.16 acquire=VK_SUCCESS present=VK_SUCCESS wait=VK_SUCCESS
+vulkan surface frame 5 tag=X11-seq1-X11-window-0001 image=4 color=0.9,0.18,0.22 acquire=VK_SUCCESS present=VK_SUCCESS wait=VK_SUCCESS
+vulkan surface frame 6 tag=X11-seq2-X11-window-0002 image=5 color=0.12,0.72,0.36 acquire=VK_SUCCESS present=VK_SUCCESS wait=VK_SUCCESS
+vulkan surface frame 7 tag=X11-seq3-X11-window-0003 image=6 color=0.16,0.3,0.92 acquire=VK_SUCCESS present=VK_SUCCESS wait=VK_SUCCESS
+vulkan surface frame 8 tag=X11-seq4-X11-window-0004 image=5 color=0.94,0.72,0.16 acquire=VK_SUCCESS present=VK_SUCCESS wait=VK_SUCCESS
+vulkan surface frames rendered=8
+vulkan surface frames dropped=0
+vulkan surface frame lossless=true
+vulkan surface last guest command tag=X11-seq4-X11-window-0004
+vulkan surface last acquire=VK_SUCCESS
+vulkan surface last present=VK_SUCCESS
+host vulkan surface present supported=true
+host vulkan surface hardware render=true
+guest vulkan clear present hardware render=true
+
+--- Linux guest Wayland/X11 GUI GPU surface renderer ---
+host gpu surface renderer=android-surface-egl-gles
+surface frame stream protocol=gui-compositor-clear-color-v4
+surface requested frames=8
+surface window=ok width=1920 height=239
+surface egl initialize=ok version=1.5
+surface egl choose config=ok count=1
+surface egl window surface=ok
+surface egl context=ok api=gles2
+surface egl make current=ok
+surface gl vendor=ARM
+surface gl renderer=Mali-G615 MC2
+surface frame 1 tag=WAYLAND-seq1-WAYLAND-window-0001 color=0.9,0.18,0.22 gl_error=0x0 swap=ok
+surface frame 2 tag=WAYLAND-seq2-WAYLAND-window-0002 color=0.12,0.72,0.36 gl_error=0x0 swap=ok
+surface frame 3 tag=WAYLAND-seq3-WAYLAND-window-0003 color=0.16,0.3,0.92 gl_error=0x0 swap=ok
+surface frame 4 tag=WAYLAND-seq4-WAYLAND-window-0004 color=0.94,0.72,0.16 gl_error=0x0 swap=ok
+surface frame 5 tag=X11-seq1-X11-window-0001 color=0.9,0.18,0.22 gl_error=0x0 swap=ok
+surface frame 6 tag=X11-seq2-X11-window-0002 color=0.12,0.72,0.36 gl_error=0x0 swap=ok
+surface frame 7 tag=X11-seq3-X11-window-0003 color=0.16,0.3,0.92 gl_error=0x0 swap=ok
+surface frame 8 tag=X11-seq4-X11-window-0004 color=0.94,0.72,0.16 gl_error=0x0 swap=ok
+surface wayland frames rendered=4
+surface x11 frames rendered=4
+surface other frames rendered=0
+surface gui total frames rendered=8
+surface frames rendered=8
+surface frames dropped=0
+surface frame lossless=true
+surface last guest command tag=X11-seq4-X11-window-0004
+surface gl clear error=0x0
+surface egl swap buffers=ok
+surface gpu software renderer=false
+surface gpu hardware render=true
+guest gpu ipc bridge hardware render=true
+guest gui gpu compositor hardware render=true
+guest wayland/x11 gui gpu surface hardware render=true
+guest gpu bridge hardware render=true
+
+ALR WAYLAND COMPOSITOR UP (libwayland-server on SurfaceView): PASS
+ALR WAYLAND FIRST WINDOW (guest wl_shm client → compositor → SurfaceView): PASS
+ALR REAL 2D TOOLKIT WINDOW (pixman gradient+AA shapes+text → SurfaceView): PASS
+
+--- ALR Wayland compositor (Phase 3) ---
+ALR WAYLAND COMPOSITOR: started socket=/data/user/0/dev.chanwoo.androlinux/cache/alr-xdg/wayland-0 globals=wl_compositor,wl_shm,wl_seat,wl_output,xdg_wm_base,wl_subcompositor
+ALR WAYLAND COMPOSITOR STATUS: running
+alr wl present=presented-frame
+alr wl frames=2
+
+--- ALR guest wl_shm client ---
+ALR NATIVE LOADER PROBE: android-native-attempt
+alr native loader guest=/bin/alr-wl-test
+alr native loader argc=1
+alr native loader bytes=72544
+ALR NATIVE LOADER PARSE: PASS
+alr native loader elf type=ET_DYN(static-PIE)
+alr native loader entry=0x18680
+alr native loader phnum=11
+ALR NATIVE LOADER MAP: PASS
+ALR NATIVE LOADER LINK MODE: DYNAMIC(interp-handoff)
+ALR NATIVE LOADER INTERP MAP: PASS
+ALR NATIVE LOADER GUEST EXEC: PASS
+alr native loader reached=jumped-to-entry
+alr native loader child exit=0 signal=0
+alr native loader fault signo=0 pc=0x0 addr=0x0 lr=0x0 x0=0x0 x8=0x0 syscall=-1
+alr native loader guest threads spawned=0
+alr native loader path-mediation traps=3 rewrites=1
+alr native loader first path rewrite=/etc/ld.so.preload=>/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/etc/ld.so.preload
+alr native loader seccomp-emulated syscalls=1 nums=99
+alr native loader diag=DYN;INTERP_READ=0x0000000000031cc0 PROG:IREL=0x0000000000000000 INTERP:IREL=0x0000000000000000 MAPPED;SIGRESET;E@0x0000007b8b23aa40 code=0xd280001dd503201f P@0x0000007b8d41a040 p0=0x0000000400000006 sp@0x00000078b83ffad0 argc=0x0000000000000001 BASE=0x0000007b8b220000 PROGE=0x0000007b8d432680 PROGB=0x0000007b8d41a000 INTRE@0x0000007b8b23aa40 JUMPING;PFLT_OK;
+alr native loader guest stdout=alr-wl: bound compositor+shm+xdg
+alr-wl: committed frame (released=1 frame_done=1)
+
+--- ALR guest pixman 2D toolkit client ---
+ALR NATIVE LOADER PROBE: android-native-attempt
+alr native loader guest=/bin/alr-pixman-test
+alr native loader argc=1
+alr native loader bytes=511112
+ALR NATIVE LOADER PARSE: PASS
+alr native loader elf type=ET_DYN(static-PIE)
+alr native loader entry=0x2ae40
+alr native loader phnum=12
+ALR NATIVE LOADER MAP: PASS
+ALR NATIVE LOADER LINK MODE: DYNAMIC(interp-handoff)
+ALR NATIVE LOADER INTERP MAP: PASS
+ALR NATIVE LOADER GUEST EXEC: PASS
+alr native loader reached=jumped-to-entry
+alr native loader child exit=0 signal=0
+alr native loader fault signo=0 pc=0x0 addr=0x0 lr=0x0 x0=0x0 x8=0x0 syscall=-1
+alr native loader guest threads spawned=0
+alr native loader path-mediation traps=4 rewrites=1
+alr native loader first path rewrite=/etc/ld.so.preload=>/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/etc/ld.so.preload
+alr native loader seccomp-emulated syscalls=1 nums=99
+alr native loader diag=DYN;INTERP_READ=0x0000000000031cc0 PROG:IREL=0x0000000000000000 INTERP:IREL=0x0000000000000000 MAPPED;SIGRESET;E@0x0000007b88d4ea40 code=0xd280001dd503201f P@0x00000078b8353040 p0=0x0000000400000006 sp@0x00000078b8352ac0 argc=0x0000000000000001 BASE=0x0000007b88d34000 PROGE=0x00000078b837de40 PROGB=0x00000078b8353000 INTRE@0x0000007b88d4ea40 JUMPING;PFLT_OK;
+alr native loader guest stdout=alr-toolkit: pixman drew frame (480x320 released=1 frame_done=0)
+ALR WAYLAND INPUT INJECTION (Android→wl_seat→client): PASS (received=24)
+
+--- ALR guest wl_seat input-echo client ---
+ALR NATIVE LOADER PROBE: android-native-attempt
+alr native loader guest=/bin/alr-input-test
+alr native loader argc=1
+alr native loader bytes=77736
+ALR NATIVE LOADER PARSE: PASS
+alr native loader elf type=ET_DYN(static-PIE)
+alr native loader entry=0x191c0
+alr native loader phnum=11
+ALR NATIVE LOADER MAP: PASS
+ALR NATIVE LOADER LINK MODE: DYNAMIC(interp-handoff)
+ALR NATIVE LOADER INTERP MAP: PASS
+ALR NATIVE LOADER GUEST EXEC: PASS
+alr native loader reached=jumped-to-entry
+alr native loader child exit=0 signal=0
+alr native loader fault signo=0 pc=0x0 addr=0x0 lr=0x0 x0=0x0 x8=0x0 syscall=-1
+alr native loader guest threads spawned=0
+alr native loader path-mediation traps=3 rewrites=1
+alr native loader first path rewrite=/etc/ld.so.preload=>/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/etc/ld.so.preload
+alr native loader seccomp-emulated syscalls=1 nums=99
+alr native loader diag=DYN;INTERP_READ=0x0000000000031cc0 PROG:IREL=0x0000000000000000 INTERP:IREL=0x0000000000000000 MAPPED;SIGRESET;E@0x0000007b852e8a40 code=0xd280001dd503201f P@0x0000007b88c03040 p0=0x0000000400000006 sp@0x00000078b83ffad0 argc=0x0000000000000001 BASE=0x0000007b852ce000 PROGE=0x0000007b88c1c1c0 PROGB=0x0000007b88c03000 INTRE@0x0000007b852e8a40 JUMPING;PFLT_OK;
+alr native loader guest stdout=alr-input: bound seat
+alr-input: seat capabilities=0x7 (pointer=1 keyboard=1 touch=1)
+alr-input: got wl_pointer
+alr-input: got wl_keyboard
+alr-input: got wl_touch
+alr-input: seat name=alr-seat
+alr-input: keymap fd format=0 size=0
+alr-input: surface mapped (320x240 0xFF20A020); waiting for input...
+alr-input: pointer enter serial=7 x=120.00 y=120.00
+alr-input: pointer motion x=120.00 y=120.00
+alr-input: pointer button=272 state=1
+alr-input: pointer button=272 state=0
+alr-input: touch down id=0 x=120.00 y=120.00
+alr-input: touch up id=0
+alr-input: keyboard enter serial=12
+alr-input: key=30 state=1
+alr-input: key=30 state=0
+alr-input: pointer motion x=160.00 y=160.00
+alr-input: pointer button=272 state=1
+alr-input: pointer button=272 state=0
+alr-input: touch down id=0 x=160.00 y=160.00
+alr-input: touch up id=0
+alr-input: key=30 state=1
+alr-input: key=30 state=0
+alr-input: pointer motion x=200.00 y=200.00
+alr-input: pointer button=272 state=1
+alr-input: pointer button=272 state=0
+alr-input: touch down id=0 x=200.00 y=200.00
+alr-input: touch up id=0
+alr-input: key=30 state=1
+alr-input: key=30 state=0
+alr-input: received 24 input events (pointer=10 key=8 touch=6)
+ALR WAYLAND INTERACTIVE TOOLKIT (input→redraw→display loop): PASS (redraws=5 hits=2)
+
+--- ALR guest interactive pixman client ---
+ALR NATIVE LOADER PROBE: android-native-attempt
+alr native loader guest=/bin/alr-interactive-test
+alr native loader argc=1
+alr native loader bytes=515016
+ALR NATIVE LOADER PARSE: PASS
+alr native loader elf type=ET_DYN(static-PIE)
+alr native loader entry=0x2b440
+alr native loader phnum=12
+ALR NATIVE LOADER MAP: PASS
+ALR NATIVE LOADER LINK MODE: DYNAMIC(interp-handoff)
+ALR NATIVE LOADER INTERP MAP: PASS
+ALR NATIVE LOADER GUEST EXEC: PASS
+alr native loader reached=jumped-to-entry
+alr native loader child exit=0 signal=0
+alr native loader fault signo=0 pc=0x0 addr=0x0 lr=0x0 x0=0x0 x8=0x0 syscall=-1
+alr native loader guest threads spawned=0
+alr native loader path-mediation traps=4 rewrites=1
+alr native loader first path rewrite=/etc/ld.so.preload=>/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/etc/ld.so.preload
+alr native loader seccomp-emulated syscalls=1 nums=99
+alr native loader diag=DYN;INTERP_READ=0x0000000000031cc0 PROG:IREL=0x0000000000000000 INTERP:IREL=0x0000000000000000 MAPPED;SIGRESET;E@0x0000007b88d4ea40 code=0xd280001dd503201f P@0x00000078dccdf040 p0=0x0000000400000006 sp@0x00000078dccdeac0 argc=0x0000000000000001 BASE=0x0000007b88d34000 PROGE=0x00000078dcd0a440 PROGB=0x00000078dccdf000 INTRE@0x0000007b88d4ea40 JUMPING;PFLT_OK;
+alr native loader guest stdout=alr-interactive: ready
+alr-interactive: redraws=5 hits=2 lastxy=480,360

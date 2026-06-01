@@ -1,0 +1,89 @@
+name: Workstream task
+description: Track a scoped Codex or Hermes work item.
+title: "[Workstream] "
+labels:
+  - needs-triage
+body:
+  - type: dropdown
+    id: owner
+    attributes:
+      label: Owner
+      options:
+        - Codex
+        - Hermes
+        - Human
+        - Shared
+    validations:
+      required: true
+  - type: dropdown
+    id: workstream
+    attributes:
+      label: Workstream
+      options:
+        - ALR runtime
+        - Device evidence
+        - Graphics bridge
+        - Optional backend
+        - Documentation
+        - Build and release
+    validations:
+      required: true
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What should this task accomplish?
+      placeholder: "Implement the ALR launcher skeleton and report PASS/SKIP lines without claiming guest execution."
+    validations:
+      required: true
+  - type: textarea
+    id: write_scope
+    attributes:
+      label: Write scope
+      description: Files or directories this task may modify.
+      placeholder: |
+        - app/src/main/cpp/alr_runtime/
+        - tests/test_alr_runtime_*.py
+    validations:
+      required: true
+  - type: textarea
+    id: do_not_touch
+    attributes:
+      label: Do not touch
+      description: Files or directories that should stay out of scope.
+      placeholder: |
+        - docs/evidence/
+        - optional proprietary backend artifacts
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance
+      description: Concrete pass/fail criteria and expected report strings.
+      placeholder: |
+        - [ ] ALR RUNTIME LAUNCHER AVAILABLE: PASS
+        - [ ] scripts/test-native-core.sh passes
+    validations:
+      required: true
+  - type: textarea
+    id: clean_room
+    attributes:
+      label: Clean-room notes
+      description: Required boundaries for proprietary or closed runtime behavior.
+      placeholder: "Optional proroot-class backends are black-box probes only. Do not copy proprietary implementation details."
+    validations:
+      required: false
+  - type: textarea
+    id: handoff
+    attributes:
+      label: Handoff
+      description: Fill this in before closing or handing off.
+      placeholder: |
+        Files touched:
+        Commands/tests:
+        Evidence:
+        Blockers:
+        Next recommended action:
+    validations:
+      required: false

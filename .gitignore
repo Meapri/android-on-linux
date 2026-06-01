@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.gradle/
+.kotlin/
+build/
+app/build/
+app/.cxx/
+local.properties
+.DS_Store
+
+# Build/JVM crash artifacts that landed in the repo root (not source)
+*.hprof
+a.o
