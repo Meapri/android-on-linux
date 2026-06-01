@@ -41,8 +41,8 @@ android {
         applicationId = "dev.chanwoo.androlinux"
         minSdk = 26
         targetSdk = 35
-        versionCode = 113
-        versionName = "0.4.113-android-gimp-ahb-zerocopy-v113"
+        versionCode = 114
+        versionName = "0.4.114-android-gimp-ahb-present-v114"
         ndkVersion = "27.2.12479018"
 
         externalNativeBuild {

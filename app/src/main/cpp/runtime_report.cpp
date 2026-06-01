@@ -1172,6 +1172,48 @@ static bool alr_install_path_trace_filter(int dg) {
     return true;
 }
 
+// PCGATE fast path (ALR_PCGATE != "0", the default): the LOADER traces ONLY
+// execve/execveat and RET_ALLOWs everything else — INCLUDING the 9 path syscalls,
+// which it deliberately does NOT trace here. In this mode the in-process
+// LD_PRELOAD interposer installs its own PC-gated path filter (see
+// libalr_interpose.c): syscalls it emits from its trampoline run un-traced
+// (RET_ALLOW), while any path syscall outside that trampoline still RET_TRACEs as
+// a backstop. seccomp filters STACK and the kernel takes the MOST-RESTRICTIVE
+// action per syscall (ALLOW is the WEAKEST action — TRACE wins over ALLOW), so the
+// loader MUST emit ALLOW for the path syscalls here; otherwise a loader TRACE
+// would override the interposer's later ALLOW and nothing would speed up.
+// We still trace execve/execveat so the supervisor retains W^X exec re-entry
+// control hooks (the handler refinement that rewrites the exec'd program path into
+// the rootfs is a noted follow-up; the trap point must exist first). The full
+// 9-path-syscall filter above remains the ALR_PCGATE=="0" A/B baseline.
+static bool alr_install_execve_trace_filter(int dg) {
+    ::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    struct sock_filter filter[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 1, 0),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),  // foreign arch -> allow
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_execve, 1, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_execveat, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE),  // execve/execveat -> tracer
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),  // everything else -> allow
+    };
+    struct sock_fprog prog = {
+        static_cast<unsigned short>(sizeof(filter) / sizeof(filter[0])),
+        filter,
+    };
+    long fr = ::syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, 0u, &prog);
+    if (fr != 0) {
+        fr = ::prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog, 0, 0);
+    }
+    if (fr != 0) {
+        ::write(dg, "XFLT_FAIL;", 10);
+        return false;
+    }
+    ::write(dg, "XFLT_OK;", 8);
+    return true;
+}
+
 // Result of mapping one ELF image (program or interpreter) into execmem.
 struct MappedImage {
     uintptr_t base = 0;   // load bias: runtime_addr = base + p_vaddr
@@ -1429,26 +1471,53 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     // The rootfs root, for an in-process LD_PRELOAD path interposer (fast path
     // mediation without a ptrace round-trip per file op). The interposer wraps
     // the libc file entry points (open/openat/stat/access/...) and rewrites
-    // absolute guest paths to <rootfs>+path IN-PROCESS before the syscall, so
-    // the seccomp-trace net (its idempotency guard) leaves the already-rootfs
-    // path alone. This removes the per-file ptrace round-trip that GIMP hammers
-    // at startup (thousands of font/brush/data opens). It reads ALR_ROOTFS at
-    // init and self-disables (pure passthrough) if it is unset — fail-safe; the
-    // ptrace net stays the backstop for raw syscalls and ld.so library loads.
+    // absolute guest paths to <rootfs>+path IN-PROCESS before the syscall.
+    // Under PCGATE (ALR_PCGATE != "0", the default) the interposer also installs a
+    // PC-gated seccomp filter: a path syscall it emits from its own trampoline
+    // matches the gate's instruction-pointer range and is RET_ALLOWed (NO trap,
+    // NO ptrace round-trip — this is what eliminates the per-file traps GIMP
+    // hammers at startup, thousands of font/brush/data opens); a path syscall
+    // OUTSIDE the trampoline (pre-constructor, or post-exec with a stale range)
+    // falls to RET_TRACE and the supervisor rewrites it as the backstop. The
+    // loader's own filter in this mode (alr_install_execve_trace_filter) traces
+    // only execve/execveat, so it never overrides that gated ALLOW. The interposer
+    // reads ALR_ROOTFS at init and self-disables (pure passthrough) if it is unset
+    // — fail-safe; with the interposer absent (ALR_DISABLE_INTERPOSE=1) AND PCGATE
+    // on, NO path filter exists at all, so that A/B arm measures the cost floor and
+    // is expected to read wrong host paths. The full-trace baseline (ALR_PCGATE=="0")
+    // keeps the supervisor doing every rewrite, exactly as before PCGATE.
     guest_env.push_back("ALR_ROOTFS=" + config.rootfs_dir);
-    // A/B gate: setting ALR_DISABLE_INTERPOSE=1 in the HOST (app) environment omits the
-    // in-process path interposer, so the seccomp/ptrace net does ALL path rewrites. Used to
-    // prove the interposer's effect: compare `path_rewrites` between a gated and an ungated run
-    // of the same guest. Default (unset) keeps the interposer ON.
-    {
-        const char* disable = ::getenv("ALR_DISABLE_INTERPOSE");
-        const bool interpose_off = (disable != nullptr && disable[0] == '1');
-        if (!interpose_off) {
-            guest_env.push_back("LD_PRELOAD=/usr/lib/androlinux/libalr_interpose.so");
-        }
-        // Record the arm in the report so each run is self-identifying.
-        out << "\nalr native loader interposer=" << (interpose_off ? "OFF" : "ON");
+    // Two A/B gates, both read from the HOST (app) environment and decided here in
+    // the parent. They are hoisted to function scope (not an inner block) so the
+    // report lines below — including the path-mediation traps/rewrites line — can
+    // re-use them.
+    //   ALR_DISABLE_INTERPOSE (default OFF, i.e. interposer ON): setting it to "1"
+    //     omits the LD_PRELOAD interposer, so the seccomp/ptrace net does ALL path
+    //     rewrites. Used to prove the interposer's effect (compare path_rewrites).
+    //   ALR_PCGATE (default ON): "0" reproduces the full-9-syscall loader trace
+    //     (pre-PCGATE baseline); anything else selects the reduced execve-only
+    //     loader filter (alr_install_execve_trace_filter) plus the interposer's
+    //     PC-gated path filter. NOTE the inverse polarity vs ALR_DISABLE_INTERPOSE:
+    //     PCGATE defaults ON so it is on unless the first char is exactly '0'.
+    // ALR_PCGATE is pushed into the guest env UNCONDITIONALLY (=0 or =1) so the
+    // interposer constructor reads exactly what the loader chose (never its own
+    // default); the loader's filter-install site (in the forked child) independently
+    // re-reads ALR_PCGATE from the COW-inherited host env, so the two cannot disagree.
+    const bool interpose_off = []{
+        const char* d = ::getenv("ALR_DISABLE_INTERPOSE");
+        return d != nullptr && d[0] == '1';
+    }();
+    const bool pcgate_on = []{
+        const char* p = ::getenv("ALR_PCGATE");
+        return !(p != nullptr && p[0] == '0');
+    }();
+    if (!interpose_off) {
+        guest_env.push_back("LD_PRELOAD=/usr/lib/androlinux/libalr_interpose.so");
     }
+    guest_env.push_back(pcgate_on ? "ALR_PCGATE=1" : "ALR_PCGATE=0");
+    // Record both arms in the report so each run is self-identifying for A/B.
+    out << "\nalr native loader pcgate=" << (pcgate_on ? "on" : "off")
+        << " interpose=" << (interpose_off ? "off" : "on");
     guest_env.push_back("GDK_PIXBUF_MODULE_FILE=/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders.cache");
 
     const int fd = ::open(host_path.c_str(), O_RDONLY | O_CLOEXEC);
@@ -1685,10 +1754,31 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
             ::write(dg, "INTRE@", 6); diag_hex(dg, interp.entry);
         }
         ::write(dg, "JUMPING;", 8);
-        // Stack the path-mediation seccomp filter LAST, so none of the loader's
-        // own file reads trap — only the guest's openat-family calls do, which the
-        // parent supervisor rewrites into the rootfs.
-        alr_install_path_trace_filter(dg);
+        // Stack the seccomp filter LAST, after the loader's own file reads (the
+        // rootfs opens at the open() above and the ELF reads), so the guest runs
+        // under it from its very first instruction. WHICH filter depends on
+        // ALR_PCGATE, re-read here in the forked child; the host env is COW-inherited
+        // across fork(), so this matches the parent's pcgate decision used for the
+        // guest-env push and the report — they cannot disagree.
+        //   ALR_PCGATE != "0" (default): reduced execve/execveat-only TRACE. The
+        //     in-process interposer installs the PC-gated path filter, so path
+        //     syscalls it emits post-rewrite run un-traced. FAIL-SAFE: if the
+        //     interposer is absent (ALR_DISABLE_INTERPOSE=1) NO path filter exists,
+        //     so path syscalls are ALLOWed un-mediated — that A/B arm measures the
+        //     cost floor and is EXPECTED to read wrong host paths; it bounds cost,
+        //     it is not a correctness configuration.
+        //   ALR_PCGATE == "0" (baseline): the full 9-path-syscall TRACE filter, i.e.
+        //     today's behavior, so the supervisor does every rewrite. Used for A/B.
+        // Polarity matches the parent: on unless the first char is exactly '0'.
+        {
+            const char* pcgate = ::getenv("ALR_PCGATE");
+            const bool pcgate_on = !(pcgate != nullptr && pcgate[0] == '0');
+            if (pcgate_on) {
+                alr_install_execve_trace_filter(dg);
+            } else {
+                alr_install_path_trace_filter(dg);
+            }
+        }
         // Dynamic GUI guests (GIMP) must persist long enough to be USED
         // interactively (touch -> redraw), not just rendered once; a tiny static
         // probe keeps a short leash. 1800s ~= 30 min of live, interactive GIMP.
@@ -1937,7 +2027,9 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         << " syscall=" << fault_syscall;
     out << "\nalr native loader guest threads spawned=" << guest_threads;
     out << "\nalr native loader path-mediation traps=" << path_traps
-        << " rewrites=" << path_rewrites;
+        << " rewrites=" << path_rewrites
+        << " (pcgate=" << (pcgate_on ? "on" : "off")
+        << " interpose=" << (interpose_off ? "off" : "on") << ")";
     if (!first_rewrite.empty()) {
         out << "\nalr native loader first path rewrite=" << first_rewrite;
     }
@@ -1970,9 +2062,10 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                 ? guest_stdout.substr(guest_stdout.size() - kHeadTail)
                 : std::string();
         __android_log_print(ANDROID_LOG_INFO, "alr_loader",
-                            "gimp-probe guest=%s exit=%d sig=%d traps=%d rewrites=%d "
-                            "first_rewrite=%s stdout_bytes=%zu",
-                            guest_rel.c_str(), code, sig, path_traps, path_rewrites,
+                            "gimp-probe guest=%s exit=%d sig=%d pcgate=%d interpose=%d "
+                            "traps=%d rewrites=%d first_rewrite=%s stdout_bytes=%zu",
+                            guest_rel.c_str(), code, sig, pcgate_on ? 1 : 0,
+                            interpose_off ? 0 : 1, path_traps, path_rewrites,
                             first_rewrite.empty() ? "(none)" : first_rewrite.c_str(),
                             guest_stdout.size());
         __android_log_print(ANDROID_LOG_INFO, "alr_loader",
@@ -3890,9 +3983,36 @@ struct WaylandPresenter {
     // compositor's stable surface_key; we re-upload a texture only when that
     // surface's content_serial changes. Textures whose surface vanished are reaped
     // each frame (any key not seen in the incoming list is deleted).
-    struct CachedTex { GLuint tex = 0; uint64_t content_serial = 0; bool seen = false; };
+    //
+    // M2 zero-copy: when AHardwareBuffer + EGLImage + external-OES are available
+    // (proven by the M1 probe), each surface caches an AHB sized to its content.
+    // On a content change we memcpy the committed pixels into the AHB's locked CPU
+    // plane (replacing the old CPU->GPU glTexImage2D transfer — ~33 MB/frame at 4K)
+    // and the GPU samples the AHB directly via a GL_TEXTURE_EXTERNAL_OES texture.
+    // Falls back to the glTexImage2D path (tex) when AHB is unavailable.
+    struct CachedTex {
+        GLuint tex = 0;               // sampler2D texture (glTexImage2D fallback)
+        GLuint ext_tex = 0;           // GL_TEXTURE_EXTERNAL_OES (AHB import)
+        AHardwareBuffer* ahb = nullptr;
+        void* image = nullptr;        // EGLImageKHR (void* to avoid header in struct)
+        int ahb_w = 0, ahb_h = 0;     // AHB allocation size (realloc on resize)
+        bool use_ahb = false;         // this surface is on the zero-copy path
+        uint64_t content_serial = 0;
+        bool seen = false;
+    };
     std::map<uint64_t, CachedTex> tex_cache;
     std::mutex present_mutex;            // serialize present() vs present_list()
+
+    // ---- M2 AHardwareBuffer zero-copy plumbing (resolved once at init) ----
+    bool ahb_ready = false;             // all extensions + procs present
+    GLuint ext_program = 0;             // samplerExternalOES program (for AHB path)
+    GLint ext_a_pos = -1, ext_a_uv = -1, ext_u_tex = -1;
+    PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC p_get_native_buf = nullptr;
+    PFNEGLCREATEIMAGEKHRPROC p_create_image = nullptr;
+    PFNEGLDESTROYIMAGEKHRPROC p_destroy_image = nullptr;
+    PFNGLEGLIMAGETARGETTEXTURE2DOESPROC p_image_target_tex = nullptr;
+    int ahb_uploads = 0;                // count of zero-copy AHB content uploads
+    int gltex_uploads = 0;             // count of fallback glTexImage2D uploads
 
     static GLuint compile(GLenum type, const char* src) {
         GLuint s = glCreateShader(type);
@@ -3977,9 +4097,136 @@ struct WaylandPresenter {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+        // ---- M2: set up the AHardwareBuffer zero-copy path (best-effort). If any
+        // piece is missing we leave ahb_ready=false and the present loop uses the
+        // glTexImage2D fallback, so nothing regresses. ----
+        init_ahb_path();
+
         init_ok = true;
-        status = "egl-init-ok";
+        status = ahb_ready ? "egl-init-ok+ahb" : "egl-init-ok";
         return true;
+    }
+
+    // Resolve AHB/EGLImage/external-OES extensions + a samplerExternalOES program.
+    void init_ahb_path() {
+        const char* egl_exts = eglQueryString(display, EGL_EXTENSIONS);
+        const auto* gl_exts = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
+        const std::string e = egl_exts ? egl_exts : "";
+        const std::string g = gl_exts ? gl_exts : "";
+        if (e.find("EGL_ANDROID_get_native_client_buffer") == std::string::npos ||
+            e.find("EGL_KHR_image_base") == std::string::npos ||
+            g.find("GL_OES_EGL_image_external") == std::string::npos) {
+            return;  // not supported -> glTexImage2D fallback
+        }
+        p_get_native_buf = reinterpret_cast<PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC>(
+            eglGetProcAddress("eglGetNativeClientBufferANDROID"));
+        p_create_image = reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(
+            eglGetProcAddress("eglCreateImageKHR"));
+        p_destroy_image = reinterpret_cast<PFNEGLDESTROYIMAGEKHRPROC>(
+            eglGetProcAddress("eglDestroyImageKHR"));
+        p_image_target_tex = reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(
+            eglGetProcAddress("glEGLImageTargetTexture2DOES"));
+        if (!p_get_native_buf || !p_create_image || !p_destroy_image || !p_image_target_tex) {
+            return;
+        }
+        // External-OES sampler program. Same V-flip + .bgra swizzle as the sampler2D
+        // path (AHB is R8G8B8A8 holding the wl_shm BGRA-in-memory bytes).
+        const char* vsrc =
+            "attribute vec2 aPos; attribute vec2 aUv; varying vec2 vUv;"
+            "void main(){ vUv = aUv; gl_Position = vec4(aPos, 0.0, 1.0); }";
+        const char* fsrc =
+            "#extension GL_OES_EGL_image_external : require\n"
+            "precision mediump float; varying vec2 vUv;"
+            "uniform samplerExternalOES uTex;"
+            "void main(){ gl_FragColor = texture2D(uTex, vUv).bgra; }";
+        GLuint vs = compile(GL_VERTEX_SHADER, vsrc);
+        GLuint fs = compile(GL_FRAGMENT_SHADER, fsrc);
+        if (vs == 0 || fs == 0) return;
+        ext_program = glCreateProgram();
+        glAttachShader(ext_program, vs);
+        glAttachShader(ext_program, fs);
+        glLinkProgram(ext_program);
+        GLint linked = 0;
+        glGetProgramiv(ext_program, GL_LINK_STATUS, &linked);
+        if (!linked) { glDeleteProgram(ext_program); ext_program = 0; return; }
+        ext_a_pos = glGetAttribLocation(ext_program, "aPos");
+        ext_a_uv = glGetAttribLocation(ext_program, "aUv");
+        ext_u_tex = glGetUniformLocation(ext_program, "uTex");
+        ahb_ready = true;
+    }
+
+    // Allocate/realloc a surface's AHB to (w,h), import it as an external-OES
+    // texture, and copy `pixels` (tight BGRA, w*4 stride) into it. Returns false on
+    // any failure (caller falls back to glTexImage2D). Zero per-frame GPU upload:
+    // the GPU samples the AHB directly; only a CPU memcpy into the AHB occurs (and
+    // the compositor already produced these tight CPU pixels, so it's one copy, not
+    // an extra GPU transfer).
+    bool ahb_upload(CachedTex& ct, int w, int h, const void* pixels) {
+        if (!ahb_ready || w <= 0 || h <= 0 || pixels == nullptr) return false;
+        if (ct.ahb == nullptr || ct.ahb_w != w || ct.ahb_h != h) {
+            ahb_release(ct);
+            AHardwareBuffer_Desc d{};
+            d.width = static_cast<uint32_t>(w);
+            d.height = static_cast<uint32_t>(h);
+            d.layers = 1;
+            d.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+            d.usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
+                      AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN;
+            if (AHardwareBuffer_allocate(&d, &ct.ahb) != 0 || ct.ahb == nullptr) {
+                ct.ahb = nullptr;
+                return false;
+            }
+            ct.ahb_w = w; ct.ahb_h = h;
+            EGLClientBuffer cb = p_get_native_buf(ct.ahb);
+            const EGLint attribs[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
+            EGLImageKHR img = cb ? p_create_image(display, EGL_NO_CONTEXT,
+                                                  EGL_NATIVE_BUFFER_ANDROID, cb, attribs)
+                                 : EGL_NO_IMAGE_KHR;
+            if (img == EGL_NO_IMAGE_KHR) { ahb_release(ct); return false; }
+            ct.image = img;
+            if (ct.ext_tex == 0) glGenTextures(1, &ct.ext_tex);
+            glBindTexture(GL_TEXTURE_EXTERNAL_OES, ct.ext_tex);
+            glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            p_image_target_tex(GL_TEXTURE_EXTERNAL_OES,
+                               static_cast<GLeglImageOES>(ct.image));
+        }
+        // Copy the committed pixels into the AHB CPU plane, honoring its stride.
+        AHardwareBuffer_Desc got{};
+        AHardwareBuffer_describe(ct.ahb, &got);
+        void* dst = nullptr;
+        if (AHardwareBuffer_lock(ct.ahb, AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1,
+                                 nullptr, &dst) != 0 || dst == nullptr) {
+            return false;
+        }
+        const int tight = w * 4;
+        const uint32_t dst_stride = (got.stride ? got.stride : static_cast<uint32_t>(w)) * 4;
+        const auto* src = static_cast<const uint8_t*>(pixels);
+        auto* d8 = static_cast<uint8_t*>(dst);
+        if (dst_stride == static_cast<uint32_t>(tight)) {
+            std::memcpy(d8, src, static_cast<size_t>(tight) * h);
+        } else {
+            for (int y = 0; y < h; ++y) {
+                std::memcpy(d8 + static_cast<size_t>(y) * dst_stride,
+                            src + static_cast<size_t>(y) * tight,
+                            static_cast<size_t>(tight));
+            }
+        }
+        AHardwareBuffer_unlock(ct.ahb, nullptr);
+        ct.use_ahb = true;
+        return true;
+    }
+
+    void ahb_release(CachedTex& ct) {
+        if (ct.image != nullptr && p_destroy_image) {
+            p_destroy_image(display, static_cast<EGLImageKHR>(ct.image));
+        }
+        ct.image = nullptr;
+        if (ct.ahb) { AHardwareBuffer_release(ct.ahb); ct.ahb = nullptr; }
+        ct.ahb_w = ct.ahb_h = 0;
     }
 
     // Upload a tightly-packed (stride==w*4) BGRA-in-memory buffer into `tex`.
@@ -3994,20 +4241,25 @@ struct WaylandPresenter {
 
     // Draw the currently-bound texture as a quad covering the NDC rect
     // [x0,x1] x [y0,y1]. UVs are V-flipped (wl_shm top-left vs GL bottom-left).
-    void draw_quad_ndc(float x0, float y0, float x1, float y1) {
+    // `ap`/`au` are the active program's aPos/aUv attribute locations (the AHB
+    // external-OES program and the sampler2D program have their own).
+    void draw_quad_ndc_attr(GLint ap, GLint au, float x0, float y0, float x1, float y1) {
         const GLfloat verts[] = {
             x0, y0, 0.0f, 1.0f,
             x1, y0, 1.0f, 1.0f,
             x0, y1, 0.0f, 0.0f,
             x1, y1, 1.0f, 0.0f,
         };
-        glEnableVertexAttribArray(static_cast<GLuint>(a_pos));
-        glVertexAttribPointer(static_cast<GLuint>(a_pos), 2, GL_FLOAT, GL_FALSE,
+        glEnableVertexAttribArray(static_cast<GLuint>(ap));
+        glVertexAttribPointer(static_cast<GLuint>(ap), 2, GL_FLOAT, GL_FALSE,
                               4 * sizeof(GLfloat), verts);
-        glEnableVertexAttribArray(static_cast<GLuint>(a_uv));
-        glVertexAttribPointer(static_cast<GLuint>(a_uv), 2, GL_FLOAT, GL_FALSE,
+        glEnableVertexAttribArray(static_cast<GLuint>(au));
+        glVertexAttribPointer(static_cast<GLuint>(au), 2, GL_FLOAT, GL_FALSE,
                               4 * sizeof(GLfloat), verts + 2);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    }
+    void draw_quad_ndc(float x0, float y0, float x1, float y1) {
+        draw_quad_ndc_attr(a_pos, a_uv, x0, y0, x1, y1);
     }
 
     // ---- legacy single-surface present (unchanged behaviour) ----
@@ -4065,9 +4317,7 @@ struct WaylandPresenter {
         glViewport(0, 0, win_w, win_h);
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
-        glUseProgram(program);
         glActiveTexture(GL_TEXTURE0);
-        glUniform1i(u_tex, 0);
         glEnable(GL_BLEND);
         glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);  // premultiplied-alpha over
 
@@ -4078,38 +4328,70 @@ struct WaylandPresenter {
         for (const alr::wayland::PresentSurface& s : surfaces) {
             if (s.pixels == nullptr || s.width <= 0 || s.height <= 0) continue;
             CachedTex& ct = tex_cache[s.surface_key];
-            if (ct.tex == 0) {
-                glGenTextures(1, &ct.tex);
-                glBindTexture(GL_TEXTURE_2D, ct.tex);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-                ct.content_serial = 0;  // force first upload
+            const bool content_changed = (ct.content_serial != s.content_serial);
+
+            // M2 zero-copy path: try to upload into a per-surface AHardwareBuffer and
+            // sample it via external-OES (no glTexImage2D GPU transfer). On content
+            // change we memcpy into the AHB; otherwise the existing AHB import is
+            // reused. Falls back to the sampler2D/glTexImage2D path on any failure.
+            bool drawn_via_ahb = false;
+            if (ahb_ready) {
+                if (content_changed) {
+                    if (ahb_upload(ct, s.width, s.height, s.pixels)) {
+                        ++ahb_uploads;
+                        ct.content_serial = s.content_serial;
+                    }
+                }
+                if (ct.use_ahb && ct.ext_tex != 0) {
+                    glUseProgram(ext_program);
+                    glUniform1i(ext_u_tex, 0);
+                    glBindTexture(GL_TEXTURE_EXTERNAL_OES, ct.ext_tex);
+                    drawn_via_ahb = true;
+                }
+            }
+
+            if (!drawn_via_ahb) {
+                // Fallback: sampler2D + glTexImage2D (CPU->GPU upload on change).
+                if (ct.tex == 0) {
+                    glGenTextures(1, &ct.tex);
+                    glBindTexture(GL_TEXTURE_2D, ct.tex);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                }
+                glUseProgram(program);
+                glUniform1i(u_tex, 0);
+                if (content_changed) {
+                    upload_tight(ct.tex, s.width, s.height, s.pixels);
+                    ++gltex_uploads;
+                    ct.content_serial = s.content_serial;
+                } else {
+                    glBindTexture(GL_TEXTURE_2D, ct.tex);
+                }
             }
             ct.seen = true;
-            // Compositor delivers tight rows (stride == width*4); upload only when
-            // the content changed since we last saw this surface.
-            if (ct.content_serial != s.content_serial) {
-                upload_tight(ct.tex, s.width, s.height, s.pixels);
-                ct.content_serial = s.content_serial;
-            } else {
-                glBindTexture(GL_TEXTURE_2D, ct.tex);
-            }
             // Placement rect (output px, top-left origin, +Y down) -> NDC. NDC y is
             // bottom-up, so flip: top of the rect -> larger NDC y.
             const float x0 = (static_cast<float>(s.dst_x) / ref_w) * 2.0f - 1.0f;
             const float x1 = (static_cast<float>(s.dst_x + s.dst_w) / ref_w) * 2.0f - 1.0f;
             const float y_top    = 1.0f - (static_cast<float>(s.dst_y) / ref_h) * 2.0f;
             const float y_bottom = 1.0f - (static_cast<float>(s.dst_y + s.dst_h) / ref_h) * 2.0f;
-            // draw_quad_ndc(x0,y0,x1,y1): y0 is the bottom edge, y1 the top edge.
-            draw_quad_ndc(x0, y_bottom, x1, y_top);
+            // Use the active program's attribute locations (AHB external-OES program
+            // vs sampler2D program). draw_quad_ndc_attr(...,x0,y0,x1,y1): y0=bottom.
+            if (drawn_via_ahb) {
+                draw_quad_ndc_attr(ext_a_pos, ext_a_uv, x0, y_bottom, x1, y_top);
+            } else {
+                draw_quad_ndc_attr(a_pos, a_uv, x0, y_bottom, x1, y_top);
+            }
         }
 
-        // Reap textures for surfaces that disappeared.
+        // Reap textures + AHBs for surfaces that disappeared.
         for (auto it = tex_cache.begin(); it != tex_cache.end();) {
             if (!it->second.seen) {
                 if (it->second.tex != 0) glDeleteTextures(1, &it->second.tex);
+                if (it->second.ext_tex != 0) glDeleteTextures(1, &it->second.ext_tex);
+                ahb_release(it->second);
                 it = tex_cache.erase(it);
             } else {
                 ++it;
@@ -4119,7 +4401,11 @@ struct WaylandPresenter {
         glDisable(GL_BLEND);
         eglSwapBuffers(display, surface);
         ++frames;
-        status = "presented-scene";
+        // Report which upload path is in use so the zero-copy win is observable:
+        // ahb=<n> zero-copy AHB uploads vs gltex=<n> glTexImage2D fallback uploads.
+        status = std::string("presented-scene ahb=") + std::to_string(ahb_uploads) +
+                 " gltex=" + std::to_string(gltex_uploads) +
+                 (ahb_ready ? " path=zerocopy" : " path=gltex-fallback");
     }
 };
 

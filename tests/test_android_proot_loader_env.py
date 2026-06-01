@@ -33,4 +33,4 @@ def test_proot_launch_plan_and_report_show_actual_loader_environment():
 
 def test_visible_build_stamp_bumped_for_termux_pair_probe():
     text = MAIN.read_text()
-    assert "build: 0.4.113-android-gimp-ahb-zerocopy-v113" in text
+    assert "build: 0.4.114-android-gimp-ahb-present-v114" in text

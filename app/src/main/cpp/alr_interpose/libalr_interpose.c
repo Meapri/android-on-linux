@@ -53,6 +53,62 @@
  * - Everything is implemented with hand-rolled byte ops (no strlen/strcpy)
  *   to avoid any chance of recursing through an interposed libc string routine
  *   and to stay allocation-free.
+ *
+ * PCGATE fast path (ALR_PCGATE, default "1")
+ * ------------------------------------------
+ * In the default (PCGATE=1) mode the loader installs an ALLOW-all seccomp
+ * filter (it does NOT trace the 9 path syscalls). This constructor then
+ * installs a SECOND, PC-GATED filter, stacked on top, that:
+ *     - if seccomp_data.instruction_pointer is inside the interposer's single
+ *       'svc #0' trampoline  [alr_tramp_lo, alr_tramp_hi)   -> RET_ALLOW
+ *     - else if nr is one of the 9 traced path syscalls      -> RET_TRACE
+ *     - else                                                 -> RET_ALLOW
+ * Every path wrapper below, AFTER rewriting the path, emits its underlying
+ * syscall through that ONE trampoline (alr_tramp_syscall), so the trusted PC
+ * is unique and only reachable post-rewrite. The supervisor's ptrace path
+ * thus stops trapping interposer-mediated I/O (path_traps collapses), while
+ * any path syscall that escapes the interposer (raw syscalls, ld.so loads,
+ * compositional wrappers like realpath/opendir that call libc internally)
+ * still traps at a non-trampoline PC -> RET_TRACE -> the supervisor backstop.
+ *
+ * FAIL-SAFE: if the trampoline range is ever stale/wrong (e.g. after a guest
+ * execve re-maps this .so at a fresh ASLR base), the PC gate simply misses and
+ * path syscalls fall through to RET_TRACE -- slower, NEVER silently allowed.
+ * Completeness can only degrade toward MORE tracing.
+ *
+ * Stacked-filter precedence (kernel: signed-min of the masked action wins, so
+ * TRACE < ALLOW => TRACE beats ALLOW): the interposer's in-range ALLOW only
+ * governs because the loader's filter is ALSO ALLOW for those syscalls, AND
+ * the always-present Android zygote app filter ALLOWs the 7 path syscalls it
+ * knows. For any syscall the zygote filter TRAPs (notably openat2=437 and
+ * faccessat2=439, which are NOT in bionic's allowlist), no later filter can
+ * rescue it -> SIGSYS. That is why the openat2/faccessat2 fast paths below are
+ * gated behind a constructor probe that catches SIGSYS (not just ENOSYS) and
+ * disables them on any device whose app filter lacks those syscalls.
+ *
+ * PCGATE=0 (A/B baseline): the constructor installs NO filter and every
+ * wrapper reverts to its exact pre-PCGATE behavior (real libc via RTLD_NEXT
+ * after string rewrite); the loader's full 9-syscall TRACE filter + the
+ * supervisor's idempotent rewrite reproduce today's measured behavior.
+ *
+ * DEFERRED (design notes, NOT implemented here):
+ *   - SECCOMP_USER_NOTIF instead of RET_TRACE: incompatible with the in-process
+ *     model without a dedicated out-of-process supervisor (the triggering
+ *     thread would block in-kernel awaiting a response no in-process thread can
+ *     deliver). The existing cross-process ptrace supervisor already provides
+ *     that supervision; the PC gate just removes its per-syscall round-trip for
+ *     trampoline-emitted I/O. Revisit if exec-chain filter stacking (each guest
+ *     execve adds another immutable, cumulative stale filter layer) makes the
+ *     RET_TRACE backstop's cost matter -- USER_NOTIF sidesteps the stacked-
+ *     filter trap.
+ *   - stat/readlink result cache: not implemented.
+ *   - kernel-enforced confinement (RESOLVE_IN_ROOT) for the non-open path
+ *     syscalls (statx/faccessat*/readlinkat/mkdirat/unlinkat): no UAPI variant
+ *     exists, so they keep the string-prefix rewrite. Migrate if such resolve
+ *     flags are ever extended to them.
+ *   - renameat2/linkat kernel confinement via tracing: deferred; they are not
+ *     in the traced 9, so their two-/single-path string rewrite is the sole
+ *     (and unchanged) mediation.
  */
 
 #define _GNU_SOURCE
@@ -64,6 +120,49 @@
 #include <time.h>       /* struct timespec (utimensat) */
 #include <sys/types.h>
 #include <sys/stat.h>   /* struct stat[64], struct statx, statx flags */
+
+/* PCGATE additions: raw UAPI seccomp/BPF + openat2, plus the SIGSYS-catching
+ * availability probe. We deliberately use raw __NR_/SECCOMP_RET_ numbers (not
+ * glibc's seccomp helpers) to keep the BPF byte-identical in intent to the
+ * loader's and to minimize the dependency surface. */
+#include <stdint.h>
+#include <signal.h>          /* SIGSYS, struct sigaction (openat2/faccessat2 probe) */
+#include <setjmp.h>          /* sigsetjmp/siglongjmp around the SIGSYS probe */
+#include <errno.h>           /* errno, ENOSYS, EISDIR, EINTR */
+#include <linux/audit.h>     /* AUDIT_ARCH_AARCH64 */
+#include <linux/filter.h>    /* struct sock_filter, struct sock_fprog, BPF_* */
+#include <linux/seccomp.h>   /* SECCOMP_SET_MODE_FILTER, SECCOMP_RET_* */
+#include <sys/prctl.h>       /* PR_SET_NO_NEW_PRIVS, PR_SET_SECCOMP (fallback) */
+#include <sys/syscall.h>     /* __NR_* */
+
+/* linux/openat2.h (struct open_how, RESOLVE_IN_ROOT) is present on the
+ * aarch64-linux-gnu.2.36 zig sysroot, but guard it so the file still builds if
+ * a future/older sysroot drops it. */
+#if defined(__has_include)
+#  if __has_include(<linux/openat2.h>)
+#    include <linux/openat2.h>
+#  endif
+#endif
+#ifndef RESOLVE_IN_ROOT
+#define RESOLVE_IN_ROOT 0x10
+struct open_how { uint64_t flags; uint64_t mode; uint64_t resolve; };
+#endif
+
+/* arm64 syscall numbers we may need that an older sysroot might lack. All are
+ * stable in asm-generic/unistd.h; these fallbacks just keep the file portable. */
+#ifndef __NR_openat2
+#define __NR_openat2 437
+#endif
+#ifndef __NR_faccessat2
+#define __NR_faccessat2 439
+#endif
+
+/* SECCOMP_FILTER_FLAG_TSYNC: apply the PC gate to every guest thread that may
+ * already exist when the constructor runs (defensive; ld.so init normally runs
+ * single-threaded). Fall back to 0 (current thread only) if undefined. */
+#ifndef SECCOMP_FILTER_FLAG_TSYNC
+#define SECCOMP_FILTER_FLAG_TSYNC (1UL << 0)
+#endif
 
 /* glibc marks the path arg of many of these wrappers __nonnull, so the
  * compiler "knows" path != NULL and warns that our defensive `path &&` guard
