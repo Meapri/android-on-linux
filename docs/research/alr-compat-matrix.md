@@ -4,7 +4,7 @@
 > 도는지의 앱×결과 표. **device evidence가 있는 행만 USABLE/RUNS/RENDERS로 표기**한다.
 > host-only/예정은 WIRED/PENDING. 이 표는 WS-5가 유지하며, 새 device evidence가 추가될 때마다 갱신.
 
-작성 baseline: HEAD `0df74dc` (v124) → 통합 트리 v127 (CP-1 landed) → v128/v129 (CP-2 GPU-native FINAL + CP-5 8MiB ring). 디바이스 `R5KL20B6S3X` (SM-X236N, mt6878 SoC, Mali-G615 MC2, Android 16, 1200×1920@90Hz, untrusted_app).
+작성 baseline: HEAD `0df74dc` (v124) → 통합 트리 v127 (CP-1 landed) → v128/v129 (CP-2 GPU-native FINAL + CP-5 8MiB ring) → v130 (5-WS fan-out drain#9: GL_RENDERER passthrough + getpwuid fix + apt/dpkg/Xwayland 기능 device-PROVEN). 디바이스 `R5KL20B6S3X` (SM-X236N, mt6878 SoC, Mali-G615 MC2, Android 16, 1200×1920@90Hz, untrusted_app).
 
 ## 상태 범례
 - **USABLE** — device에서 사람이 실제로 조작 가능(입력 포함).
@@ -31,6 +31,21 @@
 
 → 이 집합이 **회귀 게이트**(`bench/regression_gate.py`)의 기준선. mediation 불변식: `pcgate=1 interpose=1 traps=0 rewrites=0`.
 
+## 패키지 매니저 / X11 (L4 — 기능 device-PROVEN)
+drain#9(v130)에서 dpkg/apt/Xwayland 가 **ALR native loader 로 실행+버전 보고**까지 device-증명됨
+(`pkgfunc-*` 마커, 전부 `ok=true exec=GUEST EXEC PASS`). 즉 stage-only 가 아니라 **글리브 게스트로
+on-device 실행**. 단, 실제 `apt install`(네트워크/소스 fetch+unpack)은 아직 **PENDING**.
+
+| 앱/바이너리 | 결과 | Evidence | 비고 |
+|-------------|------|----------|------|
+| `dpkg-query --version` | **RUNS** (`ok=true`, marker `[Debian dpkg-query]`) | 2026-06-02-5ws-fanout-renderer-getpwuid-pkgfunc | glibc 게스트로 실행+버전 보고 (drain#9) |
+| `dpkg-query -l libc6` | **RUNS** (`ok=true`, marker `[libc6]`) | 2026-06-02-5ws-fanout-renderer-getpwuid-pkgfunc | dpkg-db overlay(ws-3/ws-4 staged) 조회 OK |
+| `apt-get --version` | **RUNS** (`ok=true`, marker `[apt ]`) | 2026-06-02-5ws-fanout-renderer-getpwuid-pkgfunc | apt-config overlay 적재, 실행+버전 보고 |
+| `Xwayland -version` | **RUNS** (`ok=true`, marker `[Xwayland]`) | 2026-06-02-5ws-fanout-renderer-getpwuid-pkgfunc | x11 overlay; X11-only 앱 호스팅 기반 (전체 X11 앱 표시는 PENDING) |
+| 실제 `apt install <pkg>` (네트워크 fetch+unpack) | PENDING | — | dpkg unpack/maintainer-script 경로 device 미검증 (clone3 PRoot 한계 메모리: device-evidence-mali-android16) |
+
+mediation 불변식: `pcgate=1 interpose=1 traps=0 rewrites=0` (CLI 집합과 동일).
+
 **성능 (device, v127 WS-1 M2):** 일반 CLI native-exec wall-clock(`exec_ms`) ~**18-20ms**(`dynhello`/`env`/`id`/`dash`/`alr-png-test`) = native 프로세스 수준. path-mediation은 **traps=0 device-verified**(in-process translate, supervisor 라운드트립 0). path-xlate cold 4334.7 ns/op(≈19.9 syscall units, raw getppid 218.3 ns/op 대비; 256-entry cache로 분할 상환). **CP-3 apples-to-apples CLOSED** ✅: 동일 microbench(static musl)를 native(adb shell)+ALR loader 양쪽 실행 — **compute 0% overhead**(ALR 4.06 = native 4.06 ns/op, **gated <5% PASS**), syscall(getpid 동일 call) **~12%**(ALR 224.36 vs native 200.36, storm reported). 즉 **일반 연산/CLI는 native급 0% 오버헤드 device-verified**, syscall-storm만 ~12%. (이전 근사 ~9%는 정밀치로 대체.) 이 ~12%(24ns)는 **seccomp 디스패치 고정비용**이라 BPF 슬림화로 ~1ns만 감소(223.37 vs 224.36) — seccomp 켜는 한 syscall 0%는 원천 불가, per-app `ALR_PCGATE=0` 옵션만(raw-svc 백스톱이라 전역 off는 위험). PRoot A/B는 SELinux로 보류. 상세: `docs/evidence/2026-06-01-cp3-apples-to-apples-gtk3-svg-perm.md`, `docs/evidence/2026-06-01-ws5-cpu-overhead-quantified.md`.
 
 ## GUI 툴킷 (L2/L3)
@@ -42,9 +57,9 @@
 | in-process 이미지 디코드 (gdk-pixbuf PNG/JPEG/BMP/GIF) | — | RUNS (PASS, 전 포맷) | — | v95-image-decode, 2026-06-01-gtk3-svg-sigabrt-resolved-gui-runs | shared-mime-info DB + **.so x-bit fix 후 bmp/gif/png/jpeg 전부 decode OK** |
 | 입력 주입 (`/bin/alr-input-test`/`alr-interactive-test`) | wl_seat | USABLE (received=24: pointer 10/key 8/touch 6) | (의도된 dispatch 대기) | v86-input-injection, v87-interactive-toolkit-pacing | redraw 루프(redraws=5 hits=2) |
 | foot | (terminal) | **RENDERS** (rendered=true) | — | 2026-06-01-gtk3-svg-sigabrt-resolved-gui-runs | GUI 안정화(keymap+locale+SVG) 후 렌더; libfcft4/libutf8proc shim closure OK |
-| Qt5/Qt6 (qtwayland) | Qt | PENDING | — | — | WS-4 M2 |
-| SDL2 | SDL | PENDING | — | — | WS-4 M2 / WS-2 M4 |
-| netsurf | (경량 브라우저) | PENDING | — | — | WS-4 M2 |
+| Qt6 (qtwayland) | Qt | PENDING (overlay staged, device launch 미검증) | — | — | WS-4 M2 — stage tar 준비, device render/launch 아직 |
+| SDL2 | SDL | PENDING (overlay staged ~31MB, device launch 미검증) | — | — | WS-4 M2 / WS-2 M4 — stage 준비, device launch 아직 |
+| netsurf-gtk | (경량 브라우저) | PENDING (overlay staged ~195MB, device launch 미검증) | — | — | WS-4 M2 — stage 준비, device launch 아직 |
 
 ## 브라우저 (Goal-2)
 | 앱 | 결과 | Evidence | 비고 |
@@ -53,7 +68,7 @@
 | chromium `--dump-dom` / `--headless` (V8+render) | WALL | chromium-runs-inprocess (v121), v123/v124 commit msg | raw `svc` syscall-storm → LD_PRELOAD interposer 후킹 불가 → seccomp RET_TRACE 라운드트립 벽 (CP-6 / L1.M3 USER_NOTIF 후보) |
 
 ## GPU (L2)
-host 백본(decode/ring/AHB-FBO/zero-copy present)은 Mali-G615 MC2에 픽셀 검증(software renderer=false). **CP-2 FINAL 달성**(drain#7/#8): guest glibc glmark2 가 shim→ring→host executor 로 실 Mali 에 렌더 — build 1206 / texture 1123 FPS → **Score 1163**, `software=false`. ALR-vs-Mali-직접 **비율**은 `docs/research/cp2-gpu-ratio-glmark2.md` (Mali-직접 baseline = PENDING_DEVICE, 통합 세션이 채움).
+host 백본(decode/ring/AHB-FBO/zero-copy present)은 Mali-G615 MC2에 픽셀 검증(software renderer=false). **CP-2 FINAL 달성**(drain#7/#8): guest glibc glmark2 가 shim→ring→host executor 로 실 Mali 에 렌더 — build 1206 / texture 1123 FPS → **Score 1163**, `software=false`. drain#9(v130)에서 게스트가 실 Mali `GL_RENDERER`(Mali-G615 MC2, GLES 3.2)를 passthrough 로 보는 것까지 device-검증(합성 문자열 아님). ALR-vs-Mali-직접 **비율**은 `docs/research/cp2-gpu-ratio-glmark2.md` (Mali-직접 baseline = PENDING_DEVICE, 통합 세션이 채움).
 
 | 항목 | 결과 | Evidence | 비고 |
 |------|------|----------|------|
@@ -65,8 +80,10 @@ host 백본(decode/ring/AHB-FBO/zero-copy present)은 Mali-G615 MC2에 픽셀 �
 | guest libEGL/libGLESv2 shim (M3) | wire-verified (소스) | v118-gpu-native-live-integration | device 연결 pending (WS-2 M2) |
 | 화면 cube present (M4 STEP B, loader fork) | PENDING | v119-gpu-screen-cube-present | guest fork + ring fd 상속 |
 | CP-2 INFRA: loader ring attach + EGL dlopen + Mali software=false | **DEVICE-VERIFIED** | 2026-06-01-cp2-glmark2-egl-dlopen-resolved | `alr_loader_attach_gpu_ring`(glmark2 감지)+ring/doorbell+GpuExecutorService; libpthread 수정 후 EGL library dlopen 성공; Mali self-test 전부 `software renderer=false`(Mali-G615). 인프라만 검증 — Score는 아래 행 참조 |
-| glmark2-es2 **build** scene (ALR, software=false) | **RUNS** (renders on Mali, build 1075 FPS @ 1920×1200 → **Score 1074**) | 2026-06-02-cp2-FINAL-glmark2-score-1074 | CP-2 **FINAL** (drain#7). shim shader-source fix(`997a1c0`: `glGetShaderiv(GL_SHADER_SOURCE_LENGTH)` 로컬 응답) 후 build scene 컴파일·렌더. `software renderer=false`, Mali-G615. ALR `GL_RENDERER`는 shim 합성 문자열(실 draw는 Mali — 외형 passthrough는 WS-2 follow-up) |
+| glmark2-es2 **build** scene (ALR, software=false) | **RUNS** (renders on Mali, build 1075 FPS @ 1920×1200 → **Score 1074**) | 2026-06-02-cp2-FINAL-glmark2-score-1074 | CP-2 **FINAL** (drain#7). shim shader-source fix(`997a1c0`: `glGetShaderiv(GL_SHADER_SOURCE_LENGTH)` 로컬 응답) 후 build scene 컴파일·렌더. `software renderer=false`, Mali-G615 |
 | glmark2-es2 **build+texture** scene (ALR, software=false, 8 MiB ring) | **RUNS** (build 1206 / texture 1123 FPS → **Score 1163**) | 2026-06-02-cp5-batch-8mibring-texture-ws4-overlays | CP-5 batch (drain#8, v129). texture scene 의 4 MiB 텍스처 upload(`OP_TEX_IMAGE_2D`)이 8 MiB host ring(ws-2 `dc4198e`)으로 통과(1 MiB면 drop). `software=false`. CP-2 가 geometry→texture scene 까지 확장 device-증명 |
+| glmark2-es2 build+texture (ALR, drain#9 regression check) | **RUNS** (build 1012 / texture 1095 FPS → **Score 1052**) | 2026-06-02-5ws-fanout-renderer-getpwuid-pkgfunc | v130. drain#8 의 1163 대비 dip 은 run-to-run/thermal(반복 drain 후) — 여전히 GPU-class ~1000+ FPS, 기능 회귀 0. texture scene 이 8 MiB ring 재행사 |
+| ALR `GL_RENDERER` host passthrough (게스트가 실 Mali 문자열 인지) | **DEVICE-VERIFIED** (`GL_VENDOR: ARM` / `GL_RENDERER: Mali-G615 MC2` / `GL_VERSION: OpenGL ES 3.2`) | 2026-06-02-5ws-fanout-renderer-getpwuid-pkgfunc | drain#9, v130. 게스트 libGLESv2 shim 이 ring-header identity 블록으로 host 실 `glGetString` 을 그대로 보고(합성 문자열 아님; 벤더 하드코딩 없음 → 비-Mali GPU 에서도 정직). 부수: host Mali context = GLES **3.2**(GLES3+/Vulkan follow-up 참고) |
 | glmark2 전체 14-scene 종합 Score | PENDING | — | duration↑ 또는 분할 launch 로 전 scene 1빌드 실행 필요(현 1163은 build+texture 2-scene 부분 종합). **ALR vs Mali-직접 비율**은 `docs/research/cp2-gpu-ratio-glmark2.md` (Mali-직접 baseline = PENDING_DEVICE) |
 
 ## 디스플레이/입력 (L3)
@@ -77,11 +94,11 @@ host 백본(decode/ring/AHB-FBO/zero-copy present)은 Mali-G615 MC2에 픽셀 �
 | guest-GUI XKB 키맵 | 수정됨 (SIGSEGV fix, v127) | v127-xkb-config-root-gui-keymap-segv-fixed | `XKB_CONFIG_ROOT`를 rootfs-absolute 경로로 설정 → sig=11 카운트 0 |
 | `zwp_linux_dmabuf` zero-copy present (AHB→external-OES) | **DEVICE-VERIFIED** (`ALR AHB ZEROCOPY IMPORT: PASS`; gtk3demo rendered=true frames 12→13, ws-3 WaylandPresenter, 단일 게이트 후 회귀 0) | 2026-06-01-drain5-cp4-dmabuf-present-single-gate, v114-ahb-zerocopy-present-live | CP-4 / ws-3 M2. AHB→EGLImage→external-OES import는 device 검증됨. 남은 정직한 nuance: guest-side dmabuf 프로토콜 광고(zwp_linux_dmabuf 게스트 advertise)는 WS-3 M2 잔여 디테일 |
 
-## 미지원 (현재 불가)
+## 미지원 / 부분 (현재 한계)
 | 항목 | 상태 | 비고 |
 |------|------|------|
-| X11-only 앱 | PENDING | Xwayland stage 필요 (WS-4 M4) |
-| in-app `apt`/`dpkg` | 부분(WALL) | dpkg clone3 PRoot 한계 (메모리: device-evidence-mali-android16) |
+| X11-only 앱 (실제 X11 클라이언트 표시) | PENDING | `Xwayland -version` 은 RUNS(drain#9, 위 패키지매니저 섹션) — Xwayland 바이너리는 게스트로 실행됨. 실제 X11 클라이언트를 Xwayland 에 붙여 화면에 띄우는 end-to-end 는 device 미검증 (WS-4 M4 잔여) |
+| in-app `apt`/`dpkg` 실제 설치 | 부분 | `dpkg-query`/`apt-get`/`Xwayland` **버전 보고 실행**은 device-PROVEN(drain#9, 위 섹션). 실제 `apt install`(네트워크 fetch + dpkg unpack/maintainer-script)은 PENDING — dpkg clone3 PRoot 한계 (메모리: device-evidence-mali-android16) |
 | OpenCL / 벤더 GPU compute | 미추진 | non-root/public-API 계약 위반; GIMP GEGL은 CPU (v114 honest-scope) |
 
 ---
