@@ -29,4 +29,4 @@ def test_main_activity_reports_gpu_marshalling_gate():
     assert "ALR GPU MARSHALLING HARDWARE RENDER: " in text
     assert "alrGpuMarshallingPassed" in text
     assert "ALR GPU command-marshalling probe" in text
-    assert "build: 0.4.127-cp1-gui-baseline-v127" in text
+    assert "build: 0.4.128-cp2-glmark2-persist-hoststate-v128" in text

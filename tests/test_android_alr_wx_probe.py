@@ -23,7 +23,7 @@ def test_main_activity_reports_android_wx_safe_exec_gate():
     assert "ALR WX-SAFE EXEC STRATEGY: " in text
     assert "alr wx-safe exec passed=" in text
     assert "ALR W^X-safe exec strategy probe:" in text
-    assert "build: 0.4.127-cp1-gui-baseline-v127" in text
+    assert "build: 0.4.128-cp2-glmark2-persist-hoststate-v128" in text
 
 
 def test_execution_backend_docs_require_wx_safe_exec_strategy_probe():

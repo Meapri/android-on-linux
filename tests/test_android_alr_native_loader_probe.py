@@ -43,4 +43,4 @@ def test_main_activity_reports_native_loader_gate():
     assert "ALR NATIVE LOADER GUEST EXEC (glibc static): " in text
     assert "nativeAlrNativeLoaderSelftest" in text
     assert "ALR native ELF loader (anon-mmap-loader) probe:" in text
-    assert "build: 0.4.127-cp1-gui-baseline-v127" in text
+    assert "build: 0.4.128-cp2-glmark2-persist-hoststate-v128" in text
