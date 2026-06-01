@@ -54,6 +54,7 @@ class RootfsInstaller(private val context: Context) {
             cleanRootfsDir(plan.rootfsDir)
             extractVerifiedTar(stagedArchive, plan.rootfsDir)
             removeStaleHostDpkgConfig(plan.rootfsDir)
+            writeRuntimeUserEntry(plan.rootfsDir, android.os.Process.myUid(), android.os.Process.myUid())
             writeInstallMarker(plan.markerPath)
             isExtracted(plan)
         } else {
@@ -97,6 +98,49 @@ class RootfsInstaller(private val context: Context) {
 
     fun removeStaleHostDpkgConfig(rootfsDir: File) {
         File(rootfsDir, "etc/dpkg/dpkg.cfg.d/needrestart").delete()
+    }
+
+    /**
+     * passwd/nss mediation: the guest runs under the Android app uid (a runtime value,
+     * e.g. 10326) but the base /etc/passwd only carries root(0)/nobody(65534). glibc's
+     * `getpwuid_r(geteuid())` then fails with "unknown user id" — non-fatal for many
+     * apps (gtk3-widget-factory just warns) but breaks any that hard-depend on a passwd
+     * entry (HOME resolution, shell lookup, dbus/X auth, some toolkits).
+     *
+     * We append a real entry mapping the actual runtime uid/gid to a user named `androlinux`
+     * (HOME=/root, shell=/bin/dash) plus a matching group, so getpwuid_r/getgrgid_r succeed
+     * through nsswitch `files` → libnss_files. The uid is only known at runtime, so this is
+     * written here at install time (not bakeable into the shipped tar). Idempotent: an
+     * existing `androlinux:` line for this uid is rewritten, others are preserved.
+     *
+     * Public-API only (no root): plain file append on the app-private rootfs.
+     */
+    fun writeRuntimeUserEntry(rootfsDir: File, uid: Int, gid: Int) {
+        val etc = File(rootfsDir, "etc")
+        etc.mkdirs()
+        val userName = "androlinux"
+        val passwdLine = "$userName:x:$uid:$gid:Android on Linux:/root:/bin/dash"
+        val groupLine = "$userName:x:$gid:"
+        upsertColonRecord(File(etc, "passwd"), userName, passwdLine)
+        upsertColonRecord(File(etc, "group"), userName, groupLine)
+    }
+
+    /**
+     * Replace the line whose first colon-field equals [key] with [line] (preserving all
+     * other lines), or append [line] if no such record exists. Used to keep the runtime
+     * passwd/group entry idempotent across cold-start re-extractions.
+     */
+    private fun upsertColonRecord(file: File, key: String, line: String) {
+        file.parentFile?.mkdirs()
+        val existing = if (file.isFile) {
+            file.readText().split("\n").filter { it.isNotEmpty() }
+        } else {
+            emptyList()
+        }
+        val kept = existing.filterNot { it.substringBefore(":") == key }
+        val merged = (kept + line).joinToString(separator = "\n", postfix = "\n")
+        file.writeText(merged)
+        file.setReadable(true, false)
     }
 
     fun extractVerifiedTar(archive: File, rootfsDir: File) {
