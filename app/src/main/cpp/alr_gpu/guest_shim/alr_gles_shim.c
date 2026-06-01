@@ -294,6 +294,20 @@ void glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage
     alr_shim_emit(build_buffer_data, &a);
 }
 
+struct BufferSubDataArgs { uint32_t target, offset; const void *data; uint32_t len; };
+static void build_buffer_subdata(AlrEncoder *e, void *p) {
+    struct BufferSubDataArgs *a = (struct BufferSubDataArgs*)p;
+    alr_enc_u8(e, ALR_OP_BUFFER_SUBDATA);
+    alr_enc_u32(e, a->target);
+    alr_enc_u32(e, a->offset);
+    alr_enc_blob(e, a->data, a->len);
+}
+void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void *data) {
+    uint32_t len = (size > 0) ? (uint32_t)size : 0;
+    struct BufferSubDataArgs a = { (uint32_t)target, (uint32_t)offset, data, len };
+    alr_shim_emit(build_buffer_subdata, &a);
+}
+
 /* ---- vertex attrib + draw ---- */
 struct IndexArgs { uint32_t index; };
 static void build_enable_vaa(AlrEncoder *e, void *p) {
@@ -680,6 +694,44 @@ void glPixelStorei(GLenum pname, GLint param) {
      * (see decoder OP_TEX_IMAGE_2D), which is what the cube's tight RGBA needs.
      * Accept + drop. */
     (void)pname; (void)param;
+}
+
+struct GenMipmapArgs { uint32_t target; };
+static void build_generate_mipmap(AlrEncoder *e, void *p) {
+    alr_enc_u8(e, ALR_OP_GENERATE_MIPMAP); alr_enc_u32(e, ((struct GenMipmapArgs*)p)->target);
+}
+void glGenerateMipmap(GLenum target) {
+    struct GenMipmapArgs a = { (uint32_t)target }; alr_shim_emit(build_generate_mipmap, &a);
+}
+
+struct TexSubImage2DArgs {
+    uint32_t target; int32_t level, xoff, yoff, w, h; uint32_t fmt, type;
+    const void *pixels; uint32_t bytes;
+};
+static void build_tex_subimage_2d(AlrEncoder *e, void *p) {
+    struct TexSubImage2DArgs *a = (struct TexSubImage2DArgs*)p;
+    alr_enc_u8(e, ALR_OP_TEX_SUBIMAGE_2D);
+    alr_enc_u32(e, a->target);
+    alr_enc_i32(e, a->level);
+    alr_enc_i32(e, a->xoff);
+    alr_enc_i32(e, a->yoff);
+    alr_enc_i32(e, a->w);
+    alr_enc_i32(e, a->h);
+    alr_enc_u32(e, a->fmt);
+    alr_enc_u32(e, a->type);
+    alr_enc_blob(e, a->pixels, a->bytes);
+}
+void glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width,
+                     GLsizei height, GLenum format, GLenum type, const void *pixels) {
+    uint32_t bytes = 0;
+    if (pixels && width > 0 && height > 0) {
+        bytes = (uint32_t)width * (uint32_t)height *
+                gl_format_components(format) * gl_type_bytes(type);  /* tight (host UNPACK=1) */
+    }
+    struct TexSubImage2DArgs a = { (uint32_t)target, (int32_t)level, (int32_t)xoffset,
+                                   (int32_t)yoffset, (int32_t)width, (int32_t)height,
+                                   (uint32_t)format, (uint32_t)type, pixels, bytes };
+    alr_shim_emit(build_tex_subimage_2d, &a);
 }
 
 /* ---- deletes (no host opcodes; the host frees on teardown / leaks until then).

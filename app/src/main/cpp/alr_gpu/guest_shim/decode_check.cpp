@@ -43,6 +43,11 @@ static std::vector<GLuint> fb_binds;     // real fb id per glBindFramebuffer (0 
 static std::vector<FbTex> fb_texs;
 static std::vector<RbStore> rb_stores;
 static std::vector<FbRb> fb_rbs;
+struct BufSub { GLenum target; GLintptr offset; GLsizeiptr size; };
+struct TexSub { GLint xoff, yoff, w, h; GLenum fmt, type; };
+static std::vector<BufSub> buf_subs;
+static std::vector<GLenum> mipmaps;
+static std::vector<TexSub> tex_subs;
 static std::map<GLint, std::string> uniform_loc_name;  // glGetUniformLocation -> name
 static std::map<GLint, std::string> attrib_loc_name;   // glGetAttribLocation  -> name
 static std::map<std::string, std::vector<float>> mat_by_name;   // glUniformMatrix4fv
@@ -163,6 +168,12 @@ void glRenderbufferStorage(GLenum, GLenum ifmt, GLsizei w, GLsizei h) {
 void glFramebufferRenderbuffer(GLenum, GLenum att, GLenum rbt, GLuint) {
     rec::fb_rbs.push_back({att, rbt});
 }
+void glBufferSubData(GLenum t, GLintptr off, GLsizeiptr sz, const void *) {
+    rec::buf_subs.push_back({t, off, sz});
+}
+void glGenerateMipmap(GLenum t) { rec::mipmaps.push_back(t); }
+void glTexSubImage2D(GLenum, GLint, GLint xo, GLint yo, GLsizei w, GLsizei h, GLenum f, GLenum ty,
+                     const void *) { rec::tex_subs.push_back({xo, yo, w, h, f, ty}); }
 }  // extern "C"
 
 // GL tokens the assertions compare against (not all in the minimal stub header).
@@ -200,7 +211,7 @@ int main(int argc, char **argv) {
 
     // --- the stream decoded into exactly the cube + mesh GL calls. ---
     check(ok && st.ok, "decode_batch returned true (well-formed, no bad/unknown opcode)");
-    check(st.decoded == 56, "decoded op count == 56 (34 cube + 4 uniform-var + 10 mesh + 8 fbo)");
+    check(st.decoded == 61, "decoded op count == 61 (34 cube + 4 uniform-var + 10 mesh + 8 fbo + 5 completeness)");
     check(st.shaders.size() == 2, "2 shaders mapped");
     check(st.programs.size() == 1, "1 program mapped");
     check(st.buffers.size() == 2, "2 buffers mapped (vbo + ebo)");
@@ -303,6 +314,17 @@ int main(int argc, char **argv) {
     check(rec::fb_rbs.size() == 1 && rec::fb_rbs[0].attachment == 0x8D00 /*DEPTH_ATTACHMENT*/ &&
               rec::fb_rbs[0].rbtarget == 0x8D41 /*RENDERBUFFER*/,
           "glFramebufferRenderbuffer DEPTH_ATTACHMENT <- renderbuffer");
+
+    // completeness ops
+    check(rec::buf_subs.size() == 1 && rec::buf_subs[0].target == 0x8892 /*ARRAY_BUFFER*/ &&
+              rec::buf_subs[0].offset == 0 && rec::buf_subs[0].size == 16,
+          "glBufferSubData ARRAY_BUFFER offset 0, 16 bytes");
+    check(rec::mipmaps.size() == 1 && rec::mipmaps[0] == 0x0DE1 /*TEXTURE_2D*/,
+          "glGenerateMipmap(GL_TEXTURE_2D)");
+    bool ts_ok = rec::tex_subs.size() == 1 && rec::tex_subs[0].xoff == 1 && rec::tex_subs[0].yoff == 1 &&
+                 rec::tex_subs[0].w == 4 && rec::tex_subs[0].h == 4 &&
+                 rec::tex_subs[0].fmt == kGL_RGBA && rec::tex_subs[0].type == kGL_UNSIGNED_BYTE;
+    check(ts_ok, "glTexSubImage2D 4x4 at (1,1) RGBA/UNSIGNED_BYTE (64-byte sub-upload)");
 
     std::printf("\nALR GPU WIRE-FORMAT CHECK: %s\n", g_fail ? "FAIL" : "PASS");
     return g_fail;
