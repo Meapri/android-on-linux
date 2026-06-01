@@ -124,6 +124,29 @@ enum Op : uint8_t {
     OP_DRAW_ELEMENTS_INSTANCED = 103,// u32 mode, i32 count, u32 type, u32 offset, i32 instancecount
     OP_VERTEX_ATTRIB_DIVISOR = 104,      // u32 index, u32 divisor
     OP_VERTEX_ATTRIB_DIVISOR_NAMED = 105,// u32 vprog, blob(name), u32 divisor
+    // --- per-fragment / raster STATE setters (blend / write-mask / depth-range /
+    //     stencil / polygon-offset / line-width / sample-coverage). Plain scalar/enum
+    //     state replayed 1:1; the state glmark2's blend/effect/shading/refract/shadow
+    //     scenes (and GTK4-GL/SDL2 apps) set away from the GL defaults. No virtual ids. ---
+    OP_BLEND_FUNC = 110,             // u32 sfactor, u32 dfactor
+    OP_BLEND_FUNC_SEPARATE = 111,    // u32 srcRGB, u32 dstRGB, u32 srcAlpha, u32 dstAlpha
+    OP_BLEND_EQUATION = 112,         // u32 mode
+    OP_BLEND_EQUATION_SEPARATE = 113,// u32 modeRGB, u32 modeAlpha
+    OP_BLEND_COLOR = 114,            // f32 r,g,b,a
+    OP_COLOR_MASK = 115,             // u8 r, u8 g, u8 b, u8 a
+    OP_DEPTH_MASK = 116,             // u8 flag
+    OP_DEPTH_RANGEF = 117,           // f32 near, f32 far
+    OP_CLEAR_DEPTHF = 118,           // f32 depth
+    OP_CLEAR_STENCIL = 119,          // i32 s
+    OP_STENCIL_FUNC = 120,           // u32 func, i32 ref, u32 mask
+    OP_STENCIL_FUNC_SEPARATE = 121,  // u32 face, u32 func, i32 ref, u32 mask
+    OP_STENCIL_OP = 122,             // u32 sfail, u32 dpfail, u32 dppass
+    OP_STENCIL_OP_SEPARATE = 123,    // u32 face, u32 sfail, u32 dpfail, u32 dppass
+    OP_STENCIL_MASK = 124,           // u32 mask
+    OP_STENCIL_MASK_SEPARATE = 125,  // u32 face, u32 mask
+    OP_POLYGON_OFFSET = 126,         // f32 factor, f32 units
+    OP_LINE_WIDTH = 127,             // f32 width
+    OP_SAMPLE_COVERAGE = 128,        // f32 value, u8 invert
 };
 
 // Host-side decode state: the virtual->real GL name translation tables. The guest
@@ -593,6 +616,98 @@ inline bool decode_batch(const uint8_t* data, size_t len, HostState& st) {
                 GLint loc = glGetAttribLocation(st.real_prog(vp), nm.c_str());
                 if (loc >= 0) glVertexAttribDivisor(static_cast<GLuint>(loc), divisor);
                 ++st.decoded; break;
+            }
+            // ---- per-fragment / raster state setters (replayed 1:1; no virtual ids) ----
+            case OP_BLEND_FUNC: {
+                uint32_t s, d;
+                if (!r.u32(s) || !r.u32(d)) { st.ok = false; break; }
+                glBlendFunc(s, d); ++st.decoded; break;
+            }
+            case OP_BLEND_FUNC_SEPARATE: {
+                uint32_t sr, dr, sa, da;
+                if (!r.u32(sr) || !r.u32(dr) || !r.u32(sa) || !r.u32(da)) { st.ok = false; break; }
+                glBlendFuncSeparate(sr, dr, sa, da); ++st.decoded; break;
+            }
+            case OP_BLEND_EQUATION: {
+                uint32_t mode; if (!r.u32(mode)) { st.ok = false; break; }
+                glBlendEquation(mode); ++st.decoded; break;
+            }
+            case OP_BLEND_EQUATION_SEPARATE: {
+                uint32_t mr, ma;
+                if (!r.u32(mr) || !r.u32(ma)) { st.ok = false; break; }
+                glBlendEquationSeparate(mr, ma); ++st.decoded; break;
+            }
+            case OP_BLEND_COLOR: {
+                float c[4];
+                if (!r.floats(c, 4)) { st.ok = false; break; }
+                glBlendColor(c[0], c[1], c[2], c[3]); ++st.decoded; break;
+            }
+            case OP_COLOR_MASK: {
+                uint8_t cr, cg, cb, ca;
+                if (!r.u8(cr) || !r.u8(cg) || !r.u8(cb) || !r.u8(ca)) { st.ok = false; break; }
+                glColorMask(cr ? GL_TRUE : GL_FALSE, cg ? GL_TRUE : GL_FALSE,
+                            cb ? GL_TRUE : GL_FALSE, ca ? GL_TRUE : GL_FALSE);
+                ++st.decoded; break;
+            }
+            case OP_DEPTH_MASK: {
+                uint8_t f; if (!r.u8(f)) { st.ok = false; break; }
+                glDepthMask(f ? GL_TRUE : GL_FALSE); ++st.decoded; break;
+            }
+            case OP_DEPTH_RANGEF: {
+                float n, fr;
+                if (!r.f32(n) || !r.f32(fr)) { st.ok = false; break; }
+                glDepthRangef(n, fr); ++st.decoded; break;
+            }
+            case OP_CLEAR_DEPTHF: {
+                float d; if (!r.f32(d)) { st.ok = false; break; }
+                glClearDepthf(d); ++st.decoded; break;
+            }
+            case OP_CLEAR_STENCIL: {
+                int32_t s; if (!r.i32(s)) { st.ok = false; break; }
+                glClearStencil(s); ++st.decoded; break;
+            }
+            case OP_STENCIL_FUNC: {
+                uint32_t func, mask; int32_t ref;
+                if (!r.u32(func) || !r.i32(ref) || !r.u32(mask)) { st.ok = false; break; }
+                glStencilFunc(func, ref, mask); ++st.decoded; break;
+            }
+            case OP_STENCIL_FUNC_SEPARATE: {
+                uint32_t face, func, mask; int32_t ref;
+                if (!r.u32(face) || !r.u32(func) || !r.i32(ref) || !r.u32(mask)) { st.ok = false; break; }
+                glStencilFuncSeparate(face, func, ref, mask); ++st.decoded; break;
+            }
+            case OP_STENCIL_OP: {
+                uint32_t sf, df, dp;
+                if (!r.u32(sf) || !r.u32(df) || !r.u32(dp)) { st.ok = false; break; }
+                glStencilOp(sf, df, dp); ++st.decoded; break;
+            }
+            case OP_STENCIL_OP_SEPARATE: {
+                uint32_t face, sf, df, dp;
+                if (!r.u32(face) || !r.u32(sf) || !r.u32(df) || !r.u32(dp)) { st.ok = false; break; }
+                glStencilOpSeparate(face, sf, df, dp); ++st.decoded; break;
+            }
+            case OP_STENCIL_MASK: {
+                uint32_t m; if (!r.u32(m)) { st.ok = false; break; }
+                glStencilMask(m); ++st.decoded; break;
+            }
+            case OP_STENCIL_MASK_SEPARATE: {
+                uint32_t face, m;
+                if (!r.u32(face) || !r.u32(m)) { st.ok = false; break; }
+                glStencilMaskSeparate(face, m); ++st.decoded; break;
+            }
+            case OP_POLYGON_OFFSET: {
+                float factor, units;
+                if (!r.f32(factor) || !r.f32(units)) { st.ok = false; break; }
+                glPolygonOffset(factor, units); ++st.decoded; break;
+            }
+            case OP_LINE_WIDTH: {
+                float w; if (!r.f32(w)) { st.ok = false; break; }
+                glLineWidth(w); ++st.decoded; break;
+            }
+            case OP_SAMPLE_COVERAGE: {
+                float v; uint8_t inv;
+                if (!r.f32(v) || !r.u8(inv)) { st.ok = false; break; }
+                glSampleCoverage(v, inv ? GL_TRUE : GL_FALSE); ++st.decoded; break;
             }
             default:
                 st.ok = false; break;  // unknown opcode -> fail-stop (fail-safe)

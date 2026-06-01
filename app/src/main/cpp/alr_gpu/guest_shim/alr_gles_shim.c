@@ -925,28 +925,156 @@ void glVertexAttribDivisor(GLuint index, GLuint divisor) {
  * Exact GLES2 ABI signatures (glmark2 calls through the real prototype).
  * =========================================================================== */
 
-/* --- state setters: accepted, host GL defaults are correct for the build scene.
- *     (blend/stencil/color+depth mask off the default path -> wire op follow-up.) --- */
-void glBlendFunc(GLenum a, GLenum b) { (void)a; (void)b; }
-void glBlendFuncSeparate(GLenum a, GLenum b, GLenum c, GLenum d) { (void)a;(void)b;(void)c;(void)d; }
-void glBlendEquation(GLenum a) { (void)a; }
-void glBlendEquationSeparate(GLenum a, GLenum b) { (void)a; (void)b; }
-void glBlendColor(GLclampf r, GLclampf g, GLclampf b, GLclampf a) { (void)r;(void)g;(void)b;(void)a; }
-void glColorMask(GLboolean r, GLboolean g, GLboolean b, GLboolean a) { (void)r;(void)g;(void)b;(void)a; }
-void glDepthMask(GLboolean f) { (void)f; }
-void glDepthRangef(GLclampf n, GLclampf f) { (void)n; (void)f; }
-void glClearDepthf(GLclampf d) { (void)d; }   /* host clears DEPTH to its default (1.0) */
-void glClearStencil(GLint s) { (void)s; }
-void glStencilFunc(GLenum a, GLint b, GLuint c) { (void)a;(void)b;(void)c; }
-void glStencilFuncSeparate(GLenum a, GLenum b, GLint c, GLuint d) { (void)a;(void)b;(void)c;(void)d; }
-void glStencilOp(GLenum a, GLenum b, GLenum c) { (void)a;(void)b;(void)c; }
-void glStencilOpSeparate(GLenum a, GLenum b, GLenum c, GLenum d) { (void)a;(void)b;(void)c;(void)d; }
-void glStencilMask(GLuint m) { (void)m; }
-void glStencilMaskSeparate(GLenum a, GLuint m) { (void)a; (void)m; }
+/* --- per-fragment / raster STATE setters: REAL fire-and-forget wire ops (the host
+ *     replays each 1:1 on its GLES2 context). These are the state the build/texture
+ *     scenes leave at GL defaults but blend/effect/shading/refract/shadow scenes (and
+ *     GTK4-GL / SDL2 apps) set explicitly — dropping them produced wrong compositing
+ *     (no blending), depth-buffer pollution (no DepthMask), or broken stencil/clip.
+ *     Plain scalar/enum state, no virtual ids, so each is a tiny POD + one op. --- */
+struct Blend2Args { uint32_t a, b; };
+static void build_blend_func(AlrEncoder *e, void *p) {
+    struct Blend2Args *a = (struct Blend2Args*)p;
+    alr_enc_u8(e, ALR_OP_BLEND_FUNC); alr_enc_u32(e, a->a); alr_enc_u32(e, a->b);
+}
+void glBlendFunc(GLenum sfactor, GLenum dfactor) {
+    struct Blend2Args a = { (uint32_t)sfactor, (uint32_t)dfactor };
+    alr_shim_emit(build_blend_func, &a);
+}
+struct Blend4Args { uint32_t a, b, c, d; };
+static void build_blend_func_separate(AlrEncoder *e, void *p) {
+    struct Blend4Args *a = (struct Blend4Args*)p;
+    alr_enc_u8(e, ALR_OP_BLEND_FUNC_SEPARATE);
+    alr_enc_u32(e, a->a); alr_enc_u32(e, a->b); alr_enc_u32(e, a->c); alr_enc_u32(e, a->d);
+}
+void glBlendFuncSeparate(GLenum srcRGB, GLenum dstRGB, GLenum srcAlpha, GLenum dstAlpha) {
+    struct Blend4Args a = { (uint32_t)srcRGB, (uint32_t)dstRGB, (uint32_t)srcAlpha, (uint32_t)dstAlpha };
+    alr_shim_emit(build_blend_func_separate, &a);
+}
+static void build_blend_equation(AlrEncoder *e, void *p) {
+    alr_enc_u8(e, ALR_OP_BLEND_EQUATION); alr_enc_u32(e, ((struct ModeArgs*)p)->mode);
+}
+void glBlendEquation(GLenum mode) { struct ModeArgs a = { (uint32_t)mode }; alr_shim_emit(build_blend_equation, &a); }
+static void build_blend_equation_separate(AlrEncoder *e, void *p) {
+    struct Blend2Args *a = (struct Blend2Args*)p;
+    alr_enc_u8(e, ALR_OP_BLEND_EQUATION_SEPARATE); alr_enc_u32(e, a->a); alr_enc_u32(e, a->b);
+}
+void glBlendEquationSeparate(GLenum modeRGB, GLenum modeAlpha) {
+    struct Blend2Args a = { (uint32_t)modeRGB, (uint32_t)modeAlpha };
+    alr_shim_emit(build_blend_equation_separate, &a);
+}
+static void build_blend_color(AlrEncoder *e, void *p) {
+    struct ClearColorArgs *a = (struct ClearColorArgs*)p;
+    alr_enc_u8(e, ALR_OP_BLEND_COLOR);
+    alr_enc_f32(e, a->r); alr_enc_f32(e, a->g); alr_enc_f32(e, a->b); alr_enc_f32(e, a->a);
+}
+void glBlendColor(GLclampf r, GLclampf g, GLclampf b, GLclampf a) {
+    struct ClearColorArgs args = { r, g, b, a };
+    alr_shim_emit(build_blend_color, &args);
+}
+struct ColorMaskArgs { uint8_t r, g, b, a; };
+static void build_color_mask(AlrEncoder *e, void *p) {
+    struct ColorMaskArgs *a = (struct ColorMaskArgs*)p;
+    alr_enc_u8(e, ALR_OP_COLOR_MASK);
+    alr_enc_u8(e, a->r); alr_enc_u8(e, a->g); alr_enc_u8(e, a->b); alr_enc_u8(e, a->a);
+}
+void glColorMask(GLboolean r, GLboolean g, GLboolean b, GLboolean a) {
+    struct ColorMaskArgs args = { (uint8_t)(r?1:0), (uint8_t)(g?1:0), (uint8_t)(b?1:0), (uint8_t)(a?1:0) };
+    alr_shim_emit(build_color_mask, &args);
+}
+struct FlagArgs { uint8_t flag; };
+static void build_depth_mask(AlrEncoder *e, void *p) {
+    alr_enc_u8(e, ALR_OP_DEPTH_MASK); alr_enc_u8(e, ((struct FlagArgs*)p)->flag);
+}
+void glDepthMask(GLboolean f) { struct FlagArgs a = { (uint8_t)(f?1:0) }; alr_shim_emit(build_depth_mask, &a); }
+struct Range2Args { float a, b; };
+static void build_depth_rangef(AlrEncoder *e, void *p) {
+    struct Range2Args *a = (struct Range2Args*)p;
+    alr_enc_u8(e, ALR_OP_DEPTH_RANGEF); alr_enc_f32(e, a->a); alr_enc_f32(e, a->b);
+}
+void glDepthRangef(GLclampf n, GLclampf f) { struct Range2Args a = { n, f }; alr_shim_emit(build_depth_rangef, &a); }
+struct F1Args { float v; };
+static void build_clear_depthf(AlrEncoder *e, void *p) {
+    alr_enc_u8(e, ALR_OP_CLEAR_DEPTHF); alr_enc_f32(e, ((struct F1Args*)p)->v);
+}
+void glClearDepthf(GLclampf d) { struct F1Args a = { d }; alr_shim_emit(build_clear_depthf, &a); }
+struct I1Args { int32_t v; };
+static void build_clear_stencil(AlrEncoder *e, void *p) {
+    alr_enc_u8(e, ALR_OP_CLEAR_STENCIL); alr_enc_i32(e, ((struct I1Args*)p)->v);
+}
+void glClearStencil(GLint s) { struct I1Args a = { (int32_t)s }; alr_shim_emit(build_clear_stencil, &a); }
+struct StencilFuncArgs { uint32_t func; int32_t ref; uint32_t mask; };
+static void build_stencil_func(AlrEncoder *e, void *p) {
+    struct StencilFuncArgs *a = (struct StencilFuncArgs*)p;
+    alr_enc_u8(e, ALR_OP_STENCIL_FUNC); alr_enc_u32(e, a->func); alr_enc_i32(e, a->ref); alr_enc_u32(e, a->mask);
+}
+void glStencilFunc(GLenum func, GLint ref, GLuint mask) {
+    struct StencilFuncArgs a = { (uint32_t)func, (int32_t)ref, (uint32_t)mask };
+    alr_shim_emit(build_stencil_func, &a);
+}
+struct StencilFuncSepArgs { uint32_t face, func; int32_t ref; uint32_t mask; };
+static void build_stencil_func_separate(AlrEncoder *e, void *p) {
+    struct StencilFuncSepArgs *a = (struct StencilFuncSepArgs*)p;
+    alr_enc_u8(e, ALR_OP_STENCIL_FUNC_SEPARATE);
+    alr_enc_u32(e, a->face); alr_enc_u32(e, a->func); alr_enc_i32(e, a->ref); alr_enc_u32(e, a->mask);
+}
+void glStencilFuncSeparate(GLenum face, GLenum func, GLint ref, GLuint mask) {
+    struct StencilFuncSepArgs a = { (uint32_t)face, (uint32_t)func, (int32_t)ref, (uint32_t)mask };
+    alr_shim_emit(build_stencil_func_separate, &a);
+}
+struct Stencil3Args { uint32_t a, b, c; };
+static void build_stencil_op(AlrEncoder *e, void *p) {
+    struct Stencil3Args *a = (struct Stencil3Args*)p;
+    alr_enc_u8(e, ALR_OP_STENCIL_OP); alr_enc_u32(e, a->a); alr_enc_u32(e, a->b); alr_enc_u32(e, a->c);
+}
+void glStencilOp(GLenum sfail, GLenum dpfail, GLenum dppass) {
+    struct Stencil3Args a = { (uint32_t)sfail, (uint32_t)dpfail, (uint32_t)dppass };
+    alr_shim_emit(build_stencil_op, &a);
+}
+static void build_stencil_op_separate(AlrEncoder *e, void *p) {
+    struct Blend4Args *a = (struct Blend4Args*)p;   /* face, sfail, dpfail, dppass */
+    alr_enc_u8(e, ALR_OP_STENCIL_OP_SEPARATE);
+    alr_enc_u32(e, a->a); alr_enc_u32(e, a->b); alr_enc_u32(e, a->c); alr_enc_u32(e, a->d);
+}
+void glStencilOpSeparate(GLenum face, GLenum sfail, GLenum dpfail, GLenum dppass) {
+    struct Blend4Args a = { (uint32_t)face, (uint32_t)sfail, (uint32_t)dpfail, (uint32_t)dppass };
+    alr_shim_emit(build_stencil_op_separate, &a);
+}
+struct U1Args { uint32_t v; };
+static void build_stencil_mask(AlrEncoder *e, void *p) {
+    alr_enc_u8(e, ALR_OP_STENCIL_MASK); alr_enc_u32(e, ((struct U1Args*)p)->v);
+}
+void glStencilMask(GLuint m) { struct U1Args a = { (uint32_t)m }; alr_shim_emit(build_stencil_mask, &a); }
+static void build_stencil_mask_separate(AlrEncoder *e, void *p) {
+    struct Blend2Args *a = (struct Blend2Args*)p;   /* face, mask */
+    alr_enc_u8(e, ALR_OP_STENCIL_MASK_SEPARATE); alr_enc_u32(e, a->a); alr_enc_u32(e, a->b);
+}
+void glStencilMaskSeparate(GLenum face, GLuint m) {
+    struct Blend2Args a = { (uint32_t)face, (uint32_t)m };
+    alr_shim_emit(build_stencil_mask_separate, &a);
+}
+static void build_polygon_offset(AlrEncoder *e, void *p) {
+    struct Range2Args *a = (struct Range2Args*)p;   /* factor, units */
+    alr_enc_u8(e, ALR_OP_POLYGON_OFFSET); alr_enc_f32(e, a->a); alr_enc_f32(e, a->b);
+}
+void glPolygonOffset(GLfloat factor, GLfloat units) {
+    struct Range2Args a = { factor, units }; alr_shim_emit(build_polygon_offset, &a);
+}
+static void build_line_width(AlrEncoder *e, void *p) {
+    alr_enc_u8(e, ALR_OP_LINE_WIDTH); alr_enc_f32(e, ((struct F1Args*)p)->v);
+}
+void glLineWidth(GLfloat w) { struct F1Args a = { w }; alr_shim_emit(build_line_width, &a); }
+struct SampleCovArgs { float value; uint8_t invert; };
+static void build_sample_coverage(AlrEncoder *e, void *p) {
+    struct SampleCovArgs *a = (struct SampleCovArgs*)p;
+    alr_enc_u8(e, ALR_OP_SAMPLE_COVERAGE); alr_enc_f32(e, a->value); alr_enc_u8(e, a->invert);
+}
+void glSampleCoverage(GLclampf v, GLboolean invert) {
+    struct SampleCovArgs a = { v, (uint8_t)(invert?1:0) };
+    alr_shim_emit(build_sample_coverage, &a);
+}
+/* glHint stays accept-and-drop: it is a HINT only (GENERATE_MIPMAP_HINT etc.) and never
+ * changes rendered pixels; promoting it would add a wire op for a no-visible-effect call. */
 void glHint(GLenum a, GLenum b) { (void)a; (void)b; }
-void glLineWidth(GLfloat w) { (void)w; }
-void glPolygonOffset(GLfloat a, GLfloat b) { (void)a; (void)b; }
-void glSampleCoverage(GLclampf v, GLboolean i) { (void)v; (void)i; }
 void glDetachShader(GLuint p, GLuint s) { (void)p; (void)s; }
 void glReleaseShaderCompiler(void) {}
 void glValidateProgram(GLuint p) { (void)p; }

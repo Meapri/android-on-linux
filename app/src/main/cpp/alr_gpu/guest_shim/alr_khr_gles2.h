@@ -68,6 +68,26 @@ typedef ssize_t          GLsizeiptr;
 #define GL_DEPTH_TEST                     0x0B71
 #define GL_BLEND                          0x0BE2
 #define GL_SCISSOR_TEST                   0x0C11
+#define GL_STENCIL_TEST                   0x0B90
+
+/* blend factors / equations + stencil ops (for the per-fragment state setters) */
+#define GL_ZERO                           0
+#define GL_ONE                            1
+#define GL_SRC_ALPHA                      0x0302
+#define GL_ONE_MINUS_SRC_ALPHA            0x0303
+#define GL_DST_ALPHA                      0x0304
+#define GL_ONE_MINUS_DST_ALPHA            0x0305
+#define GL_SRC_COLOR                      0x0300
+#define GL_ONE_MINUS_SRC_COLOR            0x0301
+#define GL_DST_COLOR                      0x0306
+#define GL_ONE_MINUS_DST_COLOR            0x0307
+#define GL_FUNC_ADD                       0x8006
+#define GL_FUNC_SUBTRACT                  0x800A
+#define GL_FUNC_REVERSE_SUBTRACT          0x800B
+#define GL_KEEP                           0x1E00
+#define GL_REPLACE                        0x1E01
+#define GL_INCR                           0x1E02
+#define GL_DECR                           0x1E03
 
 #define GL_TEXTURE_2D                     0x0DE1
 #define GL_UNPACK_ALIGNMENT               0x0CF5
@@ -208,6 +228,27 @@ void   glVertexAttribDivisor(GLuint index, GLuint divisor);
 void   glCullFace(GLenum mode);
 void   glFrontFace(GLenum mode);
 void   glGetIntegerv(GLenum pname, GLint *params);
+
+/* per-fragment / raster state setters (real wire ops; host replays 1:1) */
+void   glBlendFunc(GLenum sfactor, GLenum dfactor);
+void   glBlendFuncSeparate(GLenum srcRGB, GLenum dstRGB, GLenum srcAlpha, GLenum dstAlpha);
+void   glBlendEquation(GLenum mode);
+void   glBlendEquationSeparate(GLenum modeRGB, GLenum modeAlpha);
+void   glBlendColor(GLclampf r, GLclampf g, GLclampf b, GLclampf a);
+void   glColorMask(GLboolean r, GLboolean g, GLboolean b, GLboolean a);
+void   glDepthMask(GLboolean flag);
+void   glDepthRangef(GLclampf n, GLclampf f);
+void   glClearDepthf(GLclampf d);
+void   glClearStencil(GLint s);
+void   glStencilFunc(GLenum func, GLint ref, GLuint mask);
+void   glStencilFuncSeparate(GLenum face, GLenum func, GLint ref, GLuint mask);
+void   glStencilOp(GLenum sfail, GLenum dpfail, GLenum dppass);
+void   glStencilOpSeparate(GLenum face, GLenum sfail, GLenum dpfail, GLenum dppass);
+void   glStencilMask(GLuint mask);
+void   glStencilMaskSeparate(GLenum face, GLuint mask);
+void   glPolygonOffset(GLfloat factor, GLfloat units);
+void   glLineWidth(GLfloat width);
+void   glSampleCoverage(GLclampf value, GLboolean invert);
 
 GLint  glGetUniformLocation(GLuint program, const GLchar *name);
 void   glUniform1i(GLint location, GLint v0);

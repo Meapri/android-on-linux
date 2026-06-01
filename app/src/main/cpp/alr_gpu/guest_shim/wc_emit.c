@@ -275,6 +275,29 @@ int main(int argc, char **argv) {
     glVertexAttribDivisor(a_pos, 2);    /* by-name path (a_pos is a packed glGetAttribLocation handle) */
     glBindVertexArray(0);                            /* back to default VAO */
 
+    /* --- per-fragment / raster STATE setters (blend/effect/shading/refract/shadow
+     *     scenes + GTK4-GL/SDL2). Each is a real fire-and-forget wire op now. The
+     *     literal arg values are asserted byte-for-byte by decode_check.cpp. --- */
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);          /* OP_BLEND_FUNC */
+    glBlendFuncSeparate(GL_ONE, GL_ZERO, GL_SRC_ALPHA, GL_ONE); /* OP_BLEND_FUNC_SEPARATE */
+    glBlendEquation(GL_FUNC_ADD);                               /* OP_BLEND_EQUATION */
+    glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_SUBTRACT);     /* OP_BLEND_EQUATION_SEPARATE */
+    glBlendColor(0.25f, 0.5f, 0.75f, 1.0f);                     /* OP_BLEND_COLOR */
+    glColorMask(GL_TRUE, GL_FALSE, GL_TRUE, GL_FALSE);          /* OP_COLOR_MASK */
+    glDepthMask(GL_FALSE);                                      /* OP_DEPTH_MASK */
+    glDepthRangef(0.0f, 0.5f);                                  /* OP_DEPTH_RANGEF */
+    glClearDepthf(0.0f);                                        /* OP_CLEAR_DEPTHF */
+    glClearStencil(1);                                          /* OP_CLEAR_STENCIL */
+    glStencilFunc(GL_ALWAYS, 1, 0xFF);                          /* OP_STENCIL_FUNC */
+    glStencilFuncSeparate(GL_FRONT, GL_ALWAYS, 2, 0x0F);        /* OP_STENCIL_FUNC_SEPARATE */
+    glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);                  /* OP_STENCIL_OP */
+    glStencilOpSeparate(GL_FRONT, GL_KEEP, GL_REPLACE, GL_KEEP);/* OP_STENCIL_OP_SEPARATE */
+    glStencilMask(0xFF);                                        /* OP_STENCIL_MASK */
+    glStencilMaskSeparate(GL_FRONT, 0x0F);                      /* OP_STENCIL_MASK_SEPARATE */
+    glPolygonOffset(1.0f, 2.0f);                                /* OP_POLYGON_OFFSET */
+    glLineWidth(2.0f);                                          /* OP_LINE_WIDTH */
+    glSampleCoverage(0.5f, GL_TRUE);                            /* OP_SAMPLE_COVERAGE */
+
     FILE *f = fopen(argv[1], "wb");
     if (!f) { fprintf(stderr, "wc_emit: cannot open %s\n", argv[1]); return 2; }
     fwrite(g_capture, 1, g_capture_len, f);

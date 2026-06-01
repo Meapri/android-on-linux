@@ -57,6 +57,35 @@ struct VadPlain { GLuint index; GLuint divisor; };
 struct VadNamed { std::string name; GLuint divisor; };
 static std::vector<VadPlain> vad_plain;
 static std::vector<VadNamed> vad_named;
+// per-fragment / raster state setters
+struct Blend2 { GLenum a, b; };
+struct Blend4 { GLenum a, b, c, d; };
+struct ColorMaskRec { GLboolean r, g, b, a; };
+struct StencilFuncRec { GLenum func; GLint ref; GLuint mask; };
+struct StencilFuncSepRec { GLenum face, func; GLint ref; GLuint mask; };
+struct Stencil3 { GLenum a, b, c; };
+struct Stencil4 { GLenum a, b, c, d; };
+struct F2 { GLfloat a, b; };
+struct SampleCovRec { GLfloat value; GLboolean invert; };
+static std::vector<Blend2> blend_funcs;            // glBlendFunc(s,d)
+static std::vector<Blend4> blend_func_seps;        // glBlendFuncSeparate
+static std::vector<GLenum> blend_eqs;              // glBlendEquation
+static std::vector<Blend2> blend_eq_seps;          // glBlendEquationSeparate
+static std::vector<std::vector<float>> blend_colors;  // glBlendColor
+static std::vector<ColorMaskRec> color_masks;      // glColorMask
+static std::vector<GLboolean> depth_masks;         // glDepthMask
+static std::vector<F2> depth_ranges;               // glDepthRangef
+static std::vector<GLfloat> clear_depths;          // glClearDepthf
+static std::vector<GLint> clear_stencils;          // glClearStencil
+static std::vector<StencilFuncRec> stencil_funcs;  // glStencilFunc
+static std::vector<StencilFuncSepRec> stencil_func_seps; // glStencilFuncSeparate
+static std::vector<Stencil3> stencil_ops;          // glStencilOp
+static std::vector<Stencil4> stencil_op_seps;      // glStencilOpSeparate
+static std::vector<GLuint> stencil_masks;          // glStencilMask
+static std::vector<Blend2> stencil_mask_seps;      // glStencilMaskSeparate (face,mask)
+static std::vector<F2> polygon_offsets;            // glPolygonOffset
+static std::vector<GLfloat> line_widths;           // glLineWidth
+static std::vector<SampleCovRec> sample_coverages; // glSampleCoverage
 static std::map<GLint, std::string> uniform_loc_name;  // glGetUniformLocation -> name
 static std::map<GLint, std::string> attrib_loc_name;   // glGetAttribLocation  -> name
 static std::map<std::string, std::vector<float>> mat_by_name;   // glUniformMatrix4fv
@@ -196,6 +225,38 @@ void glVertexAttribDivisor(GLuint index, GLuint divisor) {
     if (it != rec::attrib_loc_name.end()) rec::vad_named.push_back({it->second, divisor});
     else rec::vad_plain.push_back({index, divisor});
 }
+// per-fragment / raster state setters
+void glBlendFunc(GLenum s, GLenum d) { rec::blend_funcs.push_back({s, d}); }
+void glBlendFuncSeparate(GLenum sr, GLenum dr, GLenum sa, GLenum da) {
+    rec::blend_func_seps.push_back({sr, dr, sa, da});
+}
+void glBlendEquation(GLenum m) { rec::blend_eqs.push_back(m); }
+void glBlendEquationSeparate(GLenum mr, GLenum ma) { rec::blend_eq_seps.push_back({mr, ma}); }
+void glBlendColor(GLclampf r, GLclampf g, GLclampf b, GLclampf a) {
+    rec::blend_colors.push_back({r, g, b, a});
+}
+void glColorMask(GLboolean r, GLboolean g, GLboolean b, GLboolean a) {
+    rec::color_masks.push_back({r, g, b, a});
+}
+void glDepthMask(GLboolean f) { rec::depth_masks.push_back(f); }
+void glDepthRangef(GLclampf n, GLclampf f) { rec::depth_ranges.push_back({n, f}); }
+void glClearDepthf(GLclampf d) { rec::clear_depths.push_back(d); }
+void glClearStencil(GLint s) { rec::clear_stencils.push_back(s); }
+void glStencilFunc(GLenum func, GLint ref, GLuint mask) {
+    rec::stencil_funcs.push_back({func, ref, mask});
+}
+void glStencilFuncSeparate(GLenum face, GLenum func, GLint ref, GLuint mask) {
+    rec::stencil_func_seps.push_back({face, func, ref, mask});
+}
+void glStencilOp(GLenum sf, GLenum df, GLenum dp) { rec::stencil_ops.push_back({sf, df, dp}); }
+void glStencilOpSeparate(GLenum face, GLenum sf, GLenum df, GLenum dp) {
+    rec::stencil_op_seps.push_back({face, sf, df, dp});
+}
+void glStencilMask(GLuint m) { rec::stencil_masks.push_back(m); }
+void glStencilMaskSeparate(GLenum face, GLuint m) { rec::stencil_mask_seps.push_back({face, m}); }
+void glPolygonOffset(GLfloat factor, GLfloat units) { rec::polygon_offsets.push_back({factor, units}); }
+void glLineWidth(GLfloat w) { rec::line_widths.push_back(w); }
+void glSampleCoverage(GLclampf v, GLboolean inv) { rec::sample_coverages.push_back({v, inv}); }
 }  // extern "C"
 
 // GL tokens the assertions compare against (not all in the minimal stub header).
@@ -207,6 +268,17 @@ static constexpr unsigned kGL_UNSIGNED_SHORT       = 0x1403;
 static constexpr unsigned kGL_TRIANGLES            = 0x0004;
 static constexpr unsigned kGL_BACK                 = 0x0405;
 static constexpr unsigned kGL_CCW                  = 0x0901;
+// blend / stencil tokens (standard registry values) for the state-setter assertions
+static constexpr unsigned kGL_SRC_ALPHA            = 0x0302;
+static constexpr unsigned kGL_ONE_MINUS_SRC_ALPHA  = 0x0303;
+static constexpr unsigned kGL_ONE                  = 1;
+static constexpr unsigned kGL_ZERO                 = 0;
+static constexpr unsigned kGL_FUNC_ADD             = 0x8006;
+static constexpr unsigned kGL_FUNC_SUBTRACT        = 0x800A;
+static constexpr unsigned kGL_FRONT                = 0x0404;
+static constexpr unsigned kGL_ALWAYS               = 0x0207;
+static constexpr unsigned kGL_KEEP                 = 0x1E00;
+static constexpr unsigned kGL_REPLACE              = 0x1E01;
 
 static int g_fail = 0;
 static void check(bool ok, const char *what) {
@@ -233,7 +305,7 @@ int main(int argc, char **argv) {
 
     // --- the stream decoded into exactly the cube + mesh GL calls. ---
     check(ok && st.ok, "decode_batch returned true (well-formed, no bad/unknown opcode)");
-    check(st.decoded == 68, "decoded op count == 68 (+2 vertex-attrib-divisor)");
+    check(st.decoded == 87, "decoded op count == 87 (+19 per-fragment/raster state setters)");
     check(st.shaders.size() == 2, "2 shaders mapped");
     check(st.programs.size() == 1, "1 program mapped");
     check(st.buffers.size() == 2, "2 buffers mapped (vbo + ebo)");
@@ -368,6 +440,64 @@ int main(int argc, char **argv) {
           "glVertexAttribDivisor plain index 0 -> divisor 1");
     check(rec::vad_named.size() == 1 && rec::vad_named[0].name == "position" && rec::vad_named[0].divisor == 2,
           "glVertexAttribDivisor BY NAME (position) -> divisor 2");
+
+    // ---- per-fragment / raster state setters (the new wire ops) ----
+    check(rec::blend_funcs.size() == 1 && rec::blend_funcs[0].a == kGL_SRC_ALPHA &&
+              rec::blend_funcs[0].b == kGL_ONE_MINUS_SRC_ALPHA,
+          "glBlendFunc(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)");
+    check(rec::blend_func_seps.size() == 1 && rec::blend_func_seps[0].a == kGL_ONE &&
+              rec::blend_func_seps[0].b == kGL_ZERO && rec::blend_func_seps[0].c == kGL_SRC_ALPHA &&
+              rec::blend_func_seps[0].d == kGL_ONE,
+          "glBlendFuncSeparate(ONE, ZERO, SRC_ALPHA, ONE)");
+    check(rec::blend_eqs.size() == 1 && rec::blend_eqs[0] == kGL_FUNC_ADD,
+          "glBlendEquation(FUNC_ADD)");
+    check(rec::blend_eq_seps.size() == 1 && rec::blend_eq_seps[0].a == kGL_FUNC_ADD &&
+              rec::blend_eq_seps[0].b == kGL_FUNC_SUBTRACT,
+          "glBlendEquationSeparate(FUNC_ADD, FUNC_SUBTRACT)");
+    bool bc_ok = rec::blend_colors.size() == 1 && rec::blend_colors[0].size() == 4 &&
+                 rec::blend_colors[0][0] == 0.25f && rec::blend_colors[0][1] == 0.5f &&
+                 rec::blend_colors[0][2] == 0.75f && rec::blend_colors[0][3] == 1.0f;
+    check(bc_ok, "glBlendColor(0.25, 0.5, 0.75, 1.0)");
+    check(rec::color_masks.size() == 1 && rec::color_masks[0].r == GL_TRUE &&
+              rec::color_masks[0].g == GL_FALSE && rec::color_masks[0].b == GL_TRUE &&
+              rec::color_masks[0].a == GL_FALSE,
+          "glColorMask(TRUE, FALSE, TRUE, FALSE)");
+    check(rec::depth_masks.size() == 1 && rec::depth_masks[0] == GL_FALSE,
+          "glDepthMask(GL_FALSE)");
+    check(rec::depth_ranges.size() == 1 && rec::depth_ranges[0].a == 0.0f &&
+              rec::depth_ranges[0].b == 0.5f,
+          "glDepthRangef(0.0, 0.5)");
+    check(rec::clear_depths.size() == 1 && rec::clear_depths[0] == 0.0f,
+          "glClearDepthf(0.0)");
+    check(rec::clear_stencils.size() == 1 && rec::clear_stencils[0] == 1,
+          "glClearStencil(1)");
+    check(rec::stencil_funcs.size() == 1 && rec::stencil_funcs[0].func == kGL_ALWAYS &&
+              rec::stencil_funcs[0].ref == 1 && rec::stencil_funcs[0].mask == 0xFFu,
+          "glStencilFunc(ALWAYS, 1, 0xFF)");
+    check(rec::stencil_func_seps.size() == 1 && rec::stencil_func_seps[0].face == kGL_FRONT &&
+              rec::stencil_func_seps[0].func == kGL_ALWAYS && rec::stencil_func_seps[0].ref == 2 &&
+              rec::stencil_func_seps[0].mask == 0x0Fu,
+          "glStencilFuncSeparate(FRONT, ALWAYS, 2, 0x0F)");
+    check(rec::stencil_ops.size() == 1 && rec::stencil_ops[0].a == kGL_KEEP &&
+              rec::stencil_ops[0].b == kGL_KEEP && rec::stencil_ops[0].c == kGL_REPLACE,
+          "glStencilOp(KEEP, KEEP, REPLACE)");
+    check(rec::stencil_op_seps.size() == 1 && rec::stencil_op_seps[0].a == kGL_FRONT &&
+              rec::stencil_op_seps[0].b == kGL_KEEP && rec::stencil_op_seps[0].c == kGL_REPLACE &&
+              rec::stencil_op_seps[0].d == kGL_KEEP,
+          "glStencilOpSeparate(FRONT, KEEP, REPLACE, KEEP)");
+    check(rec::stencil_masks.size() == 1 && rec::stencil_masks[0] == 0xFFu,
+          "glStencilMask(0xFF)");
+    check(rec::stencil_mask_seps.size() == 1 && rec::stencil_mask_seps[0].a == kGL_FRONT &&
+              rec::stencil_mask_seps[0].b == 0x0Fu,
+          "glStencilMaskSeparate(FRONT, 0x0F)");
+    check(rec::polygon_offsets.size() == 1 && rec::polygon_offsets[0].a == 1.0f &&
+              rec::polygon_offsets[0].b == 2.0f,
+          "glPolygonOffset(1.0, 2.0)");
+    check(rec::line_widths.size() == 1 && rec::line_widths[0] == 2.0f,
+          "glLineWidth(2.0)");
+    check(rec::sample_coverages.size() == 1 && rec::sample_coverages[0].value == 0.5f &&
+              rec::sample_coverages[0].invert == GL_TRUE,
+          "glSampleCoverage(0.5, GL_TRUE)");
 
     std::printf("\nALR GPU WIRE-FORMAT CHECK: %s\n", g_fail ? "FAIL" : "PASS");
     return g_fail;

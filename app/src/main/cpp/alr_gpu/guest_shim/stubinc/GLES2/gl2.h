@@ -99,6 +99,27 @@ void   glBindRenderbuffer(GLenum, GLuint);
 void   glRenderbufferStorage(GLenum, GLenum, GLsizei, GLsizei);
 void   glFramebufferRenderbuffer(GLenum, GLenum, GLenum, GLuint);
 
+/* per-fragment / raster state setters (decode_batch replays these 1:1) */
+void   glBlendFunc(GLenum, GLenum);
+void   glBlendFuncSeparate(GLenum, GLenum, GLenum, GLenum);
+void   glBlendEquation(GLenum);
+void   glBlendEquationSeparate(GLenum, GLenum);
+void   glBlendColor(GLclampf, GLclampf, GLclampf, GLclampf);
+void   glColorMask(GLboolean, GLboolean, GLboolean, GLboolean);
+void   glDepthMask(GLboolean);
+void   glDepthRangef(GLclampf, GLclampf);
+void   glClearDepthf(GLclampf);
+void   glClearStencil(GLint);
+void   glStencilFunc(GLenum, GLint, GLuint);
+void   glStencilFuncSeparate(GLenum, GLenum, GLint, GLuint);
+void   glStencilOp(GLenum, GLenum, GLenum);
+void   glStencilOpSeparate(GLenum, GLenum, GLenum, GLenum);
+void   glStencilMask(GLuint);
+void   glStencilMaskSeparate(GLenum, GLuint);
+void   glPolygonOffset(GLfloat, GLfloat);
+void   glLineWidth(GLfloat);
+void   glSampleCoverage(GLclampf, GLboolean);
+
 #ifdef __cplusplus
 }
 #endif
