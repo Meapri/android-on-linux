@@ -146,13 +146,13 @@
 
 ## 6. 충돌 관리
 
-1. **격리:** 세션당 git worktree(브랜치 `ws-1`..`ws-5`). 통합 세션이 `main`으로 merge.
+1. **격리:** 세션당 git worktree(브랜치 `ws-1`..`ws-5`). **세션은 자기 `ws-N` 브랜치에만 commit/push, `main`에 직접 push·merge 금지.** `main` 병합은 통합 세션이 단독 수행(§6.5 단일 게이트). 이전의 "세션이 직접 `Merge ws-N into main`" 자율 방식은 폐기.
 2. **소유권 매트릭스(§2):** 파일/함수 단위. 다른 WS 소유 파일은 **읽기만**. 변경이 필요하면 인터페이스 계약(§5)으로 요청.
 3. **핫스팟 규약:**
    - `runtime_report.cpp` — WS-1: `build_native_loader_probe`+supervisor / WS-2: `nativeAlrGpu*`+`GpuRingHook` 구현 / WS-3: `nativeWayland*`+`WaylandPresenter`. **함수 추가 위주, 기존 함수 시그니처 변경은 계약 통해.**
    - `MainActivity.kt` — launch/wiring을 WS별 private fun으로 분리, onCreate/surfaceCreated에서는 호출만.
 4. **version stamp는 통합 세션만 bump**(메모리: version-stamp-pin-sites). 세션은 stamp/tests 핀을 건드리지 않음(머지 충돌의 최대 원인).
-5. **merge 주기:** 마일스톤 완료 시 또는 1일 1회. 통합 세션이 인터페이스 계약 기준으로 검수 → device 게이트(WS-5 회귀) → merge.
+5. **단일 통합 게이트(merge):** 세션은 `ws-N` 브랜치를 push만 한다(또는 worktree 유지). 통합 세션이 전담: `git merge-tree --write-tree main ws-N`로 충돌 검수 → 소유권(§2)·계약(§5) 위반은 merge 거부 후 환송 → host 게이트 `uvx pytest tests/ -q`(녹색 필수) → `git merge --no-ff` → push. GPU/display처럼 device 검증이 필요하면 merge 메시지에 **`DEVICE-REQ`** 마커 → 통합 세션이 §9 device drain으로 게이트(세션은 APK install 안 함). version stamp는 통합 세션만 bump(§6.4).
 6. **`git add -A` 금지** — 항상 명시 경로만(다른 세션 uncommitted 작업 보호).
 
 ---
