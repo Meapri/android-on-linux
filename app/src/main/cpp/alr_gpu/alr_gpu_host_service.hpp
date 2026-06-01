@@ -864,7 +864,10 @@ inline std::string run_gpu_throughput_probe() {
     out << "\nalr gpu throughput alr_fps=" << static_cast<long>(alr_fps + 0.5)
         << " frames=" << alr_frames;
     out << "\nalr gpu throughput ratio_alr_over_direct=" << ratio
-        << " (" << pct << "% of native-Mali, light single-draw regime)";
+        << " (ALR ring+executor vs SINGLE-THREAD direct decode of the same op-stream on the "
+           "same Mali, same per-frame glFinish; ratio>=1 means the 2-thread pipeline fully hides "
+           "the command-ring marshalling cost behind GPU work — NOT a claim of beating a native "
+           "app's pipelined ceiling. pct=" << pct << "%)";
     out << "\nalr gpu throughput direct renderer=" << renderer
         << " software=" << (software ? "true" : "false");
     out << "\nalr gpu throughput alr renderer=" << alr_renderer;

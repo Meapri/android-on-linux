@@ -71,6 +71,18 @@ GL_VERSION:  OpenGL ES 3.2 v1.r44p1-01eac0.ed1fb6cfc1040479b92ddf50a952e57c
 - 보조 GPU 셀프테스트도 실 Mali에서 PASS: **`ALR GPU LIVE INTEGRATION: PASS`**(guest→ring→host→AHB present, 8프레임), **`ALR GPU SCREEN CUBE: PASS`**(live 파이프라인→AHB→external-OES 화면 present).
 - ~1000–1200 FPS @ 1920×1200는 **소프트웨어 래스터라이저로는 불가능한 수치** → GPU 가속의 정성 증명.
 
+### 3.1 마샬링 오버헤드 = 병목 아님 (ring vs direct, 같은 Mali)
+같은 triangle op-스트림을 **같은 Mali에서** 두 경로로 렌더해 throughput 비교 ([evidence](evidence/2026-06-02-gpu-throughput-ring-vs-direct.md)):
+
+| 경로 | FPS (512×512, 600 frames) | renderer |
+|------|---------------------------|----------|
+| ALR (2-thread ring + executor → AHB-FBO, 실 glmark2 경로) | **1158** | Mali-G615 MC2, software=false |
+| DIRECT (단일 스레드 decode + 프레임당 glFinish, ring 없음) | 757 | Mali-G615 MC2, software=false |
+| ratio (ALR / direct) | **1.53** | — |
+
+- ratio **≥ 1** = ALR의 command-ring 마샬링 비용이 **2-thread 파이프라인에 완전히 가려진다**(producer가 프레임 N+1을 마샬링하는 동안 executor가 프레임 N의 GPU 작업 수행). 즉 **§0(b) "per-call 마샬링/카피"는 이 워크로드에서 throughput 병목이 아니다** (client-side virtual GL ID로 per-call 라운드트립 0 + 스레드 오버랩).
+- **주의(과장 금지):** 이건 "ALR이 네이티브 앱보다 1.5배 빠르다"는 주장이 **아니다**. DIRECT는 의도적으로 보수적인 단일 스레드+프레임당 glFinish 기준선이다. 하드-최적화 네이티브 앱의 swapchain 파이프라인 천장 대비 절대 %는 별개의 더 어려운 측정으로 **미해결**(§5).
+
 ---
 
 ## 4. 보조 증거 — 디스플레이 / present / GUI / 범용성
@@ -88,7 +100,9 @@ GL_VERSION:  OpenGL ES 3.2 v1.r44p1-01eac0.ed1fb6cfc1040479b92ddf50a952e57c
 
 이 문서는 증명된 것만 단정한다. 다음은 **진행 중**:
 
-1. **GPU %-of-native 비율** — glmark2가 실 Mali에서 도는 건 증명됐지만(`software=false`, 실 renderer, ~1000+ FPS), "Mali **직접** 대비 몇 %"인지의 분모(같은 기기에서 ALR 우회 직접 측정)는 **측정 예정**. 절차는 [CP-2 ratio 문서](research/cp2-gpu-ratio-glmark2.md) §3. 현 Score(1052–1163)는 **build+texture 2-scene 부분 종합**이며 전체 14-scene 종합이 아니다.
+1. **GPU 절대 %-of-native-app 비율** — 두 가지를 구분한다:
+   - **마샬링 오버헤드는 병목 아님 = 증명됨** (§3.1): ALR ring 경로가 같은 Mali·같은 op로 단일 스레드 direct decode 대비 1.53× → 마샬링이 GPU 작업에 가려짐.
+   - **하드-최적화 네이티브 앱의 파이프라인 천장 대비 절대 %는 미해결**: glmark2가 glibc/Wayland라 맨-Android Mali에서 직접 못 돌아가므로(§3.1 주의), swapchain 기반 네이티브 천장 baseline이 필요 — [CP-2 ratio 문서](research/cp2-gpu-ratio-glmark2.md) §3에 절차. 현 glmark2 Score(1052–1163)는 **build+texture 2-scene 부분 종합**(전체 14-scene 아님). 이 절대 비율(§0 ≥70% 목표)은 아직 단정하지 않는다.
 2. **CPU syscall-storm(chromium류)** — light `getpid` ~12%와 별개로, raw-`svc` storm은 ptrace 라운드트립 벽([ADR-001](design/adr-001-syscall-overhead-user-notif.md)). chromium은 현재 보류.
 3. GLES3+/Vulkan(호스트 ES 3.2 확인됨), qt6/netsurf 등 toolkit 매트릭스 확장.
 
@@ -110,4 +124,5 @@ python -m bench gpu --alr-score 1163 --mali-score <BASE> --alr-renderer "Mali-G6
 - GPU CP-2 FINAL: [`2026-06-02-cp2-FINAL-glmark2-score-1074.md`](evidence/2026-06-02-cp2-FINAL-glmark2-score-1074.md)
 - GPU 8MiB ring + texture: [`2026-06-02-cp5-batch-8mibring-texture-ws4-overlays.md`](evidence/2026-06-02-cp5-batch-8mibring-texture-ws4-overlays.md)
 - GL_RENDERER passthrough + apt/X11 + GUI: [`2026-06-02-5ws-fanout-renderer-getpwuid-pkgfunc.md`](evidence/2026-06-02-5ws-fanout-renderer-getpwuid-pkgfunc.md)
+- GPU marshalling throughput (ring vs direct): [`2026-06-02-gpu-throughput-ring-vs-direct.md`](evidence/2026-06-02-gpu-throughput-ring-vs-direct.md)
 - 분석: [CP-2 ratio](research/cp2-gpu-ratio-glmark2.md) · [CP-3 ratio](research/cp3-cpu-overhead-ratio.md) · [오케스트레이션 플랜 §0/§8](research/orchestration-5session-plan.md)
