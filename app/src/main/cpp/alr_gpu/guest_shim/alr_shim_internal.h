@@ -27,11 +27,13 @@
 extern "C" {
 #endif
 
-/* Largest single encoded op the cube emits before an append is the one-time
- * texture upload (OP_TEX_IMAGE_2D with a 64x64 RGBA = 16 KiB payload) or the VBO
- * (OP_BUFFER_DATA, ~1.2 KiB). Scratch is sized well above that; uploads larger
- * than scratch are rejected (set error) — the cube never approaches this. */
-#define ALR_SHIM_SCRATCH_BYTES (256 * 1024)
+/* Scratch holds ONE encoded op before it is appended to the ring. It must be >= the
+ * largest single op's payload. The self-test cube only needs ~16 KiB (64x64 RGBA), but
+ * REAL apps upload much larger assets in one op: glmark2's textures decode to up to
+ * 1024x1024 RGBA = 4 MiB (OP_TEX_IMAGE_2D), and model VBOs reach ~1-2 MiB (bunny.obj).
+ * 8 MiB covers glmark2's largest single op with headroom; an op larger than scratch is
+ * rejected (gl_error) — truly-huge (>8 MiB) uploads would need chunking (future). */
+#define ALR_SHIM_SCRATCH_BYTES (8 * 1024 * 1024)
 
 /* Per-program uniform-name table: glGetUniformLocation returns a small virtual
  * handle = an index into this name list; glUniform* looks the name back up and
