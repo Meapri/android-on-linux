@@ -30,4 +30,4 @@ def test_main_activity_reports_gpu_live_gate():
     assert "alrGpuLiveProbe" in text
     assert "alrGpuLivePassed" in text
     assert "ALR GPU LIVE INTEGRATION:" in text
-    assert "build: 0.4.119-android-gpu-screen-cube-v119" in text
+    assert "build: 0.4.120-chromium-jitwx-probe-v120" in text

@@ -89,6 +89,10 @@
 // context, dodging the v117 same-context black-AHB hazard). run_screen_cube_demo()
 // streams a spinning textured cube to the SurfaceView (in-process, no fork/rootfs).
 #include "alr_gpu/alr_gpu_screen.hpp"
+// alr_jit_probe.hpp: V8-style iterative W^X (RW<->RX) executable-memory cycle probe —
+// decides whether Chromium (V8/SwiftShader JIT) can run WITHOUT --jitless on this
+// untrusted_app domain. Pure anonymous mmap/mprotect; no memfd-exec (that's EACCES).
+#include "alr_jit/alr_jit_probe.hpp"
 
 namespace {
 
@@ -4856,6 +4860,17 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeAlrGpuScreenCube(
     const auto report = alr::gpu::run_screen_cube_demo(win, static_cast<int>(frames));
     ANativeWindow_release(win);
     __android_log_print(ANDROID_LOG_INFO, "alr_loader", "gpu-screen-cube:\n%s", report.c_str());
+    return env->NewStringUTF(report.c_str());
+}
+
+// Goal-2 (Chromium) prep: does V8-style iterative W^X executable memory work on this
+// untrusted_app domain? PASS => V8 JIT viable without --jitless. Mirrored to logcat.
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeJitWxProbe(
+    JNIEnv* env,
+    jobject /* thiz */) {
+    const auto report = alr::jit::run_jit_wx_cycle_probe();
+    __android_log_print(ANDROID_LOG_INFO, "alr_loader", "jit-wx:\n%s", report.c_str());
     return env->NewStringUTF(report.c_str());
 }
 

@@ -14,4 +14,4 @@ def test_termux_proot_prebuilts_are_excluded_from_gradle_strip():
 
 def test_build_stamp_identifies_unstripped_proot_package():
     text = BUILD.read_text()
-    assert 'versionName = "0.4.119-android-gpu-screen-cube-v119"' in text
+    assert 'versionName = "0.4.120-chromium-jitwx-probe-v120"' in text

@@ -23,7 +23,7 @@ def test_main_activity_reports_android_wx_safe_exec_gate():
     assert "ALR WX-SAFE EXEC STRATEGY: " in text
     assert "alr wx-safe exec passed=" in text
     assert "ALR W^X-safe exec strategy probe:" in text
-    assert "build: 0.4.119-android-gpu-screen-cube-v119" in text
+    assert "build: 0.4.120-chromium-jitwx-probe-v120" in text
 
 
 def test_execution_backend_docs_require_wx_safe_exec_strategy_probe():

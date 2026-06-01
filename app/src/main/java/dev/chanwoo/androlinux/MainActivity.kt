@@ -337,6 +337,11 @@ class MainActivity : Activity() {
         val alrGpuLivePassed =
             alrGpuLiveProbe.lineStartingWith("ALR GPU LIVE INTEGRATION:") ==
                 "ALR GPU LIVE INTEGRATION: PASS"
+        // Goal-2 (Chromium) prep: V8-style iterative W^X executable memory. PASS => V8
+        // JIT runs without --jitless on this untrusted_app domain.
+        val jitWxProbe = nativeJitWxProbe()
+        val jitWxPassed =
+            jitWxProbe.lineStartingWith("ALR JIT WX CYCLE:") == "ALR JIT WX CYCLE: PASS"
         val hostGpuProbe = nativeHostGpuProbe()
         val hostVulkanProbe = nativeHostVulkanProbe()
         val requestedPermissions = requestedPermissionNames()
@@ -506,7 +511,7 @@ class MainActivity : Activity() {
             alrSeccompPathTrapProbe.lineStartingWith("alr sc PATH_MEDIATION_VIABLE=")
                 .substringAfter("PATH_MEDIATION_VIABLE=", "") == "yes"
 
-        val executionSummary = "build: 0.4.119-android-gpu-screen-cube-v119" +
+        val executionSummary = "build: 0.4.120-chromium-jitwx-probe-v120" +
             "\nexecution summary" +
             "\nROOTFS EXECUTION: ${if (rootfsExecutionPassed) "PASS" else "FAIL"}" +
             "\nSHELL SCRIPT EXECUTION: ${if (shellScriptExecutionPassed) "PASS" else "FAIL"}" +
@@ -553,6 +558,7 @@ class MainActivity : Activity() {
             "\nALR GPU RING HARDWARE RENDER (op stream via SPSC ring -> Mali): ${if (alrGpuRingPassed) "PASS" else "FAIL"}" +
             "\nALR GPU AHB RENDER (guest draw -> AHB render target, direct read): ${if (alrGpuFboPassed) "PASS" else "FAIL"}" +
             "\nALR GPU LIVE INTEGRATION (guest -> ring -> host executor -> AHB present, 8 frames on Mali): ${if (alrGpuLivePassed) "PASS" else "FAIL"}" +
+            "\nALR JIT WX CYCLE (V8-style iterative RW<->RX exec memory; PASS => Chromium V8 needs no --jitless): ${if (jitWxPassed) "PASS" else "FAIL"}" +
             "\nHOST GPU EGL/GLES EXECUTION: ${if (hostGpuHardwareCandidate) "PASS" else "FAIL"}" +
             "\nANDROID HOST VULKAN PROBE EXECUTION: ${if (hostVulkanHardwareCandidate) "PASS" else "FAIL"}" +
             "\nANDROID HOST VULKAN SURFACE PROBE EXECUTION: PENDING_SURFACE_CALLBACK" +
@@ -1653,6 +1659,8 @@ class MainActivity : Activity() {
     private external fun nativeAlrGpuFboProbe(): String
 
     private external fun nativeAlrGpuLiveProbe(): String
+
+    private external fun nativeJitWxProbe(): String
 
     private external fun nativeAlrGpuScreenCube(surface: android.view.Surface, frames: Int): String
 
