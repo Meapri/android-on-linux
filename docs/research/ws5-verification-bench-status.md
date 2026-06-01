@@ -59,6 +59,7 @@ WS-5는 전 WS 산출물을 **측정**한다. 계약 자체는 제공하지 않�
 | `docs/evidence/CAPTURE-RUNBOOK.md` | 공유 디바이스 안전 캡처 런북 | done |
 | `docs/research/alr-compat-matrix.md` | M4 앱×결과 호환 매트릭스 | seeded (기존 evidence 기반) |
 | `.github/workflows/ws5-host-ci.yml` + `scripts/run-host-tests.sh` | M5 host CI 게이트 (device는 수동) | done |
+| `docs/research/ci-regression-gate.md` | M5 CI 관점 문서 — host-자동(pytest+NDK 4-ABI+zig shim/wire) vs device-수동(§9 단일 디바이스 직렬) + no-regression 기준(GIMP/foot/gtk3demo/CLI/glmark2 RUN 유지 + version-stamp 핀) | done (drain#9 반영) |
 | `bench/display_verify.py` | CP-1 device-exact 디스플레이 검증 (1200×1920@90Hz) | **device-VERIFIED** — 통합 빌드의 `display: 1920x1200 @ 90000mHz density=213` 마커로 해상도+90Hz refresh 둘 다 검증 (`docs/evidence/2026-06-01-ws5-cp1-display-verified.md`); 더 이상 host-only/unverified 아님 |
 | `bench/report_parse.py` 일반화 | 제네릭 `ALR X: status` 마커 맵 + `wl_output` 파싱 (future-proof) | host-done, 테스트됨 |
 | `docs/research/ws5-premerge-gate.md` + `scripts/ws5-premerge-check.sh` | §5 게이트 기준 (통합 세션 pre-merge 게이트, CP별) | done |
