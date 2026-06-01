@@ -203,13 +203,13 @@ ALR 디바이스는 **단 하나**(SM-X236N, `R5KL20B6S3X`). 5세션이 동시�
 
 **각 세션은 여기서 자기 다음 일감을 읽는다** — 킥오프 프롬프트엔 일감을 넣지 않는다(이 §10이 SSOT; 머리말의 "plan을 읽어라"가 이리로 보낸다). 완료분은 `ws-N` push만, device 검증은 `DEVICE-REQ` 마커(§6.5).
 
-- **WS-1 (CPU/loader/통합) — CP-1✓ M2✓ CP-2-infra✓ CP-4✓(drain#5):** 다음 = (a) **native(adb shell)+PRoot baseline 측정**(WS-5 CP-3 % ratio 블로커), (b) device 큐 직렬 drain + 단일 게이트 merge(§6.5/§9), (c) §9/§10 통제.
-- **WS-2 (GPU, 크리티컬 패스) — ring-hook✓ GLES ops✓ VK-M1 host✓; glmark2 launch wiring은 통합 세션이 완료:** 다음 = **shim EGL/GLES 완성**(`eglChooseConfig`가 ≥1 config → `eglCreateWindowSurface`(wl_egl_window) → `eglMakeCurrent` → GLES를 ring으로 → host Mali replay). glmark2-es2가 Mali Score 낼 때까지 = **CP-2 최종**. **build-shim.sh 영속화 필수**: zig target `aarch64-linux-gnu.2.34` + `-lpthread` 제거(현재 /tmp 재빌드만; 누락 시 libGLESv2가 `libpthread.so.0` NEEDED → rootfs에 없어 EGL dlopen이 깨짐 = drain#2 재발).
-- **WS-3 (compositor) — M1 90Hz✓ PresentSource✓ CP-4 dmabuf present✓(drain#5):** 다음 = M3 멀티윈도우 present, M4 입력/keymap 완성.
-- **WS-4 (rootfs) — guard✓ stage-tar✓ xkb-data✓ SDL2 proof✓:** 다음 = (a) **`locales-all`(C.UTF-8) + babl/gegl `.so`**(gimp/gtk3 SIGABRT 잔여 → GUI 완전 안정), (b) toolkit 매트릭스(qt6-wayland/netsurf stage), (c) apt/dpkg.
-- **WS-5 (verify/bench) — harness(398)✓ CP-1 verified✓ compat-matrix 착수✓:** 다음 = (a) WS-1 native/PRoot baseline 받아 **CP-3 % overhead ratio 완성**, (b) CP-2/CP-4 device evidence 파싱, (c) `alr-compat-matrix` 채우기.
+- **WS-1 (CPU/loader/통합) — CP-1✓ CP-3✓(microbench A/B: compute 0%=native, syscall ~12%=seccomp 디스패치 본질) gtk3-GUI-fix✓(GDK_PIXBUF rootfs-absolute) PCGATE-슬림✓(효과~0):** 다음 = (a) locale `LOCPATH` rootfs-absolute(ws-4 handoff; locale-archive는 이미 rewrite됨), (b) device 큐 직렬 drain + 단일 게이트(§6.5/§9), (c) §9/§10 통제. PRoot baseline은 app-private rootfs SELinux로 보류.
+- **WS-2 (GPU, ★유일 크리티컬 패스) — CP-2 software=false + GL context + config(STENCIL=0)✓ device-달성:** 다음 = **glmark2 build scene이 Score>0** — shim glClear/glDraw*/eglSwapBuffers를 ring으로 → host AHB-FBO 렌더 → present로 frame advance. (현재 GL_RENDERER 뜨고 eglMakeCurrent까지 OK인데 frames 미advance·Score 0.) = **CP-2 최종 = GPU 풀가속 마지막 관문**.
+- **WS-3 (compositor) — M1 90Hz✓ PresentSource✓ CP-4 dmabuf present✓ M3/M4 입력 다수✓(subsurface/scroll/modifiers/keyboard-nav/popup-gravity/pointer-leave):** 다음 = M4 멀티윈도우 present 마무리 + 입력 device 검증(C.UTF-8 GUI 안정돼 검증 가능).
+- **WS-4 (rootfs) — .so-x-bit✓ C.UTF-8(noble)✓ SVG-loader✓ toolkit-noble(qt6/netsurf)✓:** 다음 = (a) passwd/nss(`getpwuid` uid 10326 매핑), (b) babl/gegl `.so`(gimp 모듈), (c) qt6/netsurf device 검증.
+- **WS-5 (verify/bench) — CP-1✓ CP-3✓(microbench A/B) CP-4✓ + gtk3-GUI evidence:** 다음 = (a) **CP-2 glmark2 Score 파싱**(WS-2 draw/present 후), (b) compat-matrix(gtk3demo 2213f/foot/gtk3-widget-factory RAN/gimp), (c) CP-3 ratio 문서화.
 
-GUI SIGSEGV(keymap)는 해결됨(WS-1 `XKB_CONFIG_ROOT` v127 + WS-4 xkb-data); 잔여 SIGABRT(locale/gegl)는 WS-4 (a). **크리티컬 패스 = WS-2 shim EGL config**(GPU 풀가속 증명의 마지막 관문).
+GUI 안정화 완료: keymap SIGSEGV(XKB_CONFIG_ROOT) + locale SIGABRT(C.UTF-8) + SVG SIGABRT(.so x-bit + GDK_PIXBUF) 전부 device-해소 → gtk3demo/foot/gtk3-widget-factory GUI 실행. **남은 단 하나의 크리티컬 패스 = WS-2 glmark2 draw/present(Score>0)** — CPU/display/present/GUI는 native급 device-증명 완료.
 
 ## 부록 — 현재 미커밋 작업(이 플랜 직전)
 v126: chromium overlay 비활성화(harfbuzz 회귀 수정), 해상도/주사율 device-exact plumb(MainActivity+JNI+compositor timerfd), `alarm` 25s(검증용), foot/gtk3-widget-factory launch wiring. → CP-1로 흡수. (device 검증 finalizing.)
