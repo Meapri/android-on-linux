@@ -1104,16 +1104,34 @@ void glGetIntegerv(GLenum pname, GLint *params) {
     }
 }
 
+/* glGetString passthrough: the host executor reads its REAL glGetString(GL_RENDERER/
+ * VENDOR/VERSION) on its Mali context and publishes them into the ring header's identity
+ * block (ring_set_identity). Here we read those back so a GLES guest sees the actual host
+ * GPU (e.g. "Mali-G615") instead of a placeholder. The pointer aliases the shared mapping
+ * and is stable for the ring's lifetime, so we can return it directly (no copy/cache).
+ *
+ * NEVER hardcode a vendor: alr_ring_identity returns NULL until the host has filled the
+ * block (identity_ready), or when running ring-less (host_GPU absent / smoke run), in
+ * which case we GRACEFULLY FALL BACK to the original vendor-neutral synthetic strings —
+ * so a non-Mali host is reported truthfully and a host-less shim still answers sanely. */
 const GLubyte *glGetString(GLenum name) {
+    AlrShimState *s = alr_shim();
+    const char *host;
     switch (name) {
-        case GL_VENDOR:                   return (const GLubyte*)"Android-on-Linux (ALR)";
-        /* GL_RENDERER is vendor-NEUTRAL on purpose: the real draws run on whatever
-         * vendor GPU driver the host reaches via NDK libEGL/libGLESv2 (Mali, Adreno,
-         * Xclipse, ...). Never hardcode a vendor here — it would be a lie on non-Mali
-         * devices and could trip apps that branch on the renderer string. TODO: a ring
-         * handshake can pass the host's actual GL_RENDERER through to the guest. */
-        case GL_RENDERER:                 return (const GLubyte*)"ALR command-stream (host GPU passthrough)";
-        case GL_VERSION:                  return (const GLubyte*)"OpenGL ES 2.0 ALR";
+        case GL_VENDOR:
+            host = alr_ring_identity(&s->ring, ALR_IDENT_VENDOR);
+            return host ? (const GLubyte*)host : (const GLubyte*)"Android-on-Linux (ALR)";
+        /* GL_RENDERER is vendor-NEUTRAL in the fallback ON PURPOSE: the real draws run on
+         * whatever vendor GPU driver the host reaches via NDK libEGL/libGLESv2 (Mali,
+         * Adreno, Xclipse, ...). The passthrough above forwards the host's ACTUAL renderer
+         * when known; the synthetic string is only the host-unknown fallback. */
+        case GL_RENDERER:
+            host = alr_ring_identity(&s->ring, ALR_IDENT_RENDERER);
+            return host ? (const GLubyte*)host
+                        : (const GLubyte*)"ALR command-stream (host GPU passthrough)";
+        case GL_VERSION:
+            host = alr_ring_identity(&s->ring, ALR_IDENT_VERSION);
+            return host ? (const GLubyte*)host : (const GLubyte*)"OpenGL ES 2.0 ALR";
         case GL_SHADING_LANGUAGE_VERSION: return (const GLubyte*)"OpenGL ES GLSL ES 1.00";
         case GL_EXTENSIONS:               return (const GLubyte*)"";
         default:                          return (const GLubyte*)"";

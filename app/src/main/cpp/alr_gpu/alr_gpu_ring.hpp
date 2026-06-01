@@ -29,9 +29,23 @@
 
 namespace alr::gpu {
 
+// Max bytes (incl. NUL) for each renderer/vendor/version identity string carried in
+// the header. The host writes its REAL glGetString() values here once at startup; the
+// guest shim reads them so a GLES guest's glGetString(GL_RENDERER/VENDOR/VERSION)
+// reports the actual host GPU (e.g. "Mali-G615") rather than a synthetic placeholder.
+// MUST match alr_gpu_ring_c.h's ALR_RING_IDENT_MAX (the guest reads this same field).
+inline constexpr uint32_t kRingIdentMax = 64u;
+
 // Shared-region header. Lives at offset 0 of the mapping; the data ring follows.
 // All cursors are MONOTONIC absolute byte counts (never wrapped); the ring index
 // is cursor % ring_bytes. 64-bit cursors never realistically overflow.
+//
+// The first 48 bytes (magic .. pad2) are the ORIGINAL hot-path layout and MUST stay
+// byte-identical to alr_gpu_ring_c.h's AlrRingHeader. The identity block below is an
+// APPEND-ONLY extension: it lives between pad2 and the data ring (which starts at
+// sizeof(RingHeader) on BOTH sides, so growing the struct identically on both keeps
+// the data ring placement consistent). The guest only reads it after identity_ready
+// != 0, so an old host that never sets it leaves the guest on its synthetic fallback.
 struct RingHeader {
     static constexpr uint32_t kMagic = 0x47524C41u;  // 'ALRG' little-endian
     static constexpr uint32_t kVersion = 1u;
@@ -46,7 +60,51 @@ struct RingHeader {
     std::atomic<uint32_t> req_seq{0};    // producer bumps when it flushes a sync request
     std::atomic<uint32_t> closed{0};     // 1 = producer gone / teardown
     std::atomic<uint32_t> pad2{0};
+    // ---- identity block (off 48): host->guest glGetString passthrough ----
+    std::atomic<uint32_t> identity_ready{0};  // host sets 1 (release) AFTER the strings are filled
+    uint32_t identity_pad = 0;                // keep the char arrays 8-byte aligned
+    char renderer[kRingIdentMax] = {0};       // host glGetString(GL_RENDERER), NUL-terminated
+    char vendor[kRingIdentMax] = {0};         // host glGetString(GL_VENDOR)
+    char gl_version[kRingIdentMax] = {0};     // host glGetString(GL_VERSION)
 };
+
+// Layout lock: the hot-path fields must keep their original offsets (the C producer
+// in alr_gpu_ring_c.h mirrors them byte-for-byte), and the identity block must sit at
+// the documented offsets so the C side reads the same bytes the host wrote.
+static_assert(offsetof(RingHeader, head) == 16, "head@16");
+static_assert(offsetof(RingHeader, tail) == 24, "tail@24");
+static_assert(offsetof(RingHeader, reply_seq) == 32, "reply_seq@32");
+static_assert(offsetof(RingHeader, req_seq) == 36, "req_seq@36");
+static_assert(offsetof(RingHeader, closed) == 40, "closed@40");
+static_assert(offsetof(RingHeader, pad2) == 44, "pad2@44");
+static_assert(offsetof(RingHeader, identity_ready) == 48, "identity_ready@48");
+static_assert(offsetof(RingHeader, renderer) == 56, "renderer@56");
+static_assert(offsetof(RingHeader, vendor) == 56 + kRingIdentMax, "vendor follows renderer");
+static_assert(offsetof(RingHeader, gl_version) == 56 + 2 * kRingIdentMax, "gl_version follows vendor");
+static_assert(sizeof(RingHeader) == 56 + 3 * kRingIdentMax, "RingHeader == 248 bytes");
+
+// Fill the header's identity strings (host glGetString values) and publish them with a
+// release store so a guest that observes identity_ready != 0 (acquire) sees fully-written
+// strings. Idempotent and safe to call from the host's GL thread once a context is current.
+// Each string is truncated to kRingIdentMax-1 chars + NUL. A null/empty arg leaves that
+// field empty (the guest then keeps its synthetic fallback for that one).
+inline void ring_set_identity(void* region, const char* renderer,
+                              const char* vendor, const char* version) {
+    if (region == nullptr) return;
+    auto* h = static_cast<RingHeader*>(region);
+    auto copy = [](char* dst, const char* src) {
+        if (src == nullptr) { dst[0] = '\0'; return; }
+        std::size_t n = 0;
+        for (; n < kRingIdentMax - 1 && src[n] != '\0'; ++n) dst[n] = src[n];
+        dst[n] = '\0';
+    };
+    copy(h->renderer, renderer);
+    copy(h->vendor, vendor);
+    copy(h->gl_version, version);
+    // Publish AFTER the strings are written so the guest's acquire-load of identity_ready
+    // implies the bytes are visible.
+    h->identity_ready.store(1u, std::memory_order_release);
+}
 
 // Total bytes a caller must allocate (and zero) for a ring of `ring_bytes` data.
 inline size_t ring_region_size(uint32_t ring_bytes) {
@@ -71,6 +129,13 @@ inline bool ring_init(void* region, uint32_t ring_bytes) {
     h->req_seq.store(0, std::memory_order_relaxed);
     h->closed.store(0, std::memory_order_relaxed);
     h->pad2.store(0, std::memory_order_relaxed);
+    // Identity not yet known (the host fills it from glGetString once a GL context is
+    // current via ring_set_identity); the guest stays on its synthetic fallback until then.
+    h->identity_ready.store(0, std::memory_order_relaxed);
+    h->identity_pad = 0;
+    h->renderer[0] = '\0';
+    h->vendor[0] = '\0';
+    h->gl_version[0] = '\0';
     return true;
 }
 
