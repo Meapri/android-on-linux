@@ -122,6 +122,13 @@ struct SurfaceState {
     int32_t gpu_w = 0;
     int32_t gpu_h = 0;
     uint64_t gpu_serial = 0;
+    // M3 P0-4: wl_subsurface — a child surface composited at an offset within its
+    // parent (GTK menus/tooltips). Tracked by parent KEY (never deref a parent
+    // resource). sub_x/sub_y are the set_position offset relative to the parent.
+    bool is_subsurface = false;
+    uint64_t sub_parent_key = 0;
+    int32_t sub_x = 0;
+    int32_t sub_y = 0;
 };
 
 }  // namespace
@@ -750,6 +757,29 @@ void present_composited() {
         ps.z = z++;
         snap.push_back(ps);
 
+        // P0-4: composite subsurfaces parented to this toplevel, above it, at their
+        // set_position offset (GTK menus/tooltips). Same shape as the popup loop;
+        // matched by parent KEY, never by dereferencing a parent resource.
+        for (SurfaceState* su : g_all_surfaces) {
+            if (!su || su == s) continue;
+            if (!su->is_subsurface || !su->mapped || su->pixels.empty()) continue;
+            if (su->sub_parent_key != s->key) continue;
+            if (su->buf_w <= 0 || su->buf_h <= 0) continue;
+            PresentSurface sq;
+            sq.pixels = su->pixels.data();
+            sq.width = su->buf_w;
+            sq.height = su->buf_h;
+            int32_t sx = r.x + su->sub_x;
+            int32_t sy = r.y + su->sub_y;
+            if (sx < 0) sx = 0;
+            if (sy < 0) sy = 0;
+            sq.dst_x = sx; sq.dst_y = sy; sq.dst_w = su->buf_w; sq.dst_h = su->buf_h;
+            sq.surface_key = su->key;
+            sq.content_serial = su->content_serial;
+            sq.z = z++;
+            snap.push_back(sq);
+        }
+
         // Append popups anchored to this toplevel, on top of it, at their offset.
         for (SurfaceState* pp : g_all_surfaces) {
             if (!pp || pp == s) continue;  // defensive: skip stray entries / self
@@ -1315,7 +1345,11 @@ const struct wl_output_interface kOutputImpl = {output_release};
 // global to exist; actual subsurface compositing (stacking the child quads) is
 // a later stage. These requests are accepted so GTK initializes cleanly.
 void subsurface_destroy(struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); }
-void subsurface_set_position(struct wl_client*, struct wl_resource*, int32_t, int32_t) {}
+void subsurface_set_position(struct wl_client*, struct wl_resource* res,
+                             int32_t x, int32_t y) {
+    auto* s = static_cast<SurfaceState*>(wl_resource_get_user_data(res));
+    if (s) { s->sub_x = x; s->sub_y = y; }
+}
 void subsurface_place_above(struct wl_client*, struct wl_resource*, struct wl_resource*) {}
 void subsurface_place_below(struct wl_client*, struct wl_resource*, struct wl_resource*) {}
 void subsurface_set_sync(struct wl_client*, struct wl_resource*) {}
@@ -1326,16 +1360,29 @@ const struct wl_subsurface_interface kSubsurfaceImpl = {
 
 void subcompositor_destroy(struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); }
 void subcompositor_get_subsurface(struct wl_client* client, struct wl_resource* resource,
-                                  uint32_t id, struct wl_resource* /*surface*/,
-                                  struct wl_resource* /*parent*/) {
+                                  uint32_t id, struct wl_resource* surface,
+                                  struct wl_resource* parent) {
     struct wl_resource* sub = wl_resource_create(
         client, &wl_subsurface_interface, wl_resource_get_version(resource), id);
     if (!sub) {
         wl_client_post_no_memory(client);
         return;
     }
-    wl_resource_set_implementation(sub, &kSubsurfaceImpl, nullptr, nullptr);
-    ALR_WL_LOGI("wl_subcompositor.get_subsurface id=%u", id);
+    // P0-4: link the child surface to its parent by KEY so present_composited can
+    // composite it at its offset. The subsurface resource's user_data = the child
+    // SurfaceState (so set_position resolves it). Never store/deref the parent
+    // resource later — match by key/value (UAF discipline).
+    auto* child = surface ? static_cast<SurfaceState*>(wl_resource_get_user_data(surface))
+                          : nullptr;
+    auto* par = parent ? static_cast<SurfaceState*>(wl_resource_get_user_data(parent))
+                       : nullptr;
+    if (child) {
+        child->is_subsurface = true;
+        child->sub_parent_key = par ? par->key : 0;
+    }
+    wl_resource_set_implementation(sub, &kSubsurfaceImpl, child, nullptr);
+    ALR_WL_LOGI("wl_subcompositor.get_subsurface id=%u parent_key=%llu", id,
+                static_cast<unsigned long long>(par ? par->key : 0));
 }
 const struct wl_subcompositor_interface kSubcompositorImpl = {
     subcompositor_destroy, subcompositor_get_subsurface};
