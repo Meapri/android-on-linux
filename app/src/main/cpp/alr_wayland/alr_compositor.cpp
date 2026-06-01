@@ -122,6 +122,13 @@ struct SurfaceState {
     int32_t gpu_w = 0;
     int32_t gpu_h = 0;
     uint64_t gpu_serial = 0;
+    // M3 P0-4: wl_subsurface — a child surface composited at an offset within its
+    // parent (GTK menus/tooltips). Tracked by parent KEY (never deref a parent
+    // resource). sub_x/sub_y are the set_position offset relative to the parent.
+    bool is_subsurface = false;
+    uint64_t sub_parent_key = 0;
+    int32_t sub_x = 0;
+    int32_t sub_y = 0;
 };
 
 }  // namespace
@@ -271,6 +278,23 @@ std::vector<InjectEvent> g_inject_queue;  // guarded by g_inject_mutex
 struct GpuSubmit { void* ahb = nullptr; int32_t w = 0, h = 0; uint64_t serial = 0; };
 std::mutex g_gpu_mutex;
 std::vector<GpuSubmit> g_gpu_queue;  // guarded by g_gpu_mutex
+
+// M4: real-modifier state derived from injected key events so wl_keyboard.modifiers
+// tells the client which mods are held (Shift/Ctrl/Alt/Super/AltGr) + Caps lock —
+// without it, modified keys never register on the client. Bit positions = the US
+// pc105 xkb default real-modifier indices (matching the keymap the compositor sends).
+uint32_t g_mods_depressed = 0;  // momentary mods currently held
+uint32_t g_mods_locked = 0;     // locking mods (CapsLock)
+inline uint32_t evdev_to_mod_bit(uint32_t code) {
+    switch (code) {
+        case 42: case 54:   return 1u << 0;  // KEY_LEFT/RIGHTSHIFT -> Shift
+        case 29: case 97:   return 1u << 2;  // KEY_LEFT/RIGHTCTRL  -> Control
+        case 56:            return 1u << 3;  // KEY_LEFTALT         -> Mod1
+        case 100:           return 1u << 7;  // KEY_RIGHTALT (AltGr)-> Mod5
+        case 125: case 126: return 1u << 6;  // KEY_LEFT/RIGHTMETA  -> Mod4
+        default:            return 0;
+    }
+}
 std::vector<struct wl_resource*> g_pointers;
 std::vector<struct wl_resource*> g_keyboards;
 std::vector<struct wl_resource*> g_touches;
@@ -732,6 +756,29 @@ void present_composited() {
         ps.content_serial = s->content_serial;
         ps.z = z++;
         snap.push_back(ps);
+
+        // P0-4: composite subsurfaces parented to this toplevel, above it, at their
+        // set_position offset (GTK menus/tooltips). Same shape as the popup loop;
+        // matched by parent KEY, never by dereferencing a parent resource.
+        for (SurfaceState* su : g_all_surfaces) {
+            if (!su || su == s) continue;
+            if (!su->is_subsurface || !su->mapped || su->pixels.empty()) continue;
+            if (su->sub_parent_key != s->key) continue;
+            if (su->buf_w <= 0 || su->buf_h <= 0) continue;
+            PresentSurface sq;
+            sq.pixels = su->pixels.data();
+            sq.width = su->buf_w;
+            sq.height = su->buf_h;
+            int32_t sx = r.x + su->sub_x;
+            int32_t sy = r.y + su->sub_y;
+            if (sx < 0) sx = 0;
+            if (sy < 0) sy = 0;
+            sq.dst_x = sx; sq.dst_y = sy; sq.dst_w = su->buf_w; sq.dst_h = su->buf_h;
+            sq.surface_key = su->key;
+            sq.content_serial = su->content_serial;
+            sq.z = z++;
+            snap.push_back(sq);
+        }
 
         // Append popups anchored to this toplevel, on top of it, at their offset.
         for (SurfaceState* pp : g_all_surfaces) {
@@ -1298,7 +1345,11 @@ const struct wl_output_interface kOutputImpl = {output_release};
 // global to exist; actual subsurface compositing (stacking the child quads) is
 // a later stage. These requests are accepted so GTK initializes cleanly.
 void subsurface_destroy(struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); }
-void subsurface_set_position(struct wl_client*, struct wl_resource*, int32_t, int32_t) {}
+void subsurface_set_position(struct wl_client*, struct wl_resource* res,
+                             int32_t x, int32_t y) {
+    auto* s = static_cast<SurfaceState*>(wl_resource_get_user_data(res));
+    if (s) { s->sub_x = x; s->sub_y = y; }
+}
 void subsurface_place_above(struct wl_client*, struct wl_resource*, struct wl_resource*) {}
 void subsurface_place_below(struct wl_client*, struct wl_resource*, struct wl_resource*) {}
 void subsurface_set_sync(struct wl_client*, struct wl_resource*) {}
@@ -1309,16 +1360,29 @@ const struct wl_subsurface_interface kSubsurfaceImpl = {
 
 void subcompositor_destroy(struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); }
 void subcompositor_get_subsurface(struct wl_client* client, struct wl_resource* resource,
-                                  uint32_t id, struct wl_resource* /*surface*/,
-                                  struct wl_resource* /*parent*/) {
+                                  uint32_t id, struct wl_resource* surface,
+                                  struct wl_resource* parent) {
     struct wl_resource* sub = wl_resource_create(
         client, &wl_subsurface_interface, wl_resource_get_version(resource), id);
     if (!sub) {
         wl_client_post_no_memory(client);
         return;
     }
-    wl_resource_set_implementation(sub, &kSubsurfaceImpl, nullptr, nullptr);
-    ALR_WL_LOGI("wl_subcompositor.get_subsurface id=%u", id);
+    // P0-4: link the child surface to its parent by KEY so present_composited can
+    // composite it at its offset. The subsurface resource's user_data = the child
+    // SurfaceState (so set_position resolves it). Never store/deref the parent
+    // resource later — match by key/value (UAF discipline).
+    auto* child = surface ? static_cast<SurfaceState*>(wl_resource_get_user_data(surface))
+                          : nullptr;
+    auto* par = parent ? static_cast<SurfaceState*>(wl_resource_get_user_data(parent))
+                       : nullptr;
+    if (child) {
+        child->is_subsurface = true;
+        child->sub_parent_key = par ? par->key : 0;
+    }
+    wl_resource_set_implementation(sub, &kSubsurfaceImpl, child, nullptr);
+    ALR_WL_LOGI("wl_subcompositor.get_subsurface id=%u parent_key=%llu", id,
+                static_cast<unsigned long long>(par ? par->key : 0));
 }
 const struct wl_subcompositor_interface kSubcompositorImpl = {
     subcompositor_destroy, subcompositor_get_subsurface};
@@ -1692,6 +1756,19 @@ void Compositor::drain_input_queue() {
             break;
         case InjectKind::Key: {
             if (!g_focus_surface) break;
+            // M4: update real-modifier state so the client's xkb_state matches and
+            // Shift/Ctrl/Alt apply to the keys that follow.
+            const uint32_t mbit = evdev_to_mod_bit(e.button);
+            bool mods_changed = false;
+            if (mbit) {
+                const uint32_t before = g_mods_depressed;
+                if (e.state) g_mods_depressed |= mbit; else g_mods_depressed &= ~mbit;
+                mods_changed = (g_mods_depressed != before);
+            }
+            if (e.button == 58 /*KEY_CAPSLOCK*/ && e.state) {
+                g_mods_locked ^= (1u << 1);  // Lock
+                mods_changed = true;
+            }
             for (auto* k : g_keyboards) {
                 if (!g_keyboard_entered) {
                     struct wl_array keys;
@@ -1699,11 +1776,18 @@ void Compositor::drain_input_queue() {
                     wl_keyboard_send_enter(k, wl_display_next_serial(display_),
                                            g_focus_surface, &keys);
                     wl_array_release(&keys);
+                    // Initial modifier state for the newly-focused surface.
+                    wl_keyboard_send_modifiers(k, wl_display_next_serial(display_),
+                                               g_mods_depressed, 0, g_mods_locked, 0);
                 }
                 // e.button carries the evdev keycode directly.
                 wl_keyboard_send_key(k, wl_display_next_serial(display_), e.time_ms,
                     e.button, e.state ? WL_KEYBOARD_KEY_STATE_PRESSED
                                       : WL_KEYBOARD_KEY_STATE_RELEASED);
+                if (mods_changed) {
+                    wl_keyboard_send_modifiers(k, wl_display_next_serial(display_),
+                                               g_mods_depressed, 0, g_mods_locked, 0);
+                }
             }
             g_keyboard_entered = true;
             break;
