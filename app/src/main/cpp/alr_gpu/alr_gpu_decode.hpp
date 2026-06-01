@@ -45,7 +45,24 @@ void glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei inst
 void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void* indices,
                              GLsizei instancecount);
 void glVertexAttribDivisor(GLuint index, GLuint divisor);
+// GLES3 core: UBO binding, sampler objects, MRT / read-buffer / FBO invalidation.
+void glBindBufferBase(GLenum target, GLuint index, GLuint buffer);
+void glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offset,
+                       GLsizeiptr size);
+GLuint glGetUniformBlockIndex(GLuint program, const GLchar* uniformBlockName);
+void glUniformBlockBinding(GLuint program, GLuint uniformBlockIndex, GLuint uniformBlockBinding);
+void glGenSamplers(GLsizei count, GLuint* samplers);
+void glBindSampler(GLuint unit, GLuint sampler);
+void glSamplerParameteri(GLuint sampler, GLenum pname, GLint param);
+void glDrawBuffers(GLsizei n, const GLenum* bufs);
+void glReadBuffer(GLenum src);
+void glInvalidateFramebuffer(GLenum target, GLsizei numAttachments, const GLenum* attachments);
 }
+
+// GL_INVALID_INDEX (returned by glGetUniformBlockIndex for an absent block).
+#ifndef GL_INVALID_INDEX
+#define GL_INVALID_INDEX 0xFFFFFFFFu
+#endif
 
 namespace alr::gpu {
 
@@ -147,6 +164,19 @@ enum Op : uint8_t {
     OP_POLYGON_OFFSET = 126,         // f32 factor, f32 units
     OP_LINE_WIDTH = 127,             // f32 width
     OP_SAMPLE_COVERAGE = 128,        // f32 value, u8 invert
+    // --- GLES3 core: UBO binding, sampler objects, MRT / read-buffer / FBO invalidation.
+    //     Replayed on the GLES3 context GpuExecutorService requests (Mali-G615 = ES3.2).
+    //     UBOs reuse the virtual buffer ids; samplers get their own virtual ids (like VAOs);
+    //     uniform-block ops carry the block NAME (host resolves the real index by name). ---
+    OP_BIND_BUFFER_BASE = 130,       // u32 target, u32 index, u32 vbuf_id
+    OP_BIND_BUFFER_RANGE = 131,      // u32 target, u32 index, u32 vbuf_id, u32 offset, u32 size
+    OP_UNIFORM_BLOCK_BINDING = 132,  // u32 vprog, blob(block_name), u32 binding
+    OP_GEN_SAMPLER = 133,            // u32 vsampler_id
+    OP_BIND_SAMPLER = 134,           // u32 unit, u32 vsampler_id (0 -> none)
+    OP_SAMPLER_PARAMETERI = 135,     // u32 vsampler_id, u32 pname, i32 param
+    OP_DRAW_BUFFERS = 136,           // u32 n, u32 bufs[n]
+    OP_READ_BUFFER = 137,            // u32 mode
+    OP_INVALIDATE_FRAMEBUFFER = 138, // u32 target, u32 n, u32 attachments[n]
 };
 
 // Host-side decode state: the virtual->real GL name translation tables. The guest
@@ -159,6 +189,7 @@ struct HostState {
     std::map<uint32_t, GLuint> framebuffers;   // vfb_id -> real FBO
     std::map<uint32_t, GLuint> renderbuffers;  // vrb_id -> real RBO
     std::map<uint32_t, GLuint> vertex_arrays;  // vva_id -> real VAO (GLES3)
+    std::map<uint32_t, GLuint> samplers;       // vsampler_id -> real sampler object (GLES3)
     GLuint cur_program = 0;               // real program currently in use (for uniforms)
     // The guest's framebuffer 0 is its "default" target. In this marshalling executor
     // the default target is the AHB-backed FBO, NOT GL's window framebuffer 0 — so the
@@ -190,6 +221,15 @@ struct HostState {
         if (v == 0) return 0;
         auto it = vertex_arrays.find(v);
         return it == vertex_arrays.end() ? 0 : it->second;
+    }
+    GLuint real_sampler(uint32_t v) const {       // vsampler 0 -> "no sampler" (real 0)
+        if (v == 0) return 0;
+        auto it = samplers.find(v);
+        return it == samplers.end() ? 0 : it->second;
+    }
+    GLuint real_buf(uint32_t v) const {           // UBO binding resolves the virtual buffer id
+        auto it = buffers.find(v);
+        return it == buffers.end() ? 0 : it->second;
     }
 };
 
@@ -708,6 +748,71 @@ inline bool decode_batch(const uint8_t* data, size_t len, HostState& st) {
                 float v; uint8_t inv;
                 if (!r.f32(v) || !r.u8(inv)) { st.ok = false; break; }
                 glSampleCoverage(v, inv ? GL_TRUE : GL_FALSE); ++st.decoded; break;
+            }
+            // ---- GLES3 core: UBO binding, sampler objects, MRT / read-buffer / invalidate ----
+            case OP_BIND_BUFFER_BASE: {
+                uint32_t target, index, vid;
+                if (!r.u32(target) || !r.u32(index) || !r.u32(vid)) { st.ok = false; break; }
+                glBindBufferBase(target, index, st.real_buf(vid)); ++st.decoded; break;
+            }
+            case OP_BIND_BUFFER_RANGE: {
+                uint32_t target, index, vid, offset, size;
+                if (!r.u32(target) || !r.u32(index) || !r.u32(vid) ||
+                    !r.u32(offset) || !r.u32(size)) { st.ok = false; break; }
+                glBindBufferRange(target, index, st.real_buf(vid),
+                                  static_cast<GLintptr>(offset), static_cast<GLsizeiptr>(size));
+                ++st.decoded; break;
+            }
+            case OP_UNIFORM_BLOCK_BINDING: {
+                uint32_t vp, nlen, binding; const uint8_t* name;
+                if (!r.u32(vp)) { st.ok = false; break; }
+                if (!r.blob(name, nlen)) { st.ok = false; break; }
+                if (!r.u32(binding)) { st.ok = false; break; }
+                std::string nm(reinterpret_cast<const char*>(name), nlen);
+                // Resolve the real block index BY NAME (no guest round-trip), mirroring the
+                // uniform/attribute path. GL_INVALID_INDEX (absent block) is a silent no-op.
+                GLuint idx = glGetUniformBlockIndex(st.real_prog(vp), nm.c_str());
+                if (idx != GL_INVALID_INDEX)
+                    glUniformBlockBinding(st.real_prog(vp), idx, binding);
+                ++st.decoded; break;
+            }
+            case OP_GEN_SAMPLER: {
+                uint32_t vid; if (!r.u32(vid)) { st.ok = false; break; }
+                GLuint s = 0; glGenSamplers(1, &s); st.samplers[vid] = s; ++st.decoded; break;
+            }
+            case OP_BIND_SAMPLER: {
+                uint32_t unit, vid;
+                if (!r.u32(unit) || !r.u32(vid)) { st.ok = false; break; }
+                glBindSampler(unit, st.real_sampler(vid)); ++st.decoded; break;
+            }
+            case OP_SAMPLER_PARAMETERI: {
+                uint32_t vid, pname; int32_t param;
+                if (!r.u32(vid) || !r.u32(pname) || !r.i32(param)) { st.ok = false; break; }
+                glSamplerParameteri(st.real_sampler(vid), pname, param); ++st.decoded; break;
+            }
+            case OP_DRAW_BUFFERS: {
+                uint32_t n; if (!r.u32(n)) { st.ok = false; break; }
+                std::vector<GLenum> bufs(n);
+                bool rok = true;
+                for (uint32_t i = 0; i < n; ++i) { uint32_t b; if (!r.u32(b)) { rok = false; break; } bufs[i] = b; }
+                if (!rok) { st.ok = false; break; }
+                glDrawBuffers(static_cast<GLsizei>(n), bufs.empty() ? nullptr : bufs.data());
+                ++st.decoded; break;
+            }
+            case OP_READ_BUFFER: {
+                uint32_t mode; if (!r.u32(mode)) { st.ok = false; break; }
+                glReadBuffer(mode); ++st.decoded; break;
+            }
+            case OP_INVALIDATE_FRAMEBUFFER: {
+                uint32_t target, n;
+                if (!r.u32(target) || !r.u32(n)) { st.ok = false; break; }
+                std::vector<GLenum> att(n);
+                bool rok = true;
+                for (uint32_t i = 0; i < n; ++i) { uint32_t a; if (!r.u32(a)) { rok = false; break; } att[i] = a; }
+                if (!rok) { st.ok = false; break; }
+                glInvalidateFramebuffer(target, static_cast<GLsizei>(n),
+                                        att.empty() ? nullptr : att.data());
+                ++st.decoded; break;
             }
             default:
                 st.ok = false; break;  // unknown opcode -> fail-stop (fail-safe)

@@ -83,6 +83,7 @@ typedef struct AlrShimState {
     uint32_t        next_framebuffer;
     uint32_t        next_renderbuffer;
     uint32_t        next_vertex_array;
+    uint32_t        next_sampler;       /* GLES3 sampler objects (glGenSamplers) */
 
     /* per-shader source-length cache (backs glGetShaderiv(GL_SHADER_SOURCE_LENGTH)) */
     AlrShaderInfo   shaders[ALR_SHIM_MAX_SHADERS];

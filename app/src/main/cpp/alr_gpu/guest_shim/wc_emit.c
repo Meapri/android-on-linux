@@ -32,6 +32,7 @@ AlrShimState *alr_shim(void) {
         memset(&g_state, 0, sizeof(g_state));
         g_state.next_shader = g_state.next_program = g_state.next_buffer = g_state.next_texture = 1;
         g_state.next_framebuffer = g_state.next_renderbuffer = g_state.next_vertex_array = 1;
+        g_state.next_sampler = 1;
         g_state.gl_error = GL_NO_ERROR;
         g_state.doorbell_fd = -1;
         g_state.ring_ok = 1;            /* pretend attached so emits are captured, not dropped */
@@ -147,6 +148,19 @@ int alr_shim_shader_srclen(uint32_t vshader, uint32_t *out) {
         if (s->shaders[i].vid == vshader) { if (out) *out = s->shaders[i].src_len; return 1; }
     return 0;
 }
+
+/* GLES3 entry-point prototypes the harness drives (the shim exports these, but they
+ * aren't in the GLES2-only alr_khr_gles2.h, so declare them here for the driver). */
+void   glBindBufferBase(GLenum target, GLuint index, GLuint buffer);
+void   glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offset, GLsizeiptr size);
+GLuint glGetUniformBlockIndex(GLuint program, const GLchar *uniformBlockName);
+void   glUniformBlockBinding(GLuint program, GLuint uniformBlockIndex, GLuint uniformBlockBinding);
+void   glGenSamplers(GLsizei count, GLuint *samplers);
+void   glBindSampler(GLuint unit, GLuint sampler);
+void   glSamplerParameteri(GLuint sampler, GLenum pname, GLint param);
+void   glDrawBuffers(GLsizei n, const GLenum *bufs);
+void   glReadBuffer(GLenum src);
+void   glInvalidateFramebuffer(GLenum target, GLsizei numAttachments, const GLenum *attachments);
 
 /* ----- the cube GL sequence (drives the REAL shim entry points) ----- */
 static const char *kVS =
@@ -274,6 +288,32 @@ int main(int argc, char **argv) {
     glVertexAttribDivisor(0, 1);        /* plain index path */
     glVertexAttribDivisor(a_pos, 2);    /* by-name path (a_pos is a packed glGetAttribLocation handle) */
     glBindVertexArray(0);                            /* back to default VAO */
+
+    /* --- GLES3 core: UBO binding + uniform-block-binding by NAME + sampler objects +
+     *     MRT draw-buffers + read-buffer + framebuffer invalidation. UBOs reuse the
+     *     virtual buffer id (a fresh VBO here); the block binding goes through the
+     *     by-name handle scheme (glGetUniformBlockIndex). --- */
+    const GLenum kGL_UNIFORM_BUFFER = 0x8A11;              /* GLES3 token (not in the GLES2 khr header) */
+    GLuint ubo;
+    glGenBuffers(1, &ubo);                                  /* virtual buffer id (3rd buffer) */
+    glBindBuffer(kGL_UNIFORM_BUFFER, ubo);
+    float ublock[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    glBufferData(kGL_UNIFORM_BUFFER, (GLsizeiptr)sizeof(ublock), ublock, GL_DYNAMIC_DRAW);
+    glBindBufferBase(kGL_UNIFORM_BUFFER, 0, ubo);          /* OP_BIND_BUFFER_BASE index 0 */
+    glBindBufferRange(kGL_UNIFORM_BUFFER, 1, ubo, 0, 16);  /* OP_BIND_BUFFER_RANGE off0 size16 */
+    GLuint blk = glGetUniformBlockIndex(prog, "Matrices"); /* client handle (no round-trip) */
+    glUniformBlockBinding(prog, blk, 0);                   /* OP_UNIFORM_BLOCK_BINDING by name */
+
+    GLuint samp;
+    glGenSamplers(1, &samp);                               /* virtual sampler id */
+    glBindSampler(0, samp);                                /* OP_BIND_SAMPLER unit 0 */
+    glSamplerParameteri(samp, GL_TEXTURE_MIN_FILTER, GL_LINEAR); /* OP_SAMPLER_PARAMETERI */
+
+    GLenum draw_bufs[2] = {GL_COLOR_ATTACHMENT0, 0x8CE1 /*COLOR_ATTACHMENT1*/};
+    glDrawBuffers(2, draw_bufs);                           /* OP_DRAW_BUFFERS n=2 */
+    glReadBuffer(GL_COLOR_ATTACHMENT0);                    /* OP_READ_BUFFER */
+    GLenum inv_att[1] = {GL_DEPTH_ATTACHMENT};
+    glInvalidateFramebuffer(GL_FRAMEBUFFER, 1, inv_att);   /* OP_INVALIDATE_FRAMEBUFFER n=1 */
 
     /* --- per-fragment / raster STATE setters (blend/effect/shading/refract/shadow
      *     scenes + GTK4-GL/SDL2). Each is a real fire-and-forget wire op now. The

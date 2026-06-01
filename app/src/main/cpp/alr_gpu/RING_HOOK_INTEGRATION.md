@@ -111,10 +111,25 @@ On-screen needs WS-3's present (see note 2 above). `gpu_ring_frames_presented()`
 The executor now requests a **GLES3 context** (EGL_CONTEXT_CLIENT_VERSION 3, fallback to 2 — Mali-
 G615 is GLES3.2); GLES2 op streams are unaffected (superset). Added GLES3 wire ops: VAOs
 (`glGen/BindVertexArray`, virtual ids, vao 0 = default) + instanced draws
-(`glDrawArrays/ElementsInstanced`). Harness PASS (40 assertions). **DEVICE-REQ for the integration
-session:** confirm the existing GPU probes (`ALR GPU LIVE INTEGRATION: PASS`, `gpu-screen-cube`)
-still pass on the GLES3 context, alongside CP-2 glmark2. `glVertexAttribDivisor` (per-instance
-attribs) is now also landed; deferred (next): UBOs, GLES3 texture formats.
+(`glDrawArrays/ElementsInstanced`) + per-instance attribs (`glVertexAttribDivisor`).
+
+**GLES3 core expansion (latest round):** uniform buffer objects — `glBindBufferBase` /
+`glBindBufferRange` (reuse the existing virtual buffer ids), `glGetUniformBlockIndex` (client-side
+by-NAME handle, NO round-trip) + `glUniformBlockBinding` (host resolves the real block index by
+name at decode, like uniforms/attribs); sampler objects — `glGen/Bind/SamplerParameteri`
+(own virtual ids, like VAOs); MRT/read — `glDrawBuffers`, `glReadBuffer`; FBO discard —
+`glInvalidateFramebuffer`/`SubFramebuffer`. Wire ops 130–138 (proto + decoder + harness in sync).
+Harness PASS (99 decoded ops, all assertions green). **HONEST LIMIT:** `glMapBufferRange`/
+`glUnmapBuffer` return NULL/FALSE (a real mapped pointer needs a host round-trip the design
+forbids) so apps take the `glBufferSubData` fallback; `glGetStringi`(GL_EXTENSIONS) answers empty
+locally (GL_NUM_EXTENSIONS reads 0, so a well-behaved iterator makes no call). These are
+dispatch-surface completeness with correct GL semantics, not silent wrong-pixels.
+
+**DEVICE-REQ for the integration session:** confirm the existing GPU probes (`ALR GPU LIVE
+INTEGRATION: PASS`, `gpu-screen-cube`) still pass on the GLES3 context, alongside CP-2 glmark2;
+the new UBO/sampler/MRT ops are exercised when an ES3 app (or glmark2 ES3 scene) emits them.
+Deferred (next): GLES3 texture formats (`glTexStorage2D`, integer/float internal formats),
+transform feedback (Mali ceiling — see guest-gpu-accel-strategy memory).
 
 ## VK-M1 JNI wiring (drop-in for the integration session — unblocks the VK-M1 device drain)
 
