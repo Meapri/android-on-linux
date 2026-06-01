@@ -43,6 +43,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <sstream>
@@ -717,6 +718,156 @@ inline std::string run_live_integration_probe() {
     out << "\nalr gpu live software renderer=" << (sw ? "true" : "false");
     out << "\nalr gpu live producer ok=" << (prod_ok ? "true" : "false");
     out << "\nalr gpu live error=" << (no_err ? "(none)" : svc.error());
+    return out.str();
+}
+
+// ===========================================================================
+// run_gpu_throughput_probe — "% of native-Mali throughput" for the ALR GPU path.
+//
+// glmark2 is a glibc/Wayland binary and cannot run on bare-Android Mali, so a
+// literal "same glmark2 binary, Mali-direct" baseline is not runnable on-device.
+// The valid on-device comparison is to render the SAME GL op-stream on the SAME
+// Mali two ways and take the ratio (this isolates exactly §0(b) "GPU 측 per-call
+// 마샬링/카피"):
+//   DIRECT : one EGL ctx, decode setup once, then loop the draw-only stream +
+//            glFinish — NO ring, NO executor thread, NO handshake. The raw Mali
+//            ceiling for this op-stream (the native-Mali denominator).
+//   ALR    : the production path — 2-thread ring + GpuExecutorService rendering
+//            into an AHB-FBO, the producer pushing the same draw stream with the
+//            per-frame req_seq/reply_seq handshake (exactly the glmark2 path).
+// ratio = alr_fps / direct_fps. Both paths do setup ONCE then loop DRAW-only on a
+// persistent HostState (mirrors glmark2 / real apps; no per-frame recompile/leak).
+// This is a LIGHT single-draw workload — the overhead-dominated regime that
+// matches glmark2's high-FPS micro-scenes; a GPU-bound (heavy) frame amortizes the
+// fixed per-frame ring/handshake cost toward ratio 1.0.
+// ===========================================================================
+inline std::string run_gpu_throughput_probe() {
+    std::ostringstream out;
+    constexpr int W = 512, H = 512;          // real fill; AHB-safe
+    constexpr int kFrames = 600;             // bounded loop; window ~ kFrames/fps
+    const std::vector<uint8_t> setup_stream = build_triangle_setup_stream();
+    const std::vector<uint8_t> draw_stream  = build_triangle_draw_stream(W, H);
+    using clk = std::chrono::steady_clock;
+    auto secs = [](clk::time_point a, clk::time_point b) {
+        return std::chrono::duration<double>(b - a).count();
+    };
+
+    // ---------- DIRECT: raw-Mali ceiling (no ring), setup once + draw loop ----------
+    double direct_fps = 0.0; int direct_frames = 0;
+    std::string renderer; bool software = true; bool direct_ok = false;
+    {
+        EGLDisplay dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+        if (dpy != EGL_NO_DISPLAY && eglInitialize(dpy, nullptr, nullptr) == EGL_TRUE) {
+            const EGLint cfg_attribs[] = {
+                EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+                EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+                EGL_DEPTH_SIZE, 16, EGL_NONE,
+            };
+            EGLConfig cfg = nullptr; EGLint n = 0;
+            if (eglChooseConfig(dpy, cfg_attribs, &cfg, 1, &n) == EGL_TRUE && n >= 1) {
+                const EGLint pb[] = {EGL_WIDTH, W, EGL_HEIGHT, H, EGL_NONE};
+                EGLSurface surf = eglCreatePbufferSurface(dpy, cfg, pb);
+                const EGLint ctx_attribs[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
+                EGLContext ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, ctx_attribs);
+                if (surf != EGL_NO_SURFACE && ctx != EGL_NO_CONTEXT &&
+                    eglMakeCurrent(dpy, surf, surf, ctx) == EGL_TRUE) {
+                    HostState st;
+                    decode_batch(setup_stream.data(), setup_stream.size(), st);
+                    decode_batch(draw_stream.data(), draw_stream.size(), st);  // warm
+                    glFinish();
+                    std::string vendor;
+                    if (const auto* v = reinterpret_cast<const char*>(glGetString(GL_VENDOR))) vendor = v;
+                    if (const auto* r = reinterpret_cast<const char*>(glGetString(GL_RENDERER))) renderer = r;
+                    software = renderer_software_local(vendor, renderer);
+                    const auto t0 = clk::now();
+                    for (int f = 0; f < kFrames; ++f) {
+                        decode_batch(draw_stream.data(), draw_stream.size(), st);
+                        glFinish();
+                        ++direct_frames;
+                    }
+                    const double el = secs(t0, clk::now());
+                    if (el > 0.0) direct_fps = direct_frames / el;
+                    direct_ok = (direct_frames == kFrames) && !software &&
+                                glGetError() == GL_NO_ERROR;
+                    eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+                }
+                if (ctx != EGL_NO_CONTEXT) eglDestroyContext(dpy, ctx);
+                if (surf != EGL_NO_SURFACE) eglDestroySurface(dpy, surf);
+            }
+            eglTerminate(dpy);
+        }
+    }
+
+    // ---------- ALR: full ring + executor path (the glmark2 pipeline) ----------
+    double alr_fps = 0.0; uint32_t alr_frames = 0; bool alr_ok = false;
+    std::string alr_renderer;
+    {
+        constexpr uint32_t kRingBytes = 1u << 23;  // 8 MiB production default
+        std::vector<uint8_t> region(ring_region_size(kRingBytes), 0u);
+        if (ring_init(region.data(), kRingBytes)) {
+            GpuExecutorService::PresentFn present = [](const AhbRenderTarget&) {};
+            GpuExecutorService svc(region.data(), region.size(), W, H, std::move(present));
+            if (svc.start()) {
+                // Push setup ONCE (frame 0), then loop the draw stream kFrames times.
+                std::atomic<uint32_t> draw_done{0};
+                std::thread producer([&] {
+                    RingProducer prod(region.data());
+                    if (!prod.valid()) return;
+                    auto push = [&](const std::vector<uint8_t>& s) {
+                        size_t off = 0; const auto* base = s.data(); const size_t total = s.size();
+                        while (off < total) {
+                            const uint32_t chunk = static_cast<uint32_t>(
+                                std::min<size_t>(total - off, kRingBytes / 2));
+                            if (prod.append(base + off, chunk)) off += chunk;
+                            else std::this_thread::yield();
+                        }
+                        prod.flush_and_wait(1u << 24);
+                    };
+                    push(setup_stream);                       // frame 0: create objects
+                    for (int f = 0; f < kFrames; ++f) {
+                        push(draw_stream);                    // steady-state draw frames
+                        draw_done.fetch_add(1, std::memory_order_acq_rel);
+                    }
+                    prod.close();
+                });
+                // Wait until the setup frame has been presented, then time the draw frames.
+                // frames_presented counts setup(1) + draws; we time from after setup.
+                while (svc.frames_presented() < 1 && svc.error().empty())
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                const uint32_t base_presented = svc.frames_presented();
+                const auto t0 = clk::now();
+                producer.join();
+                svc.stop();
+                const double el = secs(t0, clk::now());
+                const uint32_t total_presented = svc.frames_presented();
+                alr_frames = (total_presented > base_presented)
+                                 ? (total_presented - base_presented) : 0u;
+                if (el > 0.0) alr_fps = alr_frames / el;
+                alr_renderer = svc.renderer_string();
+                alr_ok = (alr_frames > 0) && !svc.software() && svc.error().empty();
+            } else {
+                svc.stop();
+            }
+        }
+    }
+
+    const double ratio = (direct_fps > 0.0) ? (alr_fps / direct_fps) : 0.0;
+    const long pct = static_cast<long>(ratio * 100.0 + 0.5);
+    const bool pass = direct_ok && alr_ok;
+    out << "ALR GPU THROUGHPUT: " << (pass ? "PASS" : "FAIL");
+    out << "\nalr gpu throughput model=same triangle op-stream on the same Mali; "
+           "setup-once + draw-loop; DIRECT(decode+glFinish, no ring) vs "
+           "ALR(2-thread ring + GpuExecutorService -> AHB-FBO)";
+    out << "\nalr gpu throughput render=" << W << "x" << H << " frames=" << kFrames;
+    out << "\nalr gpu throughput direct_fps=" << static_cast<long>(direct_fps + 0.5)
+        << " frames=" << direct_frames;
+    out << "\nalr gpu throughput alr_fps=" << static_cast<long>(alr_fps + 0.5)
+        << " frames=" << alr_frames;
+    out << "\nalr gpu throughput ratio_alr_over_direct=" << ratio
+        << " (" << pct << "% of native-Mali, light single-draw regime)";
+    out << "\nalr gpu throughput direct renderer=" << renderer
+        << " software=" << (software ? "true" : "false");
+    out << "\nalr gpu throughput alr renderer=" << alr_renderer;
     return out.str();
 }
 

@@ -5270,6 +5270,20 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeAlrGpuLiveProbe(
     return env->NewStringUTF(report.c_str());
 }
 
+// "% of native-Mali throughput": renders the SAME triangle op-stream on the SAME
+// Mali two ways — DIRECT (decode+glFinish, no ring) vs the full ALR ring+executor
+// pipeline — and reports the FPS ratio (= the GPU per-call marshalling overhead,
+// §0(b)). glmark2 can't run on bare-Android Mali, so this same-op ring-vs-direct
+// is the valid on-device "ALR vs native-Mali" measurement.
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeAlrGpuThroughputProbe(
+    JNIEnv* env,
+    jobject /* thiz */) {
+    const auto report = alr::gpu::run_gpu_throughput_probe();
+    __android_log_print(ANDROID_LOG_INFO, "alr_loader", "gpu-throughput:\n%s", report.c_str());
+    return env->NewStringUTF(report.c_str());
+}
+
 extern "C" JNIEXPORT jstring JNICALL
 Java_dev_chanwoo_androlinux_MainActivity_nativeHostVulkanProbe(
     JNIEnv* env,

@@ -49,9 +49,14 @@ inline bool renderer_software_local(const std::string& vendor, const std::string
 // a 2x2 checker texture; then a frame that draws GL_TRIANGLES sampling the texture
 // tinted by a uniform. Returns the encoded bytes. The triangle covers the center;
 // the corners stay clear-color.
-inline std::vector<uint8_t> build_triangle_stream(int fbw, int fbh) {
-    Encoder e;
-
+// The triangle self-test op-stream, split into the one-time SETUP (shader/program/
+// VBO/2x2-texture creation) and the per-frame DRAW (viewport/clear/use/uniforms/
+// attrib/draw that REUSE those objects). Splitting mirrors how a real app — and
+// glmark2 — sets up once then draws many frames, and lets the throughput probe
+// loop draw-only on a PERSISTENT HostState + persistent GL bindings (no per-frame
+// recompile/recreate, no object leak). build_triangle_stream() = setup + one frame
+// + END, byte-identical to before, so the existing single-frame probes are unchanged.
+inline void encode_triangle_setup(Encoder& e) {
     // Virtual IDs (the guest would allocate these monotonically; here we pick them).
     // Prefixed to avoid clashing with system macros (x86 <sys/reg.h> #defines FS).
     const uint32_t vVS = 1, vFS = 2, vPROG = 1, vVBO = 1, vTEX = 1;
@@ -103,8 +108,10 @@ inline std::vector<uint8_t> build_triangle_stream(int fbw, int fbh) {
     e.u8(OP_TEX_IMAGE_2D); e.u32(GL_TEXTURE_2D); e.i32(0); e.u32(GL_RGBA);
     e.i32(2); e.i32(2); e.u32(GL_RGBA); e.u32(GL_UNSIGNED_BYTE);
     e.blob(tex, sizeof(tex));
+}
 
-    // --- a frame ---
+inline void encode_triangle_frame(Encoder& e, int fbw, int fbh) {
+    const uint32_t vPROG = 1;  // reuse the program created in encode_triangle_setup
     e.u8(OP_VIEWPORT); e.i32(0); e.i32(0); e.i32(fbw); e.i32(fbh);
     e.u8(OP_CLEARCOLOR); e.f32(0.10f); e.f32(0.10f); e.f32(0.40f); e.f32(1.0f);
     e.u8(OP_CLEAR);
@@ -120,6 +127,29 @@ inline std::vector<uint8_t> build_triangle_stream(int fbw, int fbh) {
     e.u8(OP_VERTEX_ATTRIB_POINTER); e.u32(1); e.i32(2); e.u32(GL_FLOAT);
     e.u8(0); e.i32(4 * sizeof(float)); e.u32(2 * sizeof(float)); // aUv: offset 8
     e.u8(OP_DRAW_ARRAYS); e.u32(GL_TRIANGLES); e.i32(0); e.i32(3);
+}
+
+inline std::vector<uint8_t> build_triangle_stream(int fbw, int fbh) {
+    Encoder e;
+    encode_triangle_setup(e);
+    encode_triangle_frame(e, fbw, fbh);
+    e.u8(OP_END);
+    return e.bytes();
+}
+
+// One-time setup ops (objects) terminated by OP_END — decode once on a persistent
+// HostState, then loop build_triangle_draw_stream() to render frames cheaply.
+inline std::vector<uint8_t> build_triangle_setup_stream() {
+    Encoder e;
+    encode_triangle_setup(e);
+    e.u8(OP_END);
+    return e.bytes();
+}
+
+// Per-frame draw ops (reuse the setup objects) terminated by OP_END.
+inline std::vector<uint8_t> build_triangle_draw_stream(int fbw, int fbh) {
+    Encoder e;
+    encode_triangle_frame(e, fbw, fbh);
     e.u8(OP_END);
     return e.bytes();
 }

@@ -41,8 +41,8 @@ android {
         applicationId = "dev.chanwoo.androlinux"
         minSdk = 26
         targetSdk = 35
-        versionCode = 130
-        versionName = "0.4.130-cp5-5ws-fanout-v130"
+        versionCode = 131
+        versionName = "0.4.131-cp5-gpu-throughput-v131"
         ndkVersion = "27.2.12479018"
 
         externalNativeBuild {
