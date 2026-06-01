@@ -14,4 +14,4 @@ def test_termux_proot_prebuilts_are_excluded_from_gradle_strip():
 
 def test_build_stamp_identifies_unstripped_proot_package():
     text = BUILD.read_text()
-    assert 'versionName = "0.4.128-cp2-glmark2-persist-hoststate-v128"' in text
+    assert 'versionName = "0.4.129-cp5-batch-8mibring-v129"' in text

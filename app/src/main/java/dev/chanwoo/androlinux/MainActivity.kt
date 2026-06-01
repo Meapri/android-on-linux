@@ -701,7 +701,7 @@ class MainActivity : Activity() {
             alrSeccompPathTrapProbe.lineStartingWith("alr sc PATH_MEDIATION_VIABLE=")
                 .substringAfter("PATH_MEDIATION_VIABLE=", "") == "yes"
 
-        val executionSummary = "build: 0.4.128-cp2-glmark2-persist-hoststate-v128" +
+        val executionSummary = "build: 0.4.129-cp5-batch-8mibring-v129" +
             "\nexecution summary" +
             "\nROOTFS EXECUTION: ${if (rootfsExecutionPassed) "PASS" else "FAIL"}" +
             "\nSHELL SCRIPT EXECUTION: ${if (shellScriptExecutionPassed) "PASS" else "FAIL"}" +
@@ -1460,7 +1460,10 @@ class MainActivity : Activity() {
                                 filesDir.absolutePath,
                                 cacheDir.absolutePath,
                                 rootfsManifest.name,
-                                "/usr/bin/glmark2-es2-wayland\n--data-path\n/usr/share/glmark2\n--benchmark\nbuild",
+                                // build (geometry) + texture (exercises the 8MiB ring: a 1024x1024
+                                // RGBA = 4MiB single OP_TEX_IMAGE_2D the old 1MiB ring dropped).
+                                // duration capped so both scenes finish inside the guest alarm(25s).
+                                "/usr/bin/glmark2-es2-wayland\n--data-path\n/usr/share/glmark2\n--benchmark\nbuild:duration=5\n--benchmark\ntexture:duration=5",
                             )
                             val glmark2Status = nativeWaylandCompositorStatus()
                             val framesAfterGlmark2 = glmark2Status.intFieldAfter("alr wl frames=")
