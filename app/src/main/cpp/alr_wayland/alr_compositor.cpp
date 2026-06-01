@@ -2009,6 +2009,12 @@ void alr_wayland_inject_pointer_button(uint32_t evdev_button, uint32_t pressed) 
     e.button = evdev_button; e.state = pressed; e.time_ms = now_ms();
     enqueue_inject(e);
 }
+void alr_wayland_inject_pointer_axis(double value, int32_t axis) {
+    InjectEvent e{};
+    e.kind = InjectKind::PointerAxis;
+    e.axis = axis; e.axis_value = value; e.time_ms = now_ms();
+    enqueue_inject(e);
+}
 void alr_wayland_inject_touch(int32_t id, double x, double y, int32_t phase) {
     InjectEvent e{};
     e.kind = phase == 0 ? InjectKind::TouchDown

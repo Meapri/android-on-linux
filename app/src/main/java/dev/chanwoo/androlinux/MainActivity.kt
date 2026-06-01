@@ -444,6 +444,36 @@ class MainActivity : Activity() {
             alrLoaderGimpProbe.contains("GNU Image Manipulation Program") ||
                 Regex("GIMP.*version 3").containsMatchIn(alrLoaderGimpProbe) ||
                 alrLoaderGimpProbe.contains("version 3.0")
+        // WS-1 / CP-3: run the SAME microbench binary the device-native baseline uses
+        // (the static arm64 microbench, staged by WS-4 at /usr/bin/microbench) THROUGH
+        // the ALR loader, once per workload. Each emits its own
+        // "MICROBENCH mode=<m> ... ns_per_op=<x>" line on guest stdout, which
+        // build_native_loader_probe lifts into logcat (tag alr_loader) as
+        // "alr-microbench: ... MICROBENCH ...". The integration drain diffs those
+        // ns_per_op against the native baseline for a true apples-to-apples CP-3
+        // overhead % (replacing the ALR-getppid≈218ns proxy). The `compute` arm is the
+        // syscall-light gated (<5%) case; `syscall` is the syscall-storm reported case.
+        // argv is newline-delimited (path, then each arg), matching the dash probes.
+        val alrLoaderMicrobenchCompute = nativeAlrNativeLoaderProbe(
+            packageName,
+            applicationInfo.nativeLibraryDir,
+            filesDir.absolutePath,
+            cacheDir.absolutePath,
+            rootfsManifest.name,
+            "/usr/bin/microbench\ncompute",
+        )
+        val alrLoaderMicrobenchComputeRan =
+            alrLoaderMicrobenchCompute.contains("MICROBENCH mode=compute")
+        val alrLoaderMicrobenchSyscall = nativeAlrNativeLoaderProbe(
+            packageName,
+            applicationInfo.nativeLibraryDir,
+            filesDir.absolutePath,
+            cacheDir.absolutePath,
+            rootfsManifest.name,
+            "/usr/bin/microbench\nsyscall",
+        )
+        val alrLoaderMicrobenchSyscallRan =
+            alrLoaderMicrobenchSyscall.contains("MICROBENCH mode=syscall")
         val alrNativeLoaderSelftest = nativeAlrNativeLoaderSelftest()
         val alrNativeLoaderSelftestPassed =
             alrNativeLoaderSelftest.lineStartingWith("ALR NATIVE LOADER SELFTEST EXEC:") ==
@@ -711,6 +741,8 @@ class MainActivity : Activity() {
             "\nALR WRITE-PATH MEDIATION (dash writes+reads /tmp in rootfs): ${if (alrLoaderWritePassed) "PASS" else "FAIL"}" +
             "\nALR IN-PROCESS IMAGE DECODE (gdk-pixbuf PNG, GIMP prerequisite): ${if (alrLoaderPngDecoded) "PASS" else "FAIL"}" +
             "\nALR GIMP 3.0 LOADS (gimp-console-3.0 --version, 112-lib closure in-process): ${if (alrLoaderGimpVersion) "PASS" else "FAIL"}" +
+            "\nALR CP-3 MICROBENCH compute (same binary via loader, ns_per_op in logcat alr-microbench): ${if (alrLoaderMicrobenchComputeRan) "RAN" else "ABSENT"}" +
+            "\nALR CP-3 MICROBENCH syscall (same binary via loader, ns_per_op in logcat alr-microbench): ${if (alrLoaderMicrobenchSyscallRan) "RAN" else "ABSENT"}" +
             "\nALR GPU PASSTHROUGH BOUNDARY: ${if (gpuPassthroughBoundaryViable) "VIABLE" else "MARGINAL"} (shmem-ring ${gpuBoundaryShmemCmdsPerFrame} cmds/60fps-frame, inproc ${gpuBoundaryInprocCmdsPerFrame})" +
             "\nALR GPU MARSHALLING HARDWARE RENDER: ${if (alrGpuMarshallingPassed) "PASS" else "FAIL"}" +
             "\nALR AHB ZEROCOPY HARDWARE SAMPLE: ${if (alrAhbZeroCopyPassed) "PASS" else "FAIL"}" +
@@ -1076,6 +1108,19 @@ class MainActivity : Activity() {
             // to our setOnKeyListener (and the soft keyboard can target this view).
             isFocusableInTouchMode = true
             isFocusable = true
+            // Mouse wheel / trackpad scroll -> wl_pointer.axis (M4). Touch-drag scroll
+            // is handled by GTK from the wl_touch stream; this adds discrete scroll for
+            // a real mouse/trackpad attached to the device.
+            setOnGenericMotionListener { _, ev ->
+                if (ev.actionMasked == android.view.MotionEvent.ACTION_SCROLL) {
+                    val vs = ev.getAxisValue(android.view.MotionEvent.AXIS_VSCROLL)
+                    val hs = ev.getAxisValue(android.view.MotionEvent.AXIS_HSCROLL)
+                    // Wayland axis: +y = down, +x = right; Android VSCROLL +1 = scroll up.
+                    if (vs != 0f) nativeWaylandInjectScroll(ev.x, ev.y, (-vs * 10.0), 0)
+                    if (hs != 0f) nativeWaylandInjectScroll(ev.x, ev.y, (hs * 10.0), 1)
+                    true
+                } else false
+            }
             // Production input path: forward real touches on the SurfaceView to the
             // focused Wayland client (as wl_touch + wl_pointer) so GUI apps are
             // interactive once a real toolkit window is up.
@@ -1960,6 +2005,7 @@ class MainActivity : Activity() {
     private external fun nativeWaylandInjectTouch(id: Int, x: Float, y: Float, phase: Int)
 
     private external fun nativeWaylandInjectKey(evdevKey: Int, pressed: Int)
+    private external fun nativeWaylandInjectScroll(x: Float, y: Float, value: Double, axis: Int)
 
     private external fun nativeRenderVulkanSurfaceFrames(
         surface: android.view.Surface,
