@@ -43,6 +43,20 @@ extern "C" {
 #define ALR_SHIM_MAX_UNIFORMS_PER_PROG 32
 #define ALR_SHIM_MAX_UNIFORM_NAME    64
 
+/* Per-shader source-length cache: glShaderSource is fire-and-forget (the host sets
+ * + compiles the real source), but a guest like glmark2 validates by querying
+ * glGetShaderiv(GL_SHADER_SOURCE_LENGTH) right after and rejects the shader on a
+ * mismatch. We answer that query LOCALLY (no round-trip) from the length we were
+ * handed. Shader vids are monotonic and never freed (glDeleteShader is a no-op), so
+ * this is a find-or-insert table keyed by vid; the cap is generous for glmark2's
+ * per-scene shader churn and silently saturates rather than crashing. */
+#define ALR_SHIM_MAX_SHADERS         256
+
+typedef struct AlrShaderInfo {
+    uint32_t vid;       /* virtual shader id (0 = free slot; vids start at 1) */
+    uint32_t src_len;   /* byte length of the source set via glShaderSource (excl. NUL) */
+} AlrShaderInfo;
+
 typedef struct AlrUniformName {
     char name[ALR_SHIM_MAX_UNIFORM_NAME];
 } AlrUniformName;
@@ -69,6 +83,9 @@ typedef struct AlrShimState {
     uint32_t        next_framebuffer;
     uint32_t        next_renderbuffer;
     uint32_t        next_vertex_array;
+
+    /* per-shader source-length cache (backs glGetShaderiv(GL_SHADER_SOURCE_LENGTH)) */
+    AlrShaderInfo   shaders[ALR_SHIM_MAX_SHADERS];
 
     /* per-program uniform-name tables (the glGetUniformLocation backing store) */
     AlrProgramUniforms progs[ALR_SHIM_MAX_PROGRAMS];
@@ -116,6 +133,10 @@ void alr_shim_program_reset(uint32_t vprog);                    /* clear a progr
 /* Attribute-name table ops (used by glGetAttribLocation). Same scheme as uniforms. */
 int  alr_shim_attrib_intern(uint32_t vprog, const char *name);  /* -> handle (index), or -1 */
 const char *alr_shim_attrib_name(uint32_t vprog, int handle);   /* handle -> name, or NULL */
+
+/* Per-shader source-length cache (backs glGetShaderiv(GL_SHADER_SOURCE_LENGTH)). */
+void alr_shim_shader_set_srclen(uint32_t vshader, uint32_t src_len); /* record/replace */
+int  alr_shim_shader_srclen(uint32_t vshader, uint32_t *out);        /* 1+*out if known, else 0 */
 
 #ifdef __cplusplus
 }

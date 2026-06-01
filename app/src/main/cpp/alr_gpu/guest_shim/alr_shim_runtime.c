@@ -218,3 +218,32 @@ void alr_shim_program_reset(uint32_t vprog) {
     if (a) a->count = 0;
     pthread_mutex_unlock(&g_lock);
 }
+
+/* ---- per-shader source-length cache (glGetShaderiv(GL_SHADER_SOURCE_LENGTH)) ---- */
+
+void alr_shim_shader_set_srclen(uint32_t vshader, uint32_t src_len) {
+    if (vshader == 0) return;
+    AlrShimState *s = alr_shim();
+    pthread_mutex_lock(&g_lock);
+    int free_slot = -1;
+    for (int i = 0; i < ALR_SHIM_MAX_SHADERS; ++i) {
+        if (s->shaders[i].vid == vshader) { s->shaders[i].src_len = src_len; goto done; }
+        if (s->shaders[i].vid == 0 && free_slot < 0) free_slot = i;
+    }
+    if (free_slot >= 0) { s->shaders[free_slot].vid = vshader; s->shaders[free_slot].src_len = src_len; }
+    /* table full: drop silently (that shader's GL_SHADER_SOURCE_LENGTH falls back to 0). */
+done:
+    pthread_mutex_unlock(&g_lock);
+}
+
+int alr_shim_shader_srclen(uint32_t vshader, uint32_t *out) {
+    if (vshader == 0) return 0;
+    AlrShimState *s = alr_shim();
+    int found = 0;
+    pthread_mutex_lock(&g_lock);
+    for (int i = 0; i < ALR_SHIM_MAX_SHADERS; ++i) {
+        if (s->shaders[i].vid == vshader) { if (out) *out = s->shaders[i].src_len; found = 1; break; }
+    }
+    pthread_mutex_unlock(&g_lock);
+    return found;
+}

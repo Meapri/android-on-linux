@@ -171,6 +171,7 @@ void glShaderSource(GLuint shader, GLsizei count, const GLchar *const *string, c
     if (count == 1) {
         const char *src = string[0] ? string[0] : "";
         uint32_t len = (length && length[0] >= 0) ? (uint32_t)length[0] : (uint32_t)strlen(src);
+        alr_shim_shader_set_srclen((uint32_t)shader, len);  /* for glGetShaderiv(GL_SHADER_SOURCE_LENGTH) */
         struct ShaderSourceArgs a = { (uint32_t)shader, src, len };
         alr_shim_emit(build_shader_source, &a);
         return;
@@ -190,6 +191,7 @@ void glShaderSource(GLuint shader, GLsizei count, const GLchar *const *string, c
         memcpy(joined + off, s, n); off += n;
     }
     joined[off] = '\0';
+    alr_shim_shader_set_srclen((uint32_t)shader, (uint32_t)off);  /* for glGetShaderiv(GL_SHADER_SOURCE_LENGTH) */
     struct ShaderSourceArgs a = { (uint32_t)shader, joined, (uint32_t)off };
     alr_shim_emit(build_shader_source, &a);
     free(joined);
@@ -1051,10 +1053,16 @@ GLenum glGetError(void) {
 }
 
 void glGetShaderiv(GLuint shader, GLenum pname, GLint *params) {
-    (void)shader;
     if (!params) return;
     if (pname == GL_COMPILE_STATUS)      *params = GL_TRUE;   /* optimistic */
     else if (pname == GL_INFO_LOG_LENGTH) *params = 0;
+    else if (pname == GL_SHADER_SOURCE_LENGTH) {
+        /* GL spec: length of the source INCLUDING the NUL terminator, or 0 if none.
+         * Answer locally from the cached length (glmark2 validates this and rejects
+         * the shader on a mismatch — the prior hardcoded 0 failed its build scene). */
+        uint32_t L = 0;
+        *params = alr_shim_shader_srclen((uint32_t)shader, &L) ? (GLint)(L + 1) : 0;
+    }
     else                                  *params = 0;
 }
 void glGetProgramiv(GLuint program, GLenum pname, GLint *params) {
