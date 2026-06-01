@@ -75,8 +75,10 @@
 
 // GPU-native app track (Phase 4): host-side GLES command-stream decoder + probes.
 // Header-only and self-contained (owns its own EGL pbuffer context), so it adds no
-// link deps beyond EGL/GLESv2 (already linked).
+// link deps beyond EGL/GLESv2 (already linked). alr_gpu_fbo.hpp adds the M4
+// AHB-backed render-target probe (guest draws -> AHB -> zero-copy sample).
 #include "alr_gpu/alr_gpu_probe.hpp"
+#include "alr_gpu/alr_gpu_fbo.hpp"
 
 namespace {
 
@@ -4761,6 +4763,18 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeAlrGpuRingProbe(
     jobject /* thiz */) {
     const auto report = alr::gpu::run_ring_draw_probe();
     __android_log_print(ANDROID_LOG_INFO, "alr_loader", "gpu-ring:\n%s", report.c_str());
+    return env->NewStringUTF(report.c_str());
+}
+
+// GPU-native app track M4 (host half): render the decoded guest draw into an
+// AHardwareBuffer-backed FBO, then sample that AHB zero-copy (external-OES) —
+// proves the guest-draw -> AHB -> presentable loop on Mali. Mirrors to logcat.
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeAlrGpuFboProbe(
+    JNIEnv* env,
+    jobject /* thiz */) {
+    const auto report = alr::gpu::run_fbo_present_probe();
+    __android_log_print(ANDROID_LOG_INFO, "alr_loader", "gpu-fbo:\n%s", report.c_str());
     return env->NewStringUTF(report.c_str());
 }
 

@@ -43,4 +43,4 @@ def test_main_activity_reports_native_loader_gate():
     assert "ALR NATIVE LOADER GUEST EXEC (glibc static): " in text
     assert "nativeAlrNativeLoaderSelftest" in text
     assert "ALR native ELF loader (anon-mmap-loader) probe:" in text
-    assert "build: 0.4.115-android-gpu-native-m1m2-v115" in text
+    assert "build: 0.4.117-android-gpu-native-ahb-render-v117" in text

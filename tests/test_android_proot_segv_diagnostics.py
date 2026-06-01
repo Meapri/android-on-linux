@@ -24,7 +24,7 @@ def test_runner_probes_proot_with_multiple_entrypoints():
 
 def test_activity_reports_success_summary_without_default_direct_crash_probes():
     text = MAIN.read_text()
-    assert "build: 0.4.115-android-gpu-native-m1m2-v115" in text
+    assert "build: 0.4.117-android-gpu-native-ahb-render-v117" in text
     assert "ROOTFS EXECUTION:" in text
     assert "probe dlopen talloc" in text
     assert "linker64 proot --version exit" in text

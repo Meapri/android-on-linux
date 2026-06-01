@@ -322,6 +322,13 @@ class MainActivity : Activity() {
         val alrGpuRingPassed =
             alrGpuRingProbe.lineStartingWith("ALR GPU RING HARDWARE RENDER:") ==
                 "ALR GPU RING HARDWARE RENDER: PASS"
+        // M4 host half: render the decoded guest draw into an AHardwareBuffer-backed
+        // FBO, then sample that AHB zero-copy (external-OES) — the guest-draw -> AHB
+        // -> presentable loop the spinning-cube display will use.
+        val alrGpuFboProbe = nativeAlrGpuFboProbe()
+        val alrGpuFboPassed =
+            alrGpuFboProbe.lineStartingWith("ALR GPU AHB RENDER (guest draw landed in AHB, direct read):") ==
+                "ALR GPU AHB RENDER (guest draw landed in AHB, direct read): PASS"
         val hostGpuProbe = nativeHostGpuProbe()
         val hostVulkanProbe = nativeHostVulkanProbe()
         val requestedPermissions = requestedPermissionNames()
@@ -491,7 +498,7 @@ class MainActivity : Activity() {
             alrSeccompPathTrapProbe.lineStartingWith("alr sc PATH_MEDIATION_VIABLE=")
                 .substringAfter("PATH_MEDIATION_VIABLE=", "") == "yes"
 
-        val executionSummary = "build: 0.4.115-android-gpu-native-m1m2-v115" +
+        val executionSummary = "build: 0.4.117-android-gpu-native-ahb-render-v117" +
             "\nexecution summary" +
             "\nROOTFS EXECUTION: ${if (rootfsExecutionPassed) "PASS" else "FAIL"}" +
             "\nSHELL SCRIPT EXECUTION: ${if (shellScriptExecutionPassed) "PASS" else "FAIL"}" +
@@ -536,6 +543,7 @@ class MainActivity : Activity() {
             "\nALR AHB ZEROCOPY HARDWARE SAMPLE: ${if (alrAhbZeroCopyPassed) "PASS" else "FAIL"}" +
             "\nALR GPU DRAW HARDWARE RENDER (shader+VBO+texture+draw on Mali): ${if (alrGpuDrawPassed) "PASS" else "FAIL"}" +
             "\nALR GPU RING HARDWARE RENDER (op stream via SPSC ring -> Mali): ${if (alrGpuRingPassed) "PASS" else "FAIL"}" +
+            "\nALR GPU AHB RENDER (guest draw -> AHB render target, direct read): ${if (alrGpuFboPassed) "PASS" else "FAIL"}" +
             "\nHOST GPU EGL/GLES EXECUTION: ${if (hostGpuHardwareCandidate) "PASS" else "FAIL"}" +
             "\nANDROID HOST VULKAN PROBE EXECUTION: ${if (hostVulkanHardwareCandidate) "PASS" else "FAIL"}" +
             "\nANDROID HOST VULKAN SURFACE PROBE EXECUTION: PENDING_SURFACE_CALLBACK" +
@@ -837,6 +845,8 @@ class MainActivity : Activity() {
             "\n$alrGpuDrawProbe" +
             "\n\nALR GPU-native ring probe (op stream via SPSC command ring -> Mali):" +
             "\n$alrGpuRingProbe" +
+            "\n\nALR GPU-native AHB render-target probe (guest draw -> AHB-FBO -> external-OES sample):" +
+            "\n$alrGpuFboProbe" +
             "\n\nAndroid host GPU probe:" +
             "\n$hostGpuProbe" +
             "\n\nAndroid host Vulkan probe:" +
@@ -1620,6 +1630,8 @@ class MainActivity : Activity() {
     private external fun nativeAlrGpuDrawProbe(): String
 
     private external fun nativeAlrGpuRingProbe(): String
+
+    private external fun nativeAlrGpuFboProbe(): String
 
     private external fun nativeHostGpuProbe(): String
 

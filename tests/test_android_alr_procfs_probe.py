@@ -27,7 +27,7 @@ def test_main_activity_reports_android_procfs_virtualization_gate():
     assert "ALR PROCFS VIRTUALIZATION PLAN: " in text
     assert "alr procfs virtualization passed=" in text
     assert "ALR procfs virtualization plan probe:" in text
-    assert "build: 0.4.115-android-gpu-native-m1m2-v115" in text
+    assert "build: 0.4.117-android-gpu-native-ahb-render-v117" in text
 
 
 def test_execution_backend_docs_require_android_procfs_virtualization_probe():
