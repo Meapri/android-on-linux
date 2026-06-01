@@ -4,7 +4,7 @@
 > 도는지의 앱×결과 표. **device evidence가 있는 행만 USABLE/RUNS/RENDERS로 표기**한다.
 > host-only/예정은 WIRED/PENDING. 이 표는 WS-5가 유지하며, 새 device evidence가 추가될 때마다 갱신.
 
-작성 baseline: HEAD `0df74dc` (v124) → 통합 트리 v127 (CP-1 landed). 디바이스 `R5KL20B6S3X` (SM-X236N, mt6878 SoC, Mali-G615 MC2, Android 16, 1200×1920@90Hz, untrusted_app).
+작성 baseline: HEAD `0df74dc` (v124) → 통합 트리 v127 (CP-1 landed) → v128/v129 (CP-2 GPU-native FINAL + CP-5 8MiB ring). 디바이스 `R5KL20B6S3X` (SM-X236N, mt6878 SoC, Mali-G615 MC2, Android 16, 1200×1920@90Hz, untrusted_app).
 
 ## 상태 범례
 - **USABLE** — device에서 사람이 실제로 조작 가능(입력 포함).
@@ -36,7 +36,7 @@
 ## GUI 툴킷 (L2/L3)
 | 앱 | 툴킷 | 결과 | exec_ms | Evidence | 비고 |
 |----|------|------|---------|----------|------|
-| GIMP 3.0.2 | GTK3 | **USABLE** (터치로 File>New>1920×1080 캔버스>브러시 스트로크) | — | v111-gimp-fully-usable-drawing | cairo SW 렌더 → wl_shm 합성, dialog/menu/popup 입력 라우팅 |
+| GIMP 3.0.2 | GTK3 | **USABLE** (터치로 File>New>1920×1080 캔버스>브러시 스트로크; CP-2/CP-5 drain 에서 device-render 재확인) | — | v111-gimp-fully-usable-drawing, 2026-06-02-cp2-FINAL-glmark2-score-1074, 2026-06-02-cp5-batch-8mibring-texture-ws4-overlays | cairo SW 렌더 → wl_shm 합성, dialog/menu/popup 입력 라우팅. drain#7/#8 final GUI probe 에서 GIMP 3.0.2 device-render 재확인(no FATAL/SIGSEGV) |
 | gtk3-widget-factory | GTK3 | **RUNS** (SVG SIGABRT 해소; GUI 25s 생존 sig=14=alarm timeout, exec_ms=25031; traps=135 rewrites=52) | 25031 | 2026-06-01-gtk3-svg-sigabrt-resolved-gui-runs | sig=6→sig=14: 2겹 fix(WS-4 .so x-bit 0700 + WS-1 GDK_PIXBUF rootfs-absolute) — `libpixbufloader_svg.so cannot open` 제거 |
 | gtk3 데모 창 (`/bin/alr-gtk3-test`) | GTK3 | **RENDERS** (frames 12→**2213**, 렌더 루프 정상) | 197 | 2026-06-01-gtk3-svg-sigabrt-resolved-gui-runs, v89-gtk3-renders, v90-real-gtk3-window | gtk_init backend=wayland; ~2088 file open이 rootfs로 mediation |
 | in-process 이미지 디코드 (gdk-pixbuf PNG/JPEG/BMP/GIF) | — | RUNS (PASS, 전 포맷) | — | v95-image-decode, 2026-06-01-gtk3-svg-sigabrt-resolved-gui-runs | shared-mime-info DB + **.so x-bit fix 후 bmp/gif/png/jpeg 전부 decode OK** |
@@ -53,7 +53,7 @@
 | chromium `--dump-dom` / `--headless` (V8+render) | WALL | chromium-runs-inprocess (v121), v123/v124 commit msg | raw `svc` syscall-storm → LD_PRELOAD interposer 후킹 불가 → seccomp RET_TRACE 라운드트립 벽 (CP-6 / L1.M3 USER_NOTIF 후보) |
 
 ## GPU (L2)
-host 백본(decode/ring/AHB-FBO/zero-copy present)은 Mali-G615 MC2에 픽셀 검증(software renderer=false). guest shim은 소스 wire-verified, device 라이브 cube/glmark2는 pending.
+host 백본(decode/ring/AHB-FBO/zero-copy present)은 Mali-G615 MC2에 픽셀 검증(software renderer=false). **CP-2 FINAL 달성**(drain#7/#8): guest glibc glmark2 가 shim→ring→host executor 로 실 Mali 에 렌더 — build 1206 / texture 1123 FPS → **Score 1163**, `software=false`. ALR-vs-Mali-직접 **비율**은 `docs/research/cp2-gpu-ratio-glmark2.md` (Mali-직접 baseline = PENDING_DEVICE, 통합 세션이 채움).
 
 | 항목 | 결과 | Evidence | 비고 |
 |------|------|----------|------|
@@ -64,8 +64,10 @@ host 백본(decode/ring/AHB-FBO/zero-copy present)은 Mali-G615 MC2에 픽셀 �
 | GPU live producer→ring→executor→AHB present | Mali-verified (8 frames presented+verified, two-thread) | v118-gpu-native-live-integration | loader fork(STEP B)만 남음 |
 | guest libEGL/libGLESv2 shim (M3) | wire-verified (소스) | v118-gpu-native-live-integration | device 연결 pending (WS-2 M2) |
 | 화면 cube present (M4 STEP B, loader fork) | PENDING | v119-gpu-screen-cube-present | guest fork + ring fd 상속 |
-| CP-2 INFRA: loader ring attach + EGL dlopen + Mali software=false | **DEVICE-VERIFIED** | 2026-06-01-cp2-glmark2-egl-dlopen-resolved | `alr_loader_attach_gpu_ring`(glmark2 감지)+ring/doorbell+GpuExecutorService; libpthread 수정 후 EGL library dlopen 성공; Mali self-test 전부 `software renderer=false`(Mali-G615). 인프라만 검증 — Score는 아래 행에서 여전히 PENDING |
-| glmark2-es2 (ALR, software=false) score | PENDING | 2026-06-01-cp2-glmark2-egl-dlopen-resolved | WS-2 shim eglChooseConfig (0 configs) — `eglChooseConfig() didn't return any configs`. WS-2 M3가 EGL config/surface/GLES-via-ring 구현해야 Score 산출 (CP-2) |
+| CP-2 INFRA: loader ring attach + EGL dlopen + Mali software=false | **DEVICE-VERIFIED** | 2026-06-01-cp2-glmark2-egl-dlopen-resolved | `alr_loader_attach_gpu_ring`(glmark2 감지)+ring/doorbell+GpuExecutorService; libpthread 수정 후 EGL library dlopen 성공; Mali self-test 전부 `software renderer=false`(Mali-G615). 인프라만 검증 — Score는 아래 행 참조 |
+| glmark2-es2 **build** scene (ALR, software=false) | **RUNS** (renders on Mali, build 1075 FPS @ 1920×1200 → **Score 1074**) | 2026-06-02-cp2-FINAL-glmark2-score-1074 | CP-2 **FINAL** (drain#7). shim shader-source fix(`997a1c0`: `glGetShaderiv(GL_SHADER_SOURCE_LENGTH)` 로컬 응답) 후 build scene 컴파일·렌더. `software renderer=false`, Mali-G615. ALR `GL_RENDERER`는 shim 합성 문자열(실 draw는 Mali — 외형 passthrough는 WS-2 follow-up) |
+| glmark2-es2 **build+texture** scene (ALR, software=false, 8 MiB ring) | **RUNS** (build 1206 / texture 1123 FPS → **Score 1163**) | 2026-06-02-cp5-batch-8mibring-texture-ws4-overlays | CP-5 batch (drain#8, v129). texture scene 의 4 MiB 텍스처 upload(`OP_TEX_IMAGE_2D`)이 8 MiB host ring(ws-2 `dc4198e`)으로 통과(1 MiB면 drop). `software=false`. CP-2 가 geometry→texture scene 까지 확장 device-증명 |
+| glmark2 전체 14-scene 종합 Score | PENDING | — | duration↑ 또는 분할 launch 로 전 scene 1빌드 실행 필요(현 1163은 build+texture 2-scene 부분 종합). **ALR vs Mali-직접 비율**은 `docs/research/cp2-gpu-ratio-glmark2.md` (Mali-직접 baseline = PENDING_DEVICE) |
 
 ## 디스플레이/입력 (L3)
 | 항목 | 결과 | Evidence | 비고 |
