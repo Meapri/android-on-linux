@@ -29,4 +29,4 @@ def test_main_activity_reports_jit_wx_gate():
     assert "jitWxProbe" in text
     assert "jitWxPassed" in text
     assert "ALR JIT WX CYCLE" in text
-    assert "build: 0.4.120-chromium-jitwx-probe-v120" in text
+    assert "build: 0.4.121-chromium-runs-inprocess-v121" in text

@@ -40,6 +40,40 @@ class MainActivity : Activity() {
         )
         val rootfsPlan = buildRootfsInstallPlan(rootfsManifest, filesDir)
         val rootfsStatus = RootfsInstaller(this).prepareBundledTinyRootfs()
+        // Goal-2 Phase B: stage Chromium (bookworm chromium-headless-shell + deps) into
+        // the rootfs as a one-time overlay, then boot it IN-PROCESS through the ALR
+        // native loader — headless, single-process, no sandbox (sidesteps the 6 gaps).
+        // The 517MB tar is adb-push'd to /data/local/tmp (app-readable). Heavy (extract +
+        // Chromium boot) → off the UI thread. Verified via logcat tag alr_loader.
+        Thread {
+            try {
+                val crTar = java.io.File("/data/local/tmp/chromium-stage.tar")
+                // Marker keyed on tar size so re-pushing a fixed/updated stage tar
+                // (e.g. new dep symlinks) auto-triggers a fresh overlay extract.
+                val crMarker = java.io.File(rootfsStatus.rootfsDir, ".chromium-staged-${crTar.length()}")
+                if (crTar.isFile && !crMarker.isFile) {
+                    android.util.Log.i("alr_loader", "chromium-stage: extracting overlay (${crTar.length()} bytes)")
+                    RootfsInstaller(this@MainActivity).extractVerifiedTar(crTar, rootfsStatus.rootfsDir)
+                    crMarker.writeText("staged\n")
+                    android.util.Log.i("alr_loader", "chromium-stage: overlay done")
+                }
+                val crReport = nativeAlrNativeLoaderProbe(
+                    packageName,
+                    applicationInfo.nativeLibraryDir,
+                    filesDir.absolutePath,
+                    cacheDir.absolutePath,
+                    rootfsManifest.name,
+                    // First prove the 186MB binary runs to a clean exit + meaningful
+                    // output cheaply: --version skips V8/render so its syscall count is
+                    // tiny (the heavier --dump-dom is ptrace-supervisor-throttled — to
+                    // revisit once the loader's syscall fast-path is in).
+                    "/usr/lib/chromium/chromium-headless-shell\n--no-sandbox\n--version",
+                )
+                android.util.Log.i("alr_loader", "chromium-boot:\n$crReport")
+            } catch (e: Throwable) {
+                android.util.Log.e("alr_loader", "chromium-boot EXC: ${android.util.Log.getStackTraceString(e)}")
+            }
+        }.start()
         val nativeCommandRunner = NativeCommandRunner(
             File(applicationInfo.nativeLibraryDir),
             File(cacheDir, "proot-tmp"),
@@ -511,7 +545,7 @@ class MainActivity : Activity() {
             alrSeccompPathTrapProbe.lineStartingWith("alr sc PATH_MEDIATION_VIABLE=")
                 .substringAfter("PATH_MEDIATION_VIABLE=", "") == "yes"
 
-        val executionSummary = "build: 0.4.120-chromium-jitwx-probe-v120" +
+        val executionSummary = "build: 0.4.121-chromium-runs-inprocess-v121" +
             "\nexecution summary" +
             "\nROOTFS EXECUTION: ${if (rootfsExecutionPassed) "PASS" else "FAIL"}" +
             "\nSHELL SCRIPT EXECUTION: ${if (shellScriptExecutionPassed) "PASS" else "FAIL"}" +
