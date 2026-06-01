@@ -582,9 +582,23 @@ void surface_resource_destroy(struct wl_resource* resource) {
             g_input_target_surface = nullptr;
             g_pointer_entered = false;
         }
+        // And for the keyboard grab (a menu popup that grabbed keys): if the surface
+        // is torn down BEFORE its xdg_popup destroy listener runs (client disconnect
+        // gives no resource-destroy order guarantee), drain_input_queue's Key path
+        // would otherwise wl_keyboard_send_* to this freed surface — UAF.
+        if (g_keyboard_grab_surface == s->surface) {
+            g_keyboard_grab_surface = nullptr;
+            g_keyboard_entered = false;
+        }
         const bool was_visible = s->mapped;
         zorder_remove(s);
         registry_remove(s);
+        // §5-C: release any retained GPU AHB bound to this surface (one acquire ref
+        // held by drain_gpu_queue) so a GPU client exiting doesn't leak the buffer.
+        if (s->gpu_ahb) {
+            AHardwareBuffer_release(static_cast<AHardwareBuffer*>(s->gpu_ahb));
+            s->gpu_ahb = nullptr;
+        }
         // Refocus the new top-most window and repaint the remaining scene.
         if (SurfaceState* nt = zorder_top()) {
             g_focus_surface = nt->surface;
@@ -1900,7 +1914,17 @@ void Compositor::drain_gpu_queue() {
         if (local[i].ahb)
             AHardwareBuffer_release(static_cast<AHardwareBuffer*>(local[i].ahb));
     GpuSubmit& last = local.back();
-    SurfaceState* tgt = zorder_top();
+    // Single-GPU-surface contract (alr_present_source.hpp): keep the GPU stream bound
+    // to the SAME surface across frames. If a surface already holds a GPU AHB (the GPU
+    // app's window), prefer it — otherwise a later shm toplevel (e.g. a dialog) that
+    // becomes zorder_top() would steal the GPU frames, leaving the GPU window stale and
+    // painting the GPU content onto the wrong window. Fall back to the top toplevel only
+    // when no GPU surface exists yet (the first frame / bring-up).
+    SurfaceState* tgt = nullptr;
+    for (SurfaceState* s : g_all_surfaces) {
+        if (s && s->mapped && s->gpu_ahb != nullptr) { tgt = s; break; }
+    }
+    if (!tgt) tgt = zorder_top();
     if (!tgt) {
         // No Wayland toplevel to bind to (a headless / fullscreen GPU app, e.g.
         // glmark2): keep the newest AHB for a fullscreen present instead of dropping.
@@ -1998,8 +2022,22 @@ void Compositor::teardown() {
     g_all_surfaces.clear();
     g_focus_surface = nullptr;
     g_input_target_surface = nullptr;
+    g_keyboard_grab_surface = nullptr;  // stale-pointer guard on restart (UAF discipline)
     g_pointer_entered = false;
     g_keyboard_entered = false;
+    g_mods_depressed = 0;  // don't leak held mods / CapsLock into a re-created compositor
+    g_mods_locked = 0;
+    // §5-C fullscreen GPU fallback: release the retained AHB ref (one acquire held in
+    // drain_gpu_queue) and null the globals. Without this a stop while a headless GPU
+    // app (glmark2) is presenting leaks the buffer, and a re-created compositor would
+    // hand the now-dangling AHB to the presenter for a zero-copy import -> crash.
+    if (g_fullscreen_gpu_ahb) {
+        AHardwareBuffer_release(static_cast<AHardwareBuffer*>(g_fullscreen_gpu_ahb));
+        g_fullscreen_gpu_ahb = nullptr;
+    }
+    g_fullscreen_gpu_w = 0;
+    g_fullscreen_gpu_h = 0;
+    g_fullscreen_gpu_serial = 0;
     if (g_compositor_) wl_global_destroy(g_compositor_);
     if (g_seat_) wl_global_destroy(g_seat_);
     if (g_output_) wl_global_destroy(g_output_);
