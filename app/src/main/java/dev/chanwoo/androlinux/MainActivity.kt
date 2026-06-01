@@ -720,7 +720,7 @@ class MainActivity : Activity() {
             alrSeccompPathTrapProbe.lineStartingWith("alr sc PATH_MEDIATION_VIABLE=")
                 .substringAfter("PATH_MEDIATION_VIABLE=", "") == "yes"
 
-        val executionSummary = "build: 0.4.133-breadth-r3-v133" +
+        val executionSummary = "build: 0.4.134-netsurf-launch-v134" +
             "\nexecution summary" +
             "\nROOTFS EXECUTION: ${if (rootfsExecutionPassed) "PASS" else "FAIL"}" +
             "\nSHELL SCRIPT EXECUTION: ${if (shellScriptExecutionPassed) "PASS" else "FAIL"}" +
@@ -1466,6 +1466,39 @@ class MainActivity : Activity() {
                                         "${gate(gtkDemoRendered)} (frames $framesBeforeGtkDemo→$framesAfterGtkDemo)",
                                 )
                                 view.append("\n\n--- ALR guest gtk3-widget-factory ---\n$gtkDemoClient")
+                            }
+
+                            // Goal-2 universality capstone: a real WEB BROWSER — netsurf-gtk
+                            // (GTK3). drain#11 proved the ALR loader runs it to GTK init; here we
+                            // launch it DISPLAY-BACKED on the compositor (same path as
+                            // gtk3-widget-factory/GIMP: GDK → wl_shm → SurfaceView) so its window
+                            // actually renders. about:welcome is a built-in page (no network).
+                            // Guarded by binary presence (netsurf-stage auto-stage may still be
+                            // extracting on its own thread).
+                            if (java.io.File(rootfsStatus.rootfsDir, "usr/bin/netsurf-gtk").isFile) {
+                                val framesBeforeNetsurf = nativeWaylandCompositorStatus().intFieldAfter("alr wl frames=")
+                                val netsurfClient = nativeAlrNativeLoaderProbe(
+                                    packageName,
+                                    applicationInfo.nativeLibraryDir,
+                                    filesDir.absolutePath,
+                                    cacheDir.absolutePath,
+                                    rootfsManifest.name,
+                                    "/usr/bin/netsurf-gtk\nabout:welcome",
+                                )
+                                val netsurfStatus = nativeWaylandCompositorStatus()
+                                val framesAfterNetsurf = netsurfStatus.intFieldAfter("alr wl frames=")
+                                val netsurfRendered = framesAfterNetsurf > framesBeforeNetsurf
+                                android.util.Log.i("alr_loader", "netsurf-result: rendered=$netsurfRendered frames=$framesBeforeNetsurf->$framesAfterNetsurf")
+                                android.util.Log.i("alr_loader", "netsurf-client:\n$netsurfClient")
+                                runOnUiThread {
+                                    view.append(
+                                        "\nALR NETSURF BROWSER (GTK3 web browser → wl_shm → SurfaceView): " +
+                                            "${gate(netsurfRendered)} (frames $framesBeforeNetsurf→$framesAfterNetsurf)",
+                                    )
+                                    view.append("\n\n--- ALR guest netsurf-gtk about:welcome ---\n$netsurfClient")
+                                }
+                            } else {
+                                android.util.Log.i("alr_loader", "netsurf-result: skipped (usr/bin/netsurf-gtk not staged yet)")
                             }
 
                             // CP-2 GPU 풀가속: glmark2-es2-wayland를 ALR loader로 실행.

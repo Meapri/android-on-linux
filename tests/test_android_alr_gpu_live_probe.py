@@ -30,4 +30,4 @@ def test_main_activity_reports_gpu_live_gate():
     assert "alrGpuLiveProbe" in text
     assert "alrGpuLivePassed" in text
     assert "ALR GPU LIVE INTEGRATION:" in text
-    assert "build: 0.4.133-breadth-r3-v133" in text
+    assert "build: 0.4.134-netsurf-launch-v134" in text

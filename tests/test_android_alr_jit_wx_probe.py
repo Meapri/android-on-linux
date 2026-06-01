@@ -29,4 +29,4 @@ def test_main_activity_reports_jit_wx_gate():
     assert "jitWxProbe" in text
     assert "jitWxPassed" in text
     assert "ALR JIT WX CYCLE" in text
-    assert "build: 0.4.133-breadth-r3-v133" in text
+    assert "build: 0.4.134-netsurf-launch-v134" in text

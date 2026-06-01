@@ -41,8 +41,8 @@ android {
         applicationId = "dev.chanwoo.androlinux"
         minSdk = 26
         targetSdk = 35
-        versionCode = 133
-        versionName = "0.4.133-breadth-r3-v133"
+        versionCode = 134
+        versionName = "0.4.134-netsurf-launch-v134"
         ndkVersion = "27.2.12479018"
 
         externalNativeBuild {
