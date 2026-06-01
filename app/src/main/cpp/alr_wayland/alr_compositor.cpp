@@ -23,7 +23,8 @@
 // logcat ("client bound: wl_compositor", "surface committed shm ...", etc.).
 
 #include "alr_wayland/alr_compositor.hpp"
-#include "alr_wayland/alr_present_source.hpp"  // §5-C/§5-B GPU present contract
+#include "alr_wayland/alr_present_source.hpp"  // §5-C GPU present contract
+#include "alr_wayland/alr_xkb_keymap_us.h"     // embedded self-contained XKB keymap
 
 #include <android/log.h>
 
@@ -40,9 +41,12 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <linux/memfd.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/timerfd.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -1169,6 +1173,37 @@ void seat_get_pointer(struct wl_client* client, struct wl_resource* resource,
     g_pointers.push_back(p);
     ALR_WL_LOGI("wl_seat.get_pointer bound (now %zu)", g_pointers.size());
 }
+// Build a sealed memfd holding the embedded self-contained XKB_V1 keymap so guest
+// clients (GDK/libxkbcommon) compile it directly via xkb_keymap_new_from_string
+// and never look for rootfs /usr/share/X11/xkb data (absent -> XKB-338 -> NULL
+// keymap -> SEGV). Returns fd (>=0) and sets *out_size to text+NUL length, else -1.
+int make_xkb_keymap_fd(size_t* out_size) {
+    const size_t size = sizeof(kUsXkbKeymapV1);  // includes trailing NUL
+    int fd = static_cast<int>(::syscall(__NR_memfd_create, "alr-xkb-keymap",
+                                        MFD_CLOEXEC | MFD_ALLOW_SEALING));
+    if (fd < 0) {
+        ALR_WL_LOGE("memfd_create(keymap) failed: %s", std::strerror(errno));
+        return -1;
+    }
+    if (::ftruncate(fd, static_cast<off_t>(size)) != 0) {
+        ALR_WL_LOGE("ftruncate(keymap) failed: %s", std::strerror(errno));
+        ::close(fd);
+        return -1;
+    }
+    void* map = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) {
+        ALR_WL_LOGE("mmap(keymap) failed: %s", std::strerror(errno));
+        ::close(fd);
+        return -1;
+    }
+    std::memcpy(map, kUsXkbKeymapV1, size);
+    ::munmap(map, size);
+    // Seal so the client can MAP_PRIVATE it safely (wl_keyboard v7+). Best-effort.
+    ::fcntl(fd, F_ADD_SEALS,
+            F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL);
+    *out_size = size;
+    return fd;
+}
 void seat_get_keyboard(struct wl_client* client, struct wl_resource* resource,
                        uint32_t id) {
     struct wl_resource* k = wl_resource_create(
@@ -1176,12 +1211,23 @@ void seat_get_keyboard(struct wl_client* client, struct wl_resource* resource,
     if (!k) { wl_client_post_no_memory(client); return; }
     wl_resource_set_implementation(k, &kKeyboardImpl, nullptr, keyboard_destroyed);
     g_keyboards.push_back(k);
-    // NO_KEYMAP: the client uses its own default keymap (a self-contained server
-    // keymap needs xkb data the PoC rootfs lacks). A valid fd is still sent.
-    int devnull = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
-    wl_keyboard_send_keymap(k, WL_KEYBOARD_KEYMAP_FORMAT_NO_KEYMAP,
-                            devnull >= 0 ? devnull : 0, 0);
-    if (devnull >= 0) ::close(devnull);
+    // Send a self-contained XKB_V1 keymap (alr_xkb_keymap_us.h): the guest compiles
+    // it directly and never needs rootfs /usr/share/X11/xkb data (absent here ->
+    // was XKB-338 -> NULL keymap -> SEGV in GTK/GIMP/foot). NO_KEYMAP fallback only
+    // if the memfd can't be built.
+    size_t km_size = 0;
+    int km_fd = make_xkb_keymap_fd(&km_size);
+    if (km_fd >= 0) {
+        wl_keyboard_send_keymap(k, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, km_fd,
+                                static_cast<uint32_t>(km_size));
+        ::close(km_fd);  // libwayland dups the fd during marshalling
+        ALR_WL_LOGI("wl_keyboard.keymap sent XKB_V1 (%zu bytes)", km_size);
+    } else {
+        int devnull = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+        wl_keyboard_send_keymap(k, WL_KEYBOARD_KEYMAP_FORMAT_NO_KEYMAP,
+                                devnull >= 0 ? devnull : 0, 0);
+        if (devnull >= 0) ::close(devnull);
+    }
     if (wl_resource_get_version(k) >= WL_KEYBOARD_REPEAT_INFO_SINCE_VERSION) {
         wl_keyboard_send_repeat_info(k, 25, 600);
     }
