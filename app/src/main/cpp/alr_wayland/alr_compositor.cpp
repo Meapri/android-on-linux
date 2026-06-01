@@ -1196,6 +1196,23 @@ void popup_resource_destroy(struct wl_resource* r) {
         // later event never sends to a now-unmapped/destroyed surface (UAF). The
         // next drain re-resolves the target (the parent popup or the toplevel).
         if (g_input_target_surface == s->surface) {
+            // The popup's wl_surface is still ALIVE in this role-destroy listener
+            // (GTK destroys the xdg_popup ROLE and reuses the surface), so send a
+            // real pointer leave (+frame) before dropping it — symmetric with the
+            // keyboard-grab block below and the P0-2 unmap path. Without it GTK keeps
+            // the menu item's prelight/hover and the reused surface mis-behaves on the
+            // next popup map.
+            if (g_pointer_entered) {
+                Compositor* comp = instance();
+                if (comp) {
+                    for (auto* p : g_pointers) {
+                        wl_pointer_send_leave(p, wl_display_next_serial(comp->display()),
+                                              s->surface);
+                        if (wl_resource_get_version(p) >= WL_POINTER_FRAME_SINCE_VERSION)
+                            wl_pointer_send_frame(p);
+                    }
+                }
+            }
             g_input_target_surface = nullptr;
             g_pointer_entered = false;
         }
@@ -1772,9 +1789,16 @@ void Compositor::drain_input_queue() {
     // (lazily, on the next motion/down) enter to the new one so GTK updates hover.
     if (tgt_surf != g_input_target_surface) {
         if (g_pointer_entered && g_input_target_surface) {
-            for (auto* p : g_pointers)
+            for (auto* p : g_pointers) {
                 wl_pointer_send_leave(p, wl_display_next_serial(display_),
                                       g_input_target_surface);
+                // wl_pointer v5+ groups enter/leave/motion into a frame; without the
+                // terminating frame GTK/SDL buffers the leave and the OLD surface
+                // keeps its hover/prelight until an unrelated frame arrives. Pair the
+                // leave with a frame exactly as the unmap path (surface_commit) does.
+                if (wl_resource_get_version(p) >= WL_POINTER_FRAME_SINCE_VERSION)
+                    wl_pointer_send_frame(p);
+            }
         }
         g_input_target_surface = tgt_surf;
         g_pointer_entered = false;  // force a fresh enter to the new target
