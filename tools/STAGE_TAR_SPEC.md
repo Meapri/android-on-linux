@@ -352,3 +352,88 @@ rootfs). **WS-1 (L1 loader/mediation):** either ensure the path-mediation covers
 glibc's locale `open()`/`openat()` for `/usr/lib/locale`, or set `LOCPATH=/usr/lib/locale`
 in `guest_env` (§5-D). Non-fatal (Gtk-WARNING; falls back to C) — the gtk3 abort was
 the svg `.so` (§10.1), already fixed.
+
+---
+
+## 13. §10(c) apt/dpkg — reconstructed dpkg admin DB
+
+The base ships apt/dpkg binaries + Ubuntu-noble apt sources, but
+`var/lib/dpkg/status` is **empty** (built by file-extraction, not `dpkg -i`) → apt
+thinks NOTHING is installed → `apt install X` would re-fetch the entire dep tree.
+
+`tools/build_dpkg_db.py` reconstructs the dpkg admin DB from the base's files via the
+Ubuntu noble **Contents** index (file→package) + the Packages index (control fields):
+- Maps base files → packages, with **SONAME mapping** (the base flattens
+  `libgtk-3.so.0` while Contents lists `libgtk-3.so.0.2409.x`) and **merged-usr
+  aliasing** (`/lib`↔`/usr/lib`) — without these, glib/gtk/gcc/stdc++ go unmapped.
+- Emits `./var/lib/dpkg/status` (one `Status: install ok installed` stanza per pkg,
+  carrying Version/Depends/…) + `./var/lib/dpkg/info/<pkg>.list`.
+
+Built `/tmp/dpkg-db-stage.tar` (~700 KB): **194 packages** reconstructed incl.
+`libc6`, `libgtk-3-0t64`, `libglib2.0-0t64` (Ubuntu noble t64 names), `libgcc-s1`,
+`libstdc++6`, gimp, gdk-pixbuf, pango, cairo. CONFORMANT. Wired into the MainActivity
+toolkit-stage loop (guarded extractOverlayTar). Build:
+`python -m tools.build_dpkg_db --base <base.tar> --out /tmp/dpkg-db-stage.tar`.
+
+DEVICE-REQ: push dpkg-db-stage.tar → `dpkg -l` shows ~194 pkgs; `apt-get update`
+(noble); `apt-get install --no-install-recommends <leaf>` fetches only NEW deps (not
+the base stack). NOTE: actually RUNNING dpkg (maintainer-script fork/exec) under the
+ALR loader is the L1/device gate (PRoot clone3 KNOWN_FAIL; native-loader path
+untested) — the reconstructed DB is the rootfs-side prerequisite.
+
+---
+
+## 14. §3 M4 — Xwayland (X11 apps), rootful
+
+X11-only apps via Xwayland. The ALR compositor has **no XWM** → only **rootful**
+Xwayland works (one root X window as a single xdg_toplevel; an in-rootfs WM, or a
+single fullscreen app, arranges windows inside it). Rootless needs the compositor to
+be the X window manager — not viable.
+
+Overlay built from noble (`--minimal`, device-pending):
+- `/tmp/x11-stage.tar` (~11.8 MB) = `Xwayland` + `xterm` + `x11-apps` (xeyes/oclock/…)
+  + the 23 deps the noble base lacks. missing_soname=0, CONFORMANT. Wired into the
+  MainActivity toolkit-stage loop (`x11`).  (`/tmp/xwayland-stage.tar` = server only, 6.2MB.)
+- Build: `python -m tools.deb_closure --minimal --package xwayland --package x11-apps
+  --package xterm --base <base.tar> --out /tmp/x11-stage.tar --mirror
+  http://ports.ubuntu.com/ubuntu-ports --suite noble --component main --component universe`.
+
+Launch recipe (rootful; xkb-data already in base):
+```sh
+export XDG_RUNTIME_DIR=/tmp/xdg; mkdir -p $XDG_RUNTIME_DIR; chmod 700 $XDG_RUNTIME_DIR
+mkdir -p /tmp/.X11-unix; chmod 1777 /tmp/.X11-unix      # FILESYSTEM socket (NOT abstract — untrusted_app)
+Xwayland :0 -ac -shm -retro -noreset &                  # -shm=pixman→wl_shm present; -ac=no X auth
+export DISPLAY=:0 LIBGL_ALWAYS_SOFTWARE=1
+xeyes    # or: xterm
+```
+DEVICE-REQ: push x11-stage.tar → launch Xwayland rootful on the compositor →
+`xeyes`/`xterm` renders (wl_shm). NOTE: the rootful launch wiring (Xwayland as a
+Wayland client + the X filesystem socket under the rootfs-mediated /tmp) is L2/L3 +
+integration; this overlay is the WS-4 rootfs prerequisite.
+
+---
+
+## 15. WS-4 overlay roster — host-complete (all device-pending in /tmp, noble-built)
+
+All §5-E, base-subtracted, .so 0o755, missing_soname=0, overlay_guard 0 BLOCK,
+CONFORMANT. Built from Ubuntu noble (ports). Wired into MainActivity (guarded
+extractOverlayTar). The integration session adb-pushes these and re-drains.
+
+| overlay | size | provides |
+|---|---|---|
+| `xkb-gegl-stage.tar` | 6.2 MB | C.UTF-8 locale + svg pixbuf loader (0755) |
+| `netsurf-stage.tar` | 7.1 MB | netsurf-gtk (GTK3 browser) |
+| `sdl2-stage.tar` | 8.2 MB | libSDL2 + wayland/audio deps |
+| `qt6-stage.tar` | 74.2 MB | Qt6 + qtwayland plugins + ICU |
+| `x11-stage.tar` | 11.8 MB | Xwayland (rootful) + xterm + x11-apps |
+| `foot-stage.tar` | 1.1 MB | foot (wayland terminal) |
+| `gtk3demo-stage.tar` | 14.9 MB | gtk3-demo / gtk3-widget-factory |
+| `dpkg-db-stage.tar` | 0.7 MB | reconstructed dpkg admin DB (194 pkgs) |
+| `apt-config-stage.tar` | <1 KB | neutralize third-party apt sources (noble-only) |
+
+WS-4 milestones M1–M5 + §10(a)(b)(c) host-complete. Device/L1-gated remainders
+(integration/other WS): C.UTF-8 `setlocale` path-mediation (WS-1, §12); dpkg
+maintainer-script fork/exec under the loader (L1); toolkit/Xwayland launch-on-
+compositor wiring (L2/L3); and the base `.so` exec-bit fix (RootfsInstaller, ws-4
+3649725) applies on the next base re-extraction (prepareBundledTinyRootfs re-extracts
+every cold start).
