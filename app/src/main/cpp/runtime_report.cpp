@@ -1510,6 +1510,13 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     // rootfs-ABSOLUTE xkb dir: that's an already-host path, so the supervisor's
     // idempotency guard skips rewriting it and libxkbcommon opens the real files.
     guest_env.push_back("XKB_CONFIG_ROOT=" + config.rootfs_dir + "/usr/share/X11/xkb");
+    // WS-1: gdk-pixbuf가 loaders.cache + loader .so를 절대경로(/usr/lib/...)로 dlopen
+    // 하는데, XKB와 동일하게 path-mediate가 안 잡혀 ENOENT → SVG 아이콘 로드 실패로 GTK abort.
+    // rootfs-ABSOLUTE module file/dir로 직접 가리켜 mediation 우회(이미 host 경로 → idempotency 가드 skip).
+    guest_env.push_back("GDK_PIXBUF_MODULE_FILE=" + config.rootfs_dir +
+                        "/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders.cache");
+    guest_env.push_back("GDK_PIXBUF_MODULEDIR=" + config.rootfs_dir +
+                        "/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders");
     guest_env.push_back("XDG_CONFIG_HOME=/root/.config");
     guest_env.push_back("XDG_CACHE_HOME=/root/.cache");  // fontconfig cache (writable)
     guest_env.push_back("FONTCONFIG_PATH=/etc/fonts");
