@@ -833,6 +833,58 @@ GLenum glCheckFramebufferStatus(GLenum target) { (void)target; return 0x8CD5; }
 void glDeleteFramebuffers(GLsizei n, const GLuint *framebuffers)   { (void)n; (void)framebuffers; }
 void glDeleteRenderbuffers(GLsizei n, const GLuint *renderbuffers) { (void)n; (void)renderbuffers; }
 
+/* ---- GLES3: vertex array objects + instanced draws. VAOs use virtual ids (gen
+ * returns immediately; host maps virtual->real); id 0 stays 0 (default VAO). The host
+ * runs these on the GLES3 context GpuExecutorService requests. ---- */
+static void build_gen_vertex_array(AlrEncoder *e, void *p) {
+    alr_enc_u8(e, ALR_OP_GEN_VERTEX_ARRAY); alr_enc_u32(e, ((struct VidArgs*)p)->vid);
+}
+void glGenVertexArrays(GLsizei n, GLuint *arrays) {
+    if (n <= 0 || !arrays) return;
+    AlrShimState *s = alr_shim();
+    for (GLsizei i = 0; i < n; ++i) {
+        uint32_t vid = alloc_id(&s->next_vertex_array);
+        struct VidArgs a = { vid };
+        alr_shim_emit(build_gen_vertex_array, &a);
+        arrays[i] = (GLuint)vid;
+    }
+}
+struct BindVaArgs { uint32_t vid; };
+static void build_bind_vertex_array(AlrEncoder *e, void *p) {
+    alr_enc_u8(e, ALR_OP_BIND_VERTEX_ARRAY); alr_enc_u32(e, ((struct BindVaArgs*)p)->vid);
+}
+void glBindVertexArray(GLuint array) {
+    struct BindVaArgs a = { (uint32_t)array };  /* 0 stays 0 (host default VAO) */
+    alr_shim_emit(build_bind_vertex_array, &a);
+}
+void glDeleteVertexArrays(GLsizei n, const GLuint *arrays) { (void)n; (void)arrays; }
+
+struct DrawArraysInstArgs { uint32_t mode; int32_t first, count, inst; };
+static void build_draw_arrays_instanced(AlrEncoder *e, void *p) {
+    struct DrawArraysInstArgs *a = (struct DrawArraysInstArgs*)p;
+    alr_enc_u8(e, ALR_OP_DRAW_ARRAYS_INSTANCED);
+    alr_enc_u32(e, a->mode); alr_enc_i32(e, a->first);
+    alr_enc_i32(e, a->count); alr_enc_i32(e, a->inst);
+}
+void glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instancecount) {
+    struct DrawArraysInstArgs a = { (uint32_t)mode, (int32_t)first, (int32_t)count,
+                                    (int32_t)instancecount };
+    alr_shim_emit(build_draw_arrays_instanced, &a);
+}
+struct DrawElemsInstArgs { uint32_t mode; int32_t count; uint32_t type, offset; int32_t inst; };
+static void build_draw_elements_instanced(AlrEncoder *e, void *p) {
+    struct DrawElemsInstArgs *a = (struct DrawElemsInstArgs*)p;
+    alr_enc_u8(e, ALR_OP_DRAW_ELEMENTS_INSTANCED);
+    alr_enc_u32(e, a->mode); alr_enc_i32(e, a->count);
+    alr_enc_u32(e, a->type); alr_enc_u32(e, a->offset); alr_enc_i32(e, a->inst);
+}
+void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void *indices,
+                             GLsizei instancecount) {
+    struct DrawElemsInstArgs a = { (uint32_t)mode, (int32_t)count, (uint32_t)type,
+                                   (uint32_t)(uintptr_t)indices, (int32_t)instancecount };
+    alr_shim_emit(build_draw_elements_instanced, &a);
+}
+
 /* ---- optimistic queries (no round-trip) ---- */
 GLenum glGetError(void) {
     AlrShimState *s = alr_shim();
