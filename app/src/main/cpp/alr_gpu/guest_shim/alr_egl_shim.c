@@ -100,16 +100,39 @@ EGLBoolean eglGetConfigAttrib(EGLDisplay dpy, EGLConfig config, EGLint attribute
     if (dpy != ALR_EGL_DISPLAY || config != ALR_EGL_CONFIG || !value) {
         egl_set_error(EGL_BAD_PARAMETER); return EGL_FALSE;
     }
+    /* Report a COMPLETE 8888 / d24 / s8 ES2 window+pbuffer config. glmark2 reads these
+     * into a GLVisualConfig and rejects ("Failed to find suitable EGL config") if a
+     * required attr is short — notably EGL_BUFFER_SIZE, which was previously 0 (default)
+     * and disqualified the config. */
     switch (attribute) {
-        case EGL_RED_SIZE:        *value = 8; break;
-        case EGL_GREEN_SIZE:      *value = 8; break;
-        case EGL_BLUE_SIZE:       *value = 8; break;
-        case EGL_ALPHA_SIZE:      *value = 8; break;
-        case EGL_DEPTH_SIZE:      *value = 24; break;
-        case EGL_STENCIL_SIZE:    *value = 8; break;
-        case EGL_RENDERABLE_TYPE: *value = EGL_OPENGL_ES2_BIT; break;
-        case EGL_SURFACE_TYPE:    *value = EGL_WINDOW_BIT | EGL_PBUFFER_BIT; break;
-        default:                  *value = 0; break;   /* unknown attr -> 0, still EGL_TRUE */
+        case EGL_BUFFER_SIZE:        *value = 32; break;   /* 8+8+8+8 — the drain blocker */
+        case EGL_RED_SIZE:           *value = 8; break;
+        case EGL_GREEN_SIZE:         *value = 8; break;
+        case EGL_BLUE_SIZE:          *value = 8; break;
+        case EGL_ALPHA_SIZE:         *value = 8; break;
+        case EGL_LUMINANCE_SIZE:     *value = 0; break;
+        case EGL_ALPHA_MASK_SIZE:    *value = 0; break;
+        case EGL_DEPTH_SIZE:         *value = 24; break;
+        case EGL_STENCIL_SIZE:       *value = 8; break;
+        case EGL_SAMPLES:            *value = 0; break;
+        case EGL_SAMPLE_BUFFERS:     *value = 0; break;
+        case EGL_CONFIG_CAVEAT:      *value = EGL_NONE; break;
+        case EGL_CONFIG_ID:          *value = 1; break;
+        case EGL_LEVEL:              *value = 0; break;
+        case EGL_COLOR_BUFFER_TYPE:  *value = EGL_RGB_BUFFER; break;
+        case EGL_RENDERABLE_TYPE:    *value = EGL_OPENGL_ES2_BIT; break;
+        case EGL_CONFORMANT:         *value = EGL_OPENGL_ES2_BIT; break;
+        case EGL_SURFACE_TYPE:       *value = EGL_WINDOW_BIT | EGL_PBUFFER_BIT; break;
+        case EGL_NATIVE_RENDERABLE:  *value = EGL_TRUE; break;
+        case EGL_NATIVE_VISUAL_ID:   *value = 0; break;
+        case EGL_NATIVE_VISUAL_TYPE: *value = EGL_NONE; break;
+        case EGL_TRANSPARENT_TYPE:   *value = EGL_NONE; break;
+        case EGL_MAX_PBUFFER_WIDTH:  *value = 4096; break;
+        case EGL_MAX_PBUFFER_HEIGHT: *value = 4096; break;
+        case EGL_MAX_PBUFFER_PIXELS: *value = 4096 * 4096; break;
+        case EGL_MIN_SWAP_INTERVAL:  *value = 0; break;
+        case EGL_MAX_SWAP_INTERVAL:  *value = 1; break;
+        default:                     *value = 0; break;   /* unknown attr -> 0, still EGL_TRUE */
     }
     egl_set_error(EGL_SUCCESS);
     return EGL_TRUE;
