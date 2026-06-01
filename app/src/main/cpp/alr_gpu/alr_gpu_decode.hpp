@@ -44,6 +44,7 @@ void glBindVertexArray(GLuint array);
 void glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instancecount);
 void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void* indices,
                              GLsizei instancecount);
+void glVertexAttribDivisor(GLuint index, GLuint divisor);
 }
 
 namespace alr::gpu {
@@ -121,6 +122,8 @@ enum Op : uint8_t {
     OP_BIND_VERTEX_ARRAY = 101,      // u32 vva_id (0 -> default VAO)
     OP_DRAW_ARRAYS_INSTANCED = 102,  // u32 mode, i32 first, i32 count, i32 instancecount
     OP_DRAW_ELEMENTS_INSTANCED = 103,// u32 mode, i32 count, u32 type, u32 offset, i32 instancecount
+    OP_VERTEX_ATTRIB_DIVISOR = 104,      // u32 index, u32 divisor
+    OP_VERTEX_ATTRIB_DIVISOR_NAMED = 105,// u32 vprog, blob(name), u32 divisor
 };
 
 // Host-side decode state: the virtual->real GL name translation tables. The guest
@@ -574,6 +577,21 @@ inline bool decode_batch(const uint8_t* data, size_t len, HostState& st) {
                 glDrawElementsInstanced(mode, count, type,
                                         reinterpret_cast<const void*>(static_cast<uintptr_t>(offset)),
                                         inst);
+                ++st.decoded; break;
+            }
+            case OP_VERTEX_ATTRIB_DIVISOR: {
+                uint32_t index, divisor;
+                if (!r.u32(index) || !r.u32(divisor)) { st.ok = false; break; }
+                glVertexAttribDivisor(index, divisor); ++st.decoded; break;
+            }
+            case OP_VERTEX_ATTRIB_DIVISOR_NAMED: {
+                uint32_t vp, nlen, divisor; const uint8_t* name;
+                if (!r.u32(vp)) { st.ok = false; break; }
+                if (!r.blob(name, nlen)) { st.ok = false; break; }
+                if (!r.u32(divisor)) { st.ok = false; break; }
+                std::string nm(reinterpret_cast<const char*>(name), nlen);
+                GLint loc = glGetAttribLocation(st.real_prog(vp), nm.c_str());
+                if (loc >= 0) glVertexAttribDivisor(static_cast<GLuint>(loc), divisor);
                 ++st.decoded; break;
             }
             default:

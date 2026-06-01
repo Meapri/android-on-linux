@@ -202,6 +202,7 @@ void   glDeleteVertexArrays(GLsizei n, const GLuint *arrays);
 void   glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instancecount);
 void   glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void *indices,
                                GLsizei instancecount);
+void   glVertexAttribDivisor(GLuint index, GLuint divisor);
 
 void   glCullFace(GLenum mode);
 void   glFrontFace(GLenum mode);
