@@ -63,10 +63,10 @@ class MainActivity : Activity() {
                     filesDir.absolutePath,
                     cacheDir.absolutePath,
                     rootfsManifest.name,
-                    // First prove the 186MB binary runs to a clean exit + meaningful
-                    // output cheaply: --version skips V8/render so its syscall count is
-                    // tiny (the heavier --dump-dom is ptrace-supervisor-throttled — to
-                    // revisit once the loader's syscall fast-path is in).
+                    // --version: cheap (no V8/render), so it exits fast without starving
+                    // the main-thread GIMP probes and proves Chromium still runs under the
+                    // optimized supervisor. The heavy --dump-dom render path is a later
+                    // cumulative-perf phase (supervisor round-trip + Chromium's own weight).
                     "/usr/lib/chromium/chromium-headless-shell\n--no-sandbox\n--version",
                 )
                 android.util.Log.i("alr_loader", "chromium-boot:\n$crReport")
@@ -545,7 +545,7 @@ class MainActivity : Activity() {
             alrSeccompPathTrapProbe.lineStartingWith("alr sc PATH_MEDIATION_VIABLE=")
                 .substringAfter("PATH_MEDIATION_VIABLE=", "") == "yes"
 
-        val executionSummary = "build: 0.4.121-chromium-runs-inprocess-v121" +
+        val executionSummary = "build: 0.4.122-supervisor-fastpath-v122" +
             "\nexecution summary" +
             "\nROOTFS EXECUTION: ${if (rootfsExecutionPassed) "PASS" else "FAIL"}" +
             "\nSHELL SCRIPT EXECUTION: ${if (shellScriptExecutionPassed) "PASS" else "FAIL"}" +

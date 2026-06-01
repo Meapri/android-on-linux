@@ -41,8 +41,8 @@ android {
         applicationId = "dev.chanwoo.androlinux"
         minSdk = 26
         targetSdk = 35
-        versionCode = 121
-        versionName = "0.4.121-chromium-runs-inprocess-v121"
+        versionCode = 122
+        versionName = "0.4.122-supervisor-fastpath-v122"
         ndkVersion = "27.2.12479018"
 
         externalNativeBuild {

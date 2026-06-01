@@ -58,6 +58,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <unordered_map>  // per-tid /proc/<tid>/mem fd cache + translate result cache
 #include <mutex>
 
 #include "alr_runtime/alr_config.hpp"
@@ -1843,6 +1844,63 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     std::string first_rewrite;
     bool captured = false;
     bool options_set = false;
+    // --- Per-trap cost optimizations (behavior-identical to the open+close-every-
+    // trap baseline; verified against the device-proven GIMP path mediation). ---
+    //
+    // (1) Per-tid /proc/<tid>/mem fd cache. The baseline open()+close()d
+    // /proc/<tid>/mem on every PTRACE_EVENT_SECCOMP trap. Under a heavy guest
+    // (Chromium --dump-dom: 22 threads hammering path syscalls) that is two extra
+    // syscalls per trap. We instead open the mem fd O_RDWR LAZILY on the first
+    // trap for a tid and REUSE it for every subsequent trap from that tid: pread/
+    // pwrite take an explicit offset, so the same fd serves any path_addr. The fd
+    // is closed when the tid is reaped (WIFEXITED/WIFSIGNALED below — the options
+    // set on the leader do NOT include PTRACE_O_TRACEEXIT, so no PTRACE_EVENT_EXIT
+    // fires; reaping is the reliable death signal here) and evicted+reopened if a
+    // read/write ever fails with a stale-fd errno (ESRCH/EIO/EBADF). A final sweep
+    // after the loop closes any survivors. The I/O itself — O_RDWR open, pread(path), pwrite
+    // (scratch) — is byte-for-byte the SAME as the baseline, so mediation behavior
+    // is unchanged; only the redundant open+close are removed.
+    std::unordered_map<pid_t, int> mem_fds;
+    // mem_fd_for: return a cached O_RDWR /proc/<tid>/mem fd for `tid`, opening it
+    // on first use. Returns -1 if the open fails (caller then skips, exactly as the
+    // baseline skipped when its per-trap open failed — same observable behavior).
+    auto mem_fd_for = [&mem_fds](pid_t tid) -> int {
+        auto it = mem_fds.find(tid);
+        if (it != mem_fds.end()) {
+            return it->second;
+        }
+        const std::string memf = "/proc/" + std::to_string(tid) + "/mem";
+        const int mfd = ::open(memf.c_str(), O_RDWR);
+        // Cache the fd only on success; a failed open is retried on the next trap
+        // (matching the baseline, which re-open()ed every trap).
+        if (mfd >= 0) {
+            mem_fds.emplace(tid, mfd);
+        }
+        return mfd;
+    };
+    // mem_fd_evict: close + drop a tid's cached fd. Used both when a tid exits and
+    // when a pread/pwrite fails with a stale-fd errno so the next trap reopens it.
+    auto mem_fd_evict = [&mem_fds](pid_t tid) {
+        auto it = mem_fds.find(tid);
+        if (it != mem_fds.end()) {
+            if (it->second >= 0) {
+                ::close(it->second);
+            }
+            mem_fds.erase(it);
+        }
+    };
+    // (2) translate_rootfs_path result cache. translate_rootfs_path() is a PURE
+    // function of (rootfs_dir, cwd, guest_path); in this handler rootfs_dir
+    // (config.rootfs_dir) and cwd ("/") are CONSTANT for the whole run, so the
+    // result depends ONLY on the guest path string. A repeated guest path (GIMP
+    // re-opens the same font/brush/data files constantly) therefore yields the
+    // IDENTICAL host path. We memoize guest_path -> host_path in a bounded hash
+    // (cleared wholesale when it would exceed the cap — rootfs paths never change
+    // during a run, so nothing needs targeted invalidation). A hit reuses the
+    // cached host string for the scratch write and skips the translate call. Same
+    // input => same output, so the rewrite is provably unchanged.
+    std::unordered_map<std::string, std::string> xlate_cache;
+    constexpr std::size_t kXlateCacheCap = 256;
     // Multi-tracee supervisor: waitpid(-1, __WALL) catches the guest plus every
     // thread it clones and every process it forks/execs. Each blocked syscall
     // (SIGSYS) is emulated per-tracee; only blocked syscalls trap, so overhead
@@ -1857,12 +1915,14 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
             break;  // ECHILD: every tracee has been reaped
         }
         if (WIFEXITED(status)) {
+            mem_fd_evict(w);  // tid reaped: close its cached /proc/<tid>/mem fd
             if (w == pid) {
                 code = WEXITSTATUS(status);
             }
             continue;
         }
         if (WIFSIGNALED(status)) {
+            mem_fd_evict(w);  // tid killed: close its cached /proc/<tid>/mem fd
             if (w == pid) {
                 sig = WTERMSIG(status);
             }
@@ -1895,12 +1955,26 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                      sysno == static_cast<uint64_t>(__NR_execveat));
                 const uintptr_t path_addr = static_cast<uintptr_t>(regs[1]);
                 if (!is_exec && path_addr != 0) {
-                    const std::string memf = "/proc/" + std::to_string(w) + "/mem";
-                    const int mfd = ::open(memf.c_str(), O_RDWR);
+                    // Cached O_RDWR /proc/<tid>/mem fd (opened lazily, reused across
+                    // this tid's traps), replacing the baseline's per-trap open+close.
+                    int mfd = mem_fd_for(w);
                     if (mfd >= 0) {
                         char gp[512] = {0};
-                        const ssize_t got =
+                        ssize_t got =
                             ::pread(mfd, gp, sizeof(gp) - 1, static_cast<off_t>(path_addr));
+                        // Stale-fd recovery: if the cached fd's pread fails with an
+                        // errno that means the fd no longer maps this tid's address
+                        // space (the tracee re-exec'd, was reaped+reused, or the fd
+                        // went bad), evict and reopen ONCE so this trap behaves
+                        // exactly like the baseline's always-fresh per-trap open.
+                        if (got < 0 && (errno == ESRCH || errno == EIO || errno == EBADF)) {
+                            mem_fd_evict(w);
+                            mfd = mem_fd_for(w);
+                            if (mfd >= 0) {
+                                got = ::pread(mfd, gp, sizeof(gp) - 1,
+                                              static_cast<off_t>(path_addr));
+                            }
+                        }
                         if (got > 0) {
                             gp[got] = '\0';
                             // Only mediate absolute guest paths; leave relative
@@ -1923,15 +1997,43 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                             const bool already_host =
                                 under(gp, config.rootfs_dir.c_str());
                             if (gp[0] == '/' && !sysdir && !already_host) {
-                                const auto t = alr::runtime::translate_rootfs_path(
-                                    config.rootfs_dir, "/", gp);
-                                const std::string& host = t.host_path;
+                                // translate_rootfs_path is pure in (rootfs_dir, cwd,
+                                // path); rootfs_dir and cwd are fixed for the run, so
+                                // a repeated guest path yields an identical host path.
+                                // Memoize guest_path -> host_path; a hit reuses the
+                                // exact same string the translate call would return.
+                                auto cit = xlate_cache.find(gp);
+                                if (cit == xlate_cache.end()) {
+                                    const auto t = alr::runtime::translate_rootfs_path(
+                                        config.rootfs_dir, "/", gp);
+                                    // Bounded: rootfs paths are stable for a run, so
+                                    // wholesale clearing at the cap (rather than per-
+                                    // entry eviction) is correct and keeps it simple.
+                                    if (xlate_cache.size() >= kXlateCacheCap) {
+                                        xlate_cache.clear();
+                                    }
+                                    cit = xlate_cache.emplace(gp, t.host_path).first;
+                                }
+                                const std::string& host = cit->second;
                                 const uintptr_t sp = static_cast<uintptr_t>(regs[31]);
                                 const uintptr_t scratch =
                                     (sp - 2048) & ~static_cast<uintptr_t>(0xf);
-                                const ssize_t wr = ::pwrite(mfd, host.c_str(),
-                                                            host.size() + 1,
-                                                            static_cast<off_t>(scratch));
+                                ssize_t wr = ::pwrite(mfd, host.c_str(),
+                                                      host.size() + 1,
+                                                      static_cast<off_t>(scratch));
+                                // Same stale-fd recovery as the read: a cached fd that
+                                // went bad between read and write is evicted+reopened
+                                // once, so the write is as robust as the baseline's
+                                // fresh per-trap fd.
+                                if (wr < 0 &&
+                                    (errno == ESRCH || errno == EIO || errno == EBADF)) {
+                                    mem_fd_evict(w);
+                                    mfd = mem_fd_for(w);
+                                    if (mfd >= 0) {
+                                        wr = ::pwrite(mfd, host.c_str(), host.size() + 1,
+                                                      static_cast<off_t>(scratch));
+                                    }
+                                }
                                 if (wr == static_cast<ssize_t>(host.size() + 1)) {
                                     regs[1] = scratch;
                                     if (::ptrace(PTRACE_SETREGSET, w,
@@ -1945,7 +2047,9 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                                 }
                             }
                         }
-                        ::close(mfd);
+                        // NB: no per-trap ::close(mfd) — the fd is cached and closed
+                        // when the tid exits (WIFEXITED/WIFSIGNALED) or is evicted on
+                        // a stale-fd error above.
                     }
                 }
             }
@@ -2032,6 +2136,15 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         // Deliver any other signal to the tracee that received it.
         ::ptrace(PTRACE_CONT, w, nullptr, reinterpret_cast<void*>(static_cast<long>(stopsig)));
     }
+    // Supervisor loop exited (ECHILD: all tracees reaped). Per-exit eviction already
+    // closed each tid's fd; close any survivors (e.g. a tid lost to the SIGKILL
+    // runaway path before its WIFSIGNALED was observed) so no /proc/<tid>/mem fd leaks.
+    for (const auto& kv : mem_fds) {
+        if (kv.second >= 0) {
+            ::close(kv.second);
+        }
+    }
+    mem_fds.clear();
     std::string guest_stdout;
     std::string diag;
     try {
