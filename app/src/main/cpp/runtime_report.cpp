@@ -84,6 +84,11 @@
 // presenting per frame (req_seq/reply_seq handshake). run_live_integration_probe()
 // is the in-process two-thread device self-test of that whole loop.
 #include "alr_gpu/alr_gpu_host_service.hpp"
+// alr_gpu_screen.hpp: STEP B-1 on-screen present — the executor renders the cube
+// into an AHB, then presents it to an ANativeWindow via external-OES (a SECOND EGL
+// context, dodging the v117 same-context black-AHB hazard). run_screen_cube_demo()
+// streams a spinning textured cube to the SurfaceView (in-process, no fork/rootfs).
+#include "alr_gpu/alr_gpu_screen.hpp"
 
 namespace {
 
@@ -4830,6 +4835,27 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeProbeVulkanSurface(
     jobject /* thiz */,
     jobject surface) {
     const auto report = probe_vulkan_android_surface(env, surface);
+    return env->NewStringUTF(report.c_str());
+}
+
+// STEP B-1: render a spinning textured cube THROUGH the live GPU pipeline (guest op
+// stream -> SPSC ring -> host executor -> AHB) and present it onto this SurfaceView's
+// ANativeWindow zero-copy via external-OES. In-process (no fork/rootfs); the visible
+// payoff of the v118 live-integration backbone. Mirrored to logcat tag alr_loader.
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeAlrGpuScreenCube(
+    JNIEnv* env,
+    jobject /* thiz */,
+    jobject surface,
+    jint frames) {
+    ANativeWindow* win = ANativeWindow_fromSurface(env, surface);
+    if (win == nullptr) {
+        return env->NewStringUTF(
+            "ALR GPU SCREEN CUBE: FAIL\nreason=ANativeWindow_fromSurface returned null");
+    }
+    const auto report = alr::gpu::run_screen_cube_demo(win, static_cast<int>(frames));
+    ANativeWindow_release(win);
+    __android_log_print(ANDROID_LOG_INFO, "alr_loader", "gpu-screen-cube:\n%s", report.c_str());
     return env->NewStringUTF(report.c_str());
 }
 

@@ -506,7 +506,7 @@ class MainActivity : Activity() {
             alrSeccompPathTrapProbe.lineStartingWith("alr sc PATH_MEDIATION_VIABLE=")
                 .substringAfter("PATH_MEDIATION_VIABLE=", "") == "yes"
 
-        val executionSummary = "build: 0.4.118-android-gpu-native-live-v118" +
+        val executionSummary = "build: 0.4.119-android-gpu-screen-cube-v119" +
             "\nexecution summary" +
             "\nROOTFS EXECUTION: ${if (rootfsExecutionPassed) "PASS" else "FAIL"}" +
             "\nSHELL SCRIPT EXECUTION: ${if (shellScriptExecutionPassed) "PASS" else "FAIL"}" +
@@ -964,6 +964,15 @@ class MainActivity : Activity() {
                     val vulkanSurfaceReport = nativeProbeVulkanSurface(holder.surface)
                     val vulkanSurfaceRenderReport = nativeRenderVulkanSurfaceFrames(holder.surface, encodedFrames)
                     val surfaceReport = nativeRenderGpuSurfaceFrames(holder.surface, encodedFrames)
+                    // STEP B-1: a spinning textured cube through the LIVE GPU pipeline
+                    // (guest op stream -> SPSC ring -> host executor -> AHB) presented
+                    // onto this SurfaceView zero-copy via external-OES. In-process (no
+                    // fork/rootfs) — the visible payoff of the v118 live backbone. Run
+                    // synchronously here, before the compositor, so the single Surface
+                    // is used sequentially; 60 frames (~1s) stays well inside the ANR window.
+                    val cubeReport = nativeAlrGpuScreenCube(holder.surface, 60)
+                    val cubeOk = cubeReport.lineStartingWith("ALR GPU SCREEN CUBE:") ==
+                        "ALR GPU SCREEN CUBE: PASS"
 
                     // The summary was built before this callback, so its surface gates
                     // read PENDING_SURFACE_CALLBACK. Resolve them from the real render
@@ -1008,6 +1017,7 @@ class MainActivity : Activity() {
                     view.append("\n\n--- Android host Vulkan surface probe ---\n$vulkanSurfaceReport")
                     view.append("\n\n--- Android host Vulkan surface renderer ---\n$vulkanSurfaceRenderReport")
                     view.append("\n\n--- Linux guest Wayland/X11 GUI GPU surface renderer ---\n$surfaceReport")
+                    view.append("\n\nALR GPU SCREEN CUBE (live pipeline -> AHB -> external-OES on SurfaceView): ${if (cubeOk) "PASS" else "FAIL"}\n$cubeReport")
 
                     // Phase 3: stand up the in-app Wayland compositor on this
                     // Surface, then run a stock wl_shm guest client through the
@@ -1643,6 +1653,8 @@ class MainActivity : Activity() {
     private external fun nativeAlrGpuFboProbe(): String
 
     private external fun nativeAlrGpuLiveProbe(): String
+
+    private external fun nativeAlrGpuScreenCube(surface: android.view.Surface, frames: Int): String
 
     private external fun nativeHostGpuProbe(): String
 

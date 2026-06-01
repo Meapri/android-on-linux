@@ -36,6 +36,7 @@
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
 #include <android/hardware_buffer.h>
+#include <android/native_window.h>
 
 #include <algorithm>
 #include <atomic>
@@ -61,6 +62,26 @@ namespace alr::gpu {
 // be wired independently), the framebuffer dimensions, and a present callback
 // invoked once per completed frame ON the consumer thread, after glFinish, so the
 // callback may safely issue GL / glReadPixels on the same live context.
+//
+// OPTIONAL on-screen present (M5): if a non-null `window` (an ANativeWindow) is
+// supplied, the GL thread ALSO creates a second EGL context bound to a window
+// surface for that ANativeWindow, plus a samplerExternalOES "blit" program. After
+// each frame's decode-into-AHB + glFinish, it makes the WINDOW context current,
+// imports the just-rendered AHB as a GL_TEXTURE_EXTERNAL_OES texture, draws a
+// full-screen quad sampling it, and eglSwapBuffers — putting the rendered frame on
+// the screen zero-copy. When `window` is nullptr (the default) NONE of that exists
+// and the service behaves EXACTLY as the pbuffer-only original (so
+// run_live_integration_probe is byte-for-byte unchanged).
+//
+// Why two contexts, both on the one GL thread: Mali returns BLACK if you sample an
+// AHB via external-OES in the SAME EGL context that just rendered into it as an
+// FBO color attachment (tile-resolve / same-AHB read-after-write hazard, observed
+// at v117; v114 proved a DIFFERENT context samples it fine). So the decode-into-AHB
+// runs in the pbuffer context and the external-OES present runs in the window
+// context. A GL context is thread-affine, so both live on this single thread and we
+// eglMakeCurrent between them once per frame. They share an EGL share group so the
+// AHB-import path is identical; only the render-target sampling crosses the context
+// boundary, which is what defeats the hazard.
 // ===========================================================================
 class GpuExecutorService {
 public:
@@ -68,13 +89,18 @@ public:
 
     // `ring_region` must already be ring_init'd (size == ring_region_size of the
     // chosen ring_bytes). `region_bytes` is the TOTAL region size (header + data),
-    // kept for symmetry / future bounds use. `present` may be empty.
+    // kept for symmetry / future bounds use. `present` may be empty. `window` is
+    // OPTIONAL: when non-null the GL thread additionally presents each rendered AHB
+    // to that ANativeWindow (see class comment); when nullptr (default) the service
+    // is pbuffer-only and identical to the original — preserving every existing call
+    // site (e.g. run_live_integration_probe) unchanged.
     GpuExecutorService(void* ring_region, size_t region_bytes, int fb_w, int fb_h,
-                       PresentFn present)
+                       PresentFn present, ANativeWindow* window = nullptr)
         : region_(ring_region),
           fb_w_(fb_w),
           fb_h_(fb_h),
-          present_(std::move(present)) {
+          present_(std::move(present)),
+          window_(window) {
         // region_bytes is accepted for API symmetry (the data ring size lives in the
         // RingHeader the caller already ring_init'd); the consumer derives all bounds
         // from the header, so we don't store it.
@@ -128,8 +154,25 @@ public:
     const std::string& error() const { return error_; }
     const std::string& renderer_string() const { return renderer_; }
     bool software() const { return software_.load(std::memory_order_acquire); }
+    // True once the optional window context + present program were created (only
+    // meaningful when a non-null window was passed). Read after start() returns.
+    bool window_ready() const { return window_ready_.load(std::memory_order_acquire); }
 
 private:
+    // ---- Optional on-screen present: window EGL context + external-OES blit. ----
+    // Declared before the methods that take it by reference. GL handles live in the
+    // WINDOW context (shared group), so a single full-screen triangle program + the
+    // AHB-import proc is all the per-frame present needs.
+    struct WinPresent {
+        EGLSurface surf = EGL_NO_SURFACE;
+        EGLContext ctx = EGL_NO_CONTEXT;
+        GLuint program = 0;     // samplerExternalOES full-screen blit program
+        GLint a_pos = -1;       // vec2 attribute (NDC position)
+        GLint u_tex = -1;       // samplerExternalOES uniform
+        GLuint ext_tex = 0;     // GL_TEXTURE_EXTERNAL_OES the AHB is imported into
+        PFNGLEGLIMAGETARGETTEXTURE2DOESPROC p_image_target = nullptr;
+    };
+
     // ---- The consumer/GL thread. ALL EGL/GLES happens here. ----
     void thread_main() {
         // 1) EGL display + GLES2 context (surfaceless via a 1x1 pbuffer, same style
@@ -165,6 +208,53 @@ private:
             return;
         }
 
+        // OPTIONAL on-screen present: a SECOND EGL context bound to a window surface
+        // for `window_`, sharing this pbuffer context's object space. Sampling the
+        // AHB here (not in the pbuffer ctx) sidesteps the Mali same-context black-AHB
+        // hazard. If anything fails we tear the window pieces down and fall back to
+        // pbuffer-only (still a valid headless run), recording the reason in error_.
+        WinPresent win;  // all zero / EGL_NO_* when no window or on setup failure
+        if (window_ != nullptr) {
+            // A window-renderable config (window surfaces need EGL_WINDOW_BIT).
+            const EGLint win_cfg_attribs[] = {
+                EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+                EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+                EGL_NONE,
+            };
+            EGLConfig wcfg = nullptr;
+            EGLint wn = 0;
+            if (eglChooseConfig(dpy, win_cfg_attribs, &wcfg, 1, &wn) == EGL_TRUE && wn >= 1) {
+                win.surf = eglCreateWindowSurface(dpy, wcfg, window_, nullptr);
+                // Share with the pbuffer context so the AHB-import GL objects live in
+                // one namespace; only the render-target SAMPLING crosses the boundary.
+                win.ctx = eglCreateContext(dpy, wcfg, ctx, ctx_attribs);
+            }
+            // The AHB->external-OES import proc (does not need a current context).
+            win.p_image_target = reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(
+                eglGetProcAddress("glEGLImageTargetTexture2DOES"));
+            if (win.surf == EGL_NO_SURFACE || win.ctx == EGL_NO_CONTEXT) {
+                error_ = "window-egl " + egl_err_hex_local();
+            } else if (win.p_image_target == nullptr) {
+                error_ = "no-glEGLImageTargetTexture2DOES";
+            } else if (eglMakeCurrent(dpy, win.surf, win.surf, win.ctx) != EGL_TRUE ||
+                       !win_present_setup(win)) {
+                if (error_.empty()) error_ = "window-present-setup " + egl_err_hex_local();
+                win_present_teardown(dpy, win);  // window ctx is current here
+            } else {
+                // Window present is fully wired; do not enter the teardown path below.
+                window_ready_.store(true, std::memory_order_release);
+            }
+            // If setup did not fully succeed, drop any partial window state so the run
+            // proceeds headless (pbuffer-only) — still a valid headless render.
+            if (!window_ready_.load(std::memory_order_acquire)) {
+                if (win.ctx != EGL_NO_CONTEXT) eglDestroyContext(dpy, win.ctx);
+                if (win.surf != EGL_NO_SURFACE) eglDestroySurface(dpy, win.surf);
+                win = WinPresent{};
+            }
+            // Return to the pbuffer (render) context for AHB-FBO creation below.
+            eglMakeCurrent(dpy, surf, surf, ctx);
+        }
+
         // Capture renderer identity / software-ness once, now that a context is current.
         {
             std::string vendor, rr;
@@ -175,16 +265,31 @@ private:
         }
 
         // 2) AHB-backed render target (allocate + import + FBO), and verify complete.
+        //    ahb_target_create attaches only a color attachment; attach a DEPTH
+        //    renderbuffer too so depth-tested geometry (the spinning cube) occludes
+        //    correctly. The triangle stream never enables GL_DEPTH_TEST, so this is
+        //    inert for the existing probe — only the FBO completeness check sees it.
         AhbRenderTarget rt;
+        GLuint depth_rb = 0;
         bool rt_ok = ahb_target_create(rt, dpy, fb_w_, fb_h_);
         if (rt_ok) {
             glBindFramebuffer(GL_FRAMEBUFFER, rt.fbo);
+            glGenRenderbuffers(1, &depth_rb);
+            glBindRenderbuffer(GL_RENDERBUFFER, depth_rb);
+            glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, fb_w_, fb_h_);
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                      GL_RENDERBUFFER, depth_rb);
+            glBindRenderbuffer(GL_RENDERBUFFER, 0);
             rt_ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
         }
         if (!rt_ok) {
             error_ = "ahb-fbo-incomplete";
             setup_failed_.store(true, std::memory_order_release);
+            if (depth_rb) glDeleteRenderbuffers(1, &depth_rb);
             ahb_target_destroy(rt);
+            win_present_teardown(dpy, win);
+            if (win.ctx != EGL_NO_CONTEXT) eglDestroyContext(dpy, win.ctx);
+            if (win.surf != EGL_NO_SURFACE) eglDestroySurface(dpy, win.surf);
             eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
             eglDestroyContext(dpy, ctx);
             eglDestroySurface(dpy, surf);
@@ -198,11 +303,16 @@ private:
 
         // 3) Consume loop: drain ring bytes into a per-frame accumulator; on each
         //    producer flush (req_seq advances past what we've replied to) decode the
-        //    frame into the AHB-FBO, glFinish, present, and post_reply.
-        run_consume_loop(rt);
+        //    frame into the AHB-FBO, glFinish, present (callback + optional on-screen
+        //    window blit), and post_reply.
+        run_consume_loop(dpy, surf, ctx, rt, win);
 
         // 4) GL teardown — on this thread, before it exits.
+        if (depth_rb) glDeleteRenderbuffers(1, &depth_rb);
         ahb_target_destroy(rt);
+        win_present_teardown(dpy, win);
+        if (win.ctx != EGL_NO_CONTEXT) eglDestroyContext(dpy, win.ctx);
+        if (win.surf != EGL_NO_SURFACE) eglDestroySurface(dpy, win.surf);
         eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         eglDestroyContext(dpy, ctx);
         eglDestroySurface(dpy, surf);
@@ -210,7 +320,10 @@ private:
     }
 
     // The per-frame consume/handshake loop. See header comment §frame model.
-    void run_consume_loop(AhbRenderTarget& rt) {
+    // `dpy/render_surf/render_ctx` are the pbuffer (render) context; `win` is the
+    // optional window-present context (win.ctx == EGL_NO_CONTEXT => headless).
+    void run_consume_loop(EGLDisplay dpy, EGLSurface render_surf, EGLContext render_ctx,
+                          AhbRenderTarget& rt, WinPresent& win) {
         RingConsumer cons(region_);
         auto* h = static_cast<RingHeader*>(region_);
 
@@ -262,7 +375,19 @@ private:
                 glFinish();  // ensure the draw has landed in the AHB before present.
 
                 if (present_) {
-                    present_(rt);  // callback runs on THIS (GL) thread; GL is safe.
+                    present_(rt);  // callback runs on THIS (GL) thread, RENDER context.
+                }
+
+                // On-screen present (cross-context): switch to the window context and
+                // sample the just-rendered AHB via external-OES into the window
+                // surface. Sampling in the OTHER context dodges Mali's same-context
+                // black-AHB hazard. Headless when win.ctx == EGL_NO_CONTEXT.
+                if (win.ctx != EGL_NO_CONTEXT) {
+                    if (eglMakeCurrent(dpy, win.surf, win.surf, win.ctx) == EGL_TRUE) {
+                        present_to_window(dpy, rt, win);
+                    }
+                    // Restore the render context for the next frame's decode.
+                    eglMakeCurrent(dpy, render_surf, render_surf, render_ctx);
                 }
 
                 frames_presented_.fetch_add(1, std::memory_order_acq_rel);
@@ -294,16 +419,107 @@ private:
         ready_.store(true, std::memory_order_release);  // unblock start() (with error).
     }
 
+    // Build the samplerExternalOES blit program + the persistent external-OES
+    // texture object, in the CURRENTLY-CURRENT (window) context. Returns false on
+    // any GL failure. A full-screen triangle (3 verts) covers the viewport; UVs are
+    // derived from clip position so no separate attribute/VBO is needed. We DO flip V
+    // (uv.y = 1 - ...) because the AHB-FBO was rendered bottom-up (GL convention) and
+    // the window surface is also bottom-up, but the AHB content read back as a 2D
+    // texture is top-left origin — matching the WaylandPresenter external-OES path
+    // which V-flips. The cube demo is symmetric in Y at frame boundaries, so this is
+    // belt-and-suspenders; a wrong flip would still present, just upside down.
+    bool win_present_setup(WinPresent& win) {
+        const char* vsrc =
+            "attribute vec2 aPos; varying vec2 vUv;"
+            "void main(){ vUv = vec2(aPos.x*0.5+0.5, 1.0-(aPos.y*0.5+0.5));"
+            " gl_Position = vec4(aPos, 0.0, 1.0); }";
+        const char* fsrc =
+            "#extension GL_OES_EGL_image_external : require\n"
+            "precision mediump float; varying vec2 vUv;"
+            "uniform samplerExternalOES uTex;"
+            "void main(){ gl_FragColor = texture2D(uTex, vUv); }";
+        GLuint vs = run_compile(GL_VERTEX_SHADER, vsrc);
+        GLuint fs = run_compile(GL_FRAGMENT_SHADER, fsrc);
+        if (vs == 0 || fs == 0) {
+            if (vs) glDeleteShader(vs);
+            if (fs) glDeleteShader(fs);
+            return false;
+        }
+        win.program = glCreateProgram();
+        glAttachShader(win.program, vs);
+        glAttachShader(win.program, fs);
+        glBindAttribLocation(win.program, 0, "aPos");
+        glLinkProgram(win.program);
+        glDeleteShader(vs);
+        glDeleteShader(fs);
+        GLint linked = 0;
+        glGetProgramiv(win.program, GL_LINK_STATUS, &linked);
+        if (!linked) {
+            glDeleteProgram(win.program);
+            win.program = 0;
+            return false;
+        }
+        win.a_pos = glGetAttribLocation(win.program, "aPos");
+        win.u_tex = glGetUniformLocation(win.program, "uTex");
+        glGenTextures(1, &win.ext_tex);
+        return win.ext_tex != 0;
+    }
+
+    void win_present_teardown(EGLDisplay /*dpy*/, WinPresent& win) {
+        // win.program / win.ext_tex were created in win.ctx, which shares an EGL
+        // share group with the pbuffer (render) context, so they are valid to delete
+        // from EITHER context — the caller need not have the window context current.
+        // (eglDestroyContext on win.ctx would also free them, so this is belt-and-
+        // suspenders for the success path; harmless if some other context is current.)
+        if (win.ext_tex) { glDeleteTextures(1, &win.ext_tex); win.ext_tex = 0; }
+        if (win.program) { glDeleteProgram(win.program); win.program = 0; }
+    }
+
+    // Import the rendered AHB as external-OES and blit a full-screen triangle to the
+    // window surface, then swap. MUST be called with the window context current.
+    void present_to_window(EGLDisplay dpy, AhbRenderTarget& rt, WinPresent& win) {
+        // Import the AHB (already an EGLImageKHR in rt.image) into the external-OES
+        // texture. Re-binding the same EGLImage each frame is cheap and avoids any
+        // stale-content question on a persistent texture.
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, win.ext_tex);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        win.p_image_target(GL_TEXTURE_EXTERNAL_OES,
+                           static_cast<GLeglImageOES>(rt.image));
+
+        const int win_w = std::max(1, ANativeWindow_getWidth(window_));
+        const int win_h = std::max(1, ANativeWindow_getHeight(window_));
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);  // the window surface (default FBO)
+        glViewport(0, 0, win_w, win_h);
+        glDisable(GL_DEPTH_TEST);  // the blit is a flat full-screen pass
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glUseProgram(win.program);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, win.ext_tex);
+        glUniform1i(win.u_tex, 0);
+        // Full-screen triangle (covers the viewport; clipped to the quad region).
+        const GLfloat tri[] = {-1.0f, -1.0f, 3.0f, -1.0f, -1.0f, 3.0f};
+        glEnableVertexAttribArray(static_cast<GLuint>(win.a_pos));
+        glVertexAttribPointer(static_cast<GLuint>(win.a_pos), 2, GL_FLOAT, GL_FALSE, 0, tri);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        eglSwapBuffers(dpy, win.surf);
+    }
+
     void* region_ = nullptr;
     int fb_w_ = 0;
     int fb_h_ = 0;
     PresentFn present_;
+    ANativeWindow* window_ = nullptr;  // optional on-screen target (nullptr = headless)
 
     std::thread thread_;
     std::atomic<bool> stop_{false};
     std::atomic<bool> ready_{false};
     std::atomic<bool> setup_failed_{false};
     std::atomic<bool> software_{false};
+    std::atomic<bool> window_ready_{false};  // window ctx + present program created OK
     std::atomic<uint32_t> frames_presented_{0};
     std::string error_;       // written on the thread before ready_/at teardown; read after.
     std::string renderer_;    // captured once on the thread before ready_=true.

@@ -536,7 +536,12 @@ void glGetProgramInfoLog(GLuint program, GLsizei bufSize, GLsizei *length, GLcha
 const GLubyte *glGetString(GLenum name) {
     switch (name) {
         case GL_VENDOR:                   return (const GLubyte*)"Android-on-Linux (ALR)";
-        case GL_RENDERER:                 return (const GLubyte*)"ALR-marshalling -> Mali (host)";
+        /* GL_RENDERER is vendor-NEUTRAL on purpose: the real draws run on whatever
+         * vendor GPU driver the host reaches via NDK libEGL/libGLESv2 (Mali, Adreno,
+         * Xclipse, ...). Never hardcode a vendor here — it would be a lie on non-Mali
+         * devices and could trip apps that branch on the renderer string. TODO: a ring
+         * handshake can pass the host's actual GL_RENDERER through to the guest. */
+        case GL_RENDERER:                 return (const GLubyte*)"ALR command-stream (host GPU passthrough)";
         case GL_VERSION:                  return (const GLubyte*)"OpenGL ES 2.0 ALR";
         case GL_SHADING_LANGUAGE_VERSION: return (const GLubyte*)"OpenGL ES GLSL ES 1.00";
         case GL_EXTENSIONS:               return (const GLubyte*)"";
