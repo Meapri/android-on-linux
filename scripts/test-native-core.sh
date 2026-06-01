@@ -162,3 +162,13 @@ cxx="${CXX:-g++}"
   -o /tmp/alr-native-runtime-interposer-test
 
 /tmp/alr-native-runtime-interposer-test
+
+# GPU command ring (Phase 4 / M2 transport): SPSC byte-ring integrity across
+# wrap-around + the sync handshake. Header-only (alr_gpu/alr_gpu_ring.hpp), no
+# GLES needed on the host.
+"$cxx" -std=c++20 -Wall -Wextra -Werror \
+  -Iapp/src/main/cpp \
+  tests/native_gpu_ring_test.cpp \
+  -o /tmp/alr-native-gpu-ring-test
+
+/tmp/alr-native-gpu-ring-test

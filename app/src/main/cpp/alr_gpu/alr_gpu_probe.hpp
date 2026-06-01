@@ -21,6 +21,10 @@
 #include <string>
 
 #include "alr_gpu/alr_gpu_decode.hpp"
+#include "alr_gpu/alr_gpu_ring.hpp"
+
+#include <cstdlib>
+#include <vector>
 
 namespace alr::gpu {
 
@@ -195,6 +199,112 @@ inline std::string run_draw_probe() {
     out << "\nalr gpu draw renderer=" << renderer;
     out << "\nalr gpu draw gl error=0x" << std::hex << gl_error << std::dec;
     out << "\nalr gpu draw software renderer=" << (software ? "true" : "false");
+
+    eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    eglDestroyContext(dpy, ctx);
+    eglDestroySurface(dpy, surf);
+    eglTerminate(dpy);
+    return out.str();
+}
+
+// M2 (transport, same-process): the SAME triangle op stream is pushed through the
+// SPSC command ring (RingProducer) and drained by the consumer (RingConsumer) into
+// decode_batch on a real GLES2 pbuffer context, then glReadPixels-verified. This
+// proves the ring carries a real GL command batch correctly (append/wrap/snapshot/
+// advance + the sync handshake) before the device step wires it across the loader
+// fork (that step, in runtime_report.cpp, is deferred — PC-gate session owns it).
+// Single-threaded here: producer fills, then consumer drains — exercises the ring
+// data path and the decoder together without thread/IPC risk.
+inline std::string run_ring_draw_probe() {
+    std::ostringstream out;
+    out << "alr gpu ring probe=spsc-ring-decode-draw";
+
+    // --- ring in a plain heap region (same-process self-test) ---
+    constexpr uint32_t kRing = 1u << 20;  // 1 MiB, generous for one frame
+    std::vector<uint8_t> region(ring_region_size(kRing), 0);
+    if (!ring_init(region.data(), kRing)) {
+        out << "\nALR GPU RING DECODE+EXECUTE: FAIL\nalr gpu ring error=init";
+        return out.str();
+    }
+    RingProducer prod(region.data());
+    RingConsumer cons(region.data());
+
+    // --- producer: push the triangle stream into the ring ---
+    constexpr int W = 64, H = 64;
+    const std::vector<uint8_t> stream = build_triangle_stream(W, H);
+    bool pushed = prod.append(stream.data(), static_cast<uint32_t>(stream.size()));
+    const uint32_t want = prod.flush_and_wait(1);  // request a sync (consumer replies below)
+    (void)want;
+
+    // --- EGL pbuffer + GLES2 context (real Mali) ---
+    EGLDisplay dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (dpy == EGL_NO_DISPLAY || eglInitialize(dpy, nullptr, nullptr) != EGL_TRUE) {
+        out << "\nALR GPU RING DECODE+EXECUTE: FAIL\nALR GPU RING HARDWARE RENDER: FAIL"
+            << "\nalr gpu ring error=egl-init " << egl_err_hex_local();
+        return out.str();
+    }
+    const EGLint cfg_attribs[] = {
+        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+        EGL_DEPTH_SIZE, 16, EGL_NONE,
+    };
+    EGLConfig cfg = nullptr; EGLint nc = 0;
+    if (eglChooseConfig(dpy, cfg_attribs, &cfg, 1, &nc) != EGL_TRUE || nc < 1) {
+        out << "\nALR GPU RING DECODE+EXECUTE: FAIL\nALR GPU RING HARDWARE RENDER: FAIL"
+            << "\nalr gpu ring error=choose-config " << egl_err_hex_local();
+        eglTerminate(dpy);
+        return out.str();
+    }
+    const EGLint pb[] = {EGL_WIDTH, W, EGL_HEIGHT, H, EGL_NONE};
+    EGLSurface surf = eglCreatePbufferSurface(dpy, cfg, pb);
+    const EGLint ctx_attribs[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
+    EGLContext ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, ctx_attribs);
+    if (surf == EGL_NO_SURFACE || ctx == EGL_NO_CONTEXT ||
+        eglMakeCurrent(dpy, surf, surf, ctx) != EGL_TRUE) {
+        out << "\nALR GPU RING DECODE+EXECUTE: FAIL\nALR GPU RING HARDWARE RENDER: FAIL"
+            << "\nalr gpu ring error=make-current " << egl_err_hex_local();
+        if (ctx != EGL_NO_CONTEXT) eglDestroyContext(dpy, ctx);
+        if (surf != EGL_NO_SURFACE) eglDestroySurface(dpy, surf);
+        eglTerminate(dpy);
+        return out.str();
+    }
+
+    // --- consumer: drain the ring into a contiguous snapshot, decode on the GPU ---
+    std::vector<uint8_t> snap(cons.available());
+    const uint32_t got = cons.snapshot(snap.data(), static_cast<uint32_t>(snap.size()));
+    HostState st;
+    const bool decode_ok = decode_batch(snap.data(), got, st);
+    cons.advance(got);
+    cons.post_reply();  // satisfy the producer's sync request
+    glFinish();
+    const GLenum gl_error = glGetError();
+
+    unsigned char center[4] = {0, 0, 0, 0};
+    unsigned char corner[4] = {0, 0, 0, 0};
+    glReadPixels(W / 2, H / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, center);
+    glReadPixels(2, 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, corner);
+    const bool center_green = center[1] > 150 && center[0] < 100 && center[2] < 100;
+    const bool corner_blue = corner[2] > 80 && corner[1] < 90 && corner[0] < 90;
+    std::string vendor, renderer;
+    if (const auto* v = reinterpret_cast<const char*>(glGetString(GL_VENDOR))) vendor = v;
+    if (const auto* rr = reinterpret_cast<const char*>(glGetString(GL_RENDERER))) renderer = rr;
+    const bool software = renderer_software_local(vendor, renderer);
+
+    const bool ring_ok = pushed && got == stream.size() &&
+                         cons.available() == 0;  // fully drained
+    const bool decoded_ok = ring_ok && decode_ok && center_green && corner_blue;
+    const bool hw_ok = decoded_ok && !software && gl_error == GL_NO_ERROR;
+
+    out << "\nALR GPU RING TRANSPORT: " << (ring_ok ? "PASS" : "FAIL");
+    out << "\nALR GPU RING DECODE+EXECUTE: " << (decoded_ok ? "PASS" : "FAIL");
+    out << "\nALR GPU RING HARDWARE RENDER: " << (hw_ok ? "PASS" : "FAIL");
+    out << "\nalr gpu ring bytes pushed=" << stream.size() << " drained=" << got;
+    out << "\nalr gpu ring sync reply_seq>=req=" << (want >= 1 ? "yes" : "no");
+    out << "\nalr gpu ring ops decoded=" << st.decoded;
+    out << "\nalr gpu ring center pixel=" << static_cast<int>(center[0]) << ","
+        << static_cast<int>(center[1]) << "," << static_cast<int>(center[2]);
+    out << "\nalr gpu ring renderer=" << renderer;
+    out << "\nalr gpu ring software renderer=" << (software ? "true" : "false");
 
     eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     eglDestroyContext(dpy, ctx);
