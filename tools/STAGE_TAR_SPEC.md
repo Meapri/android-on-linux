@@ -308,3 +308,18 @@ librsvg re-ship is byte-identical to base — harmless). Build:
 
 DEVICE-REQ: push this `xkb-gegl-stage.tar` → cold-start gtk3-widget-factory →
 no SIGABRT (svg loader opens, icons render) + setlocale C.UTF-8 OK (noble C.utf8).
+
+### 10.1 — .so executable bit (device drain: the actual SIGABRT cause)
+Re-drain found the svg loader was present on device but `dlopen` still failed:
+ALR's file-backed PROT_EXEC (untrusted_app) **rejects a non-executable `.so`**
+(gpushim's 0700 lib loads; Debian's 0644 → extracted 0600 → fails). Fixes:
+- `RootfsInstaller.extractEntry`: give any `*.so` / `*.so.*` file the exec bit on
+  extraction (not just tar entries with x). Shared by extractVerifiedTar (base) +
+  extractOverlayTar (overlays) → fixes the base pixbuf loaders (bmp/gif) on
+  re-extraction AND overlay `.so`s.
+- `build_gui_overlay`: package `.so` as **0o755** so the tar itself carries x.
+(Stock Linux dlopen doesn't need the file x bit; ALR/Android does.)
+
+C.UTF-8 still unresolved: C.utf8 (noble) is present but `setlocale` fails — not a
+perm issue; needs a device strace of the locale `open()` path (LOCPATH /
+locale-archive / path-mediation). WS-4 follow-up, DEVICE-REQ.

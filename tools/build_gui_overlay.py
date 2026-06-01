@@ -86,7 +86,13 @@ def build_gui_overlay(
                 data = bt.extractfile(m).read()
                 ti = tarfile.TarInfo("./" + rel_n)
                 ti.size = len(data)
-                ti.mode = m.mode or 0o644
+                # Shared libs MUST be executable — ALR dlopen (file-backed PROT_EXEC)
+                # rejects a non-x .so (device-evidence: the 0644 svg loader → 0600 →
+                # gtk3 SIGABRT). 0755 so both the tar x-bit and the device extractor
+                # mark it executable.
+                base_n = rel_n.rsplit("/", 1)[-1]
+                is_so = base_n.endswith(".so") or ".so." in base_n
+                ti.mode = 0o755 if is_so else (m.mode or 0o644)
                 out.addfile(ti, io.BytesIO(data))
                 found[rel_n] = m
 
