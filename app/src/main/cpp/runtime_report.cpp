@@ -59,6 +59,7 @@
 #include <vector>
 #include <map>
 #include <unordered_map>  // per-tid /proc/<tid>/mem fd cache + translate result cache
+#include <unordered_set>  // known-tid set: new-clone-child initial-stop vs group-stop
 #include <mutex>
 
 #include "alr_runtime/alr_config.hpp"
@@ -1582,7 +1583,16 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
 
     int out_pipe[2] = {-1, -1};
     int diag_pipe[2] = {-1, -1};
-    if (::pipe(out_pipe) != 0 || ::pipe(diag_pipe) != 0) {
+    // go_pipe is the SEIZE attach handshake (replaces the TRACEME initial-stop).
+    // The child blocks reading one byte from go_pipe[0] right after fork(), BEFORE
+    // it maps/jumps to the guest; the parent writes that byte ONLY after PTRACE_SEIZE
+    // has attached with options installed. This guarantees the device-proven invariant
+    // — TRACECLONE/FORK/VFORK/EXEC/TRACESECCOMP are live before the guest runs a single
+    // traced syscall — without relying on SIGSTOP timing (SEIZE does not stop the
+    // child, and a pre-SEIZE SIGSTOP would arrive as an ambiguous attach group-stop,
+    // exactly the class of confusion this conversion removes).
+    int go_pipe[2] = {-1, -1};
+    if (::pipe(out_pipe) != 0 || ::pipe(diag_pipe) != 0 || ::pipe(go_pipe) != 0) {
         out << "\nALR NATIVE LOADER MAP: FAIL\nALR NATIVE LOADER GUEST EXEC: FAIL";
         out << "\nalr native loader error=pipe errno=" << errno;
         return out.str();
@@ -1592,15 +1602,27 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     if (pid == 0) {
         ::close(out_pipe[0]);
         ::close(diag_pipe[0]);
+        ::close(go_pipe[1]);  // child reads the SEIZE-ready byte from go_pipe[0]
         ::dup2(out_pipe[1], STDOUT_FILENO);
         ::dup2(out_pipe[1], STDERR_FILENO);  // capture guest stderr too (ld.so/glib errors)
         const int dg = diag_pipe[1];
-        // Let the parent trace this child so a crash PC/fault address can be read
-        // from outside, immune to the guest hijacking this thread's TLS. Stop here
-        // so the parent can set PTRACE_O_TRACECLONE/FORK/EXEC before the guest runs
-        // and spawns threads/children.
-        ::ptrace(PTRACE_TRACEME, 0, 0, 0);
-        ::syscall(__NR_kill, ::getpid(), SIGSTOP);
+        // SEIZE attach handshake (replaces TRACEME + raise(SIGSTOP)). Under
+        // PTRACE_SEIZE the PARENT attaches us — the child issues no PTRACE_TRACEME and
+        // is never self-stopped. Instead we BLOCK here reading one byte the parent
+        // writes only AFTER it has PTRACE_SEIZE'd us with all options installed. This
+        // is the sync point that lets the parent set TRACECLONE/FORK/VFORK/EXEC/
+        // TRACESECCOMP before we run any traced syscall (the guest's seccomp filter is
+        // installed much later, just before alr_enter_guest, so this read() itself is
+        // un-traced). The loop tolerates EINTR; on a hard read error we proceed anyway
+        // (degrades to an untraced run rather than wedging the child).
+        {
+            char go = 0;
+            ssize_t gr = 0;
+            do {
+                gr = ::read(go_pipe[0], &go, 1);
+            } while (gr < 0 && errno == EINTR);
+        }
+        ::close(go_pipe[0]);
 #if defined(__aarch64__)
         const Elf64_Ehdr* ce = reinterpret_cast<const Elf64_Ehdr*>(elf_ptr);
         const Elf64_Phdr* ph = reinterpret_cast<const Elf64_Phdr*>(elf_ptr + ce->e_phoff);
@@ -1823,6 +1845,33 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     }
     ::close(out_pipe[1]);
     ::close(diag_pipe[1]);
+    ::close(go_pipe[0]);  // parent writes the SEIZE-ready byte to go_pipe[1]
+    // SEIZE attach (replaces the child's PTRACE_TRACEME + initial SIGSTOP). The child
+    // is blocked reading go_pipe[0]; we attach with PTRACE_SEIZE — which, unlike
+    // TRACEME, installs all options ATOMICALLY at attach and does NOT stop the tracee
+    // — then release the child by writing the go byte. Because SEIZE (with options)
+    // completes before the child is unblocked, every thread/child it later spawns is
+    // auto-traced and every path syscall is RET_TRACE-mediated from the guest's first
+    // instruction, with no window where the guest runs un-optioned. The options are
+    // byte-identical to the former post-SIGSTOP SETOPTIONS set, so single/few-thread
+    // guests (GIMP, chromium --version) attach to the exact same traced configuration.
+    const long kSeizeOpts = static_cast<long>(
+        PTRACE_O_TRACECLONE | PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK |
+        PTRACE_O_TRACEEXEC | PTRACE_O_TRACESECCOMP);
+    bool seized = false;
+    if (pid > 0) {
+        seized = ::ptrace(PTRACE_SEIZE, pid, nullptr,
+                          reinterpret_cast<void*>(kSeizeOpts)) == 0;
+        // Release the child regardless: if SEIZE somehow failed we still unblock it so
+        // it does not hang in read() forever (it then runs untraced — the same
+        // degraded outcome the old code would reach if TRACEME had failed).
+        const char go = 1;
+        ssize_t gw = 0;
+        do {
+            gw = ::write(go_pipe[1], &go, 1);
+        } while (gw < 0 && errno == EINTR);
+    }
+    ::close(go_pipe[1]);
     // Trace the child so a fatal-signal PC/fault address can be read from the
     // parent (whose TLS is intact). Resume on non-fatal signals; capture and let
     // the fatal one terminate the child. Pipes are drained only after it dies, to
@@ -1843,7 +1892,15 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     int path_rewrites = 0;
     std::string first_rewrite;
     bool captured = false;
-    bool options_set = false;
+    // Under PTRACE_SEIZE the options were installed ATOMICALLY at attach (the 4th arg
+    // to PTRACE_SEIZE), so the leader is already fully optioned before its first stop —
+    // there is no longer a TRACEME initial-SIGSTOP at which to call SETOPTIONS. The
+    // latch therefore starts true; it is kept only so the defensive per-new-tid
+    // SETOPTIONS re-apply below (now a belt-and-suspenders, since SEIZE auto-inherits
+    // options to cloned tids) reads a sensible flag. seized==false (SEIZE itself
+    // failed) is the lone case where options never got set; the loop still drains the
+    // untraced child to a clean exit exactly as the old TRACEME-failure path would.
+    bool options_set = seized;
     // --- Per-trap cost optimizations (behavior-identical to the open+close-every-
     // trap baseline; verified against the device-proven GIMP path mediation). ---
     //
@@ -1860,6 +1917,12 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     // after the loop closes any survivors. The I/O itself — O_RDWR open, pread(path), pwrite
     // (scratch) — is byte-for-byte the SAME as the baseline, so mediation behavior
     // is unchanged; only the redundant open+close are removed.
+    // known_tids: every tid we've already seen stop at least once. The leader pid is
+    // pre-seeded. A PTRACE_EVENT_STOP from a tid NOT yet here is a freshly-cloned child's
+    // INITIAL stop (resume with CONT); from a KNOWN tid with GETSIGINFO==EINVAL it is a
+    // real group-stop (LISTEN). Without this split, GETSIGINFO==EINVAL on a new child's
+    // first stop would wrongly LISTEN-park it, hanging the guest at the first clone.
+    std::unordered_set<pid_t> known_tids{pid};
     std::unordered_map<pid_t, int> mem_fds;
     // mem_fd_for: return a cached O_RDWR /proc/<tid>/mem fd for `tid`, opening it
     // on first use. Returns -1 if the open fails (caller then skips, exactly as the
@@ -2056,9 +2119,80 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
             ::ptrace(PTRACE_CONT, w, nullptr, nullptr);
             continue;
         }
+        if (event == PTRACE_EVENT_STOP) {
+            // === THE MULTI-THREAD FIX (PTRACE_SEIZE only) ===
+            // Under SEIZE, status>>8 == (SIGTRAP | PTRACE_EVENT_STOP<<8) — i.e.
+            // event==PTRACE_EVENT_STOP (128), stopsig==SIGTRAP — is reported for THREE
+            // distinct situations that classic TRACEME could not tell apart:
+            //   (a) a freshly-cloned thread's initial stop,
+            //   (b) a GROUP-STOP (the whole thread group was stopped by a job-control
+            //       signal: SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU), and
+            //   (c) a PTRACE_INTERRUPT-induced stop.
+            // The classic-TRACEME deadlock (Chromium, ~22 threads: one thread parked in
+            // state 't' forever) was precisely the tracer mistaking a group-stop for a
+            // real signal-stop and either forwarding the stop signal (re-stopping the
+            // group while a sibling blocks on its futex) or PTRACE_CONT-ing a
+            // group-stopped thread (spuriously running it). SEIZE makes the three cases
+            // UNAMBIGUOUS via PTRACE_GETSIGINFO:
+            //   - a GROUP-STOP has NO siginfo: GETSIGINFO fails with EINVAL. The correct
+            //     resume is PTRACE_LISTEN — the thread stays stopped+listening, is NOT
+            //     run, and re-reports when the group-stop ends (SIGCONT). NEVER
+            //     PTRACE_CONT a group-stop (that is the bug). LISTEN is the whole fix.
+            //   - a new-thread initial stop or an INTERRUPT stop HAS siginfo (a SIGTRAP):
+            //     GETSIGINFO succeeds; resume normally with PTRACE_CONT(w, 0).
+            // A racing tid (exited/exec'd between stop and here) returns ESRCH from
+            // GETSIGINFO — treat it like the new-thread case path (the CONT/LISTEN below
+            // then no-ops with ESRCH, which we ignore), so we never wedge.
+            // FIRST: a PTRACE_EVENT_STOP from a tid we've never seen is a freshly-cloned
+            // child's INITIAL stop, NOT a group-stop. GETSIGINFO can also return EINVAL
+            // for that initial stop, so classifying purely by siginfo (below) would
+            // wrongly LISTEN-park a new worker thread at birth — the Chromium 1-thread
+            // hang. A brand-new tid is always resumed (CONT), never parked.
+            if (known_tids.insert(w).second) {
+                if (w != pid) {
+                    ::ptrace(PTRACE_SETOPTIONS, w, nullptr,
+                             reinterpret_cast<void*>(kSeizeOpts));
+                }
+                if (::ptrace(PTRACE_CONT, w, nullptr, nullptr) != 0 && errno == ESRCH) {
+                    continue;
+                }
+                continue;
+            }
+            // KNOWN tid: now GETSIGINFO unambiguously splits a real GROUP-STOP (no
+            // siginfo -> EINVAL -> LISTEN) from a PTRACE_INTERRUPT-stop (has siginfo -> CONT).
+            siginfo_t esi{};
+            errno = 0;
+            const long gsi = ::ptrace(PTRACE_GETSIGINFO, w, nullptr, &esi);
+            const bool group_stop = (gsi != 0 && errno == EINVAL);
+            if (group_stop) {
+                // Group-stop: keep the thread parked with LISTEN (do NOT run it). This
+                // is the single/multi-thread-safe handling that classic TRACEME lacked.
+                // ESRCH (tid raced away) is benign — just loop.
+                if (::ptrace(PTRACE_LISTEN, w, nullptr, nullptr) != 0 && errno == ESRCH) {
+                    continue;
+                }
+                continue;
+            }
+            // New-thread initial stop (or PTRACE_INTERRUPT): it is already auto-attached
+            // and inherits the leader's SEIZE options, so just resume it with signal 0.
+            // (We never reach the old TRACEME w!=pid SETOPTIONS dance here — SEIZE option
+            // inheritance is atomic — but a single belt-and-suspenders re-apply on a new
+            // tid keeps parity with the device-proven defensive code, and is idempotent.)
+            if (w != pid && !options_set) {
+                ::ptrace(PTRACE_SETOPTIONS, w, nullptr,
+                         reinterpret_cast<void*>(kSeizeOpts));
+            }
+            if (::ptrace(PTRACE_CONT, w, nullptr, nullptr) != 0 && errno == ESRCH) {
+                continue;  // tid raced away between stop and resume; just loop
+            }
+            continue;
+        }
         if (event != 0) {
             // A clone/fork/vfork/exec event: the new tracee is auto-attached and
-            // inherits the options. Just resume the parent of the event.
+            // inherits the options. Just resume the parent of the event. (event is in
+            // 1..6 here; PTRACE_EVENT_STOP==128 was already handled above, so it never
+            // falls into this generic resume — which previously would have wrongly
+            // PTRACE_CONT'd a group-stop.)
             if (event == PTRACE_EVENT_CLONE) {
                 ++guest_threads;
             }
@@ -2066,34 +2200,22 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
             continue;
         }
         if (stopsig == SIGSTOP || stopsig == SIGTRAP) {
-            // Initial sync stop of the guest, or a freshly spawned thread/child.
-            if (!options_set && w == pid) {
-                ::ptrace(PTRACE_SETOPTIONS, pid, nullptr,
-                         reinterpret_cast<void*>(static_cast<long>(
-                             PTRACE_O_TRACECLONE | PTRACE_O_TRACEFORK |
-                             PTRACE_O_TRACEVFORK | PTRACE_O_TRACEEXEC |
-                             PTRACE_O_TRACESECCOMP)));
-                options_set = true;
-            } else if (w != pid) {
-                // Defensive (multi-thread): a freshly cloned tid inherits the
-                // leader's options, but under classic TRACEME the new-tid SIGSTOP
-                // and its parent's PTRACE_EVENT_CLONE arrive in unspecified order,
-                // and option inheritance has historically raced on some kernels.
-                // Re-apply SETOPTIONS to this tid (idempotent — same flag set the
-                // leader already carries) so TRACESECCOMP/TRACECLONE are guaranteed
-                // live on EVERY thread before we resume it. The `options_set` latch
-                // is left untouched: it only governs the leader's one-time setup, so
-                // the single/few-thread path (no w != pid stops) is byte-identical.
+            // Under SEIZE this branch is reached only for a genuine SIGNAL-DELIVERY-stop
+            // carrying SIGSTOP or SIGTRAP — NOT the attach sync (there is none: SEIZE
+            // does not stop the child and the go-pipe handshake replaced the TRACEME
+            // initial SIGSTOP), NOT a group-stop and NOT a new-thread/INTERRUPT stop
+            // (both are PTRACE_EVENT_STOP, handled above). A defensive, idempotent
+            // SETOPTIONS re-apply on a non-leader tid is kept purely as a backstop
+            // (SEIZE already inherits options to clones); the single/few-thread guest
+            // never enters this w!=pid path, so its behavior is byte-identical.
+            if (w != pid) {
                 ::ptrace(PTRACE_SETOPTIONS, w, nullptr,
-                         reinterpret_cast<void*>(static_cast<long>(
-                             PTRACE_O_TRACECLONE | PTRACE_O_TRACEFORK |
-                             PTRACE_O_TRACEVFORK | PTRACE_O_TRACEEXEC |
-                             PTRACE_O_TRACESECCOMP)));
+                         reinterpret_cast<void*>(kSeizeOpts));
             }
-            // Never forward SIGSTOP/SIGTRAP to the tracee: SIGSTOP here is either the
-            // attach-sync stop or a new thread's initial stop (delivering it would
-            // re-stop the thread group → deadlock), and SIGTRAP is the ptrace event
-            // vehicle. Resume with signal 0 — unchanged from before.
+            // Never forward SIGSTOP/SIGTRAP to the tracee: delivering SIGSTOP would
+            // re-stop the thread group → deadlock, and SIGTRAP is the ptrace event
+            // vehicle. Resume with signal 0 — unchanged from the TRACEME version for
+            // the single-thread path.
             if (::ptrace(PTRACE_CONT, w, nullptr, nullptr) != 0 && errno == ESRCH) {
                 continue;  // tid raced away between stop and resume; just loop
             }
@@ -2155,16 +2277,16 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
             captured = true;
         }
         // Deliver any other signal to the tracee that received it — EXCEPT the
-        // four group-stop signals. Under classic TRACEME (no PTRACE_SEIZE) a
-        // group-stop is reported to the tracer as an ordinary signal-delivery-stop
-        // and is INDISTINGUISHABLE from a real SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU; if
-        // we forward it, the kernel re-enters the whole thread group into a stop and
-        // a sibling waiting on that thread's futex blocks forever (the observed
-        // multi-thread hang, thread parked in state 't'). So suppress them: resume
-        // with signal 0. SIGSTOP/SIGTRAP never actually reach here (caught above),
-        // but listing SIGSTOP keeps the suppress set complete and self-documenting.
-        // The single/few-thread guests (GIMP, chromium --version) raise none of these
-        // in this branch, so their delivery path is byte-identical.
+        // four group-stop signals. Under PTRACE_SEIZE a genuine group-stop is now
+        // reported as PTRACE_EVENT_STOP and handled with PTRACE_LISTEN above, so this
+        // suppression is a DEFENSIVE BACKSTOP: should a SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU
+        // ever reach this default path as a signal-delivery-stop, forwarding it would
+        // re-stop the whole thread group and a sibling waiting on that thread's futex
+        // would block forever (the observed multi-thread hang, thread parked in state
+        // 't'). So suppress them: resume with signal 0. SIGSTOP/SIGTRAP never actually
+        // reach here (caught above), but listing SIGSTOP keeps the suppress set complete
+        // and self-documenting. The single/few-thread guests (GIMP, chromium --version)
+        // raise none of these in this branch, so their delivery path is byte-identical.
         const bool group_stop_sig =
             (stopsig == SIGSTOP || stopsig == SIGTSTP ||
              stopsig == SIGTTIN || stopsig == SIGTTOU);
