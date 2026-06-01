@@ -70,6 +70,28 @@ gcfg.frame_sink = [](AHardwareBuffer* ahb, int w, int h, uint64_t serial) {
 ## Status
 
 - CP-0 header: **published + compile-verified** (aarch64 NDK 27.2, C++20, -Wall -Wextra, clean).
-- M2 (ring connect): unblocked for WS-1 — needs the ~8-line call site above + M1 stage on device.
-- Doorbell: created and advertised; the executor currently spin-polls (correct, busier).
-  Doorbell-driven wakeup is a WS-2 follow-up (additive change in `alr_gpu_host_service.hpp`).
+- **M2 (ring connect): WS-1 wiring IN PROGRESS** — `build_native_loader_probe` now `#include`s this
+  hook, attaches for `glmark2` (fb 1280×720), pushes `gpu_ring_guest_env`, and `detach`es on guest
+  reap. Matches this contract exactly. ✓
+- Doorbell: created + advertised; the executor now blocks on the eventfd (poll, not spin).
+- Off-device GLES op surface is wire-complete (harness PASS): create/shader/program/VBO/texture/
+  draw-arrays, attrib-by-name + drawElements, cull/front-face, all uniform scalar/vector/matrix
+  variants, FBO/renderbuffer (render-to-texture), BufferSubData/GenerateMipmap/TexSubImage2D.
+
+## M3 device-bringup notes (for WS-1 / WS-3 — risks WS-2 can't device-test)
+
+1. **Drawable size.** `glmark2-es2-wayland` takes its size from the WAYLAND surface (WS-3's
+   compositor / the `wl_egl_window` it creates), NOT from this shim's EGL — the shim's
+   `eglQuerySurface`/`eglCreateWindowSurface` are sentinels. The host AHB-FBO is `gcfg.fb_w×fb_h`
+   (1280×720). If glmark2's `glViewport`/surface ≠ the AHB size, the render is cropped/scaled.
+   Align the AHB size with the Wayland surface glmark2 gets, or (if glmark2 ends up gating on
+   `eglQuerySurface`) we add `ALR_GPU_FB_W/H` to `gpu_ring_guest_env` + an `eglQuerySurface` that
+   reads them (a small WS-2 follow-up — left out now to avoid a speculative contract change while
+   M2 is mid-integration).
+2. **Present path.** `present_window=null` ⇒ executor renders **headless** into the AHB (glmark2
+   **score/fps is valid headless**). For an on-screen cube/scene, WS-3 consumes the AHB via
+   `frame_sink` (§5-B `AhbFrameSource` → §5-C `PresentSource`), or set `gcfg.present_window`.
+3. **software=false gate.** `GpuExecutorService` captures `GL_RENDERER`; WS-5's gpu bench should
+   assert it's Mali (not swiftshader/llvmpipe) — `gpu_ring_frames_presented()` exposes liveness.
+4. **First light target:** `glmark2 -b build:use-vbo=true` (mat4-only uniforms, no FBO) is the
+   simplest scene fully covered by the wire ops; bring that up before the render-to-texture scenes.
