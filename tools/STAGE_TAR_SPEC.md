@@ -241,3 +241,42 @@ DEVICE-REQ (on the ws-4 commit): cold-start gtk3-widget-factory + gimp with
 `xkb-gegl-stage.tar` pushed → no SIGABRT (locale resolves). Source `libc-bin` is
 glibc 2.36 (bookworm); the LC_* format is backward-compatible with the 2.39 base —
 if the device shows a locale-version error, rebuild with `--suite trixie`.
+
+---
+
+## 9. DISTRO CORRECTION — the base is **Ubuntu noble (24.04)**, not Debian bookworm
+
+Confirmed (`strings libc.so.6` → "**Ubuntu GLIBC 2.39-0ubuntu8.7**"; `os-release`
+ID=androlinux-tiny; `etc/apt/sources.list.d/ubuntu.sources` → noble ports; Ubuntu
+keyrings). The plan's "bookworm-slim" label is wrong — the rootfs is Ubuntu noble
+arm64. **All overlays must be built from Ubuntu noble**, not Debian bookworm, so the
+glibc/lib ABIs and package versions match the base.
+
+`deb_closure` now supports this:
+- `fetch_packages_index(..., components=(...))` merges multiple components — Ubuntu
+  splits libs across **main + universe** (bookworm-only `main` misses deps).
+- default opener sends an apt-like **User-Agent** (ports.ubuntu.com 403s Python-urllib).
+- `extract_deb` handles **`data.tar.zst`** via the `zstd` CLI (Ubuntu .deb use zstd).
+- CLI: `--component main --component universe`.
+
+**Canonical build commands (Ubuntu noble):**
+```
+M=http://ports.ubuntu.com/ubuntu-ports
+# C.UTF-8 locale (§8):
+python -m tools.build_locale_overlay --out /tmp/xkb-gegl-stage.tar --suite noble \
+    --cache /tmp/deb-cache-ubuntu   # (build_locale_overlay --suite/--mirror; mirror=$M)
+# toolkit (minimal):
+python -m tools.deb_closure --minimal --package netsurf-gtk --base <base.tar> \
+    --out /tmp/netsurf-stage.tar --mirror $M --suite noble \
+    --component main --component universe --cache /tmp/deb-cache-ubuntu
+```
+
+**Rebuilt from noble (correct distro), device-pending:**
+| overlay | size | reachable libs (base-lacking) | note |
+|---|---|---|---|
+| `xkb-gegl-stage.tar` | 370 KB | — | noble libc-bin C.utf8 + C.UTF-8 symlink; CONFORMANT |
+| `netsurf-stage.tar` | ~7.1 MB | libcurl.so.4, libssh.so.4 | only 2 (noble base already has libjpeg/libldap/…); missing_soname=NONE, CONFORMANT |
+
+**TODO:** `sdl2-stage.tar` / `qt6-stage.tar` were first built from Debian bookworm —
+rebuild them from noble with the command above (`--package libsdl2-2.0-0` /
+`qt6-wayland`) before device-staging.

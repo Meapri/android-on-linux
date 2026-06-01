@@ -38,6 +38,7 @@ import io
 import json
 import lzma
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -373,14 +374,8 @@ def extract_deb(deb_path: str | Path, dest_dir: str | Path) -> Path:
         raise ValueError(f"no data.tar member in {deb_path} (ar t: {listing})")
     data_name = data_members[0]
 
-    if data_name.endswith(".zst"):
-        raise NotImplementedError(
-            f"{deb_path}: data member {data_name} is zstd-compressed; the host "
-            "has no stdlib zstd. Extract this .deb in the Debian build env "
-            "(`dpkg-deb -x`) and run build_stage_tar on the extracted root."
-        )
-
-    # extract the data member to a temp file via ar, then decompress in-python.
+    # extract the data member via ar, then decompress in-python (xz/gz/bz2) or via
+    # the `zstd` CLI (Ubuntu .deb use data.tar.zst — the ALR base is Ubuntu noble).
     blob = subprocess.run(
         ["ar", "p", str(deb_path), data_name],
         check=True,
@@ -393,6 +388,17 @@ def extract_deb(deb_path: str | Path, dest_dir: str | Path) -> Path:
         raw = gzip.decompress(blob)
     elif data_name.endswith(".bz2"):
         raw = bz2.decompress(blob)
+    elif data_name.endswith(".zst"):
+        zstd = shutil.which("zstd")
+        if zstd is None:
+            raise NotImplementedError(
+                f"{deb_path}: data member {data_name} is zstd-compressed and no "
+                "`zstd` CLI is on PATH (no stdlib zstd). Install zstd or extract "
+                "this .deb in the Debian build env."
+            )
+        raw = subprocess.run(
+            [zstd, "-d", "-c"], input=blob, check=True, capture_output=True
+        ).stdout
     elif data_name.endswith(".tar"):
         raw = blob
     else:
