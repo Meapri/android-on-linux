@@ -159,7 +159,7 @@
 
 ## 7. 세션 킥오프 프롬프트 (각 세션 첫 메시지로 붙여넣기)
 
-> 공통 머리말(모든 세션에 포함): "너는 ALR 프로젝트의 워크스트림 WS-N 담당이다. `docs/research/orchestration-5session-plan.md`를 먼저 읽어라. HARD CONSTRAINTS 준수(비root, public Android API only, W^X-safe, PRoot fallback-only, device evidence 없이 완료 주장 금지, `git add -A` 금지·명시 경로만, version stamp는 건드리지 말 것, device 테스트는 `am force-stop` 후 cold start). 사용자는 '찬우'이고 한국어 반말, 이모지 최소. 네 소유 파일(§2) 밖은 읽기만 하고, 레이어 경계는 §5 인터페이스 계약으로만 넘어라."
+> 공통 머리말(모든 세션에 포함): "너는 ALR 프로젝트의 워크스트림 WS-N 담당이다. `docs/research/orchestration-5session-plan.md`를 먼저 읽어라. HARD CONSTRAINTS 준수(비root, public Android API only, W^X-safe, PRoot fallback-only, device evidence 없이 완료 주장 금지, `git add -A` 금지·명시 경로만, version stamp는 건드리지 말 것, **main에 직접 push·merge 금지 — `ws-N` 브랜치에만 push하고 통합 세션(WS-1)이 단독 게이트로 merge(§6.5); device 검증은 마지막 커밋에 `DEVICE-REQ:` 마커로 요청하고 APK install 금지(단일 device=통합 세션 소유 §9)**). 사용자는 '찬우'이고 한국어 반말, 이모지 최소. 네 소유 파일(§2) 밖은 읽기만 하고, 레이어 경계는 §5 인터페이스 계약으로만 넘어라."
 
 - **WS-1:** "L1 CPU 실행/중재 담당. 목표: ptrace/seccomp 라운드트립을 0에 수렴 + chromium-class 돌파. M1(멀티스레드 SEIZE 안정·회귀0)부터. `GpuRingHook`(§5-A)·`guest_env 확장점`(§5-D) 인터페이스를 먼저 만들어 WS-2/3/4가 의존할 수 있게 공개해라. 기존 GIMP/foot/CLI 무회귀 게이트 유지."
 - **WS-2:** "L2 GPU 마샬링 담당. 목표: glmark2-es2가 Mali로 렌더(software=false). M1(`gpushim-stage.tar`+`glmark2-stage.tar` 빌드/stage)→M2(`GpuRingHook`으로 ring 연결)→M3(glmark2 score). `/tmp/gpushim-stage.tar`,`/tmp/glmark2-stage.tar`는 준비됨. host 백본(`GpuExecutorService`)·guest shim 소스는 완성됨 — 연결만. WS-3 `PresentSource` 합의 전까지는 executor→window 직접 present로 진행."
