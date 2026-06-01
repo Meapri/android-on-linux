@@ -913,6 +913,135 @@ void glVertexAttribDivisor(GLuint index, GLuint divisor) {
     alr_shim_emit(build_vad, &a);
 }
 
+/* ===========================================================================
+ * GLES2 dispatch-surface completion. glmark2 builds a FULL gl* dispatch table via
+ * dlsym; a name the shim doesn't export = a NULL slot that crashes if CALLED. These
+ * define every remaining gl* glmark2 references with semantics that are CORRECT for
+ * the opaque `build` first-light scene (host GL defaults match). State setters that a
+ * blend/stencil/2d scene would need are accepted-but-dropped here; promoting them to
+ * real wire ops is a per-scene follow-up. Queries are optimistic (no round-trip).
+ * Exact GLES2 ABI signatures (glmark2 calls through the real prototype).
+ * =========================================================================== */
+
+/* --- state setters: accepted, host GL defaults are correct for the build scene.
+ *     (blend/stencil/color+depth mask off the default path -> wire op follow-up.) --- */
+void glBlendFunc(GLenum a, GLenum b) { (void)a; (void)b; }
+void glBlendFuncSeparate(GLenum a, GLenum b, GLenum c, GLenum d) { (void)a;(void)b;(void)c;(void)d; }
+void glBlendEquation(GLenum a) { (void)a; }
+void glBlendEquationSeparate(GLenum a, GLenum b) { (void)a; (void)b; }
+void glBlendColor(GLclampf r, GLclampf g, GLclampf b, GLclampf a) { (void)r;(void)g;(void)b;(void)a; }
+void glColorMask(GLboolean r, GLboolean g, GLboolean b, GLboolean a) { (void)r;(void)g;(void)b;(void)a; }
+void glDepthMask(GLboolean f) { (void)f; }
+void glDepthRangef(GLclampf n, GLclampf f) { (void)n; (void)f; }
+void glClearDepthf(GLclampf d) { (void)d; }   /* host clears DEPTH to its default (1.0) */
+void glClearStencil(GLint s) { (void)s; }
+void glStencilFunc(GLenum a, GLint b, GLuint c) { (void)a;(void)b;(void)c; }
+void glStencilFuncSeparate(GLenum a, GLenum b, GLint c, GLuint d) { (void)a;(void)b;(void)c;(void)d; }
+void glStencilOp(GLenum a, GLenum b, GLenum c) { (void)a;(void)b;(void)c; }
+void glStencilOpSeparate(GLenum a, GLenum b, GLenum c, GLenum d) { (void)a;(void)b;(void)c;(void)d; }
+void glStencilMask(GLuint m) { (void)m; }
+void glStencilMaskSeparate(GLenum a, GLuint m) { (void)a; (void)m; }
+void glHint(GLenum a, GLenum b) { (void)a; (void)b; }
+void glLineWidth(GLfloat w) { (void)w; }
+void glPolygonOffset(GLfloat a, GLfloat b) { (void)a; (void)b; }
+void glSampleCoverage(GLclampf v, GLboolean i) { (void)v; (void)i; }
+void glDetachShader(GLuint p, GLuint s) { (void)p; (void)s; }
+void glReleaseShaderCompiler(void) {}
+void glValidateProgram(GLuint p) { (void)p; }
+void glShaderBinary(GLsizei n, const GLuint *sh, GLenum fmt, const void *bin, GLsizei len) {
+    (void)n; (void)sh; (void)fmt; (void)bin; (void)len;  /* no online compiler binary path */
+}
+
+/* --- constant generic vertex attributes: the build scene's attribs are all array-backed
+ *     (VBO), so a constant attrib is never read; accept + drop. --- */
+void glVertexAttrib1f(GLuint i, GLfloat x) { (void)i; (void)x; }
+void glVertexAttrib2f(GLuint i, GLfloat x, GLfloat y) { (void)i;(void)x;(void)y; }
+void glVertexAttrib3f(GLuint i, GLfloat x, GLfloat y, GLfloat z) { (void)i;(void)x;(void)y;(void)z; }
+void glVertexAttrib4f(GLuint i, GLfloat x, GLfloat y, GLfloat z, GLfloat w) { (void)i;(void)x;(void)y;(void)z;(void)w; }
+void glVertexAttrib1fv(GLuint i, const GLfloat *v) { (void)i; (void)v; }
+void glVertexAttrib2fv(GLuint i, const GLfloat *v) { (void)i; (void)v; }
+void glVertexAttrib3fv(GLuint i, const GLfloat *v) { (void)i; (void)v; }
+void glVertexAttrib4fv(GLuint i, const GLfloat *v) { (void)i; (void)v; }
+
+/* --- glTexParameterf/fv/iv: route to the existing integer tex-param wire op. --- */
+void glTexParameterf(GLenum target, GLenum pname, GLfloat param) {
+    glTexParameteri(target, pname, (GLint)param);
+}
+void glTexParameterfv(GLenum target, GLenum pname, const GLfloat *params) {
+    if (params) glTexParameteri(target, pname, (GLint)params[0]);
+}
+void glTexParameteriv(GLenum target, GLenum pname, const GLint *params) {
+    if (params) glTexParameteri(target, pname, params[0]);
+}
+
+/* --- compressed / copy textures: the build scene uses none; accept + drop (a real
+ *     wire op is a follow-up for BCn/copy-using scenes). --- */
+void glCompressedTexImage2D(GLenum t, GLint l, GLenum f, GLsizei w, GLsizei h, GLint b, GLsizei s, const void *d) {
+    (void)t;(void)l;(void)f;(void)w;(void)h;(void)b;(void)s;(void)d;
+}
+void glCompressedTexSubImage2D(GLenum t, GLint l, GLint xo, GLint yo, GLsizei w, GLsizei h, GLenum f, GLsizei s, const void *d) {
+    (void)t;(void)l;(void)xo;(void)yo;(void)w;(void)h;(void)f;(void)s;(void)d;
+}
+void glCopyTexImage2D(GLenum t, GLint l, GLenum f, GLint x, GLint y, GLsizei w, GLsizei h, GLint b) {
+    (void)t;(void)l;(void)f;(void)x;(void)y;(void)w;(void)h;(void)b;
+}
+void glCopyTexSubImage2D(GLenum t, GLint l, GLint xo, GLint yo, GLint x, GLint y, GLsizei w, GLsizei h) {
+    (void)t;(void)l;(void)xo;(void)yo;(void)x;(void)y;(void)w;(void)h;
+}
+
+/* --- optimistic query stubs (no round-trip). Return sane defaults so glmark2's
+ *     canvas/scene init doesn't trip; real values would need a host handshake. --- */
+void glGetBooleanv(GLenum pname, GLboolean *params) { (void)pname; if (params) params[0] = GL_FALSE; }
+void glGetFloatv(GLenum pname, GLfloat *params) { (void)pname; if (params) params[0] = 0.0f; }
+void glGetShaderPrecisionFormat(GLenum st, GLenum pt, GLint *range, GLint *precision) {
+    (void)st; (void)pt;                      /* advertise IEEE single high-float precision */
+    if (range) { range[0] = 127; range[1] = 127; }
+    if (precision) *precision = 23;
+}
+void glGetActiveAttrib(GLuint p, GLuint i, GLsizei buf, GLsizei *len, GLint *size, GLenum *type, GLchar *name) {
+    (void)p; (void)i; if (len) *len = 0; if (size) *size = 0; if (type) *type = 0;
+    if (name && buf > 0) name[0] = '\0';
+}
+void glGetActiveUniform(GLuint p, GLuint i, GLsizei buf, GLsizei *len, GLint *size, GLenum *type, GLchar *name) {
+    (void)p; (void)i; if (len) *len = 0; if (size) *size = 0; if (type) *type = 0;
+    if (name && buf > 0) name[0] = '\0';
+}
+void glGetAttachedShaders(GLuint p, GLsizei maxc, GLsizei *count, GLuint *shaders) {
+    (void)p; (void)maxc; (void)shaders; if (count) *count = 0;
+}
+void glGetShaderSource(GLuint s, GLsizei buf, GLsizei *len, GLchar *src) {
+    (void)s; if (len) *len = 0; if (src && buf > 0) src[0] = '\0';
+}
+void glGetBufferParameteriv(GLenum t, GLenum p, GLint *params) { (void)t;(void)p; if (params) params[0] = 0; }
+void glGetRenderbufferParameteriv(GLenum t, GLenum p, GLint *params) { (void)t;(void)p; if (params) params[0] = 0; }
+void glGetFramebufferAttachmentParameteriv(GLenum t, GLenum a, GLenum p, GLint *params) {
+    (void)t;(void)a;(void)p; if (params) params[0] = 0;
+}
+void glGetTexParameterfv(GLenum t, GLenum p, GLfloat *params) { (void)t;(void)p; if (params) params[0] = 0.0f; }
+void glGetTexParameteriv(GLenum t, GLenum p, GLint *params) { (void)t;(void)p; if (params) params[0] = 0; }
+void glGetUniformfv(GLuint p, GLint loc, GLfloat *params) { (void)p;(void)loc; if (params) params[0] = 0.0f; }
+void glGetUniformiv(GLuint p, GLint loc, GLint *params) { (void)p;(void)loc; if (params) params[0] = 0; }
+void glGetVertexAttribfv(GLuint i, GLenum p, GLfloat *params) { (void)i;(void)p; if (params) params[0] = 0.0f; }
+void glGetVertexAttribiv(GLuint i, GLenum p, GLint *params) { (void)i;(void)p; if (params) params[0] = 0; }
+void glGetVertexAttribPointerv(GLuint i, GLenum p, void **pointer) { (void)i;(void)p; if (pointer) *pointer = (void*)0; }
+GLboolean glIsBuffer(GLuint x) { (void)x; return GL_FALSE; }
+GLboolean glIsEnabled(GLenum x) { (void)x; return GL_FALSE; }
+GLboolean glIsFramebuffer(GLuint x) { (void)x; return GL_FALSE; }
+GLboolean glIsProgram(GLuint x) { (void)x; return GL_FALSE; }
+GLboolean glIsRenderbuffer(GLuint x) { (void)x; return GL_FALSE; }
+GLboolean glIsShader(GLuint x) { (void)x; return GL_FALSE; }
+GLboolean glIsTexture(GLuint x) { (void)x; return GL_FALSE; }
+void glReadPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum fmt, GLenum type, void *data) {
+    (void)x; (void)y; (void)fmt; (void)type;        /* no host readback path; zero-fill */
+    if (data && w > 0 && h > 0) {
+        uint32_t comp = gl_format_components(fmt), ts = gl_type_bytes(type);
+        memset(data, 0, (size_t)w * (size_t)h * comp * ts);
+    }
+}
+void *glMapBufferOES(GLenum t, GLenum a) { (void)t; (void)a; return (void*)0; }  /* -> subdata fallback */
+GLboolean glUnmapBufferOES(GLenum t) { (void)t; return GL_FALSE; }
+void glGetBufferPointervOES(GLenum t, GLenum p, void **params) { (void)t;(void)p; if (params) *params = (void*)0; }
+
 /* ---- optimistic queries (no round-trip) ---- */
 GLenum glGetError(void) {
     AlrShimState *s = alr_shim();
