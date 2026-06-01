@@ -69,39 +69,30 @@ alr perf syscall getppid ns/op = 218.338
 - → For general apps this is a fundamental advantage over PRoot's ptrace-every-syscall
   (~µs/syscall). The path-mediation "zero overhead" claim is device-verified for general apps.
 
-## CP-3 baseline — native LANDED; rigorous same-binary ratio still PENDING
-WS-1 captured a **native baseline** (microbench, static arm64, `adb shell` direct) — drain evidence
-`docs/evidence/2026-06-01-batch-drain-cp2-progress-svg-locale-cp3baseline.md`:
-- **native compute = 4.06 ns/op** (50M iters; pure CPU, no syscalls)
-- **native syscall (`getpid`) = 200.36 ns/op** (1M iters)
+## CP-3 CPU overhead — RIGOROUS apples-to-apples CLOSED (same binary, native vs ALR loader)
+WS-1 ran the **same** microbench (static musl, identical binary to the native baseline) BOTH native
+(`adb shell` direct) and via the ALR loader (MainActivity guest-probe → `alr-microbench` logcat) —
+drain evidence `docs/evidence/2026-06-01-cp3-apples-to-apples-gtk3-svg-perm.md`:
 
-### Approximate raw-syscall overhead (reported, NOT apples-to-apples)
-Comparing native `getpid` 200.36 ns/op against the ALR perf-microbench `getppid` 218.34 ns/op
-(`python -m bench overhead --native-ns 20036 --native-samples 100 --alr-ns 21834 --alr-samples 100 --storm`):
+| mode | native ns/op | ALR ns/op | overhead | gate |
+|------|-------------|-----------|----------|------|
+| **compute** (CPU-bound, no syscalls) | 4.06 | 4.06 | **+0.00%** | **PASS** (§0 syscall-light < 5%) |
+| **syscall** (`getpid` loop, same call both sides) | 200.36 | 224.36 | **+11.98%** | reported (syscall-storm, not gated) |
 
-| metric | value |
-|--------|-------|
-| native ns/op | 200.36 |
-| ALR ns/op | 218.34 |
-| overhead | **+8.97%** (1.090×) |
-| class | syscall-storm (reported, not gated) |
+(`python -m bench overhead --native-ns 406 --native-samples 100 --alr-ns 406 --alr-samples 100` for
+compute; `... --native-ns 20036 --alr-ns 22436 --alr-samples 100 --storm` for syscall.)
 
-**Caveat (per drain evidence):** this is `getpid` (native, libc wrapper) vs `getppid` (ALR, raw
-syscall via the perf probe) — **NOT apples-to-apples** (different syscall; wrapper vs raw). So ~9%
-is an *indicative* raw-syscall delta, **not** the rigorous CP-3 figure.
+**Verdict:** for general compute / CLI workloads ALR runs at **native speed — 0% overhead,
+device-verified on the same binary** (PCGATE in-process; no syscalls → no ptrace/seccomp). This
+**supersedes** the earlier approximate ~9% (which had compared `getpid` vs `getppid`). The only
+non-zero regime is raw syscalls: a `getpid`-storm is **~12%** apples-to-apples. The §0 CPU target is
+met for the dominant (syscall-light) class.
 
-### Still PENDING (rigorous same-binary ratio)
-- **compute-mode ratio not computable yet**: native compute = 4.06 ns/op, but there is **no ALR
-  measurement of the same microbench compute loop** (WS-1 has not yet run microbench AS AN ALR
-  GUEST — "option i" / guest-probe wiring). Pure-CPU ALR overhead is *expected* ~0% (in-process, no
-  mediation) but is **not yet measured**, so no number is claimed.
-- **PRoot baseline deferred**: app-private rootfs exec is blocked by SELinux → PRoot A/B remains out.
-- The rigorous CP-3 close = WS-1 runs the **same** microbench {compute,syscall} as an ALR guest →
-  feed both ns/op into `bench overhead` for a true same-binary native-vs-ALR ratio.
-
-## DEVICE-REQ filed (rigorous CP-3)
-`DEVICE-REQ: run /data/local/tmp/microbench {compute,syscall} AS AN ALR GUEST (same binary as the
-native baseline) → capture ALR ns/op per mode → true same-binary native-vs-ALR % ratio.`
+### Still open (separate; not the general-app CPU figure)
+- **PRoot A/B baseline**: deferred and **pending** — app-private rootfs exec is blocked by SELinux,
+  so a PRoot-vs-ALR comparison can't run (not required for the native-vs-ALR result above).
+- **chromium-class raw `svc` syscall-storm**: the ~12% above is a light `getpid` loop; a real
+  raw-`svc` storm (chromium) hits the bigger CP-6 ptrace wall — see "Separate wall" below.
 
 ## Separate wall (out of scope)
 chromium-class raw `svc` **syscall-storm** cannot be hooked by the LD_PRELOAD interposer → it falls

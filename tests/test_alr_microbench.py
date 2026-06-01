@@ -43,12 +43,15 @@ def test_compat_matrix_bumped_to_v127():
     assert "v127" in text
 
 
-def test_compat_matrix_gtk3_widget_factory_renders():
+def test_compat_matrix_gtk3_widget_factory_device_verified():
+    # gtk3-widget-factory advanced RENDERS -> RUNS once the SVG SIGABRT was resolved
+    # (WS-4 .so x-bit + WS-1 GDK_PIXBUF) — accept either device-verified status, but
+    # it must NOT have regressed to a host-only state (WIRED/PENDING).
     text = COMPAT_MATRIX.read_text(encoding="utf-8")
     gtk_lines = [
         line for line in text.splitlines() if "gtk3-widget-factory" in line
     ]
     assert gtk_lines, "no gtk3-widget-factory line found"
-    assert any("RENDERS" in line for line in gtk_lines), (
-        "gtk3-widget-factory line is not marked RENDERS"
+    assert any(("RUNS" in line) or ("RENDERS" in line) for line in gtk_lines), (
+        "gtk3-widget-factory line is not marked with a device-verified status (RUNS/RENDERS)"
     )

@@ -31,17 +31,17 @@
 
 → 이 집합이 **회귀 게이트**(`bench/regression_gate.py`)의 기준선. mediation 불변식: `pcgate=1 interpose=1 traps=0 rewrites=0`.
 
-**성능 (device, v127 WS-1 M2):** 일반 CLI native-exec wall-clock(`exec_ms`) ~**18-20ms**(`dynhello`/`env`/`id`/`dash`/`alr-png-test`) = native 프로세스 수준. path-mediation은 **traps=0 device-verified**(in-process translate, supervisor 라운드트립 0). path-xlate cold 4334.7 ns/op(≈19.9 syscall units, raw getppid 218.3 ns/op 대비; 256-entry cache로 분할 상환). **native baseline 랜딩**(microbench static arm64, adb shell 직접): compute **4.06 ns/op**, syscall(getpid) **200.36 ns/op**. 근사 raw-syscall 오버헤드 **~9%**(native getpid 200.36 vs ALR getppid 218.34 — **apples-to-apples 아님**: getpid/getppid·wrapper/raw). **정밀 same-binary ratio는 여전히 PENDING**(WS-1이 동일 microbench를 ALR guest로 실행해야; ALR compute 측정 없음; PRoot는 SELinux로 보류). 상세: `docs/evidence/2026-06-01-ws5-cpu-overhead-quantified.md`(원본 `2026-06-01-ws1-m2-cpu-mediation-overhead.md`, baseline `2026-06-01-batch-drain-cp2-progress-svg-locale-cp3baseline.md`).
+**성능 (device, v127 WS-1 M2):** 일반 CLI native-exec wall-clock(`exec_ms`) ~**18-20ms**(`dynhello`/`env`/`id`/`dash`/`alr-png-test`) = native 프로세스 수준. path-mediation은 **traps=0 device-verified**(in-process translate, supervisor 라운드트립 0). path-xlate cold 4334.7 ns/op(≈19.9 syscall units, raw getppid 218.3 ns/op 대비; 256-entry cache로 분할 상환). **CP-3 apples-to-apples CLOSED** ✅: 동일 microbench(static musl)를 native(adb shell)+ALR loader 양쪽 실행 — **compute 0% overhead**(ALR 4.06 = native 4.06 ns/op, **gated <5% PASS**), syscall(getpid 동일 call) **~12%**(ALR 224.36 vs native 200.36, storm reported). 즉 **일반 연산/CLI는 native급 0% 오버헤드 device-verified**, syscall-storm만 ~12%. (이전 근사 ~9%는 정밀치로 대체.) 이 ~12%(24ns)는 **seccomp 디스패치 고정비용**이라 BPF 슬림화로 ~1ns만 감소(223.37 vs 224.36) — seccomp 켜는 한 syscall 0%는 원천 불가, per-app `ALR_PCGATE=0` 옵션만(raw-svc 백스톱이라 전역 off는 위험). PRoot A/B는 SELinux로 보류. 상세: `docs/evidence/2026-06-01-cp3-apples-to-apples-gtk3-svg-perm.md`, `docs/evidence/2026-06-01-ws5-cpu-overhead-quantified.md`.
 
 ## GUI 툴킷 (L2/L3)
 | 앱 | 툴킷 | 결과 | exec_ms | Evidence | 비고 |
 |----|------|------|---------|----------|------|
 | GIMP 3.0.2 | GTK3 | **USABLE** (터치로 File>New>1920×1080 캔버스>브러시 스트로크) | — | v111-gimp-fully-usable-drawing | cairo SW 렌더 → wl_shm 합성, dialog/menu/popup 입력 라우팅 |
-| gtk3-widget-factory | GTK3 | RENDERS (rendered=true, frames 25→26) | 145 | v127-xkb-config-root-gui-keymap-segv-fixed | XKB keymap SIGSEGV 수정 후 Mali에 렌더(렌더 후 SIGABRT는 잔여 경고) |
-| gtk3 데모 창 (`/bin/alr-gtk3-test`) | GTK3 | RENDERS (exit 0, ~50-lib 클로저, 5 frames) | 197 | v89-gtk3-renders, v90-real-gtk3-window | gtk_init backend=wayland; ~2088 file open이 rootfs로 mediation |
-| in-process 이미지 디코드 (gdk-pixbuf PNG/JPEG/BMP/GIF) | — | RUNS (PASS) | — | v95-image-decode | shared-mime-info DB 보강 후 전 포맷 디코드 |
+| gtk3-widget-factory | GTK3 | **RUNS** (SVG SIGABRT 해소; GUI 25s 생존 sig=14=alarm timeout, exec_ms=25031; traps=135 rewrites=52) | 25031 | 2026-06-01-gtk3-svg-sigabrt-resolved-gui-runs | sig=6→sig=14: 2겹 fix(WS-4 .so x-bit 0700 + WS-1 GDK_PIXBUF rootfs-absolute) — `libpixbufloader_svg.so cannot open` 제거 |
+| gtk3 데모 창 (`/bin/alr-gtk3-test`) | GTK3 | **RENDERS** (frames 12→**2213**, 렌더 루프 정상) | 197 | 2026-06-01-gtk3-svg-sigabrt-resolved-gui-runs, v89-gtk3-renders, v90-real-gtk3-window | gtk_init backend=wayland; ~2088 file open이 rootfs로 mediation |
+| in-process 이미지 디코드 (gdk-pixbuf PNG/JPEG/BMP/GIF) | — | RUNS (PASS, 전 포맷) | — | v95-image-decode, 2026-06-01-gtk3-svg-sigabrt-resolved-gui-runs | shared-mime-info DB + **.so x-bit fix 후 bmp/gif/png/jpeg 전부 decode OK** |
 | 입력 주입 (`/bin/alr-input-test`/`alr-interactive-test`) | wl_seat | USABLE (received=24: pointer 10/key 8/touch 6) | (의도된 dispatch 대기) | v86-input-injection, v87-interactive-toolkit-pacing | redraw 루프(redraws=5 hits=2) |
-| foot | (terminal) | WIRED (foot --version ver=true, rendered=false) | — | v126-harfbuzz-fix-display-90hz, v127-xkb-config-root-gui-keymap-segv-fixed | libfcft4/libutf8proc shim closure OK; pty 경로(WS-3/WS-4) |
+| foot | (terminal) | **RENDERS** (rendered=true) | — | 2026-06-01-gtk3-svg-sigabrt-resolved-gui-runs | GUI 안정화(keymap+locale+SVG) 후 렌더; libfcft4/libutf8proc shim closure OK |
 | Qt5/Qt6 (qtwayland) | Qt | PENDING | — | — | WS-4 M2 |
 | SDL2 | SDL | PENDING | — | — | WS-4 M2 / WS-2 M4 |
 | netsurf | (경량 브라우저) | PENDING | — | — | WS-4 M2 |
