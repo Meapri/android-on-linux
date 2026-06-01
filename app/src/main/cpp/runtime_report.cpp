@@ -2074,8 +2074,29 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                              PTRACE_O_TRACEVFORK | PTRACE_O_TRACEEXEC |
                              PTRACE_O_TRACESECCOMP)));
                 options_set = true;
+            } else if (w != pid) {
+                // Defensive (multi-thread): a freshly cloned tid inherits the
+                // leader's options, but under classic TRACEME the new-tid SIGSTOP
+                // and its parent's PTRACE_EVENT_CLONE arrive in unspecified order,
+                // and option inheritance has historically raced on some kernels.
+                // Re-apply SETOPTIONS to this tid (idempotent — same flag set the
+                // leader already carries) so TRACESECCOMP/TRACECLONE are guaranteed
+                // live on EVERY thread before we resume it. The `options_set` latch
+                // is left untouched: it only governs the leader's one-time setup, so
+                // the single/few-thread path (no w != pid stops) is byte-identical.
+                ::ptrace(PTRACE_SETOPTIONS, w, nullptr,
+                         reinterpret_cast<void*>(static_cast<long>(
+                             PTRACE_O_TRACECLONE | PTRACE_O_TRACEFORK |
+                             PTRACE_O_TRACEVFORK | PTRACE_O_TRACEEXEC |
+                             PTRACE_O_TRACESECCOMP)));
             }
-            ::ptrace(PTRACE_CONT, w, nullptr, nullptr);
+            // Never forward SIGSTOP/SIGTRAP to the tracee: SIGSTOP here is either the
+            // attach-sync stop or a new thread's initial stop (delivering it would
+            // re-stop the thread group → deadlock), and SIGTRAP is the ptrace event
+            // vehicle. Resume with signal 0 — unchanged from before.
+            if (::ptrace(PTRACE_CONT, w, nullptr, nullptr) != 0 && errno == ESRCH) {
+                continue;  // tid raced away between stop and resume; just loop
+            }
             continue;
         }
         if (stopsig == SIGSYS) {
@@ -2133,8 +2154,27 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
             fault_signo = stopsig;
             captured = true;
         }
-        // Deliver any other signal to the tracee that received it.
-        ::ptrace(PTRACE_CONT, w, nullptr, reinterpret_cast<void*>(static_cast<long>(stopsig)));
+        // Deliver any other signal to the tracee that received it — EXCEPT the
+        // four group-stop signals. Under classic TRACEME (no PTRACE_SEIZE) a
+        // group-stop is reported to the tracer as an ordinary signal-delivery-stop
+        // and is INDISTINGUISHABLE from a real SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU; if
+        // we forward it, the kernel re-enters the whole thread group into a stop and
+        // a sibling waiting on that thread's futex blocks forever (the observed
+        // multi-thread hang, thread parked in state 't'). So suppress them: resume
+        // with signal 0. SIGSTOP/SIGTRAP never actually reach here (caught above),
+        // but listing SIGSTOP keeps the suppress set complete and self-documenting.
+        // The single/few-thread guests (GIMP, chromium --version) raise none of these
+        // in this branch, so their delivery path is byte-identical.
+        const bool group_stop_sig =
+            (stopsig == SIGSTOP || stopsig == SIGTSTP ||
+             stopsig == SIGTTIN || stopsig == SIGTTOU);
+        const long deliver = group_stop_sig ? 0L : static_cast<long>(stopsig);
+        // Robust resume: a tid can race away (exit/exec) between its stop and our
+        // PTRACE_CONT; ESRCH there is benign — just loop rather than wedge.
+        if (::ptrace(PTRACE_CONT, w, nullptr, reinterpret_cast<void*>(deliver)) != 0 &&
+            errno == ESRCH) {
+            continue;
+        }
     }
     // Supervisor loop exited (ECHILD: all tracees reaped). Per-exit eviction already
     // closed each tid's fd; close any survivors (e.g. a tid lost to the SIGKILL

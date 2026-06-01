@@ -63,10 +63,10 @@ class MainActivity : Activity() {
                     filesDir.absolutePath,
                     cacheDir.absolutePath,
                     rootfsManifest.name,
-                    // --version: cheap (no V8/render), so it exits fast without starving
-                    // the main-thread GIMP probes and proves Chromium still runs under the
-                    // optimized supervisor. The heavy --dump-dom render path is a later
-                    // cumulative-perf phase (supervisor round-trip + Chromium's own weight).
+                    // --version: reliable (single/few threads). The heavy --dump-dom render
+                    // path still hits a non-deterministic multithread ptrace deadlock (boots
+                    // to a 1-thread t-stop); the group-stop hardening below didn't fully fix
+                    // it — PTRACE_SEIZE + EVENT_STOP/LISTEN is the deeper fix (backlogged).
                     "/usr/lib/chromium/chromium-headless-shell\n--no-sandbox\n--version",
                 )
                 android.util.Log.i("alr_loader", "chromium-boot:\n$crReport")
@@ -545,7 +545,7 @@ class MainActivity : Activity() {
             alrSeccompPathTrapProbe.lineStartingWith("alr sc PATH_MEDIATION_VIABLE=")
                 .substringAfter("PATH_MEDIATION_VIABLE=", "") == "yes"
 
-        val executionSummary = "build: 0.4.122-supervisor-fastpath-v122" +
+        val executionSummary = "build: 0.4.123-mt-ptrace-harden-v123" +
             "\nexecution summary" +
             "\nROOTFS EXECUTION: ${if (rootfsExecutionPassed) "PASS" else "FAIL"}" +
             "\nSHELL SCRIPT EXECUTION: ${if (shellScriptExecutionPassed) "PASS" else "FAIL"}" +
