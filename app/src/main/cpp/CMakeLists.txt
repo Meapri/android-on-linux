@@ -36,7 +36,7 @@ target_compile_features(alr_proot_candidate PRIVATE cxx_std_20)
 target_compile_features(alr_runtime_trampoline PRIVATE cxx_std_20)
 
 target_include_directories(alr_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(alr_loader PRIVATE alr_runtime log android EGL GLESv2 vulkan)
+target_link_libraries(alr_loader PRIVATE alr_runtime log android EGL GLESv2 GLESv3 vulkan)
 target_link_libraries(alr_runtime_launcher PRIVATE alr_runtime)
 target_link_libraries(alr_runtime_hook PRIVATE alr_runtime)
 target_link_libraries(alr_runtime_interposer PRIVATE alr_runtime)
