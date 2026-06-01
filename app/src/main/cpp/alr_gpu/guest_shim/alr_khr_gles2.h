@@ -172,6 +172,7 @@ void   glDeleteProgram(GLuint program);
 void   glGenBuffers(GLsizei n, GLuint *buffers);
 void   glBindBuffer(GLenum target, GLuint buffer);
 void   glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage);
+void   glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void *data);
 void   glDeleteBuffers(GLsizei n, const GLuint *buffers);
 
 void   glGenTextures(GLsizei n, GLuint *textures);
@@ -180,6 +181,9 @@ void   glActiveTexture(GLenum texture);
 void   glTexParameteri(GLenum target, GLenum pname, GLint param);
 void   glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width,
                     GLsizei height, GLint border, GLenum format, GLenum type, const void *pixels);
+void   glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width,
+                       GLsizei height, GLenum format, GLenum type, const void *pixels);
+void   glGenerateMipmap(GLenum target);
 void   glDeleteTextures(GLsizei n, const GLuint *textures);
 void   glPixelStorei(GLenum pname, GLint param);
 

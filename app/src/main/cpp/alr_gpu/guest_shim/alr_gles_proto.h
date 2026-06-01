@@ -63,6 +63,7 @@ enum AlrOp {
     ALR_OP_GEN_BUFFER = 30,          /* u32 vbuf_id */
     ALR_OP_BIND_BUFFER = 31,         /* u32 target, u32 vbuf_id */
     ALR_OP_BUFFER_DATA = 32,         /* u32 target, blob(data), u32 usage */
+    ALR_OP_BUFFER_SUBDATA = 33,      /* u32 target, u32 offset, blob(data) */
     /* vertex attrib + draw */
     ALR_OP_ENABLE_VAA = 40,          /* u32 index */
     ALR_OP_VERTEX_ATTRIB_POINTER = 41,/* u32 index, i32 size, u32 type, u8 norm, i32 stride, u32 offset */
@@ -79,6 +80,8 @@ enum AlrOp {
     ALR_OP_BIND_TEXTURE = 62,        /* u32 target, u32 vtex_id */
     ALR_OP_TEX_PARAMETERI = 63,      /* u32 target, u32 pname, i32 param */
     ALR_OP_TEX_IMAGE_2D = 64,        /* u32 target, i32 level, u32 ifmt, i32 w, i32 h, u32 fmt, u32 type, blob(pixels) */
+    ALR_OP_GENERATE_MIPMAP = 65,     /* u32 target */
+    ALR_OP_TEX_SUBIMAGE_2D = 66,     /* u32 target, i32 level, i32 xoff, i32 yoff, i32 w, i32 h, u32 fmt, u32 type, blob */
     /* state */
     ALR_OP_ENABLE = 70,              /* u32 cap */
     ALR_OP_DISABLE = 71,             /* u32 cap */

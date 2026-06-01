@@ -59,6 +59,7 @@ enum Op : uint8_t {
     OP_GEN_BUFFER = 30,         // u32 vbuf_id
     OP_BIND_BUFFER = 31,        // u32 target, u32 vbuf_id
     OP_BUFFER_DATA = 32,        // u32 target, u32 len, bytes[len], u32 usage
+    OP_BUFFER_SUBDATA = 33,     // u32 target, u32 offset, blob(data)
     // --- vertex attrib + draw ---
     OP_ENABLE_VAA = 40,         // u32 index
     OP_VERTEX_ATTRIB_POINTER = 41, // u32 index, i32 size, u32 type, u8 norm, i32 stride, u32 offset
@@ -76,6 +77,8 @@ enum Op : uint8_t {
     OP_BIND_TEXTURE = 62,       // u32 target, u32 vtex_id
     OP_TEX_PARAMETERI = 63,     // u32 target, u32 pname, i32 param
     OP_TEX_IMAGE_2D = 64,       // u32 target,i32 level,u32 ifmt,i32 w,i32 h,u32 fmt,u32 type,u32 len,bytes
+    OP_GENERATE_MIPMAP = 65,    // u32 target
+    OP_TEX_SUBIMAGE_2D = 66,    // u32 target,i32 level,i32 xoff,i32 yoff,i32 w,i32 h,u32 fmt,u32 type,blob
     // --- state ---
     OP_ENABLE = 70,             // u32 cap
     OP_DISABLE = 71,            // u32 cap
@@ -276,6 +279,14 @@ inline bool decode_batch(const uint8_t* data, size_t len, HostState& st) {
                 if (!r.u32(usage)) { st.ok = false; break; }
                 glBufferData(target, static_cast<GLsizeiptr>(dlen), d, usage); ++st.decoded; break;
             }
+            case OP_BUFFER_SUBDATA: {
+                uint32_t target, offset, dlen; const uint8_t* d;
+                if (!r.u32(target) || !r.u32(offset)) { st.ok = false; break; }
+                if (!r.blob(d, dlen)) { st.ok = false; break; }
+                glBufferSubData(target, static_cast<GLintptr>(offset),
+                                static_cast<GLsizeiptr>(dlen), d);
+                ++st.decoded; break;
+            }
             case OP_ENABLE_VAA: {
                 uint32_t index;
                 if (!r.u32(index)) { st.ok = false; break; }
@@ -403,6 +414,19 @@ inline bool decode_batch(const uint8_t* data, size_t len, HostState& st) {
                 glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
                 glTexImage2D(target, level, static_cast<GLint>(ifmt), w, h, 0, fmt, type,
                              dlen ? d : nullptr);
+                ++st.decoded; break;
+            }
+            case OP_GENERATE_MIPMAP: {
+                uint32_t target; if (!r.u32(target)) { st.ok = false; break; }
+                glGenerateMipmap(target); ++st.decoded; break;
+            }
+            case OP_TEX_SUBIMAGE_2D: {
+                uint32_t target, fmt, type, dlen; int32_t level, xoff, yoff, w, h; const uint8_t* d;
+                if (!r.u32(target) || !r.i32(level) || !r.i32(xoff) || !r.i32(yoff) ||
+                    !r.i32(w) || !r.i32(h) || !r.u32(fmt) || !r.u32(type)) { st.ok = false; break; }
+                if (!r.blob(d, dlen)) { st.ok = false; break; }
+                glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                glTexSubImage2D(target, level, xoff, yoff, w, h, fmt, type, dlen ? d : nullptr);
                 ++st.decoded; break;
             }
             case OP_ENABLE: {

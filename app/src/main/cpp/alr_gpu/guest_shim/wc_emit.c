@@ -238,6 +238,16 @@ int main(int argc, char **argv) {
     (void)glCheckFramebufferStatus(GL_FRAMEBUFFER);  /* optimistic, no wire op */
     glBindFramebuffer(GL_FRAMEBUFFER, 0);            /* back to default (host: AHB FBO) */
 
+    /* --- completeness ops: partial VBO update, mipmap gen, partial texture upload. --- */
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    float sub[4] = {9.0f, 9.0f, 9.0f, 9.0f};
+    glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)sizeof(sub), sub);  /* 16 bytes at offset 0 */
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    unsigned char sub_px[4 * 4 * 4];                                   /* 4x4 RGBA = 64 bytes */
+    for (size_t i = 0; i < sizeof(sub_px); ++i) sub_px[i] = (unsigned char)(255 - i);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 1, 1, 4, 4, GL_RGBA, GL_UNSIGNED_BYTE, sub_px);
+
     FILE *f = fopen(argv[1], "wb");
     if (!f) { fprintf(stderr, "wc_emit: cannot open %s\n", argv[1]); return 2; }
     fwrite(g_capture, 1, g_capture_len, f);
