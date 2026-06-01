@@ -103,7 +103,10 @@ struct GpuRing {
 struct GpuRingAttachConfig {
     int fb_w = 0;                       // render-target (AHB-FBO) width  in pixels (required, > 0)
     int fb_h = 0;                       // render-target (AHB-FBO) height in pixels (required, > 0)
-    uint32_t ring_bytes = 1u << 20;     // SPSC data ring size; MUST be a power of two
+    uint32_t ring_bytes = 1u << 23;     // 8 MiB SPSC data ring (pow2). Must hold the largest
+                                        // single op: glmark2 uploads a 1024x1024 RGBA texture
+                                        // (4 MiB) / ~2 MiB VBO in one op; 1 MiB silently dropped
+                                        // them. An op > ring is dropped (back-pressure can't help).
     ANativeWindow* present_window = nullptr;  // WS-3 fallback: executor presents straight here
     AhbFrameSource frame_sink = nullptr;      // §5-B sink (WS-3); null => no zero-copy handoff
 };
