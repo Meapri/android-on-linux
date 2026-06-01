@@ -1076,6 +1076,19 @@ class MainActivity : Activity() {
             // to our setOnKeyListener (and the soft keyboard can target this view).
             isFocusableInTouchMode = true
             isFocusable = true
+            // Mouse wheel / trackpad scroll -> wl_pointer.axis (M4). Touch-drag scroll
+            // is handled by GTK from the wl_touch stream; this adds discrete scroll for
+            // a real mouse/trackpad attached to the device.
+            setOnGenericMotionListener { _, ev ->
+                if (ev.actionMasked == android.view.MotionEvent.ACTION_SCROLL) {
+                    val vs = ev.getAxisValue(android.view.MotionEvent.AXIS_VSCROLL)
+                    val hs = ev.getAxisValue(android.view.MotionEvent.AXIS_HSCROLL)
+                    // Wayland axis: +y = down, +x = right; Android VSCROLL +1 = scroll up.
+                    if (vs != 0f) nativeWaylandInjectScroll(ev.x, ev.y, (-vs * 10.0), 0)
+                    if (hs != 0f) nativeWaylandInjectScroll(ev.x, ev.y, (hs * 10.0), 1)
+                    true
+                } else false
+            }
             // Production input path: forward real touches on the SurfaceView to the
             // focused Wayland client (as wl_touch + wl_pointer) so GUI apps are
             // interactive once a real toolkit window is up.
@@ -1960,6 +1973,7 @@ class MainActivity : Activity() {
     private external fun nativeWaylandInjectTouch(id: Int, x: Float, y: Float, phase: Int)
 
     private external fun nativeWaylandInjectKey(evdevKey: Int, pressed: Int)
+    private external fun nativeWaylandInjectScroll(x: Float, y: Float, value: Double, axis: Int)
 
     private external fun nativeRenderVulkanSurfaceFrames(
         surface: android.view.Surface,
