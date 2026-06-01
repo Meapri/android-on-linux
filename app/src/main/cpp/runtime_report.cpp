@@ -1488,6 +1488,13 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     guest_env.push_back("LC_ALL=C.UTF-8");
     guest_env.push_back("LANG=C.UTF-8");
     guest_env.push_back("XDG_DATA_DIRS=/usr/local/share:/usr/share");
+    // WS-1: libxkbcommon's compiled-in XKB_CONFIG_ROOT is the GUEST path
+    // /usr/share/X11/xkb, and its keymap-file lookups (opendir/stat, not just open)
+    // don't reliably path-mediate into the rootfs → keymap compile fails ("Couldn't
+    // find rules/evdev") → GUI clients SIGSEGV on the NULL keymap. Point it at the
+    // rootfs-ABSOLUTE xkb dir: that's an already-host path, so the supervisor's
+    // idempotency guard skips rewriting it and libxkbcommon opens the real files.
+    guest_env.push_back("XKB_CONFIG_ROOT=" + config.rootfs_dir + "/usr/share/X11/xkb");
     guest_env.push_back("XDG_CONFIG_HOME=/root/.config");
     guest_env.push_back("XDG_CACHE_HOME=/root/.cache");  // fontconfig cache (writable)
     guest_env.push_back("FONTCONFIG_PATH=/etc/fonts");

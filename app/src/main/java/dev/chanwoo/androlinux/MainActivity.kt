@@ -120,6 +120,24 @@ class MainActivity : Activity() {
                 android.util.Log.e("alr_loader", "gtk3demo-stage EXC: ${android.util.Log.getStackTraceString(e)}")
             }
         }.start()
+        // CP-1 GUI 기반: xkb rules(evdev) + gegl-0.4 모듈 overlay. 컴포지터가 NO_KEYMAP을
+        // 보내므로 게스트 클라이언트가 자체 default keymap(rules 'evdev'/pc105/us)을 만들어야
+        // 하는데 rootfs에 rules/evdev가 없어 GUI 앱(gtk3/gimp/foot)이 SIGSEGV → rules를
+        // stage하면 클라이언트 keymap이 성공한다. gegl-0.4/*.so는 gimp 3.0 플러그인.
+        Thread {
+            try {
+                val xgTar = java.io.File("/data/local/tmp/xkb-gegl-stage.tar")
+                val xgMarker = java.io.File(rootfsStatus.rootfsDir, ".xkbgegl-staged-${xgTar.length()}")
+                if (xgTar.isFile && !xgMarker.isFile) {
+                    android.util.Log.i("alr_loader", "xkb-gegl-stage: extracting overlay (${xgTar.length()} bytes)")
+                    RootfsInstaller(this@MainActivity).extractVerifiedTar(xgTar, rootfsStatus.rootfsDir)
+                    xgMarker.writeText("staged\n")
+                    android.util.Log.i("alr_loader", "xkb-gegl-stage: overlay done")
+                }
+            } catch (e: Throwable) {
+                android.util.Log.e("alr_loader", "xkb-gegl-stage EXC: ${android.util.Log.getStackTraceString(e)}")
+            }
+        }.start()
         val nativeCommandRunner = NativeCommandRunner(
             File(applicationInfo.nativeLibraryDir),
             File(cacheDir, "proot-tmp"),
@@ -591,7 +609,7 @@ class MainActivity : Activity() {
             alrSeccompPathTrapProbe.lineStartingWith("alr sc PATH_MEDIATION_VIABLE=")
                 .substringAfter("PATH_MEDIATION_VIABLE=", "") == "yes"
 
-        val executionSummary = "build: 0.4.126-gui-native-perf-v126" +
+        val executionSummary = "build: 0.4.127-cp1-gui-baseline-v127" +
             "\nexecution summary" +
             "\nROOTFS EXECUTION: ${if (rootfsExecutionPassed) "PASS" else "FAIL"}" +
             "\nSHELL SCRIPT EXECUTION: ${if (shellScriptExecutionPassed) "PASS" else "FAIL"}" +
