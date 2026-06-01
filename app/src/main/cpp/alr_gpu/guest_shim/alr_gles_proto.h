@@ -70,6 +70,9 @@ enum AlrOp {
     /* uniforms (carry the uniform NAME as a blob; host looks up the real loc) */
     ALR_OP_UNIFORM_MATRIX4FV = 50,   /* u32 vprog_id, blob(name), f32[16] */
     ALR_OP_UNIFORM1I = 51,           /* u32 vprog_id, blob(name), i32 value */
+    ALR_OP_UNIFORM_FV = 52,          /* u32 vprog, blob(name), u8 cols(1..4), u32 count, f32[cols*count] */
+    ALR_OP_UNIFORM_IV = 53,          /* u32 vprog, blob(name), u8 cols(1..4), u32 count, i32[cols*count] */
+    ALR_OP_UNIFORM_MATRIX_FV = 54,   /* u32 vprog, blob(name), u8 dim(2..3), u32 count, f32[dim*dim*count] */
     /* textures */
     ALR_OP_GEN_TEXTURE = 60,         /* u32 vtex_id */
     ALR_OP_ACTIVE_TEXTURE = 61,      /* u32 unit (GL_TEXTURE0+n) */
@@ -79,7 +82,18 @@ enum AlrOp {
     /* state */
     ALR_OP_ENABLE = 70,              /* u32 cap */
     ALR_OP_DISABLE = 71,             /* u32 cap */
-    ALR_OP_DEPTH_FUNC = 72           /* u32 func */
+    ALR_OP_DEPTH_FUNC = 72,          /* u32 func */
+    ALR_OP_CULL_FACE = 73,           /* u32 mode */
+    ALR_OP_FRONT_FACE = 74,          /* u32 mode */
+    /* attribute-by-NAME (glGetAttribLocation has no round-trip — carry the NAME, the
+     * host resolves the real location by name, exactly like uniforms). Emitted instead
+     * of the index-based ENABLE_VAA / VERTEX_ATTRIB_POINTER when the location came from
+     * glGetAttribLocation (a packed handle); the glBindAttribLocation/index path still
+     * emits the plain index ops above. */
+    ALR_OP_ENABLE_VAA_NAMED = 80,            /* u32 vprog, blob(name) */
+    ALR_OP_VERTEX_ATTRIB_POINTER_NAMED = 81, /* u32 vprog, blob(name), i32 size, u32 type, u8 norm, i32 stride, u32 offset */
+    /* indexed draw (meshes) */
+    ALR_OP_DRAW_ELEMENTS = 82        /* u32 mode, i32 count, u32 type, u32 offset (into bound ELEMENT_ARRAY_BUFFER) */
 };
 
 /* ---------------------------------------------------------------------------

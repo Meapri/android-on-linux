@@ -60,6 +60,16 @@ static uint32_t alloc_id(uint32_t *counter) {
     return v;
 }
 
+/* Client handle packing shared by glGetUniformLocation AND glGetAttribLocation:
+ *   bits[16..31] = vprog (>= 1), bits[0..15] = per-program name-table index.
+ * vprog >= 1 makes a real packed handle always >= 0x10000, so it never collides with
+ * a small literal attribute index from glBindAttribLocation (0..15) — that lets
+ * glEnableVertexAttribArray / glVertexAttribPointer tell the two apart (see below).
+ * A handle of -1 stays -1 (GL "not found"). The WIRE carries the NAME, not the handle. */
+#define ALR_UNIFORM_PACK(vprog, idx)  ((GLint)(((uint32_t)(vprog) << 16) | ((uint32_t)(idx) & 0xFFFFu)))
+#define ALR_UNIFORM_VPROG(h)          ((uint32_t)(((uint32_t)(h)) >> 16))
+#define ALR_UNIFORM_IDX(h)            ((int)(((uint32_t)(h)) & 0xFFFFu))
+
 /* ============================ encode helpers ============================ *
  * Each GL call packs its args into a small POD `ctx` struct and an emit-builder
  * memcpys/encodes them in the exact field order the host Reader expects. The
@@ -111,6 +121,16 @@ static void build_depthfunc(AlrEncoder *e, void *p) {
     alr_enc_u8(e, ALR_OP_DEPTH_FUNC); alr_enc_u32(e, ((struct DepthFuncArgs*)p)->func);
 }
 void glDepthFunc(GLenum func) { struct DepthFuncArgs a = { func }; alr_shim_emit(build_depthfunc, &a); }
+
+struct ModeArgs { uint32_t mode; };
+static void build_cull_face(AlrEncoder *e, void *p) {
+    alr_enc_u8(e, ALR_OP_CULL_FACE); alr_enc_u32(e, ((struct ModeArgs*)p)->mode);
+}
+static void build_front_face(AlrEncoder *e, void *p) {
+    alr_enc_u8(e, ALR_OP_FRONT_FACE); alr_enc_u32(e, ((struct ModeArgs*)p)->mode);
+}
+void glCullFace(GLenum mode)  { struct ModeArgs a = { (uint32_t)mode }; alr_shim_emit(build_cull_face, &a); }
+void glFrontFace(GLenum mode) { struct ModeArgs a = { (uint32_t)mode }; alr_shim_emit(build_front_face, &a); }
 
 struct ScissorArgs { int32_t x, y, w, h; };
 static void build_scissor(AlrEncoder *e, void *p) {
@@ -279,7 +299,27 @@ struct IndexArgs { uint32_t index; };
 static void build_enable_vaa(AlrEncoder *e, void *p) {
     alr_enc_u8(e, ALR_OP_ENABLE_VAA); alr_enc_u32(e, ((struct IndexArgs*)p)->index);
 }
+struct EnableVaaNamedArgs { uint32_t vprog; const char *name; };
+static void build_enable_vaa_named(AlrEncoder *e, void *p) {
+    struct EnableVaaNamedArgs *a = (struct EnableVaaNamedArgs*)p;
+    alr_enc_u8(e, ALR_OP_ENABLE_VAA_NAMED);
+    alr_enc_u32(e, a->vprog);
+    alr_enc_str(e, a->name);
+}
 void glEnableVertexAttribArray(GLuint index) {
+    /* A packed glGetAttribLocation handle (high 16 bits set) -> emit BY NAME so the
+     * host resolves the real location; a small literal index (glBindAttribLocation
+     * path, e.g. the cube) -> the existing index-based op, unchanged. */
+    if ((index >> 16) != 0) {
+        uint32_t vprog = ALR_UNIFORM_VPROG(index);
+        const char *name = alr_shim_attrib_name(vprog, ALR_UNIFORM_IDX(index));
+        if (name) {
+            struct EnableVaaNamedArgs a = { vprog, name };
+            alr_shim_emit(build_enable_vaa_named, &a);
+            return;
+        }
+        /* unknown handle: fall through to the index path (defensive) */
+    }
     struct IndexArgs a = { (uint32_t)index }; alr_shim_emit(build_enable_vaa, &a);
 }
 void glDisableVertexAttribArray(GLuint index) {
@@ -300,10 +340,36 @@ static void build_vap(AlrEncoder *e, void *p) {
     alr_enc_i32(e, a->stride);          /* i32 stride */
     alr_enc_u32(e, a->offset);          /* u32 offset (VBO byte offset) */
 }
+struct VapNamedArgs { uint32_t vprog; const char *name; int32_t size; uint32_t type;
+                      uint8_t norm; int32_t stride; uint32_t offset; };
+static void build_vap_named(AlrEncoder *e, void *p) {
+    struct VapNamedArgs *a = (struct VapNamedArgs*)p;
+    alr_enc_u8(e, ALR_OP_VERTEX_ATTRIB_POINTER_NAMED);
+    alr_enc_u32(e, a->vprog);
+    alr_enc_str(e, a->name);            /* blob(name) — host resolves the real location */
+    alr_enc_i32(e, a->size);
+    alr_enc_u32(e, a->type);
+    alr_enc_u8(e, a->norm);
+    alr_enc_i32(e, a->stride);
+    alr_enc_u32(e, a->offset);          /* VBO byte offset */
+}
 void glVertexAttribPointer(GLuint index, GLint size, GLenum type, GLboolean normalized,
                            GLsizei stride, const void *pointer) {
     /* VBO-offset path only: `pointer` is a byte offset into the bound ARRAY_BUFFER,
-     * carried as a u32 (the host reinterpret_casts it back to a void* offset). */
+     * carried as a u32 (the host reinterpret_casts it back to a void* offset). A packed
+     * glGetAttribLocation handle goes through the NAMED op (host resolves by name); a
+     * literal index (glBindAttribLocation path) uses the existing index op. */
+    if ((index >> 16) != 0) {
+        uint32_t vprog = ALR_UNIFORM_VPROG(index);
+        const char *name = alr_shim_attrib_name(vprog, ALR_UNIFORM_IDX(index));
+        if (name) {
+            struct VapNamedArgs a = { vprog, name, (int32_t)size, (uint32_t)type,
+                                      (uint8_t)(normalized ? 1 : 0), (int32_t)stride,
+                                      (uint32_t)(uintptr_t)pointer };
+            alr_shim_emit(build_vap_named, &a);
+            return;
+        }
+    }
     struct VapArgs a = { (uint32_t)index, (int32_t)size, (uint32_t)type,
                          (uint8_t)(normalized ? 1 : 0), (int32_t)stride,
                          (uint32_t)(uintptr_t)pointer };
@@ -321,6 +387,22 @@ void glDrawArrays(GLenum mode, GLint first, GLsizei count) {
     alr_shim_emit(build_draw_arrays, &a);
 }
 
+struct DrawElementsArgs { uint32_t mode; int32_t count; uint32_t type; uint32_t offset; };
+static void build_draw_elements(AlrEncoder *e, void *p) {
+    struct DrawElementsArgs *a = (struct DrawElementsArgs*)p;
+    alr_enc_u8(e, ALR_OP_DRAW_ELEMENTS);
+    alr_enc_u32(e, a->mode); alr_enc_i32(e, a->count);
+    alr_enc_u32(e, a->type); alr_enc_u32(e, a->offset);
+}
+void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices) {
+    /* VBO-offset path: `indices` is a byte offset into the bound ELEMENT_ARRAY_BUFFER
+     * (carried as a u32). Client-side index arrays are out of scope, same as the
+     * ARRAY_BUFFER vertex path. */
+    struct DrawElementsArgs a = { (uint32_t)mode, (int32_t)count, (uint32_t)type,
+                                  (uint32_t)(uintptr_t)indices };
+    alr_shim_emit(build_draw_elements, &a);
+}
+
 /* ---- uniforms (carry the NAME; host resolves the real location) ----
  *
  * glGetUniformLocation returns a CLIENT handle (an index into the per-program
@@ -335,16 +417,27 @@ void glDrawArrays(GLenum mode, GLint first, GLsizei count) {
  * name with no global scan and no cross-program ambiguity. vprog is never 0 (ids
  * start at 1), so a real packed handle is never 0; a handle of -1 stays -1 (GL
  * "not found") and makes the setter a no-op. The WIRE carries the NAME, not the
- * handle, so the host is oblivious to this packing. */
-
-#define ALR_UNIFORM_PACK(vprog, idx)  ((GLint)(((uint32_t)(vprog) << 16) | ((uint32_t)(idx) & 0xFFFFu)))
-#define ALR_UNIFORM_VPROG(h)          ((uint32_t)(((uint32_t)(h)) >> 16))
-#define ALR_UNIFORM_IDX(h)            ((int)(((uint32_t)(h)) & 0xFFFFu))
+ * handle, so the host is oblivious to this packing. (ALR_UNIFORM_PACK/VPROG/IDX are
+ * defined once near the top of this file; glGetAttribLocation reuses the same scheme.) */
 
 GLint glGetUniformLocation(GLuint program, const GLchar *name) {
     if (!name) return -1;
     int idx = alr_shim_uniform_intern((uint32_t)program, name);
     if (idx < 0) return -1;             /* table full / bad program -> GL "not found" */
+    return ALR_UNIFORM_PACK((uint32_t)program, idx);
+}
+
+/* glGetAttribLocation — SAME by-name handle scheme as uniforms (no round-trip): intern
+ * the attribute name into the per-program attrib table and return the packed handle.
+ * glEnableVertexAttribArray / glVertexAttribPointer recognize a packed handle (high
+ * 16 bits != 0, i.e. value >= 0x10000 since vprog >= 1) and emit the NAMED wire ops,
+ * which carry the NAME so the host resolves the real location via the real
+ * glGetAttribLocation at decode time. A small literal index from glBindAttribLocation
+ * (0..15) is NOT a packed handle and still takes the index-based ops. */
+GLint glGetAttribLocation(GLuint program, const GLchar *name) {
+    if (!name) return -1;
+    int idx = alr_shim_attrib_intern((uint32_t)program, name);
+    if (idx < 0) return -1;
     return ALR_UNIFORM_PACK((uint32_t)program, idx);
 }
 
@@ -391,6 +484,103 @@ void glUniformMatrix4fv(GLint location, GLsizei count, GLboolean transpose, cons
     }
     struct UniformMat4Args a = { vprog, name, m };
     alr_shim_emit(build_uniform_mat4, &a);
+}
+
+/* ---- generalized uniform setters (glUniform{1..4}f[v] / {2..4}i + {1..4}iv /
+ * Matrix{2,3}fv). SAME by-name handle scheme as glUniform1i/glUniformMatrix4fv: the
+ * location is a packed (vprog<<16 | idx) handle from glGetUniformLocation; recover the
+ * program + name and emit the NAME + values. location -1 is a silent no-op. ---- */
+struct UniformVecFArgs { uint32_t vprog; const char *name; uint8_t cols; uint32_t count; const float *v; };
+static void build_uniform_fv(AlrEncoder *e, void *p) {
+    struct UniformVecFArgs *a = (struct UniformVecFArgs*)p;
+    alr_enc_u8(e, ALR_OP_UNIFORM_FV);
+    alr_enc_u32(e, a->vprog);
+    alr_enc_str(e, a->name);
+    alr_enc_u8(e, a->cols);
+    alr_enc_u32(e, a->count);
+    uint32_t n = (uint32_t)a->cols * a->count;
+    for (uint32_t i = 0; i < n; ++i) alr_enc_f32(e, a->v[i]);
+}
+static void emit_uniform_fv(GLint location, uint8_t cols, GLsizei count, const GLfloat *v) {
+    if (location < 0 || !v || count <= 0) return;
+    uint32_t vprog = ALR_UNIFORM_VPROG(location);
+    const char *name = alr_shim_uniform_name(vprog, ALR_UNIFORM_IDX(location));
+    if (!name) return;
+    struct UniformVecFArgs a = { vprog, name, cols, (uint32_t)count, v };
+    alr_shim_emit(build_uniform_fv, &a);
+}
+void glUniform1f(GLint loc, GLfloat x) { GLfloat v[1] = {x}; emit_uniform_fv(loc, 1, 1, v); }
+void glUniform2f(GLint loc, GLfloat x, GLfloat y) { GLfloat v[2] = {x,y}; emit_uniform_fv(loc, 2, 1, v); }
+void glUniform3f(GLint loc, GLfloat x, GLfloat y, GLfloat z) { GLfloat v[3] = {x,y,z}; emit_uniform_fv(loc, 3, 1, v); }
+void glUniform4f(GLint loc, GLfloat x, GLfloat y, GLfloat z, GLfloat w) { GLfloat v[4] = {x,y,z,w}; emit_uniform_fv(loc, 4, 1, v); }
+void glUniform1fv(GLint loc, GLsizei count, const GLfloat *v) { emit_uniform_fv(loc, 1, count, v); }
+void glUniform2fv(GLint loc, GLsizei count, const GLfloat *v) { emit_uniform_fv(loc, 2, count, v); }
+void glUniform3fv(GLint loc, GLsizei count, const GLfloat *v) { emit_uniform_fv(loc, 3, count, v); }
+void glUniform4fv(GLint loc, GLsizei count, const GLfloat *v) { emit_uniform_fv(loc, 4, count, v); }
+
+struct UniformVecIArgs { uint32_t vprog; const char *name; uint8_t cols; uint32_t count; const int32_t *v; };
+static void build_uniform_iv(AlrEncoder *e, void *p) {
+    struct UniformVecIArgs *a = (struct UniformVecIArgs*)p;
+    alr_enc_u8(e, ALR_OP_UNIFORM_IV);
+    alr_enc_u32(e, a->vprog);
+    alr_enc_str(e, a->name);
+    alr_enc_u8(e, a->cols);
+    alr_enc_u32(e, a->count);
+    uint32_t n = (uint32_t)a->cols * a->count;
+    for (uint32_t i = 0; i < n; ++i) alr_enc_i32(e, a->v[i]);
+}
+static void emit_uniform_iv(GLint location, uint8_t cols, GLsizei count, const GLint *v) {
+    if (location < 0 || !v || count <= 0) return;
+    uint32_t vprog = ALR_UNIFORM_VPROG(location);
+    const char *name = alr_shim_uniform_name(vprog, ALR_UNIFORM_IDX(location));
+    if (!name) return;
+    struct UniformVecIArgs a = { vprog, name, cols, (uint32_t)count, (const int32_t*)v };
+    alr_shim_emit(build_uniform_iv, &a);
+}
+/* glUniform1i keeps its dedicated op (sampler unit path); 2i/3i/4i + *iv use OP_UNIFORM_IV. */
+void glUniform2i(GLint loc, GLint x, GLint y) { GLint v[2] = {x,y}; emit_uniform_iv(loc, 2, 1, v); }
+void glUniform3i(GLint loc, GLint x, GLint y, GLint z) { GLint v[3] = {x,y,z}; emit_uniform_iv(loc, 3, 1, v); }
+void glUniform4i(GLint loc, GLint x, GLint y, GLint z, GLint w) { GLint v[4] = {x,y,z,w}; emit_uniform_iv(loc, 4, 1, v); }
+void glUniform1iv(GLint loc, GLsizei count, const GLint *v) { emit_uniform_iv(loc, 1, count, v); }
+void glUniform2iv(GLint loc, GLsizei count, const GLint *v) { emit_uniform_iv(loc, 2, count, v); }
+void glUniform3iv(GLint loc, GLsizei count, const GLint *v) { emit_uniform_iv(loc, 3, count, v); }
+void glUniform4iv(GLint loc, GLsizei count, const GLint *v) { emit_uniform_iv(loc, 4, count, v); }
+
+struct UniformMatArgs { uint32_t vprog; const char *name; uint8_t dim; uint32_t count; const float *m; };
+static void build_uniform_matrix_fv(AlrEncoder *e, void *p) {
+    struct UniformMatArgs *a = (struct UniformMatArgs*)p;
+    alr_enc_u8(e, ALR_OP_UNIFORM_MATRIX_FV);
+    alr_enc_u32(e, a->vprog);
+    alr_enc_str(e, a->name);
+    alr_enc_u8(e, a->dim);
+    alr_enc_u32(e, a->count);
+    uint32_t n = (uint32_t)a->dim * a->dim * a->count;
+    for (uint32_t i = 0; i < n; ++i) alr_enc_f32(e, a->m[i]);
+}
+static void emit_uniform_matrix_fv(GLint location, uint8_t dim, GLsizei count,
+                                   GLboolean transpose, const GLfloat *m) {
+    if (location < 0 || !m || count <= 0) return;
+    uint32_t vprog = ALR_UNIFORM_VPROG(location);
+    const char *name = alr_shim_uniform_name(vprog, ALR_UNIFORM_IDX(location));
+    if (!name) return;
+    /* Host applies GL_FALSE. glmark2 passes GL_FALSE; honor GL_TRUE for the common
+     * count==1 case by transposing locally (dim<=3 here — mat4 has its own op). */
+    if (transpose && count == 1) {
+        float t[9];
+        for (int rr = 0; rr < dim; ++rr)
+            for (int cc = 0; cc < dim; ++cc) t[cc*dim+rr] = m[rr*dim+cc];
+        struct UniformMatArgs a = { vprog, name, dim, 1, t };
+        alr_shim_emit(build_uniform_matrix_fv, &a);
+        return;
+    }
+    struct UniformMatArgs a = { vprog, name, dim, (uint32_t)count, m };
+    alr_shim_emit(build_uniform_matrix_fv, &a);
+}
+void glUniformMatrix2fv(GLint loc, GLsizei count, GLboolean transpose, const GLfloat *v) {
+    emit_uniform_matrix_fv(loc, 2, count, transpose, v);
+}
+void glUniformMatrix3fv(GLint loc, GLsizei count, GLboolean transpose, const GLfloat *v) {
+    emit_uniform_matrix_fv(loc, 3, count, transpose, v);
 }
 
 /* ---- textures ---- */
@@ -531,6 +721,27 @@ void glGetProgramInfoLog(GLuint program, GLsizei bufSize, GLsizei *length, GLcha
     (void)program;
     if (length) *length = 0;
     if (infoLog && bufSize > 0) infoLog[0] = '\0';
+}
+
+/* glGetIntegerv — NO wire op (a host round-trip per query would defeat the design).
+ * Return plausible GLES2 minimums so apps that gate on caps at init (glmark2 queries
+ * a handful when creating its canvas) don't crash on a missing/zero value. These are
+ * advisory; a real draw still runs on whatever the host GPU actually supports. */
+void glGetIntegerv(GLenum pname, GLint *params) {
+    if (!params) return;
+    switch (pname) {
+        case 0x8869: params[0] = 16;    break;  /* GL_MAX_VERTEX_ATTRIBS */
+        case 0x0D33: params[0] = 4096;  break;  /* GL_MAX_TEXTURE_SIZE */
+        case 0x8872: params[0] = 16;    break;  /* GL_MAX_TEXTURE_IMAGE_UNITS */
+        case 0x8B4D: params[0] = 32;    break;  /* GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS */
+        case 0x8B4C: params[0] = 16;    break;  /* GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS */
+        case 0x8DFB: params[0] = 256;   break;  /* GL_MAX_VERTEX_UNIFORM_VECTORS */
+        case 0x8DFD: params[0] = 15;    break;  /* GL_MAX_VARYING_VECTORS */
+        case 0x8DFC: params[0] = 224;   break;  /* GL_MAX_FRAGMENT_UNIFORM_VECTORS */
+        case 0x84E8: params[0] = 16;    break;  /* GL_MAX_RENDERBUFFER_SIZE-ish / units */
+        case 0x0D3A: params[0] = 16384; params[1] = 16384; break;  /* GL_MAX_VIEWPORT_DIMS (2) */
+        default:     params[0] = 0;     break;
+    }
 }
 
 const GLubyte *glGetString(GLenum name) {

@@ -66,6 +66,10 @@ enum Op : uint8_t {
     // --- uniforms (locations are real GL locations, looked up host-side by name) ---
     OP_UNIFORM_MATRIX4FV = 50,  // u32 vprog_id, u32 name_len, bytes(name), f32[16]
     OP_UNIFORM1I = 51,          // u32 vprog_id, u32 name_len, bytes(name), i32 value
+    // generalized uniform setters (glUniform{1..4}f[v] / {2..4}i + {1..4}iv / Matrix{2,3}fv):
+    OP_UNIFORM_FV = 52,         // u32 vprog, blob(name), u8 cols(1..4), u32 count, f32[cols*count]
+    OP_UNIFORM_IV = 53,         // u32 vprog, blob(name), u8 cols(1..4), u32 count, i32[cols*count]
+    OP_UNIFORM_MATRIX_FV = 54,  // u32 vprog, blob(name), u8 dim(2..3), u32 count, f32[dim*dim*count]
     // --- textures ---
     OP_GEN_TEXTURE = 60,        // u32 vtex_id
     OP_ACTIVE_TEXTURE = 61,     // u32 unit (GL_TEXTURE0+n)
@@ -76,6 +80,16 @@ enum Op : uint8_t {
     OP_ENABLE = 70,             // u32 cap
     OP_DISABLE = 71,            // u32 cap
     OP_DEPTH_FUNC = 72,         // u32 func
+    OP_CULL_FACE = 73,          // u32 mode (GL_FRONT/BACK/FRONT_AND_BACK)
+    OP_FRONT_FACE = 74,         // u32 mode (GL_CW/GL_CCW)
+    // --- attribute-by-NAME (glGetAttribLocation has no round-trip: the guest carries
+    //     the attribute NAME, the host resolves the real location by name, exactly as
+    //     uniforms do). The guest emits these (instead of the index-based OP_ENABLE_VAA
+    //     / OP_VERTEX_ATTRIB_POINTER) when the location came from glGetAttribLocation. ---
+    OP_ENABLE_VAA_NAMED = 80,           // u32 vprog, blob(name)
+    OP_VERTEX_ATTRIB_POINTER_NAMED = 81,// u32 vprog, blob(name), i32 size, u32 type, u8 norm, i32 stride, u32 offset
+    // --- indexed draw (meshes) ---
+    OP_DRAW_ELEMENTS = 82,      // u32 mode, i32 count, u32 type, u32 offset (into bound ELEMENT_ARRAY_BUFFER)
 };
 
 // Host-side decode state: the virtual->real GL name translation tables. The guest
@@ -272,6 +286,64 @@ inline bool decode_batch(const uint8_t* data, size_t len, HostState& st) {
                 if (loc >= 0) glUniform1i(loc, val);
                 ++st.decoded; break;
             }
+            case OP_UNIFORM_FV: {
+                uint32_t vp, nlen, count; const uint8_t* name; uint8_t cols;
+                if (!r.u32(vp)) { st.ok = false; break; }
+                if (!r.blob(name, nlen)) { st.ok = false; break; }
+                if (!r.u8(cols) || !r.u32(count)) { st.ok = false; break; }
+                if (cols < 1 || cols > 4) { st.ok = false; break; }
+                std::vector<float> v(static_cast<size_t>(cols) * count);
+                if (!r.floats(v.data(), v.size())) { st.ok = false; break; }
+                std::string nm(reinterpret_cast<const char*>(name), nlen);
+                GLint loc = glGetUniformLocation(st.real_prog(vp), nm.c_str());
+                if (loc >= 0) {
+                    switch (cols) {
+                        case 1: glUniform1fv(loc, count, v.data()); break;
+                        case 2: glUniform2fv(loc, count, v.data()); break;
+                        case 3: glUniform3fv(loc, count, v.data()); break;
+                        case 4: glUniform4fv(loc, count, v.data()); break;
+                    }
+                }
+                ++st.decoded; break;
+            }
+            case OP_UNIFORM_IV: {
+                uint32_t vp, nlen, count; const uint8_t* name; uint8_t cols;
+                if (!r.u32(vp)) { st.ok = false; break; }
+                if (!r.blob(name, nlen)) { st.ok = false; break; }
+                if (!r.u8(cols) || !r.u32(count)) { st.ok = false; break; }
+                if (cols < 1 || cols > 4) { st.ok = false; break; }
+                std::vector<int32_t> v(static_cast<size_t>(cols) * count);
+                bool rok = true;
+                for (auto& e : v) { if (!r.i32(e)) { rok = false; break; } }
+                if (!rok) { st.ok = false; break; }
+                std::string nm(reinterpret_cast<const char*>(name), nlen);
+                GLint loc = glGetUniformLocation(st.real_prog(vp), nm.c_str());
+                if (loc >= 0) {
+                    switch (cols) {
+                        case 1: glUniform1iv(loc, count, v.data()); break;
+                        case 2: glUniform2iv(loc, count, v.data()); break;
+                        case 3: glUniform3iv(loc, count, v.data()); break;
+                        case 4: glUniform4iv(loc, count, v.data()); break;
+                    }
+                }
+                ++st.decoded; break;
+            }
+            case OP_UNIFORM_MATRIX_FV: {
+                uint32_t vp, nlen, count; const uint8_t* name; uint8_t dim;
+                if (!r.u32(vp)) { st.ok = false; break; }
+                if (!r.blob(name, nlen)) { st.ok = false; break; }
+                if (!r.u8(dim) || !r.u32(count)) { st.ok = false; break; }
+                if (dim < 2 || dim > 3) { st.ok = false; break; }  // mat4 uses OP_UNIFORM_MATRIX4FV
+                std::vector<float> v(static_cast<size_t>(dim) * dim * count);
+                if (!r.floats(v.data(), v.size())) { st.ok = false; break; }
+                std::string nm(reinterpret_cast<const char*>(name), nlen);
+                GLint loc = glGetUniformLocation(st.real_prog(vp), nm.c_str());
+                if (loc >= 0) {
+                    if (dim == 2) glUniformMatrix2fv(loc, count, GL_FALSE, v.data());
+                    else          glUniformMatrix3fv(loc, count, GL_FALSE, v.data());
+                }
+                ++st.decoded; break;
+            }
             case OP_GEN_TEXTURE: {
                 uint32_t vid;
                 if (!r.u32(vid)) { st.ok = false; break; }
@@ -314,6 +386,54 @@ inline bool decode_batch(const uint8_t* data, size_t len, HostState& st) {
             case OP_DEPTH_FUNC: {
                 uint32_t func; if (!r.u32(func)) { st.ok = false; break; }
                 glDepthFunc(func); ++st.decoded; break;
+            }
+            case OP_CULL_FACE: {
+                uint32_t mode; if (!r.u32(mode)) { st.ok = false; break; }
+                glCullFace(mode); ++st.decoded; break;
+            }
+            case OP_FRONT_FACE: {
+                uint32_t mode; if (!r.u32(mode)) { st.ok = false; break; }
+                glFrontFace(mode); ++st.decoded; break;
+            }
+            case OP_ENABLE_VAA_NAMED: {
+                uint32_t vp, nlen; const uint8_t* name;
+                if (!r.u32(vp)) { st.ok = false; break; }
+                if (!r.blob(name, nlen)) { st.ok = false; break; }
+                std::string nm(reinterpret_cast<const char*>(name), nlen);
+                // Resolve the real attribute location BY NAME on the (linked) program,
+                // mirroring the uniform path. A negative location is a silent no-op
+                // (GL ignores it), matching the guest's own -1 handling.
+                GLint loc = glGetAttribLocation(st.real_prog(vp), nm.c_str());
+                if (loc >= 0) glEnableVertexAttribArray(static_cast<GLuint>(loc));
+                ++st.decoded; break;
+            }
+            case OP_VERTEX_ATTRIB_POINTER_NAMED: {
+                uint32_t vp, nlen, type, offset; int32_t size, stride; uint8_t norm;
+                const uint8_t* name;
+                if (!r.u32(vp)) { st.ok = false; break; }
+                if (!r.blob(name, nlen)) { st.ok = false; break; }
+                if (!r.i32(size) || !r.u32(type) || !r.u8(norm) || !r.i32(stride) ||
+                    !r.u32(offset)) { st.ok = false; break; }
+                std::string nm(reinterpret_cast<const char*>(name), nlen);
+                GLint loc = glGetAttribLocation(st.real_prog(vp), nm.c_str());
+                if (loc >= 0) {
+                    glVertexAttribPointer(static_cast<GLuint>(loc), size, type,
+                                          norm ? GL_TRUE : GL_FALSE, stride,
+                                          reinterpret_cast<const void*>(
+                                              static_cast<uintptr_t>(offset)));
+                }
+                ++st.decoded; break;
+            }
+            case OP_DRAW_ELEMENTS: {
+                uint32_t mode, type, offset; int32_t count;
+                if (!r.u32(mode) || !r.i32(count) || !r.u32(type) || !r.u32(offset)) {
+                    st.ok = false; break;
+                }
+                // Indices live in the bound ELEMENT_ARRAY_BUFFER (a prior OP_BIND_BUFFER
+                // + OP_BUFFER_DATA on that target); offset is a byte offset into it.
+                glDrawElements(mode, count, type,
+                               reinterpret_cast<const void*>(static_cast<uintptr_t>(offset)));
+                ++st.decoded; break;
             }
             default:
                 st.ok = false; break;  // unknown opcode -> fail-stop (fail-safe)

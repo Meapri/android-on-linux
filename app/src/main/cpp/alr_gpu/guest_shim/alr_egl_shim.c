@@ -180,6 +180,22 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     return EGL_TRUE;
 }
 
+/* [LOCAL] glmark2 (and most EGL apps) call eglBindAPI(EGL_OPENGL_ES_API) at init and
+ * abort if it fails. The shim only ever speaks GLES2, so accept any API and succeed
+ * (the host context is ES2 regardless of what the guest "binds"). */
+EGLBoolean eglBindAPI(EGLenum api) {
+    (void)api;
+    egl_set_error(EGL_SUCCESS);
+    return EGL_TRUE;
+}
+
+/* [LOCAL] current-state getters: there is exactly one of each sentinel and the host
+ * keeps its real context current on its GPU thread, so report our sentinels. (Apps
+ * query these to re-fetch the display/surface; returning EGL_NO_* would mislead.) */
+EGLDisplay eglGetCurrentDisplay(void) { return ALR_EGL_DISPLAY; }
+EGLContext eglGetCurrentContext(void) { return ALR_EGL_CONTEXT; }
+EGLSurface eglGetCurrentSurface(EGLint readdraw) { (void)readdraw; return ALR_EGL_SURFACE; }
+
 /* [LOCAL] swap interval is a host present-policy detail; accept and ignore. */
 EGLBoolean eglSwapInterval(EGLDisplay dpy, EGLint interval) {
     (void)interval;
@@ -212,6 +228,10 @@ __eglMustCastToProperFunctionPointerType eglGetProcAddress(const char *procname)
         { "eglCreatePbufferSurface",  (void*)eglCreatePbufferSurface },
         { "eglCreateContext",         (void*)eglCreateContext },
         { "eglMakeCurrent",           (void*)eglMakeCurrent },
+        { "eglBindAPI",               (void*)eglBindAPI },
+        { "eglGetCurrentDisplay",     (void*)eglGetCurrentDisplay },
+        { "eglGetCurrentContext",     (void*)eglGetCurrentContext },
+        { "eglGetCurrentSurface",     (void*)eglGetCurrentSurface },
         { "eglSwapBuffers",           (void*)eglSwapBuffers },
         { "eglSwapInterval",          (void*)eglSwapInterval },
         { "eglGetError",              (void*)eglGetError },
