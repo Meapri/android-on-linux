@@ -200,6 +200,12 @@ class MainActivity : Activity() {
                 android.util.Log.e("alr_loader", "gpu-stage EXC: ${android.util.Log.getStackTraceString(e)}")
             }
         }.start()
+        // WS-4 §10(b): apt/dpkg/X11 FUNCTIONAL probes. The dpkg-db/x11/apt-config overlays
+        // already stage above; until now their only proof on device was the exec-summary
+        // TextView (never logcat). This actually RUNS dpkg-query/apt-get/Xwayland through the
+        // ALR native loader and emits version/exit/summary to logcat tag alr_loader, so the
+        // integration device drain can capture functional evidence (not just "staged").
+        launchPackageManagerProbes(rootfsStatus.rootfsDir, rootfsManifest.name)
         val nativeCommandRunner = NativeCommandRunner(
             File(applicationInfo.nativeLibraryDir),
             File(cacheDir, "proot-tmp"),
@@ -1541,6 +1547,69 @@ class MainActivity : Activity() {
         // Android re-shows the system bars after dialogs/notifications steal focus;
         // re-hide them whenever we regain focus so the Linux GUI stays edge-to-edge.
         if (hasFocus) applyImmersive()
+    }
+
+    // WS-4 §10(b): run apt/dpkg/X11 FUNCTIONALLY through the ALR native loader and emit
+    // the result to logcat (tag alr_loader), so the integration device drain can capture
+    // real functional evidence — not just the overlay "staged" markers. Each program is
+    // run with the same newline-delimited-argv loader probe the foot/gtkdemo/glmark2
+    // launches use. No display is needed: dpkg-query/apt-get/Xwayland all have a pure
+    // --version path that exits immediately. Heavy + depends on the dpkg-db/x11/apt-config
+    // overlays being staged (the toolkit-stage thread above), so this runs on its own
+    // background thread and waits (bounded) for the staged binaries to appear.
+    private fun launchPackageManagerProbes(rootfsDir: File, rootfsName: String) {
+        Thread {
+            try {
+                // dpkg-query/apt-get ship in the base; Xwayland comes from the x11 overlay.
+                // Wait (bounded) for the staged binaries so we don't probe before the
+                // concurrent toolkit-stage thread has extracted them.
+                val dpkgQueryBin = File(rootfsDir, "usr/bin/dpkg-query")
+                val aptGetBin = File(rootfsDir, "usr/bin/apt-get")
+                val xwaylandBin = File(rootfsDir, "usr/bin/Xwayland")
+                var waited = 0
+                while (waited < 20000 &&
+                    !(dpkgQueryBin.isFile && aptGetBin.isFile && xwaylandBin.isFile)
+                ) {
+                    Thread.sleep(500)
+                    waited += 500
+                }
+                fun probe(label: String, program: String, okMarker: String) {
+                    val out = nativeAlrNativeLoaderProbe(
+                        packageName,
+                        applicationInfo.nativeLibraryDir,
+                        filesDir.absolutePath,
+                        cacheDir.absolutePath,
+                        rootfsName,
+                        program,
+                    )
+                    val exec = out.lineStartingWith("ALR NATIVE LOADER GUEST EXEC:")
+                    val ok = out.contains(okMarker)
+                    android.util.Log.i(
+                        "alr_loader",
+                        "pkgfunc-$label: ok=$ok exec=[$exec] marker=[$okMarker]",
+                    )
+                    android.util.Log.i("alr_loader", "pkgfunc-$label-out:\n$out")
+                }
+                // (b1) dpkg admin DB query: --version proves the binary runs through the
+                // loader; --list (paged via the reconstructed status DB) proves the
+                // dpkg-db overlay is a real admin DB dpkg can read.
+                android.util.Log.i(
+                    "alr_loader",
+                    "pkgfunc: dpkg-query=${dpkgQueryBin.isFile} apt-get=${aptGetBin.isFile} " +
+                        "Xwayland=${xwaylandBin.isFile} (waited ${waited}ms)",
+                )
+                probe("dpkg-query-version", "/usr/bin/dpkg-query\n--version", "Debian dpkg-query")
+                probe("dpkg-query-list", "/usr/bin/dpkg-query\n-l\nlibc6", "libc6")
+                // (b2) apt: --version proves libapt-pkg loads + apt runs through the loader.
+                probe("apt-get-version", "/usr/bin/apt-get\n--version", "apt ")
+                // (b3) X11: Xwayland -version prints the X server version and exits without a
+                // display — the no-display functional check for the x11 overlay (rootful
+                // launch-on-compositor is L2/L3 integration, not this WS).
+                probe("xwayland-version", "/usr/bin/Xwayland\n-version", "Xwayland")
+            } catch (e: Throwable) {
+                android.util.Log.e("alr_loader", "pkgfunc EXC: ${android.util.Log.getStackTraceString(e)}")
+            }
+        }.start()
     }
 
     // Hide Android's status + navigation bars (swipe to reveal) so a desktop-class
