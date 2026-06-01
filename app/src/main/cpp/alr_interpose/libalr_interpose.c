@@ -68,8 +68,12 @@
  * is unique and only reachable post-rewrite. The supervisor's ptrace path
  * thus stops trapping interposer-mediated I/O (path_traps collapses), while
  * any path syscall that escapes the interposer (raw syscalls, ld.so loads,
- * compositional wrappers like realpath/opendir that call libc internally)
+ * compositional wrappers like realpath/scandir that call libc internally)
  * still traps at a non-trampoline PC -> RET_TRACE -> the supervisor backstop.
+ * (M2, ADR-001 §4: opendir was such a compositional wrapper -- its internal
+ * directory open is now emitted through the trampoline so it no longer traps;
+ * see the opendir wrapper. The non-path credential getters getuid/geteuid/
+ * getgid/getegid are memoized to drop their seccomp-dispatch cost to zero.)
  *
  * FAIL-SAFE: if the trampoline range is ever stale/wrong (e.g. after a guest
  * execve re-maps this .so at a fresh ASLR base), the PC gate simply misses and
@@ -991,15 +995,60 @@ ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz) {
 /* directory enumeration                                               */
 /* =================================================================== */
 
-/* opendir/scandir take a path string; rewrite it. We forward to the cached
- * real impl with opaque return types to avoid pulling <dirent.h> structs into
- * every call signature. */
+/*
+ * opendir — PCGATE=1: open the directory fd THROUGH THE TRAMPOLINE, then hand it
+ * to fdopendir. This is the M2 (ADR-001 §4 candidate 4) trap reduction: the
+ * stock opendir is a *compositional* wrapper — it calls glibc's internal
+ * open from a NON-trampoline PC, so its underlying openat(56) is a path syscall
+ * that escapes the PC gate -> RET_TRACE -> a ptrace supervisor round-trip *per
+ * directory open*. GTK/GIMP scan many directories at startup (icon themes, font
+ * dirs, pixbuf loaders, GIO modules, config dirs), so each is a trap today.
+ *
+ * By emitting the openat ourselves via alr_open_emit (the same trusted-PC,
+ * RESOLVE_IN_ROOT-or-string-rewrite path the open() family already uses), the
+ * directory open is ALLOWed without tracing, and the remaining fdopendir work
+ * (fstat/fcntl/getdents on the *fd*) issues only NON-path syscalls that never
+ * trap. Net: one fewer path_trap per opendir, with byte-identical results.
+ *
+ * Semantics match glibc's __opendirat: O_RDONLY|O_NONBLOCK|O_DIRECTORY|O_CLOEXEC
+ * (LARGEFILE is implicit on arm64). fdopendir takes ownership of the fd on
+ * success; on failure it does NOT close it, so we close it ourselves to avoid an
+ * fd leak — exactly glibc's own contract. PCGATE=0 keeps the original
+ * RTLD_NEXT + string-rewrite behavior verbatim.
+ */
 void *opendir(const char *path) {
+    if (g_pcgate) {
+        int fd = alr_open_emit(AT_FDCWD, path,
+                               O_RDONLY | O_NONBLOCK | O_DIRECTORY | O_CLOEXEC, 0);
+        if (fd < 0) return NULL;                 /* errno already set by alr_ret */
+        static void *(*real_fdopendir)(int);
+        ALR_REAL(real_fdopendir, void *(*)(int), "fdopendir");
+        if (!real_fdopendir) {                   /* should never happen on glibc */
+            alr_tramp_syscall(__NR_close, fd, 0, 0, 0, 0, 0);
+            errno = ENOSYS;
+            return NULL;
+        }
+        void *d = real_fdopendir(fd);
+        if (!d) {
+            int e = errno;                        /* preserve fdopendir's errno */
+            alr_tramp_syscall(__NR_close, fd, 0, 0, 0, 0, 0);
+            errno = e;
+        }
+        return d;
+    }
     static void *(*real)(const char *);
     ALR_REAL(real, void *(*)(const char *), "opendir");
     char b[ALR_PBUF];
     return real(rw(path, b, sizeof b));
 }
+
+/* scandir/scandir64 stay on the RTLD_NEXT + string-rewrite path. They internally
+ * opendir() the directory (a traced openat), so they still trap once per call —
+ * but scandir is comparatively rare at GUI startup vs opendir, and re-expressing
+ * scandir without its libc body (qsort + dirent alloc/filter callbacks) would be
+ * far higher risk than its trap saving warrants. The string rewrite continues to
+ * mediate correctly; deferred to USER_NOTIF (ADR-001 §4 candidate 1) if it ever
+ * dominates a measured trace count. */
 int scandir(const char *path, void *namelist, void *filter, void *compar) {
     static int (*real)(const char *, void *, void *, void *);
     ALR_REAL(real, int (*)(const char *, void *, void *, void *), "scandir");
@@ -1218,6 +1267,89 @@ int mkfifoat(int dirfd, const char *path, mode_t mode) {
     char b[ALR_PBUF];
     const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
     return real(dirfd, p, mode);
+}
+
+/* =================================================================== */
+/* non-path, result-only, side-effect-free getters (process credentials) */
+/* =================================================================== */
+/*
+ * ADR-001 §4 (candidate 4 — PCGATE non-path expansion). These syscalls are NOT
+ * in the traced 9, so the PC gate already RET_ALLOWs them: they generate NO
+ * path_trap, NO ptrace round-trip. What they DO pay is the ~24 ns/syscall
+ * seccomp DISPATCH floor (docs/design/pcgate-seccomp.md §"Filter instruction
+ * layout"; ADR-001 §1-B) on EVERY invocation. GTK/GLib/GIO call the credential
+ * getters incessantly during startup (GLib's g_get_user_*, theme/permission
+ * checks), so memoizing them removes those syscalls — and their dispatch cost —
+ * entirely. This is the ONLY way to drive a syscall class below the 24 ns floor
+ * (ADR §1-B: seccomp-on => 0% impossible; the only escape is to not issue the
+ * syscall), mirroring the vDSO rationale (ADR §3 candidate 3a) for clocks.
+ *
+ * SAFETY — why these are cacheable WITHOUT side effects or correctness risk:
+ *   - Process credentials (uid/euid/gid/egid) are immutable for an untrusted_app
+ *     guest: it has no CAP_SETUID and cannot setuid/setgid, and a child of a
+ *     fork() inherits IDENTICAL credentials — so a process-wide cache is correct
+ *     across any guest fork too (unlike getpid, which a fork would invalidate;
+ *     getpid/getppid/gettid are therefore deliberately NOT cached here).
+ *   - Result-only: no pointer args, no memory the caller may have changed
+ *     (no TOCTOU — the ADR's reason path-rewrite must NOT move to a cache/notif).
+ *   - The first call resolves the real value through the trampoline (trusted PC);
+ *     every subsequent call returns the cached value with zero syscalls.
+ *
+ * The cache slots are written once with the kernel's own value and only read
+ * afterward; the benign double-resolve race (two threads before first publish)
+ * stores the same value, matching the ALR_REAL slot convention. PCGATE=0 reverts
+ * each wrapper to the real libc getter via RTLD_NEXT (no cache, no trampoline) so
+ * the A/B baseline is unchanged.
+ */
+#ifndef __NR_getuid
+#define __NR_getuid  174
+#endif
+#ifndef __NR_geteuid
+#define __NR_geteuid 175
+#endif
+#ifndef __NR_getgid
+#define __NR_getgid  176
+#endif
+#ifndef __NR_getegid
+#define __NR_getegid 177
+#endif
+
+/* -1 sentinel = "not yet resolved" (no real uid/gid is (uid_t)-1 for a guest;
+ * even if it were, a re-resolve through the trampoline is harmless). */
+#define ALR_ID_UNSET ((uid_t)-1)
+
+static uid_t alr_cached_id(uid_t *slot, long nr) {
+    uid_t v = *slot;
+    if (v != ALR_ID_UNSET) return v;
+    long r = alr_tramp_syscall(nr, 0, 0, 0, 0, 0, 0);   /* never fails (no args) */
+    v = (uid_t)r;
+    *slot = v;
+    return v;
+}
+
+uid_t getuid(void) {
+    if (g_pcgate) { static uid_t c = ALR_ID_UNSET; return alr_cached_id(&c, __NR_getuid); }
+    static uid_t (*real)(void);
+    ALR_REAL(real, uid_t (*)(void), "getuid");
+    return real();
+}
+uid_t geteuid(void) {
+    if (g_pcgate) { static uid_t c = ALR_ID_UNSET; return alr_cached_id(&c, __NR_geteuid); }
+    static uid_t (*real)(void);
+    ALR_REAL(real, uid_t (*)(void), "geteuid");
+    return real();
+}
+gid_t getgid(void) {
+    if (g_pcgate) { static uid_t c = ALR_ID_UNSET; return (gid_t)alr_cached_id(&c, __NR_getgid); }
+    static gid_t (*real)(void);
+    ALR_REAL(real, gid_t (*)(void), "getgid");
+    return real();
+}
+gid_t getegid(void) {
+    if (g_pcgate) { static uid_t c = ALR_ID_UNSET; return (gid_t)alr_cached_id(&c, __NR_getegid); }
+    static gid_t (*real)(void);
+    ALR_REAL(real, gid_t (*)(void), "getegid");
+    return real();
 }
 
 /* =================================================================== */
