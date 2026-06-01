@@ -417,11 +417,38 @@ static void alr_probe_faccessat2(void) {
  * RET_ALLOW for everything else. 64-bit IP is compared as two 32-bit words
  * (lo @ off 8, hi @ off 12) for a half-open [lo,hi) unsigned range test.
  *
+ * DECISION (unchanged contract, see docs/design/pcgate-seccomp.md):
+ *     arch != AUDIT_ARCH_AARCH64                     -> ALLOW
+ *     nr NOT in the 9 path syscalls                  -> ALLOW   (the hot case)
+ *     nr in the 9 AND IP in [lo,hi)                  -> ALLOW   (trampoline)
+ *     nr in the 9 AND IP outside [lo,hi)             -> TRACE   (supervisor)
+ *
+ * PERFORMANCE LAYOUT (the slimming): the kernel evaluates this filter on EVERY
+ * syscall the guest makes, and on-device a getpid/futex/clock_gettime storm pays
+ * for it (~24 ns/syscall measured before this change). The OLD layout ran the
+ * full two-word PC-range test FIRST, then a 9-way linear nr scan, so a harmless
+ * syscall walked ~20-24 instructions for an outcome (ALLOW) that never depended
+ * on the PC at all. This layout instead CLASSIFIES nr FIRST with a small
+ * bracketed decision tree and ALLOWs every non-path syscall in 7 instructions
+ * flat — the PC-range test is computed ONLY for the (rare) 9 path syscalls,
+ * where its result actually matters. Decision-identical to the old filter; the
+ * reorder is observably-equivalent because a non-path syscall is ALLOW under
+ * both the old PC-then-nr and the new nr-then-PC ordering.
+ *
+ * nr bracketing rationale (aarch64 NRs): the 9 path syscalls are
+ *   {34,35,48,56,78,79, 291, 437,439}. The hot harmless syscalls
+ *   (futex=98, clock_gettime=113, clock_nanosleep=115, rt_sigprocmask=135,
+ *    getpid=172, gettid=178) all sit in the gap (79,291); read=63/write=64 sit
+ *   in (56,78). A split at nr>79, then a (80,291] band, lands every one of those
+ *   on a 7-instruction ALLOW. The path NRs are matched by exact bracketed
+ *   compares so each still routes to the PC gate.
+ *
  * The jt/jf/k offsets below were laid out by instruction index and VALIDATED
- * on-host against synthetic seccomp_data (IP==lo -> ALLOW; IP==hi-1 -> ALLOW;
- * IP==hi -> TRACE; IP just below lo -> TRACE; non-path nr at any PC -> ALLOW;
- * incl. lo-word boundary and a 4GB-straddling range). Offsets are relative to
- * the NEXT instruction. If you change the layout, re-run that host check.
+ * on-host (tests/test_pcgate_bpf_logic.py decision model + an exhaustive cBPF
+ * simulator over all 9 path NRs, the hot harmless NRs, foreign arch, and IP
+ * boundaries incl. lo/hi-word edges and a 4GB-straddling window: 0 mismatches
+ * vs the contract). Offsets are relative to the NEXT instruction. If you change
+ * the layout, re-run that host check.
  */
 static void alr_install_pcgated_filter(void) {
     /* zygote already set NO_NEW_PRIVS process-wide; a re-arm is harmless and
@@ -439,37 +466,43 @@ static void alr_install_pcgated_filter(void) {
 
     struct sock_filter f[] = {
         /* 0  */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_ARCH),
-        /* 1  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 1, 0),
-        /* 2  */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),  /* foreign arch -> allow */
+        /* 1  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 1, 0), /* aarch64 -> nr classify(3); else ALLOW(2) */
+        /* 2  */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),                  /* foreign arch -> allow */
 
-        /* ---- PC gate: ALLOW iff lo <= IP < hi (unsigned 64-bit) ---- */
-        /* 3  */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_IP_HI),               /* A = IP.hi */
-        /* 4  */ BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, lo_hi, 4, 0),            /* hi>lo_hi: lower ok -> LOWER_OK(9) */
-        /* 5  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, lo_hi, 1, 0),            /* hi==lo_hi: test lo -> idx7 */
-        /* 6  */ BPF_JUMP(BPF_JMP | BPF_JA, 9, 0, 0),                         /* hi<lo_hi: below -> CLASSIFY(16) */
-        /* 7  */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_IP_LO),               /* A = IP.lo */
-        /* 8  */ BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, lo_lo, 0, 7),            /* lo>=lo_lo: LOWER_OK(9); else CLASSIFY(16) */
-        /* 9  */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_IP_HI),               /* LOWER_OK: A = IP.hi (upper-bound test) */
-        /* 10 */ BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, hi_hi, 5, 0),            /* hi>hi_hi: IP>=hi -> CLASSIFY(16) */
-        /* 11 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, hi_hi, 1, 0),            /* hi==hi_hi: test lo -> idx13; hi<hi_hi: TRUSTED(12) */
-        /* 12 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),                /* IP.hi < hi_hi -> trusted */
-        /* 13 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_IP_LO),               /* A = IP.lo */
-        /* 14 */ BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, hi_lo, 1, 0),            /* lo>=hi_lo: NOT trusted -> CLASSIFY(16); else TRUSTED(15) */
-        /* 15 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),                /* IP.lo < hi_lo -> trusted */
+        /* ---- nr classify FIRST: non-path -> ALLOW in <=7 insns ---- */
+        /* 3  */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_NR),                    /* A = nr */
+        /* 4  */ BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, 79, 7, 0),                 /* nr>79 -> UPPER(12); else LOWER(5) */
 
-        /* ---- CLASSIFY (16): untrusted PC. TRACE iff nr in the 9. ---- */
-        /* 16 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_NR),                  /* A = nr */
-        /* 17 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat,     9, 0),
-        /* 18 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat2,    8, 0),
-        /* 19 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_newfstatat, 7, 0),
-        /* 20 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_statx,      6, 0),
-        /* 21 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_faccessat,  5, 0),
-        /* 22 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_faccessat2, 4, 0),
-        /* 23 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_readlinkat, 3, 0),
-        /* 24 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_mkdirat,    2, 0),
-        /* 25 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_unlinkat,   1, 0),
-        /* 26 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),                /* non-path -> allow */
-        /* 27 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE),               /* path syscall, untrusted PC -> trace */
+        /* LOWER (nr<=79): path subset {34,35,48,56,78,79} */
+        /* 5  */ BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, 77, 0, 1),                 /* {78,79} -> L7879(6); nr<=77 -> LMID(7) */
+        /* 6  */ BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 78, 10, 20),               /* L7879: nr>=78 -> PATH(17); else ALLOW(27) */
+        /* 7  */ BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, 56, 19, 0),                /* LMID: 57..77 (read/write) -> ALLOW(27); nr<=56 -> LLOW(8) */
+        /* 8  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat,    8, 0),     /* 56  -> PATH(17) */
+        /* 9  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_faccessat, 7, 0),     /* 48  -> PATH(17) */
+        /* 10 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_unlinkat,  6, 0),     /* 35  -> PATH(17) */
+        /* 11 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_mkdirat,   5, 15),    /* 34  -> PATH(17); else ALLOW(27) */
+
+        /* UPPER (nr>79): path subset {291,437,439} */
+        /* 12 */ BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, 291, 1, 0),                /* nr>291 -> U1(14); 80..291 -> HOT(13) */
+        /* 13 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_statx,     3, 13),    /* HOT: 291 -> PATH(17); else (incl all hot NRs) ALLOW(27) */
+        /* 14 */ BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, 439, 12, 0),               /* U1: nr>439 -> ALLOW(27); 292..439 -> U2(15) */
+        /* 15 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_faccessat2, 1, 0),    /* 439 -> PATH(17) */
+        /* 16 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat2,    0, 10),   /* 437 -> PATH(17); else ALLOW(27) */
+
+        /* ---- PC gate (reached ONLY for the 9 path NRs): ALLOW iff lo<=IP<hi ---- */
+        /* 17 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_IP_HI),                 /* PATH: A = IP.hi */
+        /* 18 */ BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, lo_hi, 3, 0),              /* hi>lo_hi: lower ok -> UPCHK(22) */
+        /* 19 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, lo_hi, 0, 8),              /* hi==lo_hi: test lo(20); hi<lo_hi: below -> TRACE(28) */
+        /* 20 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_IP_LO),                 /* A = IP.lo */
+        /* 21 */ BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, lo_lo, 0, 6),              /* lo>=lo_lo: UPCHK(22); else TRACE(28) */
+        /* 22 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_IP_HI),                 /* UPCHK: A = IP.hi (upper bound) */
+        /* 23 */ BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, hi_hi, 4, 0),              /* hi>hi_hi: IP>=hi -> TRACE(28) */
+        /* 24 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, hi_hi, 0, 2),              /* hi==hi_hi: test lo(25); hi<hi_hi -> ALLOW(27) */
+        /* 25 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_IP_LO),                 /* A = IP.lo */
+        /* 26 */ BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, hi_lo, 1, 0),              /* lo>=hi_lo: NOT trusted -> TRACE(28); else ALLOW(27) */
+
+        /* 27 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),                  /* ALLOW */
+        /* 28 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE),                  /* path syscall, untrusted PC -> trace */
     };
 
     struct sock_fprog prog = {

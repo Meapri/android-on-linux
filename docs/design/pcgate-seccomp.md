@@ -184,6 +184,40 @@ hi @ off 12) and do a `[lo, hi)` range compare. The arch guard is
 `AUDIT_ARCH_AARCH64` and must precede the nr/IP inspection (so a foreign-arch
 syscall returns `RET_ALLOW` before the gate runs).
 
+### Filter instruction layout (performance, decision-invariant)
+
+The kernel evaluates this stacked filter on **every** syscall the guest makes,
+so the per-instruction cost shows up on syscall-heavy hot paths even when the
+gate intercepts nothing (`traps == 0`). A device microbench of a raw
+`syscall(SYS_getpid)` storm measured ~24 ns/op of this evaluation overhead.
+
+The filter therefore **classifies `nr` first** and only runs the (expensive,
+two-word) IP-range test for the rare 9 path syscalls. A non-path syscall is
+`RET_ALLOW` regardless of IP, so reordering nr-before-PC is decision-identical
+to PC-before-nr while making the common case far cheaper:
+
+```text
+arch != AUDIT_ARCH_AARCH64                     -> ALLOW        (insn 0-2)
+nr not in the 9 path syscalls                  -> ALLOW        (<= 7 insns)
+nr in the 9  AND  IP in [lo,hi)                -> ALLOW        (PC gate)
+nr in the 9  AND  IP outside [lo,hi)           -> TRACE        (PC gate)
+```
+
+`nr` is matched by a small **bracketed** tree (`nr>79` split, then a `(80,291]`
+band) rather than a 9-way linear scan, chosen so the hottest harmless syscalls
+land on a 7-instruction `RET_ALLOW`: `read`(63), `write`(64), `futex`(98),
+`clock_gettime`(113), `clock_nanosleep`(115), `rt_sigprocmask`(135),
+`getpid`(172), `gettid`(178), plus `mmap`/`mprotect`/`execve`/`execveat`/
+`exit_group`. The 9 path syscalls {34,35,48,56,78,79,291,437,439} still route to
+the PC gate. Total program length 29 (≤ `BPF_MAXINSNS` 4096), forward-jumps only.
+
+This is purely an instruction reordering: the security invariants are unchanged.
+A non-path syscall was always `ALLOW`; a path syscall still `RET_TRACE`s unless
+emitted from the trampoline PC (so the supervisor backstop and the S1–S5
+soundness theorems in `tests/test_pcgate_bpf_logic.py` hold verbatim). W^X is not
+this filter's concern: `mmap`/`mprotect` PROT_EXEC is gated by the Android
+platform's own SELinux/seccomp policy beneath this stacked filter.
+
 ### File ownership
 
 No file is edited by two agents:
