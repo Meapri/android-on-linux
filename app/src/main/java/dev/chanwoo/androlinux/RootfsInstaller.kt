@@ -160,7 +160,14 @@ class RootfsInstaller(private val context: Context) {
                 target.parentFile?.mkdirs()
                 target.outputStream().use { output -> tar.copyTo(output) }
                 target.setReadable(true, true)
-                if (entry.mode and 0b001_001_001 != 0) {
+                // Set the exec bit when the tar entry is executable OR the file is a
+                // shared library. ALR's dlopen (file-backed PROT_EXEC under
+                // untrusted_app) REJECTS a non-executable .so — Debian ships .so as
+                // 0644 (no x), which extracts to 0600 and breaks dlopen of e.g. the
+                // gdk-pixbuf svg loader (device-evidence: gtk3 SIGABRT) and the base
+                // pixbuf loaders. Shared libs need x here even though stock Linux
+                // dlopen does not require it.
+                if (entry.mode and 0b001_001_001 != 0 || isSharedLibName(target.name)) {
                     target.setExecutable(true, true)
                 }
             }
@@ -248,6 +255,12 @@ class RootfsInstaller(private val context: Context) {
     }
 
     private fun versionStr(v: List<Int>): String = v.joinToString(".")
+
+    /** A shared library by name: `libfoo.so`, `libfoo.so.1`, `libpixbufloader_svg.so`. */
+    private fun isSharedLibName(name: String): Boolean {
+        val base = name.substringAfterLast('/')
+        return base.endsWith(".so") || base.contains(".so.")
+    }
 
     private fun isSymlinkPath(file: File): Boolean = try {
         val st = android.system.Os.lstat(file.absolutePath)
