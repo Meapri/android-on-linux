@@ -323,3 +323,32 @@ ALR's file-backed PROT_EXEC (untrusted_app) **rejects a non-executable `.so`**
 C.UTF-8 still unresolved: C.utf8 (noble) is present but `setlocale` fails — not a
 perm issue; needs a device strace of the locale `open()` path (LOCPATH /
 locale-archive / path-mediation). WS-4 follow-up, DEVICE-REQ.
+
+---
+
+## 11. Toolkit matrix (b) — all overlays rebuilt from Ubuntu noble (distro-correct)
+
+All device-pending overlays in `/tmp`, built from `ports.ubuntu.com noble main+universe`,
+`--minimal`, base-subtracted, .so 0755, missing_soname=0, overlay_guard 0 BLOCK:
+
+| overlay | size | reachable new libs | note |
+|---|---|---|---|
+| `xkb-gegl-stage.tar` | 6.16 MB | (svg loader + librsvg + C.utf8) | GUI: locale + svg loader (0755) |
+| `netsurf-stage.tar` | 7.1 MB | libcurl, libssh | GTK3 browser |
+| `sdl2-stage.tar` | 8.2 MB | 20 | (noble base already had most deps; vs 30.6MB from bookworm) |
+| `qt6-stage.tar` | 74.2 MB | 28 | Qt6 + ICU (inherent); qtwayland plugins kept |
+
+## 12. C.UTF-8 setlocale — HANDOFF to WS-1 (path-mediation / LOCPATH)
+
+WS-4 data part is DONE and CORRECT: `/usr/lib/locale/C.utf8/LC_CTYPE` is a valid
+glibc locale (magic `0x20090720`, 360460 B, from **noble** libc-bin matching the base
+glibc 2.39) + a `C.UTF-8 → C.utf8` symlink; it sits on glibc's compiled default path
+`/usr/lib/locale` (confirmed in libc.so.6 strings). Yet device `setlocale(LC_ALL,
+"C.UTF-8")` returns NULL ("Locale not supported"). This is **NOT a rootfs/data issue**
+— it is the guest glibc's locale `open()` of `/usr/lib/locale/{locale-archive, C.utf8/LC_*}`
+not being path-mediated to the rootfs (the `.so` loader opens at `/usr/lib/aarch64-
+linux-gnu/...` ARE mediated, so the locale open path is reaching Android, not the
+rootfs). **WS-1 (L1 loader/mediation):** either ensure the path-mediation covers
+glibc's locale `open()`/`openat()` for `/usr/lib/locale`, or set `LOCPATH=/usr/lib/locale`
+in `guest_env` (§5-D). Non-fatal (Gtk-WARNING; falls back to C) — the gtk3 abort was
+the svg `.so` (§10.1), already fixed.
