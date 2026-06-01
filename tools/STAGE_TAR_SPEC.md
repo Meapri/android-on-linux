@@ -204,24 +204,27 @@ broad (~195 MB). The right next step is a **curated package list** (leaf + only 
 libs its binary's `DT_NEEDED` actually requires that the base lacks) rather than the
 conservative transitive `Depends`. `deb_closure`'s `prune=` is tunable per build.
 
-## 8. (a) GUI-stability — locale / babl-gegl investigation (device backtrace needed)
+## 8. (a) GUI-stability — C.UTF-8 locale (root cause found + fixed)
 
-§10 assigned WS-4 "(a) `locales-all` (C.UTF-8) + babl/gegl `.so`" for a residual
-gtk3-widget-factory/gimp **SIGABRT**. Host recon (this session):
-- **babl/gegl present in base**: `libbabl-0.1.so.0`, `libgegl-0.4.so.0` + **37
-  `gegl-0.4/*` op plugins**. Not missing.
-- **locale env already set**: `runtime_report.cpp` exports `LC_ALL=C.UTF-8` +
-  `LANG=C.UTF-8`. Base glibc is **2.39** (GLIBC_2.39 syms) → C.UTF-8 should be a
-  built-in locale (no archive). No `/usr/lib/locale` or `/usr/share/i18n` in base.
-- Only clearly-missing item: `/usr/share/X11/xkb/locale` (from `libx11-data`, arch
-  `all`) — but irrelevant to a pure-Wayland GTK client.
-- `locales-all` is **arm64, ~11 MB download / ~227 MB installed** — far too heavy to
-  stage blindly.
+§10(a): residual gtk3-widget-factory/gimp **SIGABRT**. **Root cause (host-confirmed):**
+- The base ships **zero** compiled locales — `/usr/lib/locale` is absent (0 entries).
+- The guest env exports `LC_ALL=C.UTF-8` / `LANG=C.UTF-8` (WS-1, runtime_report.cpp).
+- Debian glibc does **not** compile C.UTF-8 into `libc.so.6` (the literal name is not
+  in the base's 2.39 libc) — it ships the precompiled dir **`/usr/lib/locale/C.utf8`
+  in the `libc-bin` package** (~392 KB). With it missing, `setlocale(LC_ALL,"C.UTF-8")`
+  → NULL → GLib/GTK aborts at startup. (babl/gegl are NOT the cause — base already has
+  `libbabl-0.1.so.0`, `libgegl-0.4.so.0` + 37 `gegl-0.4/*` ops.)
 
-So the obvious "locale/gegl missing" pieces are NOT missing. Before staging a 227 MB
-locale-archive, the **device SIGABRT backtrace is required** to pinpoint the abort
-(which lib/`g_assert`). Requested via `DEVICE-REQ` on the merge. If it IS a genuine
-C.UTF-8 lookup failure, the minimal fix is a localedef-built `C.UTF-8` archive
-(Debian-env: `localedef -i C -f UTF-8 /usr/lib/locale/C.UTF-8`), staged into
-`xkb-gegl-stage.tar` — not the full `locales-all`. The `xkb-gegl-stage.tar`
-MainActivity slot is now wired through the guarded `extractOverlayTar`.
+**Fix (built, validated, device-pending):** `tools/build_locale_overlay.py` extracts
+`libc-bin`'s `/usr/lib/locale/C.utf8` (glibc normalizes the requested "C.UTF-8" →
+dir "C.utf8") + adds a `C.UTF-8` → `C.utf8` symlink, and emits a **370 KB** §5-E
+overlay = `xkb-gegl-stage.tar` (the already-wired, guarded MainActivity slot — no
+Kotlin change). `stage_tar_spec`: CONFORMANT; `overlay_guard`: 0 violations (new
+paths, base lacks them). This replaces the 227 MB `locales-all` approach — only the
+one needed locale is staged. Build:
+`python -m tools.build_locale_overlay --out /tmp/xkb-gegl-stage.tar --base <base.tar>`.
+
+DEVICE-REQ (on the ws-4 commit): cold-start gtk3-widget-factory + gimp with
+`xkb-gegl-stage.tar` pushed → no SIGABRT (locale resolves). Source `libc-bin` is
+glibc 2.36 (bookworm); the LC_* format is backward-compatible with the 2.39 base —
+if the device shows a locale-version error, rebuild with `--suite trixie`.
