@@ -87,8 +87,13 @@ typedef ssize_t          GLsizeiptr;
 
 #define GL_FRONT                          0x0404
 #define GL_BACK                           0x0405
+#define GL_FRONT_AND_BACK                 0x0408
 #define GL_CW                             0x0900
 #define GL_CCW                            0x0901
+
+#define GL_MAX_VERTEX_ATTRIBS             0x8869
+#define GL_MAX_TEXTURE_SIZE               0x0D33
+#define GL_MAX_TEXTURE_IMAGE_UNITS        0x8872
 
 #define GL_NEAREST                        0x2600
 #define GL_LINEAR                         0x2601
@@ -170,10 +175,33 @@ void   glDisableVertexAttribArray(GLuint index);
 void   glVertexAttribPointer(GLuint index, GLint size, GLenum type, GLboolean normalized,
                              GLsizei stride, const void *pointer);
 void   glDrawArrays(GLenum mode, GLint first, GLsizei count);
+void   glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices);
+GLint  glGetAttribLocation(GLuint program, const GLchar *name);
+
+void   glCullFace(GLenum mode);
+void   glFrontFace(GLenum mode);
+void   glGetIntegerv(GLenum pname, GLint *params);
 
 GLint  glGetUniformLocation(GLuint program, const GLchar *name);
 void   glUniform1i(GLint location, GLint v0);
 void   glUniformMatrix4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);
+void   glUniform1f(GLint location, GLfloat x);
+void   glUniform2f(GLint location, GLfloat x, GLfloat y);
+void   glUniform3f(GLint location, GLfloat x, GLfloat y, GLfloat z);
+void   glUniform4f(GLint location, GLfloat x, GLfloat y, GLfloat z, GLfloat w);
+void   glUniform1fv(GLint location, GLsizei count, const GLfloat *value);
+void   glUniform2fv(GLint location, GLsizei count, const GLfloat *value);
+void   glUniform3fv(GLint location, GLsizei count, const GLfloat *value);
+void   glUniform4fv(GLint location, GLsizei count, const GLfloat *value);
+void   glUniform2i(GLint location, GLint x, GLint y);
+void   glUniform3i(GLint location, GLint x, GLint y, GLint z);
+void   glUniform4i(GLint location, GLint x, GLint y, GLint z, GLint w);
+void   glUniform1iv(GLint location, GLsizei count, const GLint *value);
+void   glUniform2iv(GLint location, GLsizei count, const GLint *value);
+void   glUniform3iv(GLint location, GLsizei count, const GLint *value);
+void   glUniform4iv(GLint location, GLsizei count, const GLint *value);
+void   glUniformMatrix2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);
+void   glUniformMatrix3fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);
 
 GLenum glGetError(void);
 const GLubyte *glGetString(GLenum name);

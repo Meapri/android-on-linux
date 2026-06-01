@@ -68,6 +68,11 @@ typedef struct AlrShimState {
     /* per-program uniform-name tables (the glGetUniformLocation backing store) */
     AlrProgramUniforms progs[ALR_SHIM_MAX_PROGRAMS];
 
+    /* per-program attribute-name tables (the glGetAttribLocation backing store —
+     * same client-handle-by-name scheme as uniforms; reuses AlrProgramUniforms as a
+     * generic per-program name table). */
+    AlrProgramUniforms attribs[ALR_SHIM_MAX_PROGRAMS];
+
     /* shim-tracked sticky errors (the cube reads these via glGetError/eglGetError). */
     uint32_t        gl_error;       /* GL_NO_ERROR by default */
     int32_t         egl_error;      /* EGL_SUCCESS by default */
@@ -101,7 +106,11 @@ void alr_shim_flush(void);
 /* Uniform-name table ops (used by glGetUniformLocation / glLinkProgram). */
 int  alr_shim_uniform_intern(uint32_t vprog, const char *name); /* -> handle (index), or -1 */
 const char *alr_shim_uniform_name(uint32_t vprog, int handle);  /* handle -> name, or NULL */
-void alr_shim_program_reset(uint32_t vprog);                    /* clear a program's names */
+void alr_shim_program_reset(uint32_t vprog);                    /* clear a program's uniform+attrib names */
+
+/* Attribute-name table ops (used by glGetAttribLocation). Same scheme as uniforms. */
+int  alr_shim_attrib_intern(uint32_t vprog, const char *name);  /* -> handle (index), or -1 */
+const char *alr_shim_attrib_name(uint32_t vprog, int handle);   /* handle -> name, or NULL */
 
 #ifdef __cplusplus
 }

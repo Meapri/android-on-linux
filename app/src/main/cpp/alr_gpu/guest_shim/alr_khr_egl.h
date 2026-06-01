@@ -80,6 +80,10 @@ EGLSurface eglCreatePbufferSurface(EGLDisplay dpy, EGLConfig config, const EGLin
 EGLContext eglCreateContext(EGLDisplay dpy, EGLConfig config, EGLContext share_context,
                             const EGLint *attrib_list);
 EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext ctx);
+EGLBoolean eglBindAPI(EGLenum api);
+EGLDisplay eglGetCurrentDisplay(void);
+EGLContext eglGetCurrentContext(void);
+EGLSurface eglGetCurrentSurface(EGLint readdraw);
 EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface);
 EGLBoolean eglSwapInterval(EGLDisplay dpy, EGLint interval);
 EGLint     eglGetError(void);

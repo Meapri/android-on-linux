@@ -139,51 +139,69 @@ void alr_shim_flush(void) {
 
 /* ---- uniform-name table backing glGetUniformLocation ---- */
 
-static AlrProgramUniforms *find_prog(AlrShimState *s, uint32_t vprog, int create) {
+/* Generic per-program name-table lookup over a given table (progs or attribs). */
+static AlrProgramUniforms *find_in(AlrProgramUniforms *table, uint32_t vprog, int create) {
     int free_slot = -1;
     for (int i = 0; i < ALR_SHIM_MAX_PROGRAMS; ++i) {
-        if (s->progs[i].vprog == vprog && vprog != 0) return &s->progs[i];
-        if (s->progs[i].vprog == 0 && free_slot < 0) free_slot = i;
+        if (table[i].vprog == vprog && vprog != 0) return &table[i];
+        if (table[i].vprog == 0 && free_slot < 0) free_slot = i;
     }
     if (create && free_slot >= 0) {
-        s->progs[free_slot].vprog = vprog;
-        s->progs[free_slot].count = 0;
-        return &s->progs[free_slot];
+        table[free_slot].vprog = vprog;
+        table[free_slot].count = 0;
+        return &table[free_slot];
     }
     return NULL;
 }
 
-int alr_shim_uniform_intern(uint32_t vprog, const char *name) {
-    AlrShimState *s = alr_shim();
-    if (!name) return -1;
-    pthread_mutex_lock(&g_lock);
-    AlrProgramUniforms *p = find_prog(s, vprog, 1);
-    if (!p) { pthread_mutex_unlock(&g_lock); return -1; }
-    /* dedupe: same name -> same handle */
-    for (int i = 0; i < p->count; ++i) {
-        if (strncmp(p->names[i].name, name, ALR_SHIM_MAX_UNIFORM_NAME) == 0) {
-            pthread_mutex_unlock(&g_lock);
-            return i;
-        }
-    }
-    if (p->count >= ALR_SHIM_MAX_UNIFORMS_PER_PROG) {
-        pthread_mutex_unlock(&g_lock);
-        return -1;
-    }
+/* Intern a name into `table` for `vprog`, returning a stable index (dedup by name). */
+static int name_intern(AlrProgramUniforms *table, uint32_t vprog, const char *name) {
+    AlrProgramUniforms *p = find_in(table, vprog, 1);
+    if (!p) return -1;
+    for (int i = 0; i < p->count; ++i)
+        if (strncmp(p->names[i].name, name, ALR_SHIM_MAX_UNIFORM_NAME) == 0) return i;
+    if (p->count >= ALR_SHIM_MAX_UNIFORMS_PER_PROG) return -1;
     int idx = p->count++;
     strncpy(p->names[idx].name, name, ALR_SHIM_MAX_UNIFORM_NAME - 1);
     p->names[idx].name[ALR_SHIM_MAX_UNIFORM_NAME - 1] = '\0';
+    return idx;
+}
+static const char *name_lookup(AlrProgramUniforms *table, uint32_t vprog, int handle) {
+    if (handle < 0) return NULL;
+    AlrProgramUniforms *p = find_in(table, vprog, 0);
+    return (p && handle < p->count) ? p->names[handle].name : NULL;
+}
+
+int alr_shim_uniform_intern(uint32_t vprog, const char *name) {
+    if (!name) return -1;
+    AlrShimState *s = alr_shim();
+    pthread_mutex_lock(&g_lock);
+    int idx = name_intern(s->progs, vprog, name);
     pthread_mutex_unlock(&g_lock);
     return idx;
 }
 
 const char *alr_shim_uniform_name(uint32_t vprog, int handle) {
     AlrShimState *s = alr_shim();
-    if (handle < 0) return NULL;
     pthread_mutex_lock(&g_lock);
-    AlrProgramUniforms *p = find_prog(s, vprog, 0);
-    const char *out = NULL;
-    if (p && handle < p->count) out = p->names[handle].name;
+    const char *out = name_lookup(s->progs, vprog, handle);
+    pthread_mutex_unlock(&g_lock);
+    return out;
+}
+
+int alr_shim_attrib_intern(uint32_t vprog, const char *name) {
+    if (!name) return -1;
+    AlrShimState *s = alr_shim();
+    pthread_mutex_lock(&g_lock);
+    int idx = name_intern(s->attribs, vprog, name);
+    pthread_mutex_unlock(&g_lock);
+    return idx;
+}
+
+const char *alr_shim_attrib_name(uint32_t vprog, int handle) {
+    AlrShimState *s = alr_shim();
+    pthread_mutex_lock(&g_lock);
+    const char *out = name_lookup(s->attribs, vprog, handle);
     pthread_mutex_unlock(&g_lock);
     return out;
 }
@@ -191,7 +209,9 @@ const char *alr_shim_uniform_name(uint32_t vprog, int handle) {
 void alr_shim_program_reset(uint32_t vprog) {
     AlrShimState *s = alr_shim();
     pthread_mutex_lock(&g_lock);
-    AlrProgramUniforms *p = find_prog(s, vprog, 0);
-    if (p) p->count = 0;
+    AlrProgramUniforms *u = find_in(s->progs, vprog, 0);
+    if (u) u->count = 0;
+    AlrProgramUniforms *a = find_in(s->attribs, vprog, 0);
+    if (a) a->count = 0;
     pthread_mutex_unlock(&g_lock);
 }

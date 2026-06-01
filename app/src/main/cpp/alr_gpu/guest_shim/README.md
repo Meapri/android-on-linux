@@ -168,28 +168,33 @@ Notes:
 ## Wire-format verification (done, off-device)
 
 `build-shim.sh` only proves it **compiles**. To prove the bytes match the
-committed decoder, the harness here drives the real shim and decodes its output
-with the **actual** `alr_gpu_decode.hpp`:
+committed decoder, `build-wire-check.sh` drives the real shim and decodes its
+output with the **actual** `alr_gpu_decode.hpp` — one command, host-native (macOS
+or Linux `cc`/`c++`), no device / NDK / GL driver:
 
 ```sh
-# stage 1: link the real alr_gles_shim.c against a linear-buffer stub runtime,
-#          replay the cube's GL sequence, dump the bytes.
-clang -std=c11 -I. -c alr_gles_shim.c -o wc_shim.o
-clang++ -std=c++17 -I. -c wc_emit.cpp -o wc_emit.o
-clang++ wc_emit.o wc_shim.o -lpthread -o wc_emit && ./wc_emit
-
-# stage 2: decode those bytes with the COMMITTED decoder + recording GL stubs.
-clang++ -std=c++17 -Istubinc -I<repo>/app/src/main/cpp/alr_gpu -c decode_check.cpp -o wc_decode.o
-clang++ wc_decode.o -o wc_decode && ./wc_decode
+OUT=/tmp/wc_build ./build-wire-check.sh
 ```
 
-Result (PASS): 33 ops decode cleanly (`decode_batch` returns ok), the virtual IDs
-{shaders 1,2; program 1; buffer 1; texture 1} all translate through `HostState`,
-the `uMVP` uniform's 16 floats arrive intact via **name resolution** (not a
-location round-trip), `uTex` resolves to sampler unit 0, the texture upload is the
-expected 8×8×4 = 256 bytes, the two VBO attrib offsets {0, 12} are correct, and
-there is exactly one `glDrawArrays(…, 36)`. A uniform handle of `-1` emits **zero**
-bytes (GL no-op semantics).
+It runs two stages:
+* **stage 1 — `wc_emit`**: links the real `alr_gles_shim.c` against a linear-buffer
+  stub runtime (`wc_emit.c`), drives the cube GL sequence, and dumps the wire bytes.
+* **stage 2 — `wc_decode`**: decodes those bytes with the committed
+  `alr_gpu_decode.hpp` plus recording GL stubs (`decode_check.cpp` + `stubinc/`),
+  then asserts the decoded calls match the cube sequence.
+
+Result (`ALR GPU WIRE-FORMAT CHECK: PASS`, 14 assertions): 34 ops decode cleanly
+(`decode_batch` returns ok), the virtual IDs {shaders 1,2; program 1; buffer 1;
+texture 1} all translate through `HostState`, `glBindAttribLocation` carries
+aPos→0 / aUV→1, the `uMVP` uniform's 16 floats arrive intact via **name resolution**
+(not a location round-trip), `uTex` resolves to sampler unit 0, the texture upload
+is the expected 8×8×4 = 256 bytes (with host `UNPACK_ALIGNMENT=1`), the two VBO
+attrib offsets {0, 12} are correct, and there is exactly one `glDrawArrays(…, 36)`.
+
+> Note: `decode_check.cpp`, `wc_emit.c`, `stubinc/`, and `alr-gles-cube.c` were
+> restored by WS-2 (they were described here but never committed with the M3 shim
+> in 1296b29). The exact op COUNT depends on the driver sequence in `wc_emit.c`
+> (34 here); the invariants above are what matter.
 
 ## Key wire / ABI decisions
 

@@ -38,6 +38,9 @@
 #include <android/hardware_buffer.h>
 #include <android/native_window.h>
 
+#include <poll.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -94,13 +97,22 @@ public:
     // to that ANativeWindow (see class comment); when nullptr (default) the service
     // is pbuffer-only and identical to the original — preserving every existing call
     // site (e.g. run_live_integration_probe) unchanged.
+    //
+    // `doorbell_fd` is OPTIONAL: an inherited eventfd the producer (the real guest
+    // shim) signals on flush. When >= 0 the idle wait blocks briefly on it so a guest
+    // frame wakes the consumer promptly instead of spin-yielding a core (zero-overhead
+    // goal); when -1 (default — both in-process probes pass -1) the idle wait is the
+    // original spin-yield, so those probes stay byte-for-byte unchanged. The executor
+    // only reads/drains the fd; it does NOT own or close it (the creator owns it).
     GpuExecutorService(void* ring_region, size_t region_bytes, int fb_w, int fb_h,
-                       PresentFn present, ANativeWindow* window = nullptr)
+                       PresentFn present, ANativeWindow* window = nullptr,
+                       int doorbell_fd = -1)
         : region_(ring_region),
           fb_w_(fb_w),
           fb_h_(fb_h),
           present_(std::move(present)),
-          window_(window) {
+          window_(window),
+          doorbell_fd_(doorbell_fd) {
         // region_bytes is accepted for API symmetry (the data ring size lives in the
         // RingHeader the caller already ring_init'd); the consumer derives all bounds
         // from the header, so we don't store it.
@@ -409,7 +421,27 @@ private:
                 }
                 // else: a late frame arrived; loop around to service it.
             }
+            idle_wait();
+        }
+    }
+
+    // Idle wait between frames. With a doorbell (real guest) block briefly on the
+    // eventfd so a producer flush wakes us promptly instead of burning a core; the
+    // short timeout backstops any missed wakeup (the ring head/req_seq is the source
+    // of truth — the doorbell is only a latency/CPU optimization). Without a doorbell
+    // (doorbell_fd_ < 0, both in-process probes) this is the original spin-yield.
+    void idle_wait() {
+        if (doorbell_fd_ < 0) {
             std::this_thread::yield();
+            return;
+        }
+        struct pollfd pfd = {doorbell_fd_, POLLIN, 0};
+        const int pr = ::poll(&pfd, 1, /*timeout_ms=*/4);
+        if (pr > 0 && (pfd.revents & POLLIN)) {
+            // Drain the eventfd counter (readable => count > 0, so this won't block).
+            uint64_t tok = 0;
+            const ssize_t n = ::read(doorbell_fd_, &tok, sizeof(tok));
+            (void)n;
         }
     }
 
@@ -513,6 +545,7 @@ private:
     int fb_h_ = 0;
     PresentFn present_;
     ANativeWindow* window_ = nullptr;  // optional on-screen target (nullptr = headless)
+    int doorbell_fd_ = -1;             // optional guest-flush wakeup eventfd (NOT owned; -1 = spin)
 
     std::thread thread_;
     std::atomic<bool> stop_{false};
