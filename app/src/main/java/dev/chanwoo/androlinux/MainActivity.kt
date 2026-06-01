@@ -59,9 +59,14 @@ class MainActivity : Activity() {
                 val crMarker = java.io.File(rootfsStatus.rootfsDir, ".chromium-staged-${crTar.length()}")
                 if (crTar.isFile && !crMarker.isFile) {
                     android.util.Log.i("alr_loader", "chromium-stage: extracting overlay (${crTar.length()} bytes)")
-                    RootfsInstaller(this@MainActivity).extractVerifiedTar(crTar, rootfsStatus.rootfsDir)
+                    // Guarded extract (WS-4 M1): extractOverlayTar skips entries that would
+                    // downgrade a base lib — incl. the harfbuzz 8.3.0->6.0.0 symlink documented
+                    // above (and latent liblcms2/libopenjp2). With the guard the overlay can no
+                    // longer break the GTK stack; it stays gated off here only per the user hold.
+                    val ovr = RootfsInstaller(this@MainActivity).extractOverlayTar(crTar, rootfsStatus.rootfsDir)
                     crMarker.writeText("staged\n")
-                    android.util.Log.i("alr_loader", "chromium-stage: overlay done")
+                    android.util.Log.i("alr_loader", "chromium-stage: overlay done (extracted=${ovr.extracted} skipped=${ovr.skipped.size})")
+                    if (ovr.skipped.isNotEmpty()) android.util.Log.w("alr_loader", "chromium-stage: guard skipped downgrades:\n${ovr.skipped.joinToString("\n")}")
                 }
                 val crReport = nativeAlrNativeLoaderProbe(
                     packageName,
@@ -92,9 +97,12 @@ class MainActivity : Activity() {
                 val footMarker = java.io.File(rootfsStatus.rootfsDir, ".foot-staged-${footTar.length()}")
                 if (footTar.isFile && !footMarker.isFile) {
                     android.util.Log.i("alr_loader", "foot-stage: extracting overlay (${footTar.length()} bytes)")
-                    RootfsInstaller(this@MainActivity).extractVerifiedTar(footTar, rootfsStatus.rootfsDir)
+                    // Guarded extract (WS-4 M1): keep base libs if this overlay ships an
+                    // older variant of a base SONAME (foot's deps overlap the GTK stack).
+                    val ovr = RootfsInstaller(this@MainActivity).extractOverlayTar(footTar, rootfsStatus.rootfsDir)
                     footMarker.writeText("staged\n")
-                    android.util.Log.i("alr_loader", "foot-stage: overlay done")
+                    android.util.Log.i("alr_loader", "foot-stage: overlay done (extracted=${ovr.extracted} skipped=${ovr.skipped.size})")
+                    if (ovr.skipped.isNotEmpty()) android.util.Log.w("alr_loader", "foot-stage: guard skipped downgrades:\n${ovr.skipped.joinToString("\n")}")
                 }
             } catch (e: Throwable) {
                 android.util.Log.e("alr_loader", "foot-stage EXC: ${android.util.Log.getStackTraceString(e)}")
@@ -112,9 +120,12 @@ class MainActivity : Activity() {
                 val gtkDemoMarker = java.io.File(rootfsStatus.rootfsDir, ".gtk3demo-staged-${gtkDemoTar.length()}")
                 if (gtkDemoTar.isFile && !gtkDemoMarker.isFile) {
                     android.util.Log.i("alr_loader", "gtk3demo-stage: extracting overlay (${gtkDemoTar.length()} bytes)")
-                    RootfsInstaller(this@MainActivity).extractVerifiedTar(gtkDemoTar, rootfsStatus.rootfsDir)
+                    // Guarded extract (WS-4 M1): the gtk3demo closure overlaps the base GTK3
+                    // stack — keep base libs if the overlay ships an older SONAME variant.
+                    val ovr = RootfsInstaller(this@MainActivity).extractOverlayTar(gtkDemoTar, rootfsStatus.rootfsDir)
                     gtkDemoMarker.writeText("staged\n")
-                    android.util.Log.i("alr_loader", "gtk3demo-stage: overlay done")
+                    android.util.Log.i("alr_loader", "gtk3demo-stage: overlay done (extracted=${ovr.extracted} skipped=${ovr.skipped.size})")
+                    if (ovr.skipped.isNotEmpty()) android.util.Log.w("alr_loader", "gtk3demo-stage: guard skipped downgrades:\n${ovr.skipped.joinToString("\n")}")
                 }
             } catch (e: Throwable) {
                 android.util.Log.e("alr_loader", "gtk3demo-stage EXC: ${android.util.Log.getStackTraceString(e)}")
