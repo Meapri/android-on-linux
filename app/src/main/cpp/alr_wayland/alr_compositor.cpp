@@ -23,6 +23,7 @@
 // logcat ("client bound: wl_compositor", "surface committed shm ...", etc.).
 
 #include "alr_wayland/alr_compositor.hpp"
+#include "alr_wayland/alr_present_source.hpp"  // §5-C/§5-B GPU present contract
 
 #include <android/log.h>
 
@@ -1808,6 +1809,34 @@ int alr_wayland_inject_selftest(double x, double y) {
     alr_wayland_inject_key(kKeyA, 1);
     alr_wayland_inject_key(kKeyA, 0);
     return 7;
+}
+
+// ---------------------------------------------------------------------------
+// §5-C PresentSource — GPU/AHB present entry (see alr_present_source.hpp).
+// STUB until WS-3 M2 (zwp_linux_dmabuf_v1 + AHB->EGLImage import): it validates +
+// logs the submission and DROPS the frame; the buffer is not retained, so WS-2
+// (the caller) owns it throughout and may recycle on return. The signature is
+// frozen (plan §5); only this body changes when M2 lands.
+// ---------------------------------------------------------------------------
+void alr_wayland_submit_gpu_frame(void* ahardware_buffer, int32_t width,
+                                  int32_t height, uint64_t serial) {
+    // Rate-limit so a WS-2 frame loop can't flood logcat: log the first call and
+    // then every 120th (~once/1.3 s at 90 Hz) to confirm the path is live.
+    static std::atomic<uint64_t> n{0};
+    const uint64_t i = n.fetch_add(1, std::memory_order_relaxed);
+    if (i == 0 || (i % 120) == 0) {
+        ALR_WL_LOGI("submit_gpu_frame (M2 stub, dropped): ahb=%p %dx%d serial=%llu count=%llu",
+                    ahardware_buffer, width, height,
+                    (unsigned long long)serial, (unsigned long long)(i + 1));
+    }
+    // When M2 lands: AHardwareBuffer_acquire(), import as EGLImage, enqueue an
+    // ahb-backed PresentSurface into the present_list pipeline, release on the
+    // next frame for this surface.
+    (void)ahardware_buffer; (void)width; (void)height; (void)serial;
+}
+
+bool alr_wayland_gpu_present_ready() {
+    return false;  // flips true when WS-3 M2 wires AHB->EGLImage composite.
 }
 
 // ===========================================================================

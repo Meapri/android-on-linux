@@ -62,6 +62,11 @@ struct PresentSurface {
     uint64_t surface_key = 0;
     uint64_t content_serial = 0;
     uint32_t z = 0;  // 0 = bottommost; larger = nearer the top (paint order)
+    // GPU path (§5-C, see alr_present_source.hpp): when non-null this is an
+    // AHardwareBuffer* (opaque void*) the presenter imports as an EGLImage and
+    // samples zero-copy; `pixels` is then ignored. null => CPU/shm surface (the
+    // existing path). Set by the GPU present pipeline once WS-3 M2 lands.
+    void* ahb = nullptr;
 };
 
 // Whole-frame presentation hook: invoked on the compositor thread whenever the
