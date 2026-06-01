@@ -39,4 +39,4 @@ def test_main_activity_invokes_screen_cube():
     assert "nativeAlrGpuScreenCube" in text
     assert "cubeReport" in text
     assert "ALR GPU SCREEN CUBE" in text
-    assert "build: 0.4.131-cp5-gpu-throughput-v131" in text
+    assert "build: 0.4.132-breadth-fanout-v132" in text
