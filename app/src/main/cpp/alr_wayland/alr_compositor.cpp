@@ -1954,9 +1954,11 @@ void alr_wayland_submit_gpu_frame(void* ahardware_buffer, int32_t width,
 }
 
 bool alr_wayland_gpu_present_ready() {
-    // Stays false until A4 (presenter AHB->EGLImage import) lands; the submit/bind
-    // pipeline above is wired but not yet drawn, so WS-2 keeps its direct present.
-    return false;
+    // A4 landed: the presenter imports the submitted AHB zero-copy (external-OES,
+    // .rgba, V-flipped) and composites it through present_list, so WS-2 may drive the
+    // GPU present path. (Per-device EGL/GL extension availability is still checked
+    // presenter-side; a device lacking them silently keeps the CPU paths.)
+    return true;
 }
 
 // ===========================================================================
