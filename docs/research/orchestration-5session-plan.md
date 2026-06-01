@@ -185,5 +185,29 @@
 
 ---
 
+## 9. Device Lease Protocol (단일 디바이스 직렬화 — 통합 세션이 통제)
+
+ALR 디바이스는 **단 하나**(SM-X236N, `R5KL20B6S3X`). 5세션이 동시에 install/force-stop/logcat을 치면 서로의 테스트를 덮어쓴다([[device-test-force-stop-first]]). 그래서 디바이스는 **통합 세션(WS-1/오케스트레이터)이 단독 소유하고 직렬 실행**한다.
+
+**규칙:**
+1. **세션 worktree = host-only.** 각 WS는 자기 worktree에서 host 검증만: `uvx pytest tests/ -q`(WS-5 harness; `/opt/homebrew/bin/python3`엔 pytest 없음), `JAVA_HOME=/opt/homebrew/opt/openjdk@17 ./gradlew :app:externalNativeBuildDebug`(native 컴파일). **APK install 금지** — 다른 세션 device 테스트를 clobber한다.
+2. **device 테스트 요청 = main merge + DEVICE-REQ.** device 검증이 필요하면 (a) main에 merge(`git merge-tree` clean + host gate 통과), (b) merge commit 메시지에 `DEVICE-REQ: <보고 싶은 marker/PASS 조건>`을 남긴다. 통합 세션이 큐에 넣는다.
+3. **통합 세션만 device 실행.** 절차: merged HEAD → `JAVA_HOME=openjdk@17 ./gradlew :app:assembleDebug`(stamp는 통합 세션이 bump) → `adb install -r -d`(`-d`=downgrade 허용, 충돌 방지) → `am force-stop` → `logcat -c` → `am start`(cold start; warm resume는 onCreate 스킵) → `logcat -s alr_loader` 캡처 → `docs/evidence/`.
+4. **배치.** 여러 세션의 DEVICE-REQ를 한 빌드에 묶어 실행(매 세션 개별 install은 5×265MB 비효율). 통합 세션이 주기적으로 drain.
+5. **stamp는 통합 세션만.** 세션은 version stamp/pin-test를 절대 건드리지 않는다(merge 충돌 1순위).
+6. **WS-5는 device install 안 함** — merged build의 logcat evidence를 파싱해 bench/gate를 돌린다.
+
+현재 device 큐(통합 세션 처리 예정): **CP-2 GPU**(WS-1 loader-attach✓ + WS-2 ops✓ + glmark2 launch/overlay), **native+PRoot baseline**(WS-1 → WS-5 CP-3 unblock), **CP-1 display capture**(WS-3 wl_output 이미 device-verified → WS-5 marker).
+
+## 10. 일감 재분배 (2026-06-01, 오케스트레이터 통제)
+
+- **WS-1 (CPU/loader) — CP-1+M2+M3+CP-2-infra 완료:** 다음 = (a) **native(adb shell)+PRoot baseline 측정**(WS-5 CP-3 % ratio 블로커 해소), (b) CP-2 GPU 통합 device(glmark2 Mali) 실행, (c) 오케스트레이터(§9/§10 + device 큐).
+- **WS-2 (GPU) — ring-hook contract + glmark2 ops(FBO/renderbuffer/completeness) 완료:** 다음 = (a) glmark2 launch wiring 협의(통합 세션이 MainActivity에 추가; §5 계약 유지), (b) doorbell-driven wakeup(현재 spin-poll), (c) M3 GLES3/ANGLE→Vulkan. device는 통합 세션이 실행.
+- **WS-3 (compositor) — M1 90Hz✓ + §5-C PresentSource✓:** 다음 = M2 `zwp_linux_dmabuf` + AHB→EGLImage zero-copy present(WS-2 `AhbFrameSource`→`frame_sink` 어댑터로 unblock), M3 multiwindow, M4 input/keymap.
+- **WS-4 (rootfs) — lib-downgrade guard + stage-tar + xkb-data 완료:** 다음 = (a) **`locales-all`(C.UTF-8) + babl/gegl `.so`**(gtk3-widget-factory SIGABRT/gimp 잔여 → GUI 완전 안정), (b) toolkit 매트릭스(Qt/SDL2/netsurf stage), (c) apt/dpkg.
+- **WS-5 (verify/bench) — bench harness(366) + CP-3 부분정량 완료:** 다음 = (a) WS-1 native/PRoot baseline 받아 **CP-3 % overhead ratio 완성**, (b) CP-2/CP-4 device evidence 파싱, (c) `alr-compat-matrix` 채우기.
+
+GUI SIGSEGV는 WS-1 `XKB_CONFIG_ROOT`(v127, device로 gtk3-widget-factory 렌더 확인) + WS-4 xkb-data로 **해결됨**; 잔여 SIGABRT(locale/gegl)는 WS-4 (a).
+
 ## 부록 — 현재 미커밋 작업(이 플랜 직전)
 v126: chromium overlay 비활성화(harfbuzz 회귀 수정), 해상도/주사율 device-exact plumb(MainActivity+JNI+compositor timerfd), `alarm` 25s(검증용), foot/gtk3-widget-factory launch wiring. → CP-1로 흡수. (device 검증 finalizing.)
