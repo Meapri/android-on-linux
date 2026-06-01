@@ -1524,7 +1524,15 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         return !(p != nullptr && p[0] == '0');
     }();
     if (!interpose_off) {
-        guest_env.push_back("LD_PRELOAD=/usr/lib/androlinux/libalr_interpose.so");
+        // R3 / bootstrap: LD_PRELOAD MUST be the ABSOLUTE ROOTFS HOST path, not the
+        // guest path. In PCGATE=1 the loader no longer traces path syscalls, so ld.so's
+        // open of the preload is NOT rewritten by the supervisor; a guest path
+        // ("/usr/lib/...") would hit the HOST fs, the preload would fail to load, and the
+        // interposer's PC-gate filter would never install (no speedup AND no mediation).
+        // The host-absolute path opens with no mediation needed, and is idempotently
+        // left alone by the PCGATE=0 supervisor too, so it is correct in both A/B arms.
+        guest_env.push_back("LD_PRELOAD=" + config.rootfs_dir +
+                            "/usr/lib/androlinux/libalr_interpose.so");
     }
     guest_env.push_back(pcgate_on ? "ALR_PCGATE=1" : "ALR_PCGATE=0");
     // Record both arms in the report so each run is self-identifying for A/B.
@@ -1865,8 +1873,19 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
             uint64_t regs[34] = {0};
             struct iovec io{regs, sizeof(regs)};
             if (::ptrace(PTRACE_GETREGSET, w, reinterpret_cast<void*>(NT_PRSTATUS), &io) == 0) {
+                // aarch64 carries the syscall nr in x8 at the seccomp-entry stop. In
+                // PCGATE=1 the loader also RET_TRACEs execve/execveat (a future exec
+                // re-entry hook), so those traps reach this handler too — but only the
+                // 9 path syscalls put the pathname in x1; execve's x1 is argv (a char**),
+                // so blindly rewriting x1 would corrupt argv. Rewriting an exec'd program
+                // path into the rootfs is a deliberate follow-up; until then never treat
+                // an exec syscall's x1 as a path.
+                const uint64_t sysno = regs[8];
+                const bool is_exec =
+                    (sysno == static_cast<uint64_t>(__NR_execve) ||
+                     sysno == static_cast<uint64_t>(__NR_execveat));
                 const uintptr_t path_addr = static_cast<uintptr_t>(regs[1]);
-                if (path_addr != 0) {
+                if (!is_exec && path_addr != 0) {
                     const std::string memf = "/proc/" + std::to_string(w) + "/mem";
                     const int mfd = ::open(memf.c_str(), O_RDWR);
                     if (mfd >= 0) {

@@ -103,9 +103,9 @@
  *     filter trap.
  *   - stat/readlink result cache: not implemented.
  *   - kernel-enforced confinement (RESOLVE_IN_ROOT) for the non-open path
- *     syscalls (statx/faccessat*/readlinkat/mkdirat/unlinkat): no UAPI variant
- *     exists, so they keep the string-prefix rewrite. Migrate if such resolve
- *     flags are ever extended to them.
+ *     syscalls (statx, faccessat, faccessat2, readlinkat, mkdirat, unlinkat):
+ *     no UAPI variant exists, so they keep the string-prefix rewrite. Migrate
+ *     if such resolve flags are ever extended to them.
  *   - renameat2/linkat kernel confinement via tracing: deferred; they are not
  *     in the traced 9, so their two-/single-path string rewrite is the sole
  *     (and unchanged) mediation.
@@ -251,6 +251,295 @@ static const char *rw(const char *p, char *buf, size_t buflen) {
 /* Per-call scratch sized for rootfs prefix + a long guest path. */
 #define ALR_PBUF 2304
 
+/* =================================================================== */
+/* PCGATE: single-svc trampoline + PC-gated seccomp filter             */
+/* =================================================================== */
+
+/* Module-level PCGATE state. All static, set once in the constructor and only
+ * read afterward (read-only post-ctor => no locking needed, matching the benign
+ * race on the cached ALR_REAL slots). Zero heap. */
+static int      g_pcgate        = 1;    /* ALR_PCGATE, default "1" (read in ctor) */
+static uint64_t alr_tramp_lo    = 0;    /* [lo,hi): the only PCs the BPF trusts  */
+static uint64_t alr_tramp_hi    = 0;
+static int      g_rootfs_fd     = -1;   /* O_PATH|O_DIRECTORY anchor, lifetime-leaked */
+static int      g_openat2_ok    = 0;    /* 1 => openat2(RESOLVE_IN_ROOT) usable   */
+static int      g_faccessat2_ok = 0;    /* 1 => faccessat2 usable (else faccessat) */
+
+/*
+ * alr_tramp_syscall — the ONE real-syscall site of the interposer.
+ *
+ * AAPCS64 in: x0=nr, x1..x6 = a0..a5 (7 ints fit in x0..x7, no stack args).
+ * Linux arm64 syscall ABI: x8=nr, x0..x5=args, svc #0, result in x0.
+ * We shuffle x1..x6 -> x0..x5, move nr -> x8, svc, return the raw kernel value.
+ *
+ * It lives in its own section "alr_tramp" so [__start_alr_tramp,
+ * __stop_alr_tramp) is the exact, optimizer-independent mapped extent of the
+ * trusted PC window (the linker auto-emits __start_/__stop_ for a
+ * C-identifier section name). 'naked' forbids any compiler-emitted
+ * prologue/epilogue or register spills, so the section contains ONLY these
+ * instructions -> the range is tight and the stub uses no stack (leaf,
+ * reentrancy-safe). 'used' keeps it even though it has internal linkage and is
+ * only called indirectly. W^X-clean: ordinary file-backed r-x .text, no
+ * anonymous PROT_EXEC, no runtime codegen.
+ *
+ * The kernel reports seccomp_data.instruction_pointer as the PC of the 'svc'
+ * insn, which lies inside this section, so a half-open [start,stop) compare is
+ * correct.
+ */
+__attribute__((naked, used, section("alr_tramp")))
+static long alr_tramp_syscall(long nr, long a0, long a1,
+                              long a2, long a3, long a4, long a5) {
+    __asm__ volatile(
+        "mov x8, x0\n"      /* syscall number            */
+        "mov x0, x1\n"      /* a0                        */
+        "mov x1, x2\n"      /* a1                        */
+        "mov x2, x3\n"      /* a2                        */
+        "mov x3, x4\n"      /* a3                        */
+        "mov x4, x5\n"      /* a4                        */
+        "mov x5, x6\n"      /* a5                        */
+        "svc #0\n"
+        "ret\n"
+    );
+}
+
+/* Linker-provided bounds of the `alr_tramp` section. */
+extern char __start_alr_tramp[];
+extern char __stop_alr_tramp[];
+
+/* Raw kernel return -> libc convention (-1 + errno on error). The kernel
+ * returns -errno in [-4095,-1]; everything else is a valid result. Setting the
+ * (TLS) errno calls no interposed function. */
+static long alr_ret(long r) {
+    if (r < 0 && r >= -4095) { errno = (int)(-r); return -1; }
+    return r;
+}
+
+/* ----- openat2 / faccessat2 SIGSYS-catching availability probe -----
+ *
+ * On Android the guest's filter stacks on the zygote app filter whose default
+ * action is SECCOMP_RET_TRAP -> SIGSYS for any syscall outside bionic's
+ * allowlist. openat2 (437) and faccessat2 (439) are NOT in that allowlist, so a
+ * blind emission would deliver SIGSYS and kill the process BEFORE any errno
+ * (ENOSYS) check could run. We therefore probe each once at constructor time
+ * with a temporary SIGSYS handler + siglongjmp; if the probe traps (or returns
+ * an error), the corresponding fast path stays disabled and we fall back to the
+ * always-allowed openat/faccessat. */
+static sigjmp_buf  g_sigsys_jb;
+static volatile sig_atomic_t g_sigsys_armed = 0;
+
+static void alr_sigsys_handler(int sig) {
+    (void)sig;
+    if (g_sigsys_armed) {
+        g_sigsys_armed = 0;
+        siglongjmp(g_sigsys_jb, 1);
+    }
+    /* Not our probe: nothing sane to do from here; let it return (the kernel
+     * re-raises on the same insn, but we only ever arm around our own probe
+     * syscalls, so this branch is effectively unreached). */
+}
+
+/* Run `fn` (a single probe syscall via the trampoline) under a temporary SIGSYS
+ * trap. Returns the syscall's raw return on normal completion, or -ENOSYS if it
+ * raised SIGSYS (treated identically to "syscall absent"). Restores the prior
+ * SIGSYS disposition. Reentrancy/threads: the probe runs once in the ctor
+ * before guest threads/app code, so the process-wide handler swap is safe. */
+typedef long (*alr_probe_fn)(void);
+static long alr_probe_guarded(alr_probe_fn fn) {
+    struct sigaction sa, old;
+    long rc;
+
+    /* hand-rolled zero of sa (no memset -> no interposed libc) */
+    for (unsigned i = 0; i < sizeof sa; ++i) ((char *)&sa)[i] = 0;
+    sa.sa_handler = alr_sigsys_handler;
+    /* sigemptyset(&sa.sa_mask) is just an all-zero mask here. */
+    sa.sa_flags = 0;
+
+    if (alr_tramp_syscall(__NR_rt_sigaction, SIGSYS, (long)&sa, (long)&old,
+                          (long)(sizeof(unsigned long)), 0, 0) != 0) {
+        /* Could not install the handler: probe conservatively as unavailable. */
+        return -ENOSYS;
+    }
+
+    if (sigsetjmp(g_sigsys_jb, 1) == 0) {
+        g_sigsys_armed = 1;
+        rc = fn();              /* may SIGSYS -> longjmp back with rc unset */
+        g_sigsys_armed = 0;
+    } else {
+        rc = -ENOSYS;           /* trapped: treat as absent */
+    }
+
+    /* restore previous SIGSYS disposition */
+    alr_tramp_syscall(__NR_rt_sigaction, SIGSYS, (long)&old, 0,
+                      (long)(sizeof(unsigned long)), 0, 0);
+    return rc;
+}
+
+/* Probe bodies: each issues exactly one syscall through the trampoline. */
+static long alr_probe_openat2_body(void) {
+    struct open_how how;
+    how.flags   = (uint64_t)(O_PATH | O_DIRECTORY | O_CLOEXEC);
+    how.mode    = 0;
+    how.resolve = RESOLVE_IN_ROOT;
+    return alr_tramp_syscall(__NR_openat2, g_rootfs_fd, (long)".",
+                             (long)&how, (long)sizeof how, 0, 0);
+}
+static long alr_probe_faccessat2_body(void) {
+    /* faccessat2(AT_FDCWD, "/", F_OK=0, 0): harmless existence check. */
+    return alr_tramp_syscall(__NR_faccessat2, AT_FDCWD, (long)"/", 0, 0, 0, 0);
+}
+
+/* Open the O_PATH|O_DIRECTORY rootfs anchor (once) and probe openat2 against
+ * it. Both go through the trampoline so the ctor never depends on a wrapped
+ * libc symbol. The anchor fd is intentionally leaked for process lifetime. */
+static void alr_open_rootfs_fd(void) {
+    long fd = alr_tramp_syscall(__NR_openat, AT_FDCWD, (long)g_rootfs,
+                                (long)(O_PATH | O_DIRECTORY | O_CLOEXEC), 0, 0, 0);
+    if (fd >= 0) {
+        g_rootfs_fd = (int)fd;
+        long t = alr_probe_guarded(alr_probe_openat2_body);
+        if (t >= 0) {
+            alr_tramp_syscall(__NR_close, t, 0, 0, 0, 0, 0);  /* close probe fd */
+            g_openat2_ok = 1;
+        }
+        /* t < 0 (ENOSYS, SIGSYS-trapped, or any error) -> string fallback */
+    }
+}
+
+static void alr_probe_faccessat2(void) {
+    long r = alr_probe_guarded(alr_probe_faccessat2_body);
+    /* present iff it neither trapped nor returned ENOSYS */
+    g_faccessat2_ok = (r != -ENOSYS);
+}
+
+/*
+ * Install the PC-gated path filter (PCGATE=1 only). ALLOW iff the trap PC is
+ * inside the trampoline [lo,hi); else RET_TRACE for the 9 path syscalls,
+ * RET_ALLOW for everything else. 64-bit IP is compared as two 32-bit words
+ * (lo @ off 8, hi @ off 12) for a half-open [lo,hi) unsigned range test.
+ *
+ * The jt/jf/k offsets below were laid out by instruction index and VALIDATED
+ * on-host against synthetic seccomp_data (IP==lo -> ALLOW; IP==hi-1 -> ALLOW;
+ * IP==hi -> TRACE; IP just below lo -> TRACE; non-path nr at any PC -> ALLOW;
+ * incl. lo-word boundary and a 4GB-straddling range). Offsets are relative to
+ * the NEXT instruction. If you change the layout, re-run that host check.
+ */
+static void alr_install_pcgated_filter(void) {
+    /* zygote already set NO_NEW_PRIVS process-wide; a re-arm is harmless and
+     * keeps us correct if ever loaded somewhere it was not pre-set. */
+    alr_tramp_syscall(__NR_prctl, PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0, 0);
+
+    const uint32_t lo_hi = (uint32_t)(alr_tramp_lo >> 32);
+    const uint32_t lo_lo = (uint32_t)(alr_tramp_lo & 0xffffffffu);
+    const uint32_t hi_hi = (uint32_t)(alr_tramp_hi >> 32);
+    const uint32_t hi_lo = (uint32_t)(alr_tramp_hi & 0xffffffffu);
+
+    /* struct seccomp_data offsets (UAPI-stable; hardcoded to be independent of
+     * the local struct definition): nr@0, arch@4, ip@8 (lo@8, hi@12), args@16. */
+    enum { OFF_NR = 0, OFF_ARCH = 4, OFF_IP_LO = 8, OFF_IP_HI = 12 };
+
+    struct sock_filter f[] = {
+        /* 0  */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_ARCH),
+        /* 1  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 1, 0),
+        /* 2  */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),  /* foreign arch -> allow */
+
+        /* ---- PC gate: ALLOW iff lo <= IP < hi (unsigned 64-bit) ---- */
+        /* 3  */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_IP_HI),               /* A = IP.hi */
+        /* 4  */ BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, lo_hi, 4, 0),            /* hi>lo_hi: lower ok -> LOWER_OK(9) */
+        /* 5  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, lo_hi, 1, 0),            /* hi==lo_hi: test lo -> idx7 */
+        /* 6  */ BPF_JUMP(BPF_JMP | BPF_JA, 9, 0, 0),                         /* hi<lo_hi: below -> CLASSIFY(16) */
+        /* 7  */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_IP_LO),               /* A = IP.lo */
+        /* 8  */ BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, lo_lo, 0, 7),            /* lo>=lo_lo: LOWER_OK(9); else CLASSIFY(16) */
+        /* 9  */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_IP_HI),               /* LOWER_OK: A = IP.hi (upper-bound test) */
+        /* 10 */ BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, hi_hi, 5, 0),            /* hi>hi_hi: IP>=hi -> CLASSIFY(16) */
+        /* 11 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, hi_hi, 1, 0),            /* hi==hi_hi: test lo -> idx13; hi<hi_hi: TRUSTED(12) */
+        /* 12 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),                /* IP.hi < hi_hi -> trusted */
+        /* 13 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_IP_LO),               /* A = IP.lo */
+        /* 14 */ BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, hi_lo, 1, 0),            /* lo>=hi_lo: NOT trusted -> CLASSIFY(16); else TRUSTED(15) */
+        /* 15 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),                /* IP.lo < hi_lo -> trusted */
+
+        /* ---- CLASSIFY (16): untrusted PC. TRACE iff nr in the 9. ---- */
+        /* 16 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_NR),                  /* A = nr */
+        /* 17 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat,     9, 0),
+        /* 18 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat2,    8, 0),
+        /* 19 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_newfstatat, 7, 0),
+        /* 20 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_statx,      6, 0),
+        /* 21 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_faccessat,  5, 0),
+        /* 22 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_faccessat2, 4, 0),
+        /* 23 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_readlinkat, 3, 0),
+        /* 24 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_mkdirat,    2, 0),
+        /* 25 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_unlinkat,   1, 0),
+        /* 26 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),                /* non-path -> allow */
+        /* 27 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE),               /* path syscall, untrusted PC -> trace */
+    };
+
+    struct sock_fprog prog = {
+        (unsigned short)(sizeof(f) / sizeof(f[0])), f
+    };
+    /* Prefer the seccomp() syscall with TSYNC (covers any pre-existing guest
+     * thread). If TSYNC is rejected (single-threaded path, or kernel without
+     * it), retry without flags; finally fall back to prctl(PR_SET_SECCOMP). */
+    long fr = alr_tramp_syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER,
+                                (long)SECCOMP_FILTER_FLAG_TSYNC, (long)&prog, 0, 0, 0);
+    if (fr != 0) {
+        fr = alr_tramp_syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, 0,
+                               (long)&prog, 0, 0, 0);
+    }
+    if (fr != 0) {
+        alr_tramp_syscall(__NR_prctl, PR_SET_SECCOMP, SECCOMP_MODE_FILTER,
+                          (long)&prog, 0, 0, 0);
+    }
+    /* No diag fd here; success is observable via the supervisor's path_traps
+     * collapsing in a PCGATE 0-vs-1 A/B run. Install failure leaves the loader's
+     * ALLOW-all filter governing -> paths run unmediated by seccomp in this
+     * (practically unreachable on a NO_NEW_PRIVS arm64 process) case; we never
+     * abort the guest. */
+}
+
+/*
+ * Constructor. ORDERING IS LOAD-BEARING (see CONTRACT "WHY THE ORDERING IS
+ * SOUND"): it runs during ld.so init, AFTER all libraries are mapped via the
+ * loader's injected absolute LD_LIBRARY_PATH, so no path syscall before this
+ * point needs mediation. Every syscall the ctor itself issues goes through the
+ * trampoline (in-range PC); the filter is installed LAST, so the probes run
+ * before it exists and are unconditionally allowed by the loader's ALLOW-all
+ * filter. From here on, all path I/O routed through the trampoline is gated.
+ *
+ * Priority 101 sorts this ahead of any default-priority (65535) library
+ * constructor that might open data files (it cannot order ahead of an
+ * earlier-listed LD_PRELOAD, but we ship only one).
+ */
+__attribute__((constructor(101)))
+static void alr_ctor(void) {
+    alr_init();                         /* sets g_rootfs / g_rootfs_len (idempotent) */
+
+    /* Trampoline range FIRST: needed by the BPF and by every emit/probe. */
+    alr_tramp_lo = (uint64_t)(uintptr_t)__start_alr_tramp;
+    alr_tramp_hi = (uint64_t)(uintptr_t)__stop_alr_tramp;
+
+    /* PCGATE gate: read from the guest env (the loader propagates ALR_PCGATE).
+     * DEFAULT "1"; only an explicit "0" disables. */
+    const char *g = getenv("ALR_PCGATE");
+    g_pcgate = (g != NULL && g[0] == '0') ? 0 : 1;
+
+    /* rootfs anchor + openat2 probe, then the faccessat2 probe. Both use the
+     * trampoline and tolerate the rootfs being unset (self-disable). These run
+     * regardless of g_pcgate so the trampoline emit paths (used in PCGATE=1)
+     * have a valid anchor; in PCGATE=0 they are simply unused. */
+    if (g_rootfs_len > 0) alr_open_rootfs_fd();
+    alr_probe_faccessat2();
+
+    if (!g_pcgate) return;              /* PCGATE=0: install NO filter (loader does) */
+
+    /* Fail-safe: a degenerate/empty trampoline range would make the gate match
+     * nothing; rather than install a filter that TRACEs everything (which would
+     * also trap our own trampoline emits and deadlock against a tracer the
+     * loader is not running for paths), install none. The section is never
+     * empty in practice, so this is unreachable. */
+    if (alr_tramp_hi <= alr_tramp_lo) return;
+
+    alr_install_pcgated_filter();
+}
+
 /* ----- RTLD_NEXT resolution, cached per wrapper ----- */
 
 /* Resolve & cache the real libc symbol "sym" into the static slot `slot`.
@@ -276,30 +565,77 @@ static mode_t alr_va_mode(int flags, va_list ap) {
     return 0;
 }
 
+/*
+ * alr_open_emit — PCGATE=1 open emission for the whole open/creat family.
+ *
+ * Fast path: an ABSOLUTE guest path that is NOT a passthrough class, with
+ * openat2(RESOLVE_IN_ROOT) available and the rootfs anchor open. RESOLVE_IN_ROOT
+ * treats g_rootfs_fd as '/', giving kernel-enforced, symlink-escape-safe
+ * confinement with NO string concatenation (closing the ".."-normalization gap
+ * the string rewrite cannot). We pass the GUEST path made relative to the
+ * anchor (drop the leading '/'; "/" itself becomes ".").
+ *
+ * Fallback (no openat2, or a passthrough/relative path): the existing
+ * <ROOTFS>+path string rewrite + a plain openat through the trampoline. For a
+ * relative path the original dirfd and unmodified path are forwarded, exactly
+ * preserving today's "we do not mediate dirfd-relative paths" behavior.
+ *
+ * Either way the underlying syscall is emitted through alr_tramp_syscall so the
+ * trusted PC is the trampoline.
+ */
+static int alr_open_emit(int dirfd, const char *path, int flags, mode_t mode) {
+    if (g_openat2_ok && g_rootfs_fd >= 0 &&
+        path && path[0] == '/' &&
+        !a_under(path, "/proc") && !a_under(path, "/sys") && !a_under(path, "/dev") &&
+        !a_under(path, g_rootfs)) {
+        struct open_how how;
+        how.flags = (uint64_t)(unsigned)flags;
+#ifdef O_TMPFILE
+        how.mode  = (flags & (O_CREAT | O_TMPFILE)) ? (uint64_t)mode : 0;
+#else
+        how.mode  = (flags & O_CREAT) ? (uint64_t)mode : 0;
+#endif
+        how.resolve = RESOLVE_IN_ROOT;
+        const char *rel = path + 1;          /* drop leading '/'; "" => rootfs root */
+        if (rel[0] == '\0') rel = ".";
+        long r = alr_tramp_syscall(__NR_openat2, g_rootfs_fd, (long)rel,
+                                   (long)&how, (long)sizeof how, 0, 0);
+        return (int)alr_ret(r);
+    }
+    /* Fallback: string-prefix rewrite (absolute only) + plain openat. */
+    char b[ALR_PBUF];
+    const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
+    long r = alr_tramp_syscall(__NR_openat, dirfd, (long)p, flags, mode, 0, 0);
+    return (int)alr_ret(r);
+}
+
 int open(const char *path, int flags, ...) {
+    va_list ap; va_start(ap, flags);
+    mode_t m = alr_va_mode(flags, ap);
+    va_end(ap);
+    if (g_pcgate) return alr_open_emit(AT_FDCWD, path, flags, m);
+    /* PCGATE=0 baseline: original RTLD_NEXT behavior, unchanged. */
     static int (*real)(const char *, int, ...);
     ALR_REAL(real, int (*)(const char *, int, ...), "open");
     char b[ALR_PBUF];
-    const char *p = rw(path, b, sizeof b);
-    va_list ap; va_start(ap, flags);
-    mode_t m = alr_va_mode(flags, ap);
-    va_end(ap);
-    return real(p, flags, m);
+    return real(rw(path, b, sizeof b), flags, m);
 }
 
 int open64(const char *path, int flags, ...) {
-    static int (*real)(const char *, int, ...);
-    ALR_REAL(real, int (*)(const char *, int, ...), "open64");
-    char b[ALR_PBUF];
-    const char *p = rw(path, b, sizeof b);
     va_list ap; va_start(ap, flags);
     mode_t m = alr_va_mode(flags, ap);
     va_end(ap);
-    return real(p, flags, m);
+    if (g_pcgate) return alr_open_emit(AT_FDCWD, path, flags, m);
+    static int (*real)(const char *, int, ...);
+    ALR_REAL(real, int (*)(const char *, int, ...), "open64");
+    char b[ALR_PBUF];
+    return real(rw(path, b, sizeof b), flags, m);
 }
 
-/* FORTIFY (_FORTIFY_SOURCE) variants glib/GIMP may emit. */
+/* FORTIFY (_FORTIFY_SOURCE) variants glib/GIMP may emit. No mode (O_CREAT is
+ * not expressible through __open_2), so pass mode=0. */
 int __open_2(const char *path, int flags) {
+    if (g_pcgate) return alr_open_emit(AT_FDCWD, path, flags, 0);
     static int (*real)(const char *, int);
     ALR_REAL(real, int (*)(const char *, int), "__open_2");
     char b[ALR_PBUF];
@@ -307,6 +643,7 @@ int __open_2(const char *path, int flags) {
 }
 
 int __open64_2(const char *path, int flags) {
+    if (g_pcgate) return alr_open_emit(AT_FDCWD, path, flags, 0);
     static int (*real)(const char *, int);
     ALR_REAL(real, int (*)(const char *, int), "__open64_2");
     char b[ALR_PBUF];
@@ -324,24 +661,27 @@ static int alr_openat(int (*real)(int, const char *, int, ...),
 }
 
 int openat(int dirfd, const char *path, int flags, ...) {
-    static int (*real)(int, const char *, int, ...);
-    ALR_REAL(real, int (*)(int, const char *, int, ...), "openat");
     va_list ap; va_start(ap, flags);
     mode_t m = alr_va_mode(flags, ap);
     va_end(ap);
+    if (g_pcgate) return alr_open_emit(dirfd, path, flags, m);
+    static int (*real)(int, const char *, int, ...);
+    ALR_REAL(real, int (*)(int, const char *, int, ...), "openat");
     return alr_openat(real, dirfd, path, flags, m);
 }
 
 int openat64(int dirfd, const char *path, int flags, ...) {
-    static int (*real)(int, const char *, int, ...);
-    ALR_REAL(real, int (*)(int, const char *, int, ...), "openat64");
     va_list ap; va_start(ap, flags);
     mode_t m = alr_va_mode(flags, ap);
     va_end(ap);
+    if (g_pcgate) return alr_open_emit(dirfd, path, flags, m);
+    static int (*real)(int, const char *, int, ...);
+    ALR_REAL(real, int (*)(int, const char *, int, ...), "openat64");
     return alr_openat(real, dirfd, path, flags, m);
 }
 
 int __openat_2(int dirfd, const char *path, int flags) {
+    if (g_pcgate) return alr_open_emit(dirfd, path, flags, 0);
     static int (*real)(int, const char *, int);
     ALR_REAL(real, int (*)(int, const char *, int), "__openat_2");
     char b[ALR_PBUF];
@@ -350,6 +690,7 @@ int __openat_2(int dirfd, const char *path, int flags) {
 }
 
 int __openat64_2(int dirfd, const char *path, int flags) {
+    if (g_pcgate) return alr_open_emit(dirfd, path, flags, 0);
     static int (*real)(int, const char *, int);
     ALR_REAL(real, int (*)(int, const char *, int), "__openat64_2");
     char b[ALR_PBUF];
@@ -358,6 +699,7 @@ int __openat64_2(int dirfd, const char *path, int flags) {
 }
 
 int creat(const char *path, mode_t mode) {
+    if (g_pcgate) return alr_open_emit(AT_FDCWD, path, O_CREAT | O_WRONLY | O_TRUNC, mode);
     static int (*real)(const char *, mode_t);
     ALR_REAL(real, int (*)(const char *, mode_t), "creat");
     char b[ALR_PBUF];
@@ -365,6 +707,7 @@ int creat(const char *path, mode_t mode) {
 }
 
 int creat64(const char *path, mode_t mode) {
+    if (g_pcgate) return alr_open_emit(AT_FDCWD, path, O_CREAT | O_WRONLY | O_TRUNC, mode);
     static int (*real)(const char *, mode_t);
     ALR_REAL(real, int (*)(const char *, mode_t), "creat64");
     char b[ALR_PBUF];
@@ -375,47 +718,88 @@ int creat64(const char *path, mode_t mode) {
 /* stat family                                                         */
 /* =================================================================== */
 
-#define ALR_WRAP_PATH_RET(rettype, name, argtype)                      \
-    rettype name(const char *path, argtype out) {                      \
-        static rettype (*real)(const char *, argtype);                 \
-        ALR_REAL(real, rettype (*)(const char *, argtype), #name);     \
-        char b[ALR_PBUF];                                              \
-        return real(rw(path, b, sizeof b), out);                       \
+/*
+ * stat-family reduction. arm64 glibc implements stat/lstat/stat64/lstat64 and
+ * all the __xstat / fstatat vtable forms on top of the newfstatat syscall. To
+ * keep the trusted-PC syscall unique we re-express each as a newfstatat through
+ * the trampoline (PCGATE=1). The kernel writes a 'struct stat' in the kernel
+ * layout, which on arm64 IS glibc's userspace struct stat / struct stat64 (no
+ * translation, LFS default) -- the same ABI the supervisor already relies on
+ * when it traps newfstatat for these. So writing directly into the caller's buf
+ * is correct and matches the prior real() forward.
+ *
+ * alr_stat_emit rewrites an ABSOLUTE path (relative paths and AT_FDCWD-relative
+ * forms pass through unchanged via dirfd) and emits newfstatat through the
+ * trampoline. `flags` carries AT_SYMLINK_NOFOLLOW for the l* variants.
+ */
+static int alr_stat_emit(int dirfd, const char *path, void *buf, int flags) {
+    char b[ALR_PBUF];
+    const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
+    long r = alr_tramp_syscall(__NR_newfstatat, dirfd, (long)p, (long)buf, flags, 0, 0);
+    return (int)alr_ret(r);
+}
+static int alr_statx_emit(int dirfd, const char *path, int flags,
+                          unsigned int mask, void *buf) {
+    char b[ALR_PBUF];
+    const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
+    long r = alr_tramp_syscall(__NR_statx, dirfd, (long)p, flags,
+                               (long)mask, (long)buf, 0);
+    return (int)alr_ret(r);
+}
+
+/* stat/lstat/stat64/lstat64: AT_FDCWD + newfstatat (l* => AT_SYMLINK_NOFOLLOW).
+ * PCGATE=0 keeps the original RTLD_NEXT path verbatim. */
+#define ALR_WRAP_STAT(name, argtype, nofollow)                                  \
+    int name(const char *path, argtype out) {                                   \
+        if (g_pcgate)                                                           \
+            return alr_stat_emit(AT_FDCWD, path, (void *)out, (nofollow));      \
+        static int (*real)(const char *, argtype);                             \
+        ALR_REAL(real, int (*)(const char *, argtype), #name);                 \
+        char b[ALR_PBUF];                                                       \
+        return real(rw(path, b, sizeof b), out);                                \
     }
 
-ALR_WRAP_PATH_RET(int, stat,   struct stat *)
-ALR_WRAP_PATH_RET(int, lstat,  struct stat *)
-ALR_WRAP_PATH_RET(int, stat64,  struct stat64 *)
-ALR_WRAP_PATH_RET(int, lstat64, struct stat64 *)
+ALR_WRAP_STAT(stat,    struct stat *,   0)
+ALR_WRAP_STAT(lstat,   struct stat *,   AT_SYMLINK_NOFOLLOW)
+ALR_WRAP_STAT(stat64,  struct stat64 *, 0)
+ALR_WRAP_STAT(lstat64, struct stat64 *, AT_SYMLINK_NOFOLLOW)
 
-/* glibc <2.33 vtable entry points (__xstat etc.): version int + path + buf. */
+/* glibc <2.33 vtable entry points (__xstat etc.): version int + path + buf.
+ * `ver` only selected the struct ABI in the old vtable scheme; arm64 has a
+ * single kernel struct stat ABI, so dropping `ver` and routing to newfstatat is
+ * correct. */
 int __xstat(int ver, const char *path, struct stat *buf) {
+    if (g_pcgate) return alr_stat_emit(AT_FDCWD, path, buf, 0);
     static int (*real)(int, const char *, struct stat *);
     ALR_REAL(real, int (*)(int, const char *, struct stat *), "__xstat");
     char b[ALR_PBUF];
     return real(ver, rw(path, b, sizeof b), buf);
 }
 int __lxstat(int ver, const char *path, struct stat *buf) {
+    if (g_pcgate) return alr_stat_emit(AT_FDCWD, path, buf, AT_SYMLINK_NOFOLLOW);
     static int (*real)(int, const char *, struct stat *);
     ALR_REAL(real, int (*)(int, const char *, struct stat *), "__lxstat");
     char b[ALR_PBUF];
     return real(ver, rw(path, b, sizeof b), buf);
 }
 int __xstat64(int ver, const char *path, struct stat64 *buf) {
+    if (g_pcgate) return alr_stat_emit(AT_FDCWD, path, buf, 0);
     static int (*real)(int, const char *, struct stat64 *);
     ALR_REAL(real, int (*)(int, const char *, struct stat64 *), "__xstat64");
     char b[ALR_PBUF];
     return real(ver, rw(path, b, sizeof b), buf);
 }
 int __lxstat64(int ver, const char *path, struct stat64 *buf) {
+    if (g_pcgate) return alr_stat_emit(AT_FDCWD, path, buf, AT_SYMLINK_NOFOLLOW);
     static int (*real)(int, const char *, struct stat64 *);
     ALR_REAL(real, int (*)(int, const char *, struct stat64 *), "__lxstat64");
     char b[ALR_PBUF];
     return real(ver, rw(path, b, sizeof b), buf);
 }
 
-/* fstatat family — *at, rewrite only absolute paths. */
+/* fstatat family — *at, rewrite only absolute paths; emit newfstatat. */
 int fstatat(int dirfd, const char *path, struct stat *buf, int flags) {
+    if (g_pcgate) return alr_stat_emit(dirfd, path, buf, flags);
     static int (*real)(int, const char *, struct stat *, int);
     ALR_REAL(real, int (*)(int, const char *, struct stat *, int), "fstatat");
     char b[ALR_PBUF];
@@ -423,6 +807,7 @@ int fstatat(int dirfd, const char *path, struct stat *buf, int flags) {
     return real(dirfd, p, buf, flags);
 }
 int fstatat64(int dirfd, const char *path, struct stat64 *buf, int flags) {
+    if (g_pcgate) return alr_stat_emit(dirfd, path, buf, flags);
     static int (*real)(int, const char *, struct stat64 *, int);
     ALR_REAL(real, int (*)(int, const char *, struct stat64 *, int), "fstatat64");
     char b[ALR_PBUF];
@@ -430,6 +815,7 @@ int fstatat64(int dirfd, const char *path, struct stat64 *buf, int flags) {
     return real(dirfd, p, buf, flags);
 }
 int newfstatat(int dirfd, const char *path, struct stat *buf, int flags) {
+    if (g_pcgate) return alr_stat_emit(dirfd, path, buf, flags);
     static int (*real)(int, const char *, struct stat *, int);
     ALR_REAL(real, int (*)(int, const char *, struct stat *, int), "newfstatat");
     char b[ALR_PBUF];
@@ -437,6 +823,7 @@ int newfstatat(int dirfd, const char *path, struct stat *buf, int flags) {
     return real(dirfd, p, buf, flags);
 }
 int __fxstatat(int ver, int dirfd, const char *path, struct stat *buf, int flags) {
+    if (g_pcgate) return alr_stat_emit(dirfd, path, buf, flags);
     static int (*real)(int, int, const char *, struct stat *, int);
     ALR_REAL(real, int (*)(int, int, const char *, struct stat *, int), "__fxstatat");
     char b[ALR_PBUF];
@@ -444,6 +831,7 @@ int __fxstatat(int ver, int dirfd, const char *path, struct stat *buf, int flags
     return real(ver, dirfd, p, buf, flags);
 }
 int __fxstatat64(int ver, int dirfd, const char *path, struct stat64 *buf, int flags) {
+    if (g_pcgate) return alr_stat_emit(dirfd, path, buf, flags);
     static int (*real)(int, int, const char *, struct stat64 *, int);
     ALR_REAL(real, int (*)(int, int, const char *, struct stat64 *, int), "__fxstatat64");
     char b[ALR_PBUF];
@@ -454,6 +842,7 @@ int __fxstatat64(int ver, int dirfd, const char *path, struct stat64 *buf, int f
 /* statx(dirfd, path, flags, mask, buf) — *at-style, rewrite absolute only. */
 int statx(int dirfd, const char *path, int flags, unsigned int mask,
           struct statx *buf) {
+    if (g_pcgate) return alr_statx_emit(dirfd, path, flags, mask, buf);
     static int (*real)(int, const char *, int, unsigned int, struct statx *);
     ALR_REAL(real, int (*)(int, const char *, int, unsigned int, struct statx *),
              "statx");
@@ -466,25 +855,53 @@ int statx(int dirfd, const char *path, int flags, unsigned int mask,
 /* access family                                                       */
 /* =================================================================== */
 
+/*
+ * access-family emission. Both __NR_faccessat and __NR_faccessat2 are in the
+ * traced 9, so either trusted-PC syscall is allowed by the BPF. We prefer
+ * faccessat2 (which honors flags incl. AT_EACCESS) when the constructor probe
+ * found it usable, exactly as glibc itself does; otherwise plain faccessat
+ * (which historically ignored flags) -- identical to glibc's pre-5.8 fallback.
+ * If `flags` needs faccessat2 semantics but it is unavailable, we still fall to
+ * faccessat(...,0): a slightly looser id/symlink check, matching glibc.
+ */
+static int alr_access_emit(int dirfd, const char *path, int mode, int flags) {
+    char b[ALR_PBUF];
+    const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
+    long r;
+    if (flags != 0 && g_faccessat2_ok) {
+        r = alr_tramp_syscall(__NR_faccessat2, dirfd, (long)p, mode, flags, 0, 0);
+    } else {
+        r = alr_tramp_syscall(__NR_faccessat, dirfd, (long)p, mode, 0, 0, 0);
+    }
+    return (int)alr_ret(r);
+}
+
 int access(const char *path, int mode) {
+    if (g_pcgate) return alr_access_emit(AT_FDCWD, path, mode, 0);
     static int (*real)(const char *, int);
     ALR_REAL(real, int (*)(const char *, int), "access");
     char b[ALR_PBUF];
     return real(rw(path, b, sizeof b), mode);
 }
 int euidaccess(const char *path, int mode) {
+    /* effective-id check: use faccessat2(AT_EACCESS) when available. */
+    if (g_pcgate) return alr_access_emit(AT_FDCWD, path, mode,
+                                         g_faccessat2_ok ? AT_EACCESS : 0);
     static int (*real)(const char *, int);
     ALR_REAL(real, int (*)(const char *, int), "euidaccess");
     char b[ALR_PBUF];
     return real(rw(path, b, sizeof b), mode);
 }
 int eaccess(const char *path, int mode) {
+    if (g_pcgate) return alr_access_emit(AT_FDCWD, path, mode,
+                                         g_faccessat2_ok ? AT_EACCESS : 0);
     static int (*real)(const char *, int);
     ALR_REAL(real, int (*)(const char *, int), "eaccess");
     char b[ALR_PBUF];
     return real(rw(path, b, sizeof b), mode);
 }
 int faccessat(int dirfd, const char *path, int mode, int flags) {
+    if (g_pcgate) return alr_access_emit(dirfd, path, mode, flags);
     static int (*real)(int, const char *, int, int);
     ALR_REAL(real, int (*)(int, const char *, int, int), "faccessat");
     char b[ALR_PBUF];
@@ -492,6 +909,15 @@ int faccessat(int dirfd, const char *path, int mode, int flags) {
     return real(dirfd, p, mode, flags);
 }
 int faccessat2(int dirfd, const char *path, int mode, int flags) {
+    /* Explicit faccessat2 call: emit faccessat2 directly (it is in the traced
+     * 9). If the device lacks it the kernel returns ENOSYS -> normalized errno,
+     * matching a direct call's behavior. */
+    if (g_pcgate) {
+        char b[ALR_PBUF];
+        const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
+        long r = alr_tramp_syscall(__NR_faccessat2, dirfd, (long)p, mode, flags, 0, 0);
+        return (int)alr_ret(r);
+    }
     static int (*real)(int, const char *, int, int);
     ALR_REAL(real, int (*)(int, const char *, int, int), "faccessat2");
     char b[ALR_PBUF];
@@ -503,13 +929,24 @@ int faccessat2(int dirfd, const char *path, int mode, int flags) {
 /* readlink family                                                     */
 /* =================================================================== */
 
+/* readlink/readlinkat both reduce to __NR_readlinkat (in the traced 9). */
+static ssize_t alr_readlink_emit(int dirfd, const char *path,
+                                 char *buf, size_t bufsiz) {
+    char b[ALR_PBUF];
+    const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
+    long r = alr_tramp_syscall(__NR_readlinkat, dirfd, (long)p,
+                               (long)buf, (long)bufsiz, 0, 0);
+    return (ssize_t)alr_ret(r);
+}
 ssize_t readlink(const char *path, char *buf, size_t bufsiz) {
+    if (g_pcgate) return alr_readlink_emit(AT_FDCWD, path, buf, bufsiz);
     static ssize_t (*real)(const char *, char *, size_t);
     ALR_REAL(real, ssize_t (*)(const char *, char *, size_t), "readlink");
     char b[ALR_PBUF];
     return real(rw(path, b, sizeof b), buf, bufsiz);
 }
 ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz) {
+    if (g_pcgate) return alr_readlink_emit(dirfd, path, buf, bufsiz);
     static ssize_t (*real)(int, const char *, char *, size_t);
     ALR_REAL(real, ssize_t (*)(int, const char *, char *, size_t), "readlinkat");
     char b[ALR_PBUF];
@@ -547,32 +984,52 @@ int scandir64(const char *path, void *namelist, void *filter, void *compar) {
 /* mutating single-path ops                                            */
 /* =================================================================== */
 
+/* mkdir/mkdirat -> __NR_mkdirat (traced 9). */
+static int alr_mkdir_emit(int dirfd, const char *path, mode_t mode) {
+    char b[ALR_PBUF];
+    const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
+    long r = alr_tramp_syscall(__NR_mkdirat, dirfd, (long)p, mode, 0, 0, 0);
+    return (int)alr_ret(r);
+}
 int mkdir(const char *path, mode_t mode) {
+    if (g_pcgate) return alr_mkdir_emit(AT_FDCWD, path, mode);
     static int (*real)(const char *, mode_t);
     ALR_REAL(real, int (*)(const char *, mode_t), "mkdir");
     char b[ALR_PBUF];
     return real(rw(path, b, sizeof b), mode);
 }
 int mkdirat(int dirfd, const char *path, mode_t mode) {
+    if (g_pcgate) return alr_mkdir_emit(dirfd, path, mode);
     static int (*real)(int, const char *, mode_t);
     ALR_REAL(real, int (*)(int, const char *, mode_t), "mkdirat");
     char b[ALR_PBUF];
     const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
     return real(dirfd, p, mode);
 }
+
+/* unlink/rmdir/unlinkat/remove -> __NR_unlinkat (traced 9). */
+static int alr_unlink_emit(int dirfd, const char *path, int flags) {
+    char b[ALR_PBUF];
+    const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
+    long r = alr_tramp_syscall(__NR_unlinkat, dirfd, (long)p, flags, 0, 0, 0);
+    return (int)alr_ret(r);
+}
 int rmdir(const char *path) {
+    if (g_pcgate) return alr_unlink_emit(AT_FDCWD, path, AT_REMOVEDIR);
     static int (*real)(const char *);
     ALR_REAL(real, int (*)(const char *), "rmdir");
     char b[ALR_PBUF];
     return real(rw(path, b, sizeof b));
 }
 int unlink(const char *path) {
+    if (g_pcgate) return alr_unlink_emit(AT_FDCWD, path, 0);
     static int (*real)(const char *);
     ALR_REAL(real, int (*)(const char *), "unlink");
     char b[ALR_PBUF];
     return real(rw(path, b, sizeof b));
 }
 int unlinkat(int dirfd, const char *path, int flags) {
+    if (g_pcgate) return alr_unlink_emit(dirfd, path, flags);
     static int (*real)(int, const char *, int);
     ALR_REAL(real, int (*)(int, const char *, int), "unlinkat");
     char b[ALR_PBUF];
@@ -580,6 +1037,14 @@ int unlinkat(int dirfd, const char *path, int flags) {
     return real(dirfd, p, flags);
 }
 int remove(const char *path) {
+    /* glibc tries unlink then rmdir; replicate via unlinkat, retrying with
+     * AT_REMOVEDIR on EISDIR. Both syscalls are the traced __NR_unlinkat. */
+    if (g_pcgate) {
+        int r = alr_unlink_emit(AT_FDCWD, path, 0);
+        if (r != 0 && errno == EISDIR)
+            r = alr_unlink_emit(AT_FDCWD, path, AT_REMOVEDIR);
+        return r;
+    }
     static int (*real)(const char *);
     ALR_REAL(real, int (*)(const char *), "remove");
     char b[ALR_PBUF];
@@ -642,6 +1107,9 @@ int renameat(int oldfd, const char *oldp, int newfd, const char *newp) {
 }
 int renameat2(int oldfd, const char *oldp, int newfd, const char *newp,
               unsigned int flags) {
+    /* __NR_renameat2 is NOT in the traced 9 (in either mode), so its two-path
+     * string rewrite is the sole mediation -- preserved exactly; no trampoline
+     * re-route needed (the BPF would ALLOW it at any PC). */
     static int (*real)(int, const char *, int, const char *, unsigned int);
     ALR_REAL(real, int (*)(int, const char *, int, const char *, unsigned int),
              "renameat2");
@@ -649,6 +1117,74 @@ int renameat2(int oldfd, const char *oldp, int newfd, const char *newp,
     const char *o = (oldp && oldp[0] == '/') ? rw(oldp, b1, sizeof b1) : oldp;
     const char *n = (newp && newp[0] == '/') ? rw(newp, b2, sizeof b2) : newp;
     return real(oldfd, o, newfd, n, flags);
+}
+
+/* =================================================================== */
+/* link / node-creation ops                                            */
+/* =================================================================== */
+/* These were previously UNWRAPPED -- a pre-existing correctness gap (absolute
+ * link/node paths were not rewritten into the rootfs) independent of PCGATE.
+ * Their underlying syscalls (linkat/symlinkat/mknodat) are NOT in the traced 9,
+ * so they forward via RTLD_NEXT after a string rewrite, matching the
+ * rename/renameat pattern. CAUTION: for symlink/symlinkat the FIRST arg is the
+ * symlink *contents* (target), stored verbatim by the kernel -- it is NOT a
+ * filesystem location to resolve now, so it must NOT be rewritten; only the
+ * linkpath (where the symlink is created) is rewritten. */
+
+int link(const char *oldp, const char *newp) {
+    static int (*real)(const char *, const char *);
+    ALR_REAL(real, int (*)(const char *, const char *), "link");
+    char b1[ALR_PBUF], b2[ALR_PBUF];
+    /* both args are existing/target filesystem paths -> rewrite both */
+    return real(rw(oldp, b1, sizeof b1), rw(newp, b2, sizeof b2));
+}
+int linkat(int oldfd, const char *oldp, int newfd, const char *newp, int flags) {
+    static int (*real)(int, const char *, int, const char *, int);
+    ALR_REAL(real, int (*)(int, const char *, int, const char *, int), "linkat");
+    char b1[ALR_PBUF], b2[ALR_PBUF];
+    const char *o = (oldp && oldp[0] == '/') ? rw(oldp, b1, sizeof b1) : oldp;
+    const char *n = (newp && newp[0] == '/') ? rw(newp, b2, sizeof b2) : newp;
+    return real(oldfd, o, newfd, n, flags);
+}
+int symlink(const char *target, const char *linkpath) {
+    static int (*real)(const char *, const char *);
+    ALR_REAL(real, int (*)(const char *, const char *), "symlink");
+    char b[ALR_PBUF];
+    /* target is the link CONTENTS -> left untouched; only linkpath rewritten */
+    return real(target, rw(linkpath, b, sizeof b));
+}
+int symlinkat(const char *target, int newfd, const char *linkpath) {
+    static int (*real)(const char *, int, const char *);
+    ALR_REAL(real, int (*)(const char *, int, const char *), "symlinkat");
+    char b[ALR_PBUF];
+    const char *lp = (linkpath && linkpath[0] == '/') ? rw(linkpath, b, sizeof b) : linkpath;
+    return real(target, newfd, lp);
+}
+int mknod(const char *path, mode_t mode, dev_t dev) {
+    static int (*real)(const char *, mode_t, dev_t);
+    ALR_REAL(real, int (*)(const char *, mode_t, dev_t), "mknod");
+    char b[ALR_PBUF];
+    return real(rw(path, b, sizeof b), mode, dev);
+}
+int mknodat(int dirfd, const char *path, mode_t mode, dev_t dev) {
+    static int (*real)(int, const char *, mode_t, dev_t);
+    ALR_REAL(real, int (*)(int, const char *, mode_t, dev_t), "mknodat");
+    char b[ALR_PBUF];
+    const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
+    return real(dirfd, p, mode, dev);
+}
+int mkfifo(const char *path, mode_t mode) {
+    static int (*real)(const char *, mode_t);
+    ALR_REAL(real, int (*)(const char *, mode_t), "mkfifo");
+    char b[ALR_PBUF];
+    return real(rw(path, b, sizeof b), mode);
+}
+int mkfifoat(int dirfd, const char *path, mode_t mode) {
+    static int (*real)(int, const char *, mode_t);
+    ALR_REAL(real, int (*)(int, const char *, mode_t), "mkfifoat");
+    char b[ALR_PBUF];
+    const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
+    return real(dirfd, p, mode);
 }
 
 /* =================================================================== */
