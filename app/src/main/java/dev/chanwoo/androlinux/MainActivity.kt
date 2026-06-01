@@ -707,7 +707,7 @@ class MainActivity : Activity() {
             alrSeccompPathTrapProbe.lineStartingWith("alr sc PATH_MEDIATION_VIABLE=")
                 .substringAfter("PATH_MEDIATION_VIABLE=", "") == "yes"
 
-        val executionSummary = "build: 0.4.129-cp5-batch-8mibring-v129" +
+        val executionSummary = "build: 0.4.130-cp5-5ws-fanout-v130" +
             "\nexecution summary" +
             "\nROOTFS EXECUTION: ${if (rootfsExecutionPassed) "PASS" else "FAIL"}" +
             "\nSHELL SCRIPT EXECUTION: ${if (shellScriptExecutionPassed) "PASS" else "FAIL"}" +

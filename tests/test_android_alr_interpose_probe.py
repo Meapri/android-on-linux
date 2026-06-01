@@ -25,7 +25,7 @@ def test_main_activity_reports_procfs_interpose_mechanism_gate():
     assert "ALR PROCFS INTERPOSE MECHANISM: " in text
     assert "alr procfs interpose passed=" in text
     assert "ALR procfs interpose mechanism probe:" in text
-    assert "build: 0.4.129-cp5-batch-8mibring-v129" in text
+    assert "build: 0.4.130-cp5-5ws-fanout-v130" in text
 
 
 def test_execution_backend_docs_require_procfs_interpose_mechanism():
