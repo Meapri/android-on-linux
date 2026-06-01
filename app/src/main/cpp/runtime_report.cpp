@@ -5488,3 +5488,22 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandInjectKey(
     (void)pressed;
 #endif
 }
+
+// Mouse wheel / trackpad scroll -> wl_pointer.axis. Position the pointer at (x,y)
+// first so the axis targets the surface under the cursor and the pointer is entered.
+// value is the Wayland axis amount (positive = down/right); axis 0=vertical, 1=horizontal.
+extern "C" JNIEXPORT void JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandInjectScroll(
+    JNIEnv* /* env */,
+    jobject /* thiz */,
+    jfloat x,
+    jfloat y,
+    jdouble value,
+    jint axis) {
+#ifdef ALR_HAVE_WAYLAND
+    alr::wayland::alr_wayland_inject_pointer_motion(x, y);
+    alr::wayland::alr_wayland_inject_pointer_axis(value, static_cast<int32_t>(axis));
+#else
+    (void)x; (void)y; (void)value; (void)axis;
+#endif
+}

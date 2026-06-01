@@ -144,6 +144,7 @@ bool alr_wayland_compositor_running();
 // pixels. Button/key codes are Linux evdev codes. ----
 void alr_wayland_inject_pointer_motion(double x, double y);
 void alr_wayland_inject_pointer_button(uint32_t evdev_button, uint32_t pressed);
+void alr_wayland_inject_pointer_axis(double value, int32_t axis);  // axis: 0=vertical 1=horizontal
 void alr_wayland_inject_touch(int32_t id, double x, double y, int32_t phase);  // 0=down 1=move 2=up
 void alr_wayland_inject_key(uint32_t evdev_key, uint32_t pressed);
 // Inject a synthetic burst (motion+click+touch+key) at the given point for
