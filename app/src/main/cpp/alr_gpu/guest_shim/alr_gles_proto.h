@@ -111,7 +111,32 @@ enum AlrOp {
     ALR_OP_DRAW_ARRAYS_INSTANCED = 102,  /* u32 mode, i32 first, i32 count, i32 instancecount */
     ALR_OP_DRAW_ELEMENTS_INSTANCED = 103,/* u32 mode, i32 count, u32 type, u32 offset, i32 instancecount */
     ALR_OP_VERTEX_ATTRIB_DIVISOR = 104,      /* u32 index, u32 divisor */
-    ALR_OP_VERTEX_ATTRIB_DIVISOR_NAMED = 105 /* u32 vprog, blob(name), u32 divisor */
+    ALR_OP_VERTEX_ATTRIB_DIVISOR_NAMED = 105,/* u32 vprog, blob(name), u32 divisor */
+    /* --- per-fragment / raster STATE setters (blend, write-mask, depth-range, stencil,
+     *     polygon-offset, line-width, sample-coverage). Plain scalar/enum state — the
+     *     host replays them 1:1 on its real GLES2 context. These are the state that
+     *     glmark2's blend/effect/shading/refract/shadow scenes (and GTK4-GL/SDL2 apps)
+     *     set away from the GL defaults; the build/texture scenes don't, which is why
+     *     they were accept-and-drop no-ops until now. No virtual ids involved. --- */
+    ALR_OP_BLEND_FUNC = 110,             /* u32 sfactor, u32 dfactor */
+    ALR_OP_BLEND_FUNC_SEPARATE = 111,    /* u32 srcRGB, u32 dstRGB, u32 srcAlpha, u32 dstAlpha */
+    ALR_OP_BLEND_EQUATION = 112,         /* u32 mode */
+    ALR_OP_BLEND_EQUATION_SEPARATE = 113,/* u32 modeRGB, u32 modeAlpha */
+    ALR_OP_BLEND_COLOR = 114,            /* f32 r,g,b,a */
+    ALR_OP_COLOR_MASK = 115,             /* u8 r, u8 g, u8 b, u8 a */
+    ALR_OP_DEPTH_MASK = 116,             /* u8 flag */
+    ALR_OP_DEPTH_RANGEF = 117,           /* f32 near, f32 far */
+    ALR_OP_CLEAR_DEPTHF = 118,           /* f32 depth */
+    ALR_OP_CLEAR_STENCIL = 119,          /* i32 s */
+    ALR_OP_STENCIL_FUNC = 120,           /* u32 func, i32 ref, u32 mask */
+    ALR_OP_STENCIL_FUNC_SEPARATE = 121,  /* u32 face, u32 func, i32 ref, u32 mask */
+    ALR_OP_STENCIL_OP = 122,             /* u32 sfail, u32 dpfail, u32 dppass */
+    ALR_OP_STENCIL_OP_SEPARATE = 123,    /* u32 face, u32 sfail, u32 dpfail, u32 dppass */
+    ALR_OP_STENCIL_MASK = 124,           /* u32 mask */
+    ALR_OP_STENCIL_MASK_SEPARATE = 125,  /* u32 face, u32 mask */
+    ALR_OP_POLYGON_OFFSET = 126,         /* f32 factor, f32 units */
+    ALR_OP_LINE_WIDTH = 127,             /* f32 width */
+    ALR_OP_SAMPLE_COVERAGE = 128         /* f32 value, u8 invert */
 };
 
 /* ---------------------------------------------------------------------------
