@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import os
 import sys
 import tarfile
@@ -106,7 +107,8 @@ class BaseSoname:
     key: str
     soname: str
     rel_path: str       # the real library file path in the base
-    version: tuple      # resolved version of the base real file
+    version: tuple      # filename-derived version of the base real file
+    true_version: tuple | None = None  # real upstream version, when a lib-versions.json sidecar declares it
 
 
 def _iter_dir_members(base_dir: Path):
@@ -125,6 +127,33 @@ def _iter_dir_members(base_dir: Path):
 def _iter_tar_members(tar_path: Path):
     for m in inspect_tar_members(tar_path):
         yield m.name, m.kind, m.linkname
+
+
+def _load_versions_sidecar(target: str | Path) -> dict[str, tuple]:
+    """Load a ``<tar>.lib-versions.json`` / ``<dir>/lib-versions.json`` sidecar.
+
+    The sidecar is emitted by ``tools.build_stage_tar`` and maps ``"<dir>/<soname>"``
+    to a ``"MAJOR.MINOR.PATCH"`` string — the REAL upstream version a flattened
+    flat-SONAME file came from. We re-key it to the internal ``"<dir>|<soname>"``
+    form so flat-over-flat overwrites can be compared numerically (otherwise the
+    flattened filename has lost the minor/patch). Returns {} when absent/unreadable.
+    """
+    path = Path(target)
+    sidecar = path / "lib-versions.json" if path.is_dir() else Path(f"{path}.lib-versions.json")
+    if not sidecar.is_file():
+        return {}
+    try:
+        raw = json.loads(sidecar.read_text())
+    except (ValueError, OSError):
+        return {}
+    out: dict[str, tuple] = {}
+    for sidecar_key, ver in raw.items():
+        directory, _, soname = sidecar_key.rpartition("/")
+        try:
+            out[f"{directory}|{soname}"] = tuple(int(x) for x in str(ver).split("."))
+        except ValueError:
+            continue
+    return out
 
 
 def build_base_soname_index(base: str | Path) -> dict[str, BaseSoname]:
@@ -157,6 +186,21 @@ def build_base_soname_index(base: str | Path) -> dict[str, BaseSoname]:
                 rel_path=rel_path,
                 version=lib.version,
             )
+
+    # Augment with real upstream versions from a lib-versions.json sidecar, if the
+    # base carries one. This only ADDS a true_version for flat-over-flat numeric
+    # comparison; it never changes the filename-derived `version` the structural
+    # frozen-flat rules rely on.
+    for sidecar_key, true_ver in _load_versions_sidecar(base).items():
+        entry = index.get(sidecar_key)
+        if entry is not None:
+            index[sidecar_key] = BaseSoname(
+                key=entry.key,
+                soname=entry.soname,
+                rel_path=entry.rel_path,
+                version=entry.version,
+                true_version=true_ver,
+            )
     return index
 
 
@@ -177,6 +221,7 @@ def scan_overlay_violations(
 ) -> list[Violation]:
     """Return downgrade/structure violations an overlay would inflict on the base."""
     index = build_base_soname_index(base)
+    overlay_versions = _load_versions_sidecar(overlay_tar)
     violations: list[Violation] = []
 
     for member in inspect_tar_members(overlay_tar):
@@ -224,17 +269,32 @@ def scan_overlay_violations(
                 ))
         else:
             # flat-over-flat at the same soname path: in-place overwrite, same
-            # major. Filename can't prove the minor order, so we can certify
-            # neither a downgrade nor that it is safe. The device guard APPLIES it
-            # (a flat overlay is the conformant §5-E shape and may be a legitimate
-            # restore/upgrade — e.g. harfbuzz-fix-stage.tar), but it is flagged for
-            # review here. Non-blocking by default; --strict makes it blocking.
-            violations.append(Violation(
-                WARN, "flat-overwrite-ambiguous", member.name, lib.soname,
-                f"overlay overwrites base real library {base_entry.rel_path} in "
-                f"place; version unverifiable from filename ({_fmt(lib.version)} "
-                f"vs base {_fmt(base_ver)}) — applied, review recommended",
-            ))
+            # major. The flattened filename has lost the minor/patch, so the
+            # decision depends on lib-versions.json sidecars:
+            base_true = base_entry.true_version
+            overlay_true = overlay_versions.get(key)
+            if base_true is not None and overlay_true is not None:
+                # Both sides declare a real version — a reliable numeric decision.
+                if not _ver_le(base_true, overlay_true):
+                    violations.append(Violation(
+                        BLOCK, "flat-downgrade", member.name, lib.soname,
+                        f"overlay {_fmt(overlay_true)} < base {_fmt(base_true)} "
+                        f"(from lib-versions.json sidecars)",
+                    ))
+                # else: upgrade or equal — allowed, no violation.
+            else:
+                # No sidecar(s): filename can't prove the minor order, so we can
+                # certify neither a downgrade nor that it is safe. The device guard
+                # APPLIES it (a flat overlay is the conformant §5-E shape and may be
+                # a legitimate restore/upgrade — e.g. harfbuzz-fix-stage.tar), but it
+                # is flagged for review. Non-blocking by default; --strict blocks.
+                violations.append(Violation(
+                    WARN, "flat-overwrite-ambiguous", member.name, lib.soname,
+                    f"overlay overwrites base real library {base_entry.rel_path} in "
+                    f"place; version unverifiable from filename ({_fmt(lib.version)} "
+                    f"vs base {_fmt(base_ver)}) — applied, review recommended "
+                    f"(emit lib-versions.json via build_stage_tar to make this exact)",
+                ))
 
     return violations
 
@@ -338,6 +398,44 @@ def _selftest() -> int:
         )
         vup_v = scan_overlay_violations(vdown, vbase)
         check("versioned-vs-versioned upgrade allowed", vup_v == [])
+
+        # Flat-over-flat with lib-versions.json sidecars (build_stage_tar output).
+        # Base + overlay both ship a flat real libbar.so.2 — filename can't tell
+        # order, but the sidecars declare the real versions.
+        fbase = tmp_path / "flatbase.tar"
+        with tarfile.open(fbase, "w") as t:
+            _add_file(t, f"{libdir}/libbar.so.2", b"BAR-2.0.14" * 16)
+        (tmp_path / "flatbase.tar.lib-versions.json").write_text(
+            '{"usr/lib/aarch64-linux-gnu/libbar.so.2": "2.0.14"}'
+        )
+        fdown = tmp_path / "flatdown.tar"
+        with tarfile.open(fdown, "w") as t:
+            _add_file(t, f"{libdir}/libbar.so.2", b"BAR-2.0.8" * 16)
+        (tmp_path / "flatdown.tar.lib-versions.json").write_text(
+            '{"usr/lib/aarch64-linux-gnu/libbar.so.2": "2.0.8"}'
+        )
+        fup = tmp_path / "flatup.tar"
+        with tarfile.open(fup, "w") as t:
+            _add_file(t, f"{libdir}/libbar.so.2", b"BAR-2.0.20" * 16)
+        (tmp_path / "flatup.tar.lib-versions.json").write_text(
+            '{"usr/lib/aarch64-linux-gnu/libbar.so.2": "2.0.20"}'
+        )
+        fnos = tmp_path / "flatnosidecar.tar"
+        with tarfile.open(fnos, "w") as t:
+            _add_file(t, f"{libdir}/libbar.so.2", b"BAR-x" * 16)
+
+        down_v = scan_overlay_violations(fbase, fdown)
+        check(
+            "flat-over-flat downgrade blocked via sidecars",
+            any(v.severity == BLOCK and v.rule == "flat-downgrade" for v in down_v),
+        )
+        up_v = scan_overlay_violations(fbase, fup)
+        check("flat-over-flat upgrade allowed via sidecars", up_v == [])
+        nos_v = scan_overlay_violations(fbase, fnos)
+        check(
+            "flat-over-flat WARNs (not blocks) when overlay has no sidecar",
+            nos_v and all(v.severity == WARN for v in nos_v),
+        )
 
         # parse_solib unit checks
         check("parse_solib flat", parse_solib("libharfbuzz.so.0").version == (0,))
