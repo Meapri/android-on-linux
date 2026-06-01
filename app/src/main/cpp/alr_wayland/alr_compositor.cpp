@@ -27,6 +27,7 @@
 #include "alr_wayland/alr_xkb_keymap_us.h"     // embedded self-contained XKB keymap
 
 #include <android/log.h>
+#include <android/hardware_buffer.h>  // M2 §5-C: AHardwareBuffer_acquire/release
 
 #include <atomic>
 #include <algorithm>
@@ -114,6 +115,13 @@ struct SurfaceState {
     std::string title;            // last set_title (used as a dialog heuristic)
     bool is_popup = false;
     bool had_explicit_null_attach = false;  // client did attach(null) this cycle
+    // --- §5-C GPU present: a WS-2-rendered AHardwareBuffer bound to this surface for
+    // zero-copy import by the presenter. Acquired in alr_wayland_submit_gpu_frame,
+    // released when the next GPU frame for this surface binds. null => CPU/shm only.
+    void* gpu_ahb = nullptr;   // AHardwareBuffer* (compositor holds one acquire ref)
+    int32_t gpu_w = 0;
+    int32_t gpu_h = 0;
+    uint64_t gpu_serial = 0;
 };
 
 }  // namespace
@@ -191,6 +199,7 @@ private:
     void teardown();
     void reactor();
     void drain_input_queue();  // compositor thread: queue -> wl input protocol
+    void drain_gpu_queue();    // compositor thread: bind submitted AHB frames (§5-C)
     bool register_globals();
     bool make_socket();
 
@@ -256,6 +265,12 @@ struct InjectEvent {
 };
 std::mutex g_inject_mutex;
 std::vector<InjectEvent> g_inject_queue;  // guarded by g_inject_mutex
+
+// §5-C GPU frame submissions from the WS-2 executor thread, drained on the
+// compositor thread (drain_gpu_queue), mirroring the input queue above.
+struct GpuSubmit { void* ahb = nullptr; int32_t w = 0, h = 0; uint64_t serial = 0; };
+std::mutex g_gpu_mutex;
+std::vector<GpuSubmit> g_gpu_queue;  // guarded by g_gpu_mutex
 std::vector<struct wl_resource*> g_pointers;
 std::vector<struct wl_resource*> g_keyboards;
 std::vector<struct wl_resource*> g_touches;
@@ -701,10 +716,15 @@ void present_composited() {
 
     for (SurfaceState* s : g_zorder) {
         if (!s) continue;  // defensive: never deref a stray/stale z-order entry
-        if (!s->mapped || s->pixels.empty() || s->buf_w <= 0 || s->buf_h <= 0) continue;
+        // A surface presents if it has shm pixels OR a §5-C GPU buffer. drain_gpu_queue
+        // sets buf_w/buf_h from the AHB dims for a GPU-only surface, so the placement
+        // below works for both; the presenter prefers ps.ahb (zero-copy) over ps.pixels.
+        if (!s->mapped || (s->pixels.empty() && s->gpu_ahb == nullptr) ||
+            s->buf_w <= 0 || s->buf_h <= 0) continue;
         const Rect r = place_toplevel(s, out_w, out_h);
         PresentSurface ps;
-        ps.pixels = s->pixels.data();
+        ps.pixels = s->pixels.empty() ? nullptr : s->pixels.data();
+        ps.ahb = s->gpu_ahb;  // §5-C: non-null => presenter imports zero-copy
         ps.width = s->buf_w;
         ps.height = s->buf_h;
         ps.dst_x = r.x; ps.dst_y = r.y; ps.dst_w = r.w; ps.dst_h = r.h;
@@ -1693,6 +1713,40 @@ void Compositor::drain_input_queue() {
     wl_display_flush_clients(display_);
 }
 
+// §5-C: bind the newest submitted GPU frame (AHardwareBuffer) to the top toplevel
+// for zero-copy present. Compositor thread only (reactor wakeup). Single-GPU-surface
+// bring-up: newest frame wins; superseded/older frames in the batch are released.
+void Compositor::drain_gpu_queue() {
+    std::vector<GpuSubmit> local;
+    {
+        std::lock_guard<std::mutex> lk(g_gpu_mutex);
+        local.swap(g_gpu_queue);
+    }
+    if (local.empty()) return;
+    for (std::size_t i = 0; i + 1 < local.size(); ++i)
+        if (local[i].ahb)
+            AHardwareBuffer_release(static_cast<AHardwareBuffer*>(local[i].ahb));
+    GpuSubmit& last = local.back();
+    SurfaceState* tgt = zorder_top();
+    if (!tgt) {  // no surface to bind to yet -> drop (release) the frame
+        if (last.ahb) AHardwareBuffer_release(static_cast<AHardwareBuffer*>(last.ahb));
+        return;
+    }
+    // Contract (alr_present_source.hpp): release the previously-held buffer when the
+    // next one binds, so at most one AHB is retained per GPU surface.
+    if (tgt->gpu_ahb && tgt->gpu_ahb != last.ahb)
+        AHardwareBuffer_release(static_cast<AHardwareBuffer*>(tgt->gpu_ahb));
+    tgt->gpu_ahb = last.ahb;
+    tgt->gpu_w = last.w;
+    tgt->gpu_h = last.h;
+    tgt->gpu_serial = last.serial;
+    // Drive sizing/placement for a GPU-only surface (no shm buffer was committed).
+    if (tgt->buf_w <= 0) tgt->buf_w = last.w;
+    if (tgt->buf_h <= 0) tgt->buf_h = last.h;
+    tgt->content_serial = static_cast<uint64_t>(wl_display_next_serial(display_));
+    g_scene_dirty = true;  // present on the next frame-timer tick
+}
+
 void Compositor::reactor() {
     ALR_WL_LOGI("compositor reactor entering epoll loop (loop_fd=%d)", loop_fd_);
     constexpr int kMaxEvents = 8;
@@ -1712,6 +1766,7 @@ void Compositor::reactor() {
                 ssize_t r = ::read(wakeup_fd_, &v, sizeof(v));
                 (void)r;  // drain; loop condition handles stop
                 drain_input_queue();  // deliver any injected input events
+                drain_gpu_queue();    // bind any submitted §5-C GPU (AHB) frames
             } else if (events[i].data.fd == frame_timer_fd_) {
                 uint64_t v = 0;
                 ssize_t r = ::read(frame_timer_fd_, &v, sizeof(v));
@@ -1877,30 +1932,31 @@ int alr_wayland_inject_selftest(double x, double y) {
 
 // ---------------------------------------------------------------------------
 // §5-C PresentSource — GPU/AHB present entry (see alr_present_source.hpp).
-// STUB until WS-3 M2 (zwp_linux_dmabuf_v1 + AHB->EGLImage import): it validates +
-// logs the submission and DROPS the frame; the buffer is not retained, so WS-2
-// (the caller) owns it throughout and may recycle on return. The signature is
-// frozen (plan §5); only this body changes when M2 lands.
+// M2 Phase A (compositor half): acquire the AHB + queue it; drain_gpu_queue (on the
+// compositor thread) binds it to the top toplevel and marks the scene dirty, so
+// present_composited emits it as a §5-C PresentSurface (ps.ahb). The presenter's
+// zero-copy EGLImage import (A4, runtime_report.cpp WaylandPresenter) lights it on
+// screen; until that lands, alr_wayland_gpu_present_ready() stays false so WS-2
+// keeps its direct present. Callable from the WS-2 executor thread.
 // ---------------------------------------------------------------------------
 void alr_wayland_submit_gpu_frame(void* ahardware_buffer, int32_t width,
                                   int32_t height, uint64_t serial) {
-    // Rate-limit so a WS-2 frame loop can't flood logcat: log the first call and
-    // then every 120th (~once/1.3 s at 90 Hz) to confirm the path is live.
-    static std::atomic<uint64_t> n{0};
-    const uint64_t i = n.fetch_add(1, std::memory_order_relaxed);
-    if (i == 0 || (i % 120) == 0) {
-        ALR_WL_LOGI("submit_gpu_frame (M2 stub, dropped): ahb=%p %dx%d serial=%llu count=%llu",
-                    ahardware_buffer, width, height,
-                    (unsigned long long)serial, (unsigned long long)(i + 1));
+    if (!ahardware_buffer || width <= 0 || height <= 0) return;
+    // Hold a ref across the thread handoff; drain_gpu_queue releases it when the
+    // next frame binds (or drops it if there is no surface yet).
+    AHardwareBuffer_acquire(static_cast<AHardwareBuffer*>(ahardware_buffer));
+    {
+        std::lock_guard<std::mutex> lk(g_gpu_mutex);
+        g_gpu_queue.push_back({ahardware_buffer, width, height, serial});
     }
-    // When M2 lands: AHardwareBuffer_acquire(), import as EGLImage, enqueue an
-    // ahb-backed PresentSurface into the present_list pipeline, release on the
-    // next frame for this surface.
-    (void)ahardware_buffer; (void)width; (void)height; (void)serial;
+    Compositor* c = instance();
+    if (c) c->wake();
 }
 
 bool alr_wayland_gpu_present_ready() {
-    return false;  // flips true when WS-3 M2 wires AHB->EGLImage composite.
+    // Stays false until A4 (presenter AHB->EGLImage import) lands; the submit/bind
+    // pipeline above is wired but not yet drawn, so WS-2 keeps its direct present.
+    return false;
 }
 
 // ===========================================================================
