@@ -211,5 +211,9 @@ ALR 디바이스는 **단 하나**(SM-X236N, `R5KL20B6S3X`). 5세션이 동시�
 
 GUI 안정화 완료: keymap SIGSEGV(XKB_CONFIG_ROOT) + locale SIGABRT(C.UTF-8) + SVG SIGABRT(.so x-bit + GDK_PIXBUF) 전부 device-해소 → gtk3demo/foot/gtk3-widget-factory/gimp 3.0.2 GUI 실행(drain#6 화면캡처). **남은 단 하나의 크리티컬 패스 = WS-2 glmark2 Score>0** — 이제 GL context까지 도달, 막힌 곳은 **shader-source 마샬링**(persistent HostState는 device-검증됨). CPU/display/present/GUI는 native급 device-증명 완료.
 
+### 통합 게이트 상태 (오케스트레이터, 2026-06-02)
+host 큐 전부 drain됨 → main `e6d513f`. 머지: ws-2(persistent-HostState `b6a886a` + 8MiB scratch/ring `dc4198e`), ws-3(§5-C present fallback `6d1551b`), ws-4(apt/Xwayland/dpkg-DB overlays `b68482e`), ws-5(CP-3 CLOSED + compat-matrix `e6d513f`). host gate: uvx pytest 417 + NDK 4-ABI 컴파일 clean. stamp = v128(미bump 유지 — 다음 device 빌드 때 통합 세션이 bump).
+**device 배치 HOLD**: 큐의 DEVICE-REQ들(ws-2 8MiB·ws-3 present-fallback·ws-4 overlays)은 **WS-2 glShaderSource fix가 들어올 때까지 보류**. 이유: 8MiB scratch/ring은 shader-source 갭과 orthogonal(WS-2 본인 명시) → 지금 drain하면 drain#6의 shader-source 실패만 재확인. WS-2가 glShaderSource 페이로드 전달을 고치면 그 머지에 묶어 1회 batch drain(§9.4): shim 재빌드(build-shim.sh, 8MiB+shader fix 반영) + restage + glmark2 + ws-3/ws-4 마커 동시 검증.
+
 ## 부록 — 현재 미커밋 작업(이 플랜 직전)
 v126: chromium overlay 비활성화(harfbuzz 회귀 수정), 해상도/주사율 device-exact plumb(MainActivity+JNI+compositor timerfd), `alarm` 25s(검증용), foot/gtk3-widget-factory launch wiring. → CP-1로 흡수. (device 검증 finalizing.)
