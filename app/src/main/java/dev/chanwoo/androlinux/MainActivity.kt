@@ -131,22 +131,48 @@ class MainActivity : Activity() {
                 android.util.Log.e("alr_loader", "gtk3demo-stage EXC: ${android.util.Log.getStackTraceString(e)}")
             }
         }.start()
-        // CP-1 GUI 기반: xkb rules(evdev) + gegl-0.4 모듈 overlay. 컴포지터가 NO_KEYMAP을
-        // 보내므로 게스트 클라이언트가 자체 default keymap(rules 'evdev'/pc105/us)을 만들어야
-        // 하는데 rootfs에 rules/evdev가 없어 GUI 앱(gtk3/gimp/foot)이 SIGSEGV → rules를
-        // stage하면 클라이언트 keymap이 성공한다. gegl-0.4/*.so는 gimp 3.0 플러그인.
+        // CP-1 GUI completeness overlay (optional). NOTE (WS-4 verified): the base
+        // rootfs ALREADY ships the full xkb tree (rules/evdev, keycodes/evdev,
+        // symbols/{pc,us,inet}, …) and libxkbcommon — verified by tools/xkb_probe —
+        // and the keymap SIGSEGV was fixed by WS-1's XKB_CONFIG_ROOT (v127, device
+        // gtk3-widget-factory render). babl/gegl + 37 gegl-0.4 ops are also already
+        // in the base. So this slot is for any RESIDUAL completeness bits (e.g. a
+        // C.UTF-8 locale-archive, extra gimp-3.0/gegl ops) staged as needed. Applied
+        // through the guarded extractOverlayTar so it can never downgrade a base lib.
         Thread {
             try {
                 val xgTar = java.io.File("/data/local/tmp/xkb-gegl-stage.tar")
                 val xgMarker = java.io.File(rootfsStatus.rootfsDir, ".xkbgegl-staged-${xgTar.length()}")
                 if (xgTar.isFile && !xgMarker.isFile) {
                     android.util.Log.i("alr_loader", "xkb-gegl-stage: extracting overlay (${xgTar.length()} bytes)")
-                    RootfsInstaller(this@MainActivity).extractVerifiedTar(xgTar, rootfsStatus.rootfsDir)
+                    val ovr = RootfsInstaller(this@MainActivity).extractOverlayTar(xgTar, rootfsStatus.rootfsDir)
                     xgMarker.writeText("staged\n")
-                    android.util.Log.i("alr_loader", "xkb-gegl-stage: overlay done")
+                    android.util.Log.i("alr_loader", "xkb-gegl-stage: overlay done (extracted=${ovr.extracted} skipped=${ovr.skipped.size})")
+                    if (ovr.skipped.isNotEmpty()) android.util.Log.w("alr_loader", "xkb-gegl-stage: guard skipped downgrades:\n${ovr.skipped.joinToString("\n")}")
                 }
             } catch (e: Throwable) {
                 android.util.Log.e("alr_loader", "xkb-gegl-stage EXC: ${android.util.Log.getStackTraceString(e)}")
+            }
+        }.start()
+        // M2 toolkit overlays (WS-4): SDL2 + netsurf-gtk stage tars, built host-side
+        // by tools/deb_closure (base-subtracted, §5-E flat-SONAME). Guarded extract,
+        // gated on the tar being adb-push'd to /data/local/tmp. Launch-on-compositor
+        // is wired separately. Device test = CP-5.
+        Thread {
+            try {
+                for (name in listOf("sdl2", "netsurf")) {
+                    val tar = java.io.File("/data/local/tmp/$name-stage.tar")
+                    val marker = java.io.File(rootfsStatus.rootfsDir, ".$name-staged-${tar.length()}")
+                    if (tar.isFile && !marker.isFile) {
+                        android.util.Log.i("alr_loader", "$name-stage: extracting overlay (${tar.length()} bytes)")
+                        val ovr = RootfsInstaller(this@MainActivity).extractOverlayTar(tar, rootfsStatus.rootfsDir)
+                        marker.writeText("staged\n")
+                        android.util.Log.i("alr_loader", "$name-stage: overlay done (extracted=${ovr.extracted} skipped=${ovr.skipped.size})")
+                        if (ovr.skipped.isNotEmpty()) android.util.Log.w("alr_loader", "$name-stage: guard skipped downgrades:\n${ovr.skipped.joinToString("\n")}")
+                    }
+                }
+            } catch (e: Throwable) {
+                android.util.Log.e("alr_loader", "toolkit-stage EXC: ${android.util.Log.getStackTraceString(e)}")
             }
         }.start()
         val nativeCommandRunner = NativeCommandRunner(

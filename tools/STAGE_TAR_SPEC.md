@@ -178,4 +178,50 @@ to emit a real `WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1` keymap, the keymap compiler (t
 Android/NDK side, with its own libxkbcommon) must read the rootfs copy — point it at
 `XKB_CONFIG_ROOT=<filesDir>/rootfs/<name>/usr/share/X11/xkb` (or an xkb_context
 include path) before `xkb_keymap_new_from_names`. Confirm with
-`python -m tools.xkb_probe --rootfs <dir|tar>`.
+`python -m tools.xkb_probe --rootfs <dir|tar>`. (WS-1 did exactly this in v127 —
+gtk3-widget-factory now renders on device.)
+
+---
+
+## 7. overlay minimization (prune) + closure-size reality
+
+`deb_closure` over-includes: the full transitive `Depends` closure pulls perl (via
+ca-certificates), the entire Adwaita icon theme, ICU, systemd units, man/doc/locale,
+etc. `build_overlay` now drops base-duplicate paths **and** a default
+`DEFAULT_PRUNE_PREFIXES` set (man/doc/info/locale/lintian/gtk-doc/pkgconfig/include/
+systemd/tmpfiles/var) — runtime-irrelevant for a no-systemd, C.UTF-8, no-dev guest.
+Deliberately kept: `usr/share/icons` (GTK needs it), fonts, mime, perl, libicu, gconv.
+
+Built, base-subtracted + pruned, guard-clean (device-pending):
+
+| overlay | files | size | note |
+|---|---|---|---|
+| `sdl2-stage.tar` | 586 | ~31 MB | libSDL2 + audio/wayland deps; no core-lib shadow |
+| `netsurf-stage.tar` | 9083 | ~195 MB | still large — full Depends pulls perl + Adwaita + ICU |
+
+**Finding:** for a *practical* netsurf overlay, the full `Depends` closure is too
+broad (~195 MB). The right next step is a **curated package list** (leaf + only the
+libs its binary's `DT_NEEDED` actually requires that the base lacks) rather than the
+conservative transitive `Depends`. `deb_closure`'s `prune=` is tunable per build.
+
+## 8. (a) GUI-stability — locale / babl-gegl investigation (device backtrace needed)
+
+§10 assigned WS-4 "(a) `locales-all` (C.UTF-8) + babl/gegl `.so`" for a residual
+gtk3-widget-factory/gimp **SIGABRT**. Host recon (this session):
+- **babl/gegl present in base**: `libbabl-0.1.so.0`, `libgegl-0.4.so.0` + **37
+  `gegl-0.4/*` op plugins**. Not missing.
+- **locale env already set**: `runtime_report.cpp` exports `LC_ALL=C.UTF-8` +
+  `LANG=C.UTF-8`. Base glibc is **2.39** (GLIBC_2.39 syms) → C.UTF-8 should be a
+  built-in locale (no archive). No `/usr/lib/locale` or `/usr/share/i18n` in base.
+- Only clearly-missing item: `/usr/share/X11/xkb/locale` (from `libx11-data`, arch
+  `all`) — but irrelevant to a pure-Wayland GTK client.
+- `locales-all` is **arm64, ~11 MB download / ~227 MB installed** — far too heavy to
+  stage blindly.
+
+So the obvious "locale/gegl missing" pieces are NOT missing. Before staging a 227 MB
+locale-archive, the **device SIGABRT backtrace is required** to pinpoint the abort
+(which lib/`g_assert`). Requested via `DEVICE-REQ` on the merge. If it IS a genuine
+C.UTF-8 lookup failure, the minimal fix is a localedef-built `C.UTF-8` archive
+(Debian-env: `localedef -i C -f UTF-8 /usr/lib/locale/C.UTF-8`), staged into
+`xkb-gegl-stage.tar` — not the full `locales-all`. The `xkb-gegl-stage.tar`
+MainActivity slot is now wired through the guarded `extractOverlayTar`.

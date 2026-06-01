@@ -387,6 +387,60 @@ def drop_base_paths(merged_root: str | Path, base_paths: set[str]) -> list[str]:
     return removed
 
 
+# Path prefixes that are runtime-irrelevant for an ALR guest (no systemd, no docs,
+# C.UTF-8 only, no dev). Dropping them shrinks overlays a lot with zero runtime
+# impact. Deliberately NOT pruned: usr/share/icons (GTK needs them), fonts, mime,
+# usr/share/perl (some apps exec perl), libicu, gconv.
+DEFAULT_PRUNE_PREFIXES = (
+    "usr/share/man/",
+    "usr/share/doc/",
+    "usr/share/doc-base/",
+    "usr/share/info/",
+    "usr/share/lintian/",
+    "usr/share/bug/",
+    "usr/share/locale/",
+    "usr/share/gtk-doc/",
+    "usr/share/pkgconfig/",
+    "usr/include/",
+    "lib/systemd/",
+    "usr/lib/systemd/",
+    "etc/systemd/",
+    "lib/tmpfiles.d/",
+    "usr/lib/tmpfiles.d/",
+    "var/lib/dpkg/",
+    "var/cache/",
+    "var/log/",
+)
+
+
+def prune_paths(merged_root: str | Path, prefixes) -> list[str]:
+    """Delete merged-root files under any runtime-irrelevant prefix.
+
+    The prefixes match BOTH ``X`` and ``usr/X`` via merged-usr aliasing. Returns the
+    sorted list of removed rootfs-relative paths.
+    """
+    root = Path(merged_root)
+    removed: list[str] = []
+    if not root.is_dir() or not prefixes:
+        return removed
+    aliased: set[str] = set()
+    for p in prefixes:
+        aliased.update(_mergedusr_aliases(p.rstrip("/") + "/"))
+    aliased_t = tuple(aliased)
+    for dirpath, _dirs, files in os.walk(root):
+        for fname in files:
+            full = Path(dirpath) / fname
+            rel = full.relative_to(root).as_posix()
+            if rel.startswith(aliased_t):
+                try:
+                    full.unlink()
+                except OSError:
+                    continue
+                removed.append(rel)
+    removed.sort()
+    return removed
+
+
 # --------------------------------------------------------------------------- #
 # Build path (network)
 # --------------------------------------------------------------------------- #
@@ -401,6 +455,7 @@ class OverlayBuild:
     sidecar: str
     file_count: int
     violations: tuple[str, ...]            # rendered overlay_guard violations
+    pruned: tuple[str, ...] = ()           # runtime-irrelevant paths dropped (man/doc/…)
 
     def as_dict(self) -> dict:
         return {
@@ -412,6 +467,7 @@ class OverlayBuild:
             "sidecar": self.sidecar,
             "file_count": self.file_count,
             "violations": list(self.violations),
+            "pruned": list(self.pruned),
         }
 
 
@@ -450,6 +506,7 @@ def build_overlay(
     suite: str = "bookworm",
     arch: str = "arm64",
     cache_dir: str | Path | None = None,
+    prune=DEFAULT_PRUNE_PREFIXES,
     opener=urllib.request.urlopen,
 ) -> dict:
     """Resolve, download, base-subtract and flatten an overlay for ``targets``.
@@ -512,6 +569,10 @@ def build_overlay(
     skipped_paths = drop_base_paths(merged_root, base_path_set(base))
     skipped_base = sorted(set(skipped_sonames) | set(skipped_paths))
 
+    # Drop runtime-irrelevant payload (man/doc/locale/systemd/dev …) to keep the
+    # overlay practical — the full transitive Depends closure over-includes.
+    pruned = prune_paths(merged_root, prune)
+
     result = build_stage_tar(merged_root, out_tar)
 
     violations = scan_overlay_violations(base, out_tar)
@@ -525,6 +586,7 @@ def build_overlay(
         sidecar=result.sidecar,
         file_count=result.file_count,
         violations=tuple(v.render() for v in violations),
+        pruned=tuple(pruned),
     )
     return build.as_dict()
 
@@ -671,6 +733,20 @@ def _selftest() -> int:
             len(removed) == 3,
         )
         check("drop_base_sonames return is sorted/deterministic", removed == sorted(removed))
+
+        # prune_paths: drop runtime-irrelevant payload (merged-usr aliased), keep the rest.
+        (root / "usr/share/man/man1").mkdir(parents=True)
+        (root / "usr/share/man/man1/foo.1").write_bytes(b"man")
+        (root / "usr/lib/systemd/system").mkdir(parents=True)
+        (root / "usr/lib/systemd/system/x.service").write_bytes(b"unit")
+        (root / "lib/systemd").mkdir(parents=True)  # merged-usr spelling
+        (root / "lib/systemd/y").write_bytes(b"u")
+        pruned = prune_paths(root, DEFAULT_PRUNE_PREFIXES)
+        check("prune dropped man page", "usr/share/man/man1/foo.1" in pruned)
+        check("prune dropped usr/lib/systemd unit", "usr/lib/systemd/system/x.service" in pruned)
+        check("prune dropped merged-usr lib/systemd", "lib/systemd/y" in pruned)
+        check("prune KEPT the app binary", (root / "usr/bin/app").exists())
+        check("prune KEPT libwebp", (libdir / "libwebp.so.7.1.0").exists())
 
     print(f"\nselftest: {'ALL PASS' if failures == 0 else str(failures) + ' FAILED'}")
     return 1 if failures else 0
