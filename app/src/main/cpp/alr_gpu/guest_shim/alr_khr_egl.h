@@ -70,6 +70,27 @@ typedef void       (*__eglMustCastToProperFunctionPointerType)(void);
 #define EGL_RENDER_BUFFER          0x3086
 #define EGL_OPENGL_ES_API          0x30A0
 
+/* full config-attribute set (eglGetConfigAttrib — glmark2 reads these to score a config) */
+#define EGL_BUFFER_SIZE            0x3020
+#define EGL_CONFIG_CAVEAT          0x3027
+#define EGL_LEVEL                  0x3029
+#define EGL_MAX_PBUFFER_HEIGHT     0x302A
+#define EGL_MAX_PBUFFER_PIXELS     0x302B
+#define EGL_MAX_PBUFFER_WIDTH      0x302C
+#define EGL_NATIVE_RENDERABLE      0x302D
+#define EGL_NATIVE_VISUAL_ID       0x302E
+#define EGL_NATIVE_VISUAL_TYPE     0x302F
+#define EGL_SAMPLES                0x3031
+#define EGL_SAMPLE_BUFFERS         0x3032
+#define EGL_TRANSPARENT_TYPE       0x3034
+#define EGL_LUMINANCE_SIZE         0x303D
+#define EGL_ALPHA_MASK_SIZE        0x303E
+#define EGL_MIN_SWAP_INTERVAL      0x303B
+#define EGL_MAX_SWAP_INTERVAL      0x303C
+#define EGL_COLOR_BUFFER_TYPE      0x303F
+#define EGL_CONFORMANT             0x3042
+#define EGL_RGB_BUFFER             0x308E
+
 #define EGL_PBUFFER_BIT            0x0001
 #define EGL_WINDOW_BIT             0x0004
 #define EGL_OPENGL_ES2_BIT         0x0004
