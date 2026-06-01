@@ -42,10 +42,16 @@ class GpuBoundary:
 
 @dataclass(frozen=True)
 class GuestProbe:
-    """A single `gimp-probe guest=<path> exit=N` line."""
+    """A single `gimp-probe guest=<path> exit=N ... exec_ms=K` line.
+
+    `exec_ms` (WS-1 M2) is the fork->reap native-exec wall-clock in milliseconds,
+    emitted on the SAME gimp-probe line after the traps/rewrites/stdout_bytes
+    fields (runtime_report.cpp ~L2401). None when the line predates the field.
+    """
 
     guest: str
     exit_code: int
+    exec_ms: int | None = None
 
 
 @dataclass(frozen=True)
@@ -74,6 +80,10 @@ class ParsedReport:
     raw: str = ""
     alr_markers: dict[str, str] = field(default_factory=dict)
     wl_output: "WlOutput | None" = None
+    # WS-1 M2 CPU-mediation perf markers (None when the marker is absent).
+    perf_xlate_ns: float | None = None
+    perf_syscall_ns: float | None = None
+    perf_roundtrip_measured: bool | None = None
 
 
 _BUILD = re.compile(r"^build:\s*(\S+)", re.MULTILINE)
@@ -94,7 +104,18 @@ _GPU_INPROC = re.compile(r"alr gpu boundary inproc dispatch ns/op=(\d+)")
 _GPU_SOCKET = re.compile(r"alr gpu boundary socket per-cmd ns/op=(\d+)")
 _GPU_SHMEM = re.compile(r"alr gpu boundary shmem-ring ns/op=(\d+)")
 _PERF_HARNESS = re.compile(r"ALR PERF HARNESS:\s*(\S+)")
-_GIMP_PROBE = re.compile(r"gimp-probe guest=(\S+)\s+exit=(\d+)")
+# WS-1 M2 CPU-mediation perf markers. Tolerant of both the source's compact form
+# (`alr perf alr xlate ns/op=4334.727`) and the pretty-printed device-captured form
+# (`alr perf alr xlate     ns/op = 4334.727`): \s+ for the run of spaces, \s*=\s*
+# around the equals sign.
+_PERF_XLATE = re.compile(r"alr perf alr xlate\s+ns/op\s*=\s*([\d.]+)")
+_PERF_SYSCALL = re.compile(r"alr perf syscall getppid\s+ns/op\s*=\s*([\d.]+)")
+_PERF_ROUNDTRIP = re.compile(r"ALR PERF SYSCALL ROUNDTRIP MEASURED:\s*PASS")
+# gimp-probe line. `exec_ms` (WS-1 M2) sits later on the SAME line after the
+# traps/rewrites/stdout_bytes fields. We match the whole line, then pull guest/
+# exit/exec_ms out of it so exec_ms stays tied to its own guest.
+_GIMP_PROBE = re.compile(r"^.*gimp-probe guest=(\S+)\s+exit=(\d+).*$", re.MULTILINE)
+_EXEC_MS = re.compile(r"\bexec_ms=(\d+)\b")
 # Generic device marker: `ALR <name>: <status>`. Names may carry spaces/parens
 # but no internal colon (the first colon ends the name). Future-proofs the parser
 # against the growing list of `ALR <name>: PASS` markers runtime_report.cpp emits.
@@ -159,9 +180,25 @@ def parse_report(text: str) -> ParsedReport:
 
     m_perf = _PERF_HARNESS.search(text)
 
-    probes = tuple(
-        GuestProbe(guest=g, exit_code=int(e)) for g, e in _GIMP_PROBE.findall(text)
-    )
+    # WS-1 M2 CPU-mediation perf markers. None when the marker line is absent.
+    m_xlate = _PERF_XLATE.search(text)
+    m_syscall = _PERF_SYSCALL.search(text)
+    perf_xlate_ns = float(m_xlate.group(1)) if m_xlate else None
+    perf_syscall_ns = float(m_syscall.group(1)) if m_syscall else None
+    perf_roundtrip_measured = True if _PERF_ROUNDTRIP.search(text) else None
+
+    probes_list: list[GuestProbe] = []
+    for m in _GIMP_PROBE.finditer(text):
+        line = m.group(0)
+        m_ms = _EXEC_MS.search(line)  # exec_ms is on this same probe line (WS-1 M2)
+        probes_list.append(
+            GuestProbe(
+                guest=m.group(1),
+                exit_code=int(m.group(2)),
+                exec_ms=int(m_ms.group(1)) if m_ms else None,
+            )
+        )
+    probes = tuple(probes_list)
 
     alr_markers = {
         name.strip(): status for name, status in _ALR_MARKER.findall(text)
@@ -192,4 +229,7 @@ def parse_report(text: str) -> ParsedReport:
         raw=text,
         alr_markers=alr_markers,
         wl_output=wl_output,
+        perf_xlate_ns=perf_xlate_ns,
+        perf_syscall_ns=perf_syscall_ns,
+        perf_roundtrip_measured=perf_roundtrip_measured,
     )

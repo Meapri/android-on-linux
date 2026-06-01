@@ -64,6 +64,7 @@ WS-5는 전 WS 산출물을 **측정**한다. 계약 자체는 제공하지 않�
 | `docs/research/ws5-premerge-gate.md` + `scripts/ws5-premerge-check.sh` | §5 게이트 기준 (통합 세션 pre-merge 게이트, CP별) | done |
 | `bench/microbench/` (`microbench.c` + README) | M1 same-binary native-vs-ALR 측정 타깃 (compute/syscall 모드) | source-done (cross-compile/stage는 WS-4) |
 | `bench/__main__.py` `verify` 서브커맨드 | 리포트 1개로 gate + CP-1 display + 마커 요약 통합 | host-done, 테스트됨 |
-| 위 전부의 **device 실측** | M1/M2/M3 | pending (통합 빌드 + 디바이스 점유 조율) |
+| CP-3/M1 **device 실측 (ALR 절대값)** | M1 | **PARTIAL** — WS-1 M2가 device 캡처(APK v127); WS-5가 정량화 (`docs/evidence/2026-06-01-ws5-cpu-overhead-quantified.md`): 일반 CLI exec_ms ~18-20ms, path-xlate 4334.7 ns/op, **traps=0 device-verified**. native/PRoot baseline는 **PENDING** → % 오버헤드 비율 미산출 |
+| 나머지 **device 실측** | M2/M3 | pending (통합 빌드 + 디바이스 점유 조율) |
 
-baseline: `ws-5`는 **v127** 위로 rebase됨 (clean). host 테스트: `cd /Users/naen/Documents/alr-ws5 && uvx pytest tests/ -q` (pytest 미설치 → `uvx`) → **345 passed** (baseline 277 + WS-5 68). 단일 진입점: `scripts/run-host-tests.sh`; pre-merge 게이트: `scripts/ws5-premerge-check.sh`. CLI: `python -m bench {gate,verify,overhead,gpu,index}`.
+baseline: `ws-5`는 현재 main **v127** 기준 (clean; APK `0.4.127-cp1-gui-baseline-v127`). host 테스트: `cd /Users/naen/Documents/alr-ws5 && uvx pytest tests/ -q` (pytest 미설치 → `uvx`). 단일 진입점: `scripts/run-host-tests.sh`; pre-merge 게이트: `scripts/ws5-premerge-check.sh`. CLI: `python -m bench {gate,verify,overhead,gpu,index}`.
