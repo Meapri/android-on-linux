@@ -389,6 +389,18 @@ void surface_commit(struct wl_client*, struct wl_resource* resource) {
                     s->mapped = true;
                     if (s->xdg_toplevel) {
                         zorder_raise(s);  // most-recently-mapped on top
+                        // P0-1: a new toplevel steals focus while the previous one is
+                        // still ALIVE (e.g. a GIMP dialog opening) -> send the old
+                        // surface wl_keyboard.leave first, or it keeps believing it
+                        // holds the keyboard (stuck modifiers / IME to the wrong
+                        // window). Destroy paths intentionally send no leave (gone).
+                        if (g_keyboard_entered && g_focus_surface &&
+                            g_focus_surface != s->surface) {
+                            for (auto* k : g_keyboards)
+                                wl_keyboard_send_leave(
+                                    k, wl_display_next_serial(comp->display()),
+                                    g_focus_surface);
+                        }
                         g_focus_surface = s->surface;
                         g_pointer_entered = false;
                         g_keyboard_entered = false;
@@ -418,6 +430,12 @@ void surface_commit(struct wl_client*, struct wl_resource* resource) {
         s->mapped = false;
         zorder_remove(s);
         if (g_focus_surface == s->surface) {
+            // P0-1: s is unmapped but still ALIVE -> release the keyboard from it.
+            if (g_keyboard_entered) {
+                for (auto* k : g_keyboards)
+                    wl_keyboard_send_leave(
+                        k, wl_display_next_serial(comp->display()), s->surface);
+            }
             g_focus_surface = nullptr;
             g_pointer_entered = false;
             g_keyboard_entered = false;
