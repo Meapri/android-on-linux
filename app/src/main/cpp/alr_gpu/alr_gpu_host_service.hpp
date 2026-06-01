@@ -353,6 +353,19 @@ private:
         std::vector<uint8_t> frame_bytes;   // accumulated op bytes for current frame
         uint32_t replied_seq = 0;           // last req_seq we have post_reply'd to
 
+        // PERSISTENT decode state across the whole session. A real GLES app (glmark2)
+        // creates its shaders/programs/VBOs/textures ONCE (frame 0) and only DRAWS in
+        // later frames, so the virtual->real GL name maps MUST survive between frames.
+        // A fresh HostState per frame would leave frame 1+ with no mapping for the
+        // program/buffers (glUseProgram(0) -> nothing renders -> glmark2 Score=0). The
+        // self-test/cube streams that re-create every frame still work — they just
+        // overwrite the maps (leaking the prior real objects until context teardown,
+        // negligible over their few frames). default_fbo maps the guest's framebuffer 0
+        // to THIS AHB-FBO (a guest that binds 0 to composite its final frame lands back
+        // on the AHB we present).
+        HostState st;
+        st.default_fbo = rt.fbo;
+
         for (;;) {
             // Drain all currently-available ring bytes into the frame accumulator.
             uint64_t avail = cons.available();
@@ -386,15 +399,10 @@ private:
                     avail = cons.available();
                 }
 
-                // Decode this frame into the AHB-FBO with a FRESH HostState so the
-                // guest's per-frame virtual IDs (vVS=1, vFS=2, vPROG=1, ... — constants
-                // from build_triangle_stream) resolve identically every frame.
+                // Decode this frame into the AHB-FBO using the PERSISTENT HostState (its
+                // virtual->real maps carry the objects the guest created in earlier
+                // frames — see the declaration above the loop).
                 glBindFramebuffer(GL_FRAMEBUFFER, rt.fbo);
-                HostState st;
-                // The guest's framebuffer 0 (its "default") must resolve to THIS AHB-FBO,
-                // not GL's window framebuffer — so a guest that renders to its own FBO then
-                // binds 0 to composite the final frame lands back on the AHB we present.
-                st.default_fbo = rt.fbo;
                 if (!frame_bytes.empty()) {
                     decode_batch(frame_bytes.data(), frame_bytes.size(), st);
                 }
