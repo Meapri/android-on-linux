@@ -482,6 +482,21 @@ void surface_commit(struct wl_client*, struct wl_resource* resource) {
                 g_focus_surface = nt->surface;
             }
         }
+        // P0-2: s is unmapped but still ALIVE -> release the pointer from it too, or
+        // GTK keeps hover/grab state and the next menu mis-behaves (won't reopen).
+        // The next drain re-resolves the pointer target (parent popup or toplevel).
+        if (g_input_target_surface == s->surface) {
+            if (g_pointer_entered) {
+                for (auto* p : g_pointers) {
+                    wl_pointer_send_leave(p, wl_display_next_serial(comp->display()),
+                                          s->surface);
+                    if (wl_resource_get_version(p) >= WL_POINTER_FRAME_SINCE_VERSION)
+                        wl_pointer_send_frame(p);
+                }
+            }
+            g_input_target_surface = nullptr;
+            g_pointer_entered = false;
+        }
         composite_dirty = true;
         ALR_WL_LOGI("surface unmapped (null buffer) key=%llu",
                     static_cast<unsigned long long>(s->key));
