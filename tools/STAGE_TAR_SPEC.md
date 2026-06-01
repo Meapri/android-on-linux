@@ -213,6 +213,7 @@ plugin) — use `keep_prefixes=` to force-keep extra data dirs.
 |---|---|---|---|---|
 | `netsurf-gtk` | full Depends | 9083 | ~195 MB | perl + Adwaita + ICU bloat |
 | `netsurf-gtk` | **`--minimal`** | **9** | **~7.1 MB** | netsurf bin + libcurl/libjpeg/libldap/liblber/libpthread; missing_soname=NONE, guard-clean, CONFORMANT (27× smaller) |
+| `qt6-wayland` | **`--minimal`** | 47 | ~72.7 MB | Qt6 libs + ICU (inherent); reachable=27, **qtwayland platform plugins survive** (libqwayland-egl/generic, leaf files); missing_soname=NONE, CONFORMANT |
 
 Build: `python -m tools.deb_closure --minimal --package netsurf-gtk --base <base.tar> --out /tmp/netsurf-stage.tar`.
 
