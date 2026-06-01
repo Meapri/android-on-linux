@@ -17,7 +17,20 @@
  *   36   _Atomic uint32_t         req_seq      (WE bump when we flush a sync request)
  *   40   _Atomic uint32_t         closed       (1 = producer gone / teardown)
  *   44   _Atomic uint32_t         pad2
- *   ---  total 48 bytes; the data ring follows immediately after the header.
+ *   ---  the first 48 bytes are the original hot-path layout.
+ *   48   _Atomic uint32_t         identity_ready (host sets 1 after the strings are filled)
+ *   52   uint32_t                 identity_pad
+ *   56   char[64]                 renderer       (host glGetString(GL_RENDERER))
+ *   120  char[64]                 vendor         (host glGetString(GL_VENDOR))
+ *   184  char[64]                 gl_version     (host glGetString(GL_VERSION))
+ *   ---  total 248 bytes; the data ring follows immediately after the header.
+ *
+ * The identity block (off 48) is an APPEND-ONLY extension carrying the host's REAL
+ * glGetString values so the guest shim's glGetString(GL_RENDERER/VENDOR/VERSION)
+ * reports the actual host GPU (e.g. "Mali-G615") instead of a synthetic placeholder.
+ * The host writes it once at startup (ring_set_identity in alr_gpu_ring.hpp) AFTER a
+ * GL context is current; the guest only reads it when identity_ready != 0. An old host
+ * that never sets it leaves identity_ready == 0 and the guest keeps its fallback.
  *
  * Cursors are MONOTONIC absolute byte counts (never wrapped); the ring index is
  * cursor % ring_bytes. The producer logic below (append/free_bytes/flush_and_wait/
@@ -46,6 +59,9 @@
 #define ALR_RING_MAGIC   0x47524C41u  /* 'ALRG' little-endian — matches RingHeader::kMagic */
 #define ALR_RING_VERSION 1u           /* matches RingHeader::kVersion */
 
+/* Per-string identity capacity (incl. NUL). MUST equal alr_gpu_ring.hpp's kRingIdentMax. */
+#define ALR_RING_IDENT_MAX 64u
+
 typedef struct AlrRingHeader {
     uint32_t magic;
     uint32_t version;
@@ -57,11 +73,16 @@ typedef struct AlrRingHeader {
     _Atomic uint32_t req_seq;    /* producer bumps when it flushes a sync request */
     _Atomic uint32_t closed;     /* 1 = producer gone / teardown */
     _Atomic uint32_t pad2;
+    /* ---- identity block (off 48): host->guest glGetString passthrough ---- */
+    _Atomic uint32_t identity_ready;        /* host sets 1 AFTER the strings are filled */
+    uint32_t         identity_pad;          /* keeps the char arrays 8-byte aligned */
+    char             renderer[ALR_RING_IDENT_MAX];   /* host glGetString(GL_RENDERER) */
+    char             vendor[ALR_RING_IDENT_MAX];     /* host glGetString(GL_VENDOR) */
+    char             gl_version[ALR_RING_IDENT_MAX]; /* host glGetString(GL_VERSION) */
 } AlrRingHeader;
 
-/* Compile-time guard: the header MUST be 48 bytes with these field offsets, or
- * it does not interop with the C++ RingHeader. (Both sides are aarch64-LE.) */
-_Static_assert(sizeof(AlrRingHeader) == 48, "AlrRingHeader must be 48 bytes (matches RingHeader)");
+/* Compile-time guard: the hot-path fields keep their original offsets and the identity
+ * block sits where the C++ RingHeader puts it, or it does not interop. (aarch64-LE.) */
 _Static_assert(offsetof(AlrRingHeader, magic)     == 0,  "magic@0");
 _Static_assert(offsetof(AlrRingHeader, version)   == 4,  "version@4");
 _Static_assert(offsetof(AlrRingHeader, ring_bytes)== 8,  "ring_bytes@8");
@@ -71,6 +92,11 @@ _Static_assert(offsetof(AlrRingHeader, reply_seq) == 32, "reply_seq@32");
 _Static_assert(offsetof(AlrRingHeader, req_seq)   == 36, "req_seq@36");
 _Static_assert(offsetof(AlrRingHeader, closed)    == 40, "closed@40");
 _Static_assert(offsetof(AlrRingHeader, pad2)      == 44, "pad2@44");
+_Static_assert(offsetof(AlrRingHeader, identity_ready) == 48, "identity_ready@48");
+_Static_assert(offsetof(AlrRingHeader, renderer)   == 56, "renderer@56");
+_Static_assert(offsetof(AlrRingHeader, vendor)     == 56 + ALR_RING_IDENT_MAX, "vendor follows renderer");
+_Static_assert(offsetof(AlrRingHeader, gl_version) == 56 + 2u * ALR_RING_IDENT_MAX, "gl_version follows vendor");
+_Static_assert(sizeof(AlrRingHeader) == 56 + 3u * ALR_RING_IDENT_MAX, "AlrRingHeader must be 248 bytes (matches RingHeader)");
 
 /* The producer view over a mapped shared region (header + data ring). */
 typedef struct AlrRingProducer {
@@ -106,6 +132,32 @@ static inline int alr_ring_producer_attach(AlrRingProducer *p, void *region) {
 
 static inline int alr_ring_producer_valid(const AlrRingProducer *p) {
     return p && p->h && alr_ring_valid(p->h);
+}
+
+/* Identity field selector for alr_ring_identity(). */
+typedef enum AlrRingIdent {
+    ALR_IDENT_RENDERER = 0,
+    ALR_IDENT_VENDOR   = 1,
+    ALR_IDENT_VERSION  = 2,
+} AlrRingIdent;
+
+/* Return a pointer to the host-published identity string for `which`, or NULL if the
+ * host has not filled the identity block yet (identity_ready == 0) or that particular
+ * string is empty. The pointer aliases the shared mapping (read-only for the guest) and
+ * is stable for the ring's lifetime (the host writes it once at startup). Acquire-load
+ * of identity_ready pairs with the host's release store, so a non-NULL return implies
+ * the bytes are fully visible. Used by the guest shim's glGetString passthrough. */
+static inline const char *alr_ring_identity(const AlrRingProducer *p, AlrRingIdent which) {
+    const char *s;
+    if (!alr_ring_producer_valid(p)) return NULL;
+    if (atomic_load_explicit(&p->h->identity_ready, memory_order_acquire) == 0u) return NULL;
+    switch (which) {
+        case ALR_IDENT_RENDERER: s = p->h->renderer;   break;
+        case ALR_IDENT_VENDOR:   s = p->h->vendor;     break;
+        case ALR_IDENT_VERSION:  s = p->h->gl_version; break;
+        default: return NULL;
+    }
+    return (s[0] != '\0') ? s : NULL;
 }
 
 /* Free space available to the producer (ring_bytes - 1 - in-flight). One byte is

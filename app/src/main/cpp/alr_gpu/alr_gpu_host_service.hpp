@@ -277,13 +277,20 @@ private:
             eglMakeCurrent(dpy, surf, surf, ctx);
         }
 
-        // Capture renderer identity / software-ness once, now that a context is current.
+        // Capture renderer identity / software-ness once, now that a context is current,
+        // and PUBLISH the real glGetString values into the ring header's identity block so
+        // the guest shim's glGetString(GL_RENDERER/VENDOR/VERSION) reports the actual host
+        // GPU (e.g. "Mali-G615") rather than a synthetic placeholder. region_ is the
+        // consumer view of the SAME shared mapping the guest reads, so this is visible to
+        // the guest after the release store in ring_set_identity (guest acquires identity_ready).
         {
-            std::string vendor, rr;
+            std::string vendor, rr, ver;
             if (const auto* v = reinterpret_cast<const char*>(glGetString(GL_VENDOR))) vendor = v;
             if (const auto* g = reinterpret_cast<const char*>(glGetString(GL_RENDERER))) rr = g;
+            if (const auto* w = reinterpret_cast<const char*>(glGetString(GL_VERSION))) ver = w;
             renderer_ = rr;
             software_.store(renderer_software_local(vendor, rr), std::memory_order_release);
+            ring_set_identity(region_, rr.c_str(), vendor.c_str(), ver.c_str());
         }
 
         // 2) AHB-backed render target (allocate + import + FBO), and verify complete.
