@@ -104,7 +104,14 @@ enum AlrOp {
     ALR_OP_GEN_RENDERBUFFER = 93,        /* u32 vrb_id */
     ALR_OP_BIND_RENDERBUFFER = 94,       /* u32 target, u32 vrb_id */
     ALR_OP_RENDERBUFFER_STORAGE = 95,    /* u32 target, u32 internalformat, i32 w, i32 h */
-    ALR_OP_FRAMEBUFFER_RENDERBUFFER = 96 /* u32 target, u32 attachment, u32 rbtarget, u32 vrb_id */
+    ALR_OP_FRAMEBUFFER_RENDERBUFFER = 96,/* u32 target, u32 attachment, u32 rbtarget, u32 vrb_id */
+    /* GLES3: vertex array objects + instanced draws (vva 0 = default VAO) */
+    ALR_OP_GEN_VERTEX_ARRAY = 100,       /* u32 vva_id */
+    ALR_OP_BIND_VERTEX_ARRAY = 101,      /* u32 vva_id (0 -> default) */
+    ALR_OP_DRAW_ARRAYS_INSTANCED = 102,  /* u32 mode, i32 first, i32 count, i32 instancecount */
+    ALR_OP_DRAW_ELEMENTS_INSTANCED = 103,/* u32 mode, i32 count, u32 type, u32 offset, i32 instancecount */
+    ALR_OP_VERTEX_ATTRIB_DIVISOR = 104,      /* u32 index, u32 divisor */
+    ALR_OP_VERTEX_ATTRIB_DIVISOR_NAMED = 105 /* u32 vprog, blob(name), u32 divisor */
 };
 
 /* ---------------------------------------------------------------------------

@@ -31,6 +31,12 @@ GPU_ACCEL_MIN_RATIO = 0.70
 _SCORE = re.compile(r"(?:glmark2\s+)?Score:\s*(\d+)", re.IGNORECASE)
 # glmark2 OpenGL Information block, e.g. `    GL_RENDERER:  Mali-G615 ...`
 # Some harnesses emit `GL_RENDERER = Mali-G615 ...`. Accept `:` or `=`.
+# The alr-gles-cube guest binary instead prints the renderer QUOTED, on a line
+# like:  alr-gles-cube: EGL 1.4, GL_RENDERER="Mali-G615 ...", GL_VERSION="...".
+# Match the quoted form first (so we capture only what's inside the quotes and
+# don't swallow the trailing `, GL_VERSION=...`), then fall back to the bare
+# `:`/`=` glmark2 form (rest of line).
+_RENDERER_QUOTED = re.compile(r"GL_RENDERER\s*[:=]\s*\"([^\"]*)\"", re.IGNORECASE)
 _RENDERER = re.compile(r"GL_RENDERER\s*[:=]\s*(.+)", re.IGNORECASE)
 
 
@@ -46,12 +52,36 @@ def parse_glmark2_score(text: str) -> int | None:
     return int(matches[-1])
 
 
-def parse_glmark2_renderer(text: str) -> str | None:
-    """Return the `GL_RENDERER` value (to end of line, stripped), or None."""
+def parse_gl_renderer(text: str) -> str | None:
+    """Return the GL_RENDERER value (unquoted, stripped), or None.
+
+    Handles three on-the-wire forms seen in captured logcat:
+      * glmark2 OpenGL info:  ``GL_RENDERER:   Mali-G615 (...)``
+      * alt harness:          ``GL_RENDERER = Mali-G715``
+      * alr-gles-cube guest:  ``... GL_RENDERER="Mali-G615 ...", GL_VERSION=...``
+
+    The quoted alr-gles-cube form is matched first so only the text inside the
+    quotes is returned (not the trailing ``, GL_VERSION=...``). Empty quotes
+    ("") yield None. If multiple lines match, the first occurrence wins.
+    """
+    mq = _RENDERER_QUOTED.search(text)
+    if mq is not None:
+        value = mq.group(1).strip()
+        return value or None
     m = _RENDERER.search(text)
     if m is None:
         return None
-    return m.group(1).strip()
+    # Bare form runs to end of line; trim a trailing quote if one slipped in.
+    return m.group(1).strip().strip('"').strip() or None
+
+
+def parse_glmark2_renderer(text: str) -> str | None:
+    """Return the `GL_RENDERER` value (unquoted, stripped), or None.
+
+    Backwards-compatible alias for :func:`parse_gl_renderer`, which also
+    understands the quoted alr-gles-cube renderer line.
+    """
+    return parse_gl_renderer(text)
 
 
 @dataclass(frozen=True)
@@ -136,3 +166,61 @@ def compute_gpu_ratio(
         software_renderer=software,
         passes_target=passes,
     )
+
+
+def parse_gpu_from_report(text: str) -> dict | None:
+    """Pull a GPU score + renderer out of a captured logcat / report blob.
+
+    Returns ``{"score": int|None, "renderer": str|None}`` when *either* a
+    ``glmark2 Score:`` / bare ``Score:`` line OR a ``GL_RENDERER`` line (glmark2
+    or quoted alr-gles-cube form) is present, else ``None``. Either field may be
+    None individually if only one of the two markers appears in the blob.
+    """
+    score = parse_glmark2_score(text)
+    renderer = parse_gl_renderer(text)
+    if score is None and renderer is None:
+        return None
+    return {"score": score, "renderer": renderer}
+
+
+def gpu_result_from_reports(
+    alr_text: str,
+    mali_text: str,
+    *,
+    min_ratio: float = GPU_ACCEL_MIN_RATIO,
+    alr_label: str = "ALR",
+    mali_label: str = "Mali-direct",
+) -> GpuBenchResult:
+    """Build a :class:`GpuBenchResult` from two captured report blobs.
+
+    Parses each blob for a glmark2 / alr-gles-cube score + renderer, constructs
+    a :class:`GpuScore` for each side, and runs :func:`compute_gpu_ratio`. The
+    §0 GPU gate (ratio >= ``min_ratio`` AND a non-software renderer) is encoded
+    by ``compute_gpu_ratio`` and surfaced via ``result.passes_target``.
+
+    Raises :class:`ValueError` with a clear message if a score is missing from
+    either blob (a bench run with no score line cannot be rated).
+    """
+    alr_parsed = parse_gpu_from_report(alr_text)
+    mali_parsed = parse_gpu_from_report(mali_text)
+    if alr_parsed is None or alr_parsed["score"] is None:
+        raise ValueError(
+            f"{alr_label}: no glmark2 score found in the captured report "
+            "(expected a 'glmark2 Score: N' or 'Score: N' line)"
+        )
+    if mali_parsed is None or mali_parsed["score"] is None:
+        raise ValueError(
+            f"{mali_label}: no glmark2 score found in the captured report "
+            "(expected a 'glmark2 Score: N' or 'Score: N' line)"
+        )
+    alr = GpuScore(
+        label=alr_label,
+        score=alr_parsed["score"],
+        renderer=alr_parsed["renderer"] or "",
+    )
+    mali_direct = GpuScore(
+        label=mali_label,
+        score=mali_parsed["score"],
+        renderer=mali_parsed["renderer"] or "",
+    )
+    return compute_gpu_ratio(alr, mali_direct, min_ratio=min_ratio)

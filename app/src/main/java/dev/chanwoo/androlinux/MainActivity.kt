@@ -175,6 +175,31 @@ class MainActivity : Activity() {
                 android.util.Log.e("alr_loader", "toolkit-stage EXC: ${android.util.Log.getStackTraceString(e)}")
             }
         }.start()
+        // CP-2 GPU: stage the guest GPU shim(libEGL.so.1/libGLESv2.so.2 → /usr/lib/androlinux)
+        // + glmark2-es2-wayland. The shim emits GL into the GpuRingHook ring (WS-2 CP-0);
+        // the loader attaches it for the glmark2 guest → host Mali executor replays = real
+        // GPU accel. Guarded extract (WS-4) — shim is private-dir so it never downgrades base.
+        Thread {
+            try {
+                val gpushimTar = java.io.File("/data/local/tmp/gpushim-stage.tar")
+                val gpushimMarker = java.io.File(rootfsStatus.rootfsDir, ".gpushim-staged-${gpushimTar.length()}")
+                if (gpushimTar.isFile && !gpushimMarker.isFile) {
+                    val ovr = RootfsInstaller(this@MainActivity).extractOverlayTar(gpushimTar, rootfsStatus.rootfsDir)
+                    gpushimMarker.writeText("staged\n")
+                    android.util.Log.i("alr_loader", "gpushim-stage: overlay done (extracted=${ovr.extracted} skipped=${ovr.skipped.size})")
+                }
+                val glmarkTar = java.io.File("/data/local/tmp/glmark2-stage.tar")
+                val glmarkMarker = java.io.File(rootfsStatus.rootfsDir, ".glmark2-staged-${glmarkTar.length()}")
+                if (glmarkTar.isFile && !glmarkMarker.isFile) {
+                    val ovr = RootfsInstaller(this@MainActivity).extractOverlayTar(glmarkTar, rootfsStatus.rootfsDir)
+                    glmarkMarker.writeText("staged\n")
+                    android.util.Log.i("alr_loader", "glmark2-stage: overlay done (extracted=${ovr.extracted} skipped=${ovr.skipped.size})")
+                    if (ovr.skipped.isNotEmpty()) android.util.Log.w("alr_loader", "glmark2-stage: guard skipped:\n${ovr.skipped.joinToString("\n")}")
+                }
+            } catch (e: Throwable) {
+                android.util.Log.e("alr_loader", "gpu-stage EXC: ${android.util.Log.getStackTraceString(e)}")
+            }
+        }.start()
         val nativeCommandRunner = NativeCommandRunner(
             File(applicationInfo.nativeLibraryDir),
             File(cacheDir, "proot-tmp"),
@@ -1376,6 +1401,31 @@ class MainActivity : Activity() {
                                         "${gate(gtkDemoRendered)} (frames $framesBeforeGtkDemo→$framesAfterGtkDemo)",
                                 )
                                 view.append("\n\n--- ALR guest gtk3-widget-factory ---\n$gtkDemoClient")
+                            }
+
+                            // CP-2 GPU 풀가속: glmark2-es2-wayland를 ALR loader로 실행.
+                            // 게스트 libGLESv2 shim이 GL을 GpuRingHook ring으로 emit →
+                            // host GpuExecutorService가 Mali GLES2로 replay → glmark2 score =
+                            // 실제 Mali GPU 가속. loader가 config.program=glmark2 감지 →
+                            // alr_loader_attach_gpu_ring + LD_LIBRARY_PATH에 shim 우선.
+                            val framesBeforeGlmark2 = nativeWaylandCompositorStatus().intFieldAfter("alr wl frames=")
+                            val glmark2Client = nativeAlrNativeLoaderProbe(
+                                packageName,
+                                applicationInfo.nativeLibraryDir,
+                                filesDir.absolutePath,
+                                cacheDir.absolutePath,
+                                rootfsManifest.name,
+                                "/usr/bin/glmark2-es2-wayland\n--data-path\n/usr/share/glmark2\n--benchmark\nbuild",
+                            )
+                            val glmark2Status = nativeWaylandCompositorStatus()
+                            val framesAfterGlmark2 = glmark2Status.intFieldAfter("alr wl frames=")
+                            android.util.Log.i("alr_loader", "glmark2-result: frames $framesBeforeGlmark2->$framesAfterGlmark2")
+                            android.util.Log.i("alr_loader", "glmark2-client:\n$glmark2Client")
+                            runOnUiThread {
+                                view.append(
+                                    "\nALR GLMARK2 (GLES2 shim → ring → Mali executor): frames $framesBeforeGlmark2→$framesAfterGlmark2",
+                                )
+                                view.append("\n\n--- ALR guest glmark2-es2-wayland ---\n$glmark2Client")
                             }
 
                             // Phase 6 FINAL: run real GIMP 3.0 on the compositor.

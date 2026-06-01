@@ -1476,7 +1476,15 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         "/alr-xdg";
     std::vector<std::string> guest_env;
     guest_env.push_back("GLIBC_TUNABLES=glibc.pthread.rseq=0");
-    guest_env.push_back("LD_LIBRARY_PATH=" + config.rootfs_dir + "/lib/aarch64-linux-gnu:" +
+    // CP-2: a GLES guest (glmark2) dlopens the GPU shim libEGL.so.1/libGLESv2.so.2 from
+    // /usr/lib/androlinux — it MUST resolve ahead of any rootfs/vendor GL lib, so prepend
+    // that dir. Gated on glmark2 so the general path never risks shim-shadowing a real
+    // libEGL (non-GPU guests don't dlopen those sonames anyway).
+    const std::string ld_shim =
+        config.program.find("glmark2") != std::string::npos
+            ? (config.rootfs_dir + "/usr/lib/androlinux:") : std::string();
+    guest_env.push_back("LD_LIBRARY_PATH=" + ld_shim +
+                        config.rootfs_dir + "/lib/aarch64-linux-gnu:" +
                         config.rootfs_dir + "/lib:" + config.rootfs_dir + "/usr/lib/aarch64-linux-gnu:" +
                         config.rootfs_dir + "/usr/lib");
     guest_env.push_back("PATH=/usr/bin:/bin:/usr/sbin:/sbin");

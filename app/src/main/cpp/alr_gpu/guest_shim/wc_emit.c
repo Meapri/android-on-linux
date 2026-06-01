@@ -31,7 +31,7 @@ AlrShimState *alr_shim(void) {
     if (!inited) {
         memset(&g_state, 0, sizeof(g_state));
         g_state.next_shader = g_state.next_program = g_state.next_buffer = g_state.next_texture = 1;
-        g_state.next_framebuffer = g_state.next_renderbuffer = 1;
+        g_state.next_framebuffer = g_state.next_renderbuffer = g_state.next_vertex_array = 1;
         g_state.gl_error = GL_NO_ERROR;
         g_state.doorbell_fd = -1;
         g_state.ring_ok = 1;            /* pretend attached so emits are captured, not dropped */
@@ -247,6 +247,16 @@ int main(int argc, char **argv) {
     unsigned char sub_px[4 * 4 * 4];                                   /* 4x4 RGBA = 64 bytes */
     for (size_t i = 0; i < sizeof(sub_px); ++i) sub_px[i] = (unsigned char)(255 - i);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 1, 1, 4, 4, GL_RGBA, GL_UNSIGNED_BYTE, sub_px);
+
+    /* --- GLES3: vertex array object + instanced draws. --- */
+    GLuint vao;
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glDrawArraysInstanced(GL_TRIANGLES, 0, 36, 4);
+    glDrawElementsInstanced(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, (const void *)0, 4);
+    glVertexAttribDivisor(0, 1);        /* plain index path */
+    glVertexAttribDivisor(a_pos, 2);    /* by-name path (a_pos is a packed glGetAttribLocation handle) */
+    glBindVertexArray(0);                            /* back to default VAO */
 
     FILE *f = fopen(argv[1], "wb");
     if (!f) { fprintf(stderr, "wc_emit: cannot open %s\n", argv[1]); return 2; }

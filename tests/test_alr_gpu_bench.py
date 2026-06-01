@@ -8,8 +8,11 @@ from bench.gpu_bench import (
     GPU_ACCEL_MIN_RATIO,
     GpuScore,
     compute_gpu_ratio,
+    gpu_result_from_reports,
+    parse_gl_renderer,
     parse_glmark2_renderer,
     parse_glmark2_score,
+    parse_gpu_from_report,
 )
 
 
@@ -38,6 +41,15 @@ GLMARK2_NO_SCORE = """\
 =======================================================
 [build] use-vbo=false: FPS: 210 FrameTime: 4.762 ms
 """
+
+# The alr-gles-cube guest binary prints the renderer QUOTED on one line:
+#   alr-gles-cube: EGL X.Y, GL_RENDERER="<value>", GL_VERSION="<value>", frames=N
+# (see app/src/main/cpp/alr_gpu/guest_shim/alr-gles-cube.c).
+ALR_CUBE_SAMPLE = (
+    'alr-gles-cube: EGL 1.4, GL_RENDERER="Mali-G615 (Panfrost / mt6878)", '
+    'GL_VERSION="OpenGL ES 3.2", frames=120\n'
+    "alr-gles-cube: done (120 frames)\n"
+)
 
 
 def test_parse_score_from_realistic_sample():
@@ -140,3 +152,100 @@ def test_to_dict_and_json_roundtrip():
     assert d["mali_direct_score"] == 1000
     assert d["passes_target"] is True
     assert json.loads(result.to_json()) == d
+
+
+# --- alr-gles-cube quoted GL_RENDERER form -------------------------------------
+
+
+def test_parse_renderer_alr_cube_quoted_form():
+    # The quoted value must be returned WITHOUT quotes and WITHOUT the trailing
+    # `, GL_VERSION=...` text on the same line.
+    renderer = parse_gl_renderer(ALR_CUBE_SAMPLE)
+    assert renderer == "Mali-G615 (Panfrost / mt6878)"
+    assert '"' not in renderer
+    assert "GL_VERSION" not in renderer
+
+
+def test_parse_glmark2_renderer_alias_handles_cube_form():
+    # The legacy alias must also understand the quoted alr-gles-cube line.
+    assert parse_glmark2_renderer(ALR_CUBE_SAMPLE) == "Mali-G615 (Panfrost / mt6878)"
+
+
+def test_parse_gl_renderer_still_handles_glmark2_and_equals():
+    assert parse_gl_renderer(GLMARK2_SAMPLE) == "Mali-G615 (Panfrost / mt6878)"
+    assert parse_gl_renderer("GL_RENDERER = Mali-G715") == "Mali-G715"
+    assert parse_gl_renderer("no renderer line") is None
+
+
+def test_parse_gl_renderer_empty_quotes_returns_none():
+    assert parse_gl_renderer('alr-gles-cube: GL_RENDERER="", frames=1') is None
+
+
+# --- parse_gpu_from_report -----------------------------------------------------
+
+
+def test_parse_gpu_from_report_score_and_renderer():
+    blob = "preamble\nglmark2 Score: 1234\nGL_RENDERER: Mali-G615\n"
+    parsed = parse_gpu_from_report(blob)
+    assert parsed == {"score": 1234, "renderer": "Mali-G615"}
+
+
+def test_parse_gpu_from_report_glmark2_block():
+    parsed = parse_gpu_from_report(GLMARK2_SAMPLE)
+    assert parsed["score"] == 1234
+    assert "Mali-G615" in parsed["renderer"]
+
+
+def test_parse_gpu_from_report_cube_quoted():
+    # alr-gles-cube has no score line, only the quoted renderer.
+    parsed = parse_gpu_from_report(ALR_CUBE_SAMPLE)
+    assert parsed == {"score": None, "renderer": "Mali-G615 (Panfrost / mt6878)"}
+
+
+def test_parse_gpu_from_report_score_only():
+    parsed = parse_gpu_from_report("Score: 555\n")
+    assert parsed == {"score": 555, "renderer": None}
+
+
+def test_parse_gpu_from_report_neither_returns_none():
+    assert parse_gpu_from_report("nothing relevant here") is None
+
+
+# --- gpu_result_from_reports ---------------------------------------------------
+
+
+def test_gpu_result_from_reports_pass():
+    alr_text = "glmark2 Score: 800\nGL_RENDERER: Mali-G615 (Panfrost / mt6878)\n"
+    mali_text = "glmark2 Score: 1000\nGL_RENDERER: Mali-G615 (Panfrost / mt6878)\n"
+    result = gpu_result_from_reports(alr_text, mali_text)
+    assert result.ratio == pytest.approx(0.8)
+    assert result.ratio >= GPU_ACCEL_MIN_RATIO
+    assert result.software_renderer is False
+    assert result.passes_target is True
+    assert result.alr.renderer == "Mali-G615 (Panfrost / mt6878)"
+
+
+def test_gpu_result_from_reports_software_fails():
+    # ALR fell back to a software rasterizer: must FAIL even with a fine ratio.
+    alr_text = "glmark2 Score: 900\nGL_RENDERER: llvmpipe (LLVM 17)\n"
+    mali_text = "glmark2 Score: 1000\nGL_RENDERER: Mali-G615\n"
+    result = gpu_result_from_reports(alr_text, mali_text)
+    assert result.ratio == pytest.approx(0.9)
+    assert result.software_renderer is True
+    assert result.passes_target is False
+
+
+def test_gpu_result_from_reports_missing_alr_score_raises():
+    with pytest.raises(ValueError, match="ALR: no glmark2 score"):
+        gpu_result_from_reports(
+            "GL_RENDERER: Mali-G615 (no score)\n",
+            "glmark2 Score: 1000\nGL_RENDERER: Mali-G615\n",
+        )
+
+
+def test_gpu_result_from_reports_missing_mali_score_raises():
+    with pytest.raises(ValueError, match="Mali-direct: no glmark2 score"):
+        gpu_result_from_reports(
+            "glmark2 Score: 800\nGL_RENDERER: Mali-G615\n",
+            "GL_RENDERER: Mali-G615 (no score)\n",
+        )

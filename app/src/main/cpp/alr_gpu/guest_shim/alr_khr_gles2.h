@@ -195,6 +195,15 @@ void   glDrawArrays(GLenum mode, GLint first, GLsizei count);
 void   glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices);
 GLint  glGetAttribLocation(GLuint program, const GLchar *name);
 
+/* GLES3: vertex array objects + instanced draws */
+void   glGenVertexArrays(GLsizei n, GLuint *arrays);
+void   glBindVertexArray(GLuint array);
+void   glDeleteVertexArrays(GLsizei n, const GLuint *arrays);
+void   glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instancecount);
+void   glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void *indices,
+                               GLsizei instancecount);
+void   glVertexAttribDivisor(GLuint index, GLuint divisor);
+
 void   glCullFace(GLenum mode);
 void   glFrontFace(GLenum mode);
 void   glGetIntegerv(GLenum pname, GLint *params);

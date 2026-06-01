@@ -49,6 +49,7 @@ static void shim_init_once(void) {
     g_state.next_texture = 1;
     g_state.next_framebuffer  = 1;
     g_state.next_renderbuffer = 1;
+    g_state.next_vertex_array = 1;
     g_state.gl_error     = GL_NO_ERROR;
     g_state.egl_error    = EGL_SUCCESS;
     g_state.doorbell_fd  = -1;

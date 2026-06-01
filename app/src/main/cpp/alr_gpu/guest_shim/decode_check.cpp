@@ -48,6 +48,15 @@ struct TexSub { GLint xoff, yoff, w, h; GLenum fmt, type; };
 static std::vector<BufSub> buf_subs;
 static std::vector<GLenum> mipmaps;
 static std::vector<TexSub> tex_subs;
+struct DrawArrInst { GLenum mode; GLsizei count, inst; };
+struct DrawElemInst { GLenum mode; GLsizei count; GLenum type; GLsizei inst; };
+static std::vector<GLuint> va_binds;     // real VAO id per glBindVertexArray (0 = default)
+static std::vector<DrawArrInst> draw_arr_inst;
+static std::vector<DrawElemInst> draw_elem_inst;
+struct VadPlain { GLuint index; GLuint divisor; };
+struct VadNamed { std::string name; GLuint divisor; };
+static std::vector<VadPlain> vad_plain;
+static std::vector<VadNamed> vad_named;
 static std::map<GLint, std::string> uniform_loc_name;  // glGetUniformLocation -> name
 static std::map<GLint, std::string> attrib_loc_name;   // glGetAttribLocation  -> name
 static std::map<std::string, std::vector<float>> mat_by_name;   // glUniformMatrix4fv
@@ -174,6 +183,19 @@ void glBufferSubData(GLenum t, GLintptr off, GLsizeiptr sz, const void *) {
 void glGenerateMipmap(GLenum t) { rec::mipmaps.push_back(t); }
 void glTexSubImage2D(GLenum, GLint, GLint xo, GLint yo, GLsizei w, GLsizei h, GLenum f, GLenum ty,
                      const void *) { rec::tex_subs.push_back({xo, yo, w, h, f, ty}); }
+void glGenVertexArrays(GLsizei n, GLuint *a) { for (GLsizei i = 0; i < n; ++i) a[i] = rec::next_obj++; }
+void glBindVertexArray(GLuint va) { rec::va_binds.push_back(va); }
+void glDrawArraysInstanced(GLenum m, GLint, GLsizei c, GLsizei inst) {
+    rec::draw_arr_inst.push_back({m, c, inst});
+}
+void glDrawElementsInstanced(GLenum m, GLsizei c, GLenum t, const void *, GLsizei inst) {
+    rec::draw_elem_inst.push_back({m, c, t, inst});
+}
+void glVertexAttribDivisor(GLuint index, GLuint divisor) {
+    auto it = rec::attrib_loc_name.find(static_cast<GLint>(index));
+    if (it != rec::attrib_loc_name.end()) rec::vad_named.push_back({it->second, divisor});
+    else rec::vad_plain.push_back({index, divisor});
+}
 }  // extern "C"
 
 // GL tokens the assertions compare against (not all in the minimal stub header).
@@ -211,7 +233,7 @@ int main(int argc, char **argv) {
 
     // --- the stream decoded into exactly the cube + mesh GL calls. ---
     check(ok && st.ok, "decode_batch returned true (well-formed, no bad/unknown opcode)");
-    check(st.decoded == 61, "decoded op count == 61 (34 cube + 4 uniform-var + 10 mesh + 8 fbo + 5 completeness)");
+    check(st.decoded == 68, "decoded op count == 68 (+2 vertex-attrib-divisor)");
     check(st.shaders.size() == 2, "2 shaders mapped");
     check(st.programs.size() == 1, "1 program mapped");
     check(st.buffers.size() == 2, "2 buffers mapped (vbo + ebo)");
@@ -325,6 +347,27 @@ int main(int argc, char **argv) {
                  rec::tex_subs[0].w == 4 && rec::tex_subs[0].h == 4 &&
                  rec::tex_subs[0].fmt == kGL_RGBA && rec::tex_subs[0].type == kGL_UNSIGNED_BYTE;
     check(ts_ok, "glTexSubImage2D 4x4 at (1,1) RGBA/UNSIGNED_BYTE (64-byte sub-upload)");
+
+    // GLES3: VAO + instanced draws
+    check(st.vertex_arrays.size() == 1, "1 vertex array (VAO) mapped");
+    bool vab_ok = rec::va_binds.size() == 2;
+    if (vab_ok) {
+        bool nz = (rec::va_binds[0] != 0) || (rec::va_binds[1] != 0);
+        bool z = (rec::va_binds[0] == 0) || (rec::va_binds[1] == 0);
+        vab_ok = nz && z;  // bind the VAO, then back to default (0)
+    }
+    check(vab_ok, "glBindVertexArray: real VAO then default(0)");
+    check(rec::draw_arr_inst.size() == 1 && rec::draw_arr_inst[0].mode == kGL_TRIANGLES &&
+              rec::draw_arr_inst[0].count == 36 && rec::draw_arr_inst[0].inst == 4,
+          "glDrawArraysInstanced(GL_TRIANGLES, 36, 4 instances)");
+    check(rec::draw_elem_inst.size() == 1 && rec::draw_elem_inst[0].mode == kGL_TRIANGLES &&
+              rec::draw_elem_inst[0].count == 6 && rec::draw_elem_inst[0].type == kGL_UNSIGNED_SHORT &&
+              rec::draw_elem_inst[0].inst == 4,
+          "glDrawElementsInstanced(GL_TRIANGLES, 6, UNSIGNED_SHORT, 4 instances)");
+    check(rec::vad_plain.size() == 1 && rec::vad_plain[0].index == 0 && rec::vad_plain[0].divisor == 1,
+          "glVertexAttribDivisor plain index 0 -> divisor 1");
+    check(rec::vad_named.size() == 1 && rec::vad_named[0].name == "position" && rec::vad_named[0].divisor == 2,
+          "glVertexAttribDivisor BY NAME (position) -> divisor 2");
 
     std::printf("\nALR GPU WIRE-FORMAT CHECK: %s\n", g_fail ? "FAIL" : "PASS");
     return g_fail;

@@ -7,6 +7,7 @@ Pure host test, no device required.
 from bench.display_verify import (
     DEVICE_EXACT,
     DisplayExpectation,
+    parse_display_marker,
     parse_wl_output_line,
     verify_display,
     verify_from_report,
@@ -16,6 +17,10 @@ from bench.display_verify import (
 SAMPLE_WL_OUTPUT = (
     "client bound: wl_output v2 (1200x1920 px, 70x111 mm, scale=2, dpi=440)"
 )
+
+# Real WS-3/integration device marker (v126 evidence):
+#   docs/evidence/2026-06-01-v126-harfbuzz-fix-display-90hz.md
+SAMPLE_DISPLAY_MARKER = "display: 1920x1200 @ 90000mHz density=213"
 
 
 def test_device_exact_expectation():
@@ -82,6 +87,52 @@ def test_verify_from_report_resolution_only():
     # no refresh marker in the log → unverified, so resolution alone decides
     assert v.passed is True
     assert v.dpi == 440.0
+
+
+def test_parse_display_marker_real_line():
+    parsed = parse_display_marker(SAMPLE_DISPLAY_MARKER)
+    assert parsed is not None
+    assert parsed["width_px"] == 1920
+    assert parsed["height_px"] == 1200
+    assert parsed["refresh_mhz"] == 90000
+    assert parsed["density"] == 213
+
+
+def test_parse_display_marker_no_density():
+    parsed = parse_display_marker("display: 1920x1200 @ 90000mHz")
+    assert parsed is not None
+    assert parsed["width_px"] == 1920
+    assert parsed["height_px"] == 1200
+    assert parsed["refresh_mhz"] == 90000
+    assert parsed["density"] is None
+
+
+def test_parse_display_marker_absent():
+    assert parse_display_marker("no display marker here") is None
+
+
+def test_verify_from_report_display_marker_refresh_verified():
+    # The display: marker carries refresh, so refresh is VERIFIED here.
+    report = (
+        "some preamble\n"
+        f"{SAMPLE_DISPLAY_MARKER}\n"
+        "some trailer\n"
+    )
+    v = verify_from_report(report)
+    assert v is not None
+    assert v.resolution_ok is True  # 1920x1200 == device-exact 1200x1920 (rotation-agnostic)
+    assert v.refresh_ok is True
+    assert v.refresh_verified is True
+    assert v.passed is True
+
+
+def test_verify_from_report_prefers_display_marker_over_wl_output():
+    # When BOTH markers are present, the display: marker wins → refresh verified.
+    report = f"{SAMPLE_WL_OUTPUT}\n{SAMPLE_DISPLAY_MARKER}\n"
+    v = verify_from_report(report)
+    assert v is not None
+    assert v.refresh_verified is True
+    assert v.passed is True
 
 
 def test_verify_from_report_absent():

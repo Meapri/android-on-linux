@@ -95,3 +95,47 @@ gcfg.frame_sink = [](AHardwareBuffer* ahb, int w, int h, uint64_t serial) {
    assert it's Mali (not swiftshader/llvmpipe) — `gpu_ring_frames_presented()` exposes liveness.
 4. **First light target:** `glmark2 -b build:use-vbo=true` (mat4-only uniforms, no FBO) is the
    simplest scene fully covered by the wire ops; bring that up before the render-to-texture scenes.
+
+## (a) glmark2 launch wiring (integration session → MainActivity)
+
+WS-2's GPU side is ready; the only missing piece is a MainActivity entry that launches glmark2
+through the loader (like the existing GIMP/foot launch). It needs nothing GPU-specific — the
+loader auto-attaches the ring when `config.program` contains `glmark2` (WS-1, runtime_report.cpp).
+So the launch just calls the native loader with `program` = the rootfs path to the staged binary,
+e.g. `/usr/bin/glmark2-es2-wayland` (WS-4 installs `glmark2-stage.tar`). Suggested args for a
+headless score run: `glmark2-es2-wayland -b build:use-vbo=true --off-screen` (or default scenes).
+On-screen needs WS-3's present (see note 2 above). `gpu_ring_frames_presented()` exposes liveness.
+
+## GLES3 (WS-2 §10-(c), this round)
+
+The executor now requests a **GLES3 context** (EGL_CONTEXT_CLIENT_VERSION 3, fallback to 2 — Mali-
+G615 is GLES3.2); GLES2 op streams are unaffected (superset). Added GLES3 wire ops: VAOs
+(`glGen/BindVertexArray`, virtual ids, vao 0 = default) + instanced draws
+(`glDrawArrays/ElementsInstanced`). Harness PASS (40 assertions). **DEVICE-REQ for the integration
+session:** confirm the existing GPU probes (`ALR GPU LIVE INTEGRATION: PASS`, `gpu-screen-cube`)
+still pass on the GLES3 context, alongside CP-2 glmark2. `glVertexAttribDivisor` (per-instance
+attribs) is now also landed; deferred (next): UBOs, GLES3 texture formats.
+
+## VK-M1 JNI wiring (drop-in for the integration session — unblocks the VK-M1 device drain)
+
+VK-M1 (`alr_gpu/alr_gpu_vk.hpp::run_vk_ahb_render_probe`) is compile-verified but has no JNI entry
+yet (WS-2 deferred it to avoid colliding with the live CP-2 `runtime_report.cpp`/`MainActivity`
+edits). To get VK-M1 into the SAME device drain as CP-2, add these ~3 lines when wiring CP-2:
+
+`runtime_report.cpp` (near the other `nativeAlrGpu*` JNI, + `#include "alr_gpu/alr_gpu_vk.hpp"`):
+```cpp
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeAlrGpuVkProbe(JNIEnv* env, jobject) {
+    const auto report = alr::gpu::run_vk_ahb_render_probe();
+    __android_log_print(ANDROID_LOG_INFO, "alr_loader", "gpu-vk:\n%s", report.c_str());
+    return env->NewStringUTF(report.c_str());
+}
+```
+`MainActivity.kt`: `external fun nativeAlrGpuVkProbe(): String` + call it in the probe sequence
+(log the result; grep `ALR VK AHB RENDER:` and `software renderer=`).
+
+Expected device result: `ALR VK AHB RENDER: PASS`, `renderer=Mali-G615…`, `software renderer=false`,
+center pixel ~`0,255,0,255`. This is the FIRST off-device-written Vulkan path — if it FAILs, the
+`alr vk error=` line pinpoints the stage (ahb-properties / import-memory / bind-image-memory are the
+likely first-iteration suspects; the memory-type pick + format mapping are the usual Mali-AHB gotchas).
+WS-2 will iterate from that error line. (`alr_gpu_vk.hpp` is the only file involved — pure addition.)
