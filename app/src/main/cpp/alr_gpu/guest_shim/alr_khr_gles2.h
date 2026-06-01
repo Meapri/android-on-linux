@@ -119,6 +119,19 @@ typedef ssize_t          GLsizeiptr;
 #define GL_STATIC_DRAW                    0x88E4
 #define GL_DYNAMIC_DRAW                   0x88E8
 
+/* framebuffer / renderbuffer objects */
+#define GL_FRAMEBUFFER                    0x8D40
+#define GL_RENDERBUFFER                   0x8D41
+#define GL_COLOR_ATTACHMENT0              0x8CE0
+#define GL_DEPTH_ATTACHMENT               0x8D00
+#define GL_STENCIL_ATTACHMENT             0x8D20
+#define GL_FRAMEBUFFER_COMPLETE           0x8CD5
+#define GL_DEPTH_COMPONENT16              0x81A5
+#define GL_RGBA4                          0x8056
+#define GL_RGB565                         0x8D62
+#define GL_RGB5_A1                        0x8057
+#define GL_STENCIL_INDEX8                 0x8D48
+
 #define GL_FRAGMENT_SHADER                0x8B30
 #define GL_VERTEX_SHADER                  0x8B31
 #define GL_COMPILE_STATUS                 0x8B81
@@ -202,6 +215,17 @@ void   glUniform3iv(GLint location, GLsizei count, const GLint *value);
 void   glUniform4iv(GLint location, GLsizei count, const GLint *value);
 void   glUniformMatrix2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);
 void   glUniformMatrix3fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);
+
+void   glGenFramebuffers(GLsizei n, GLuint *framebuffers);
+void   glBindFramebuffer(GLenum target, GLuint framebuffer);
+void   glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level);
+void   glGenRenderbuffers(GLsizei n, GLuint *renderbuffers);
+void   glBindRenderbuffer(GLenum target, GLuint renderbuffer);
+void   glRenderbufferStorage(GLenum target, GLenum internalformat, GLsizei width, GLsizei height);
+void   glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer);
+GLenum glCheckFramebufferStatus(GLenum target);
+void   glDeleteFramebuffers(GLsizei n, const GLuint *framebuffers);
+void   glDeleteRenderbuffers(GLsizei n, const GLuint *renderbuffers);
 
 GLenum glGetError(void);
 const GLubyte *glGetString(GLenum name);

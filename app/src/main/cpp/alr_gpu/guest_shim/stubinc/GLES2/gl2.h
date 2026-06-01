@@ -88,6 +88,13 @@ void   glTexParameteri(GLenum, GLenum, GLint);
 void   glTexImage2D(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *);
 void   glPixelStorei(GLenum, GLint);
 void   glDepthFunc(GLenum);
+void   glGenFramebuffers(GLsizei, GLuint *);
+void   glBindFramebuffer(GLenum, GLuint);
+void   glFramebufferTexture2D(GLenum, GLenum, GLenum, GLuint, GLint);
+void   glGenRenderbuffers(GLsizei, GLuint *);
+void   glBindRenderbuffer(GLenum, GLuint);
+void   glRenderbufferStorage(GLenum, GLenum, GLsizei, GLsizei);
+void   glFramebufferRenderbuffer(GLenum, GLenum, GLenum, GLuint);
 
 #ifdef __cplusplus
 }

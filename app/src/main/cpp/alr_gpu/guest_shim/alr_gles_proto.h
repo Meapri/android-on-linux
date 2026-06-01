@@ -93,7 +93,15 @@ enum AlrOp {
     ALR_OP_ENABLE_VAA_NAMED = 80,            /* u32 vprog, blob(name) */
     ALR_OP_VERTEX_ATTRIB_POINTER_NAMED = 81, /* u32 vprog, blob(name), i32 size, u32 type, u8 norm, i32 stride, u32 offset */
     /* indexed draw (meshes) */
-    ALR_OP_DRAW_ELEMENTS = 82        /* u32 mode, i32 count, u32 type, u32 offset (into bound ELEMENT_ARRAY_BUFFER) */
+    ALR_OP_DRAW_ELEMENTS = 82,       /* u32 mode, i32 count, u32 type, u32 offset (into bound ELEMENT_ARRAY_BUFFER) */
+    /* framebuffer / renderbuffer objects (render-to-texture). Virtual ids; vfb 0 = default. */
+    ALR_OP_GEN_FRAMEBUFFER = 90,         /* u32 vfb_id */
+    ALR_OP_BIND_FRAMEBUFFER = 91,        /* u32 target, u32 vfb_id (0 -> default) */
+    ALR_OP_FRAMEBUFFER_TEXTURE2D = 92,   /* u32 target, u32 attachment, u32 textarget, u32 vtex_id, i32 level */
+    ALR_OP_GEN_RENDERBUFFER = 93,        /* u32 vrb_id */
+    ALR_OP_BIND_RENDERBUFFER = 94,       /* u32 target, u32 vrb_id */
+    ALR_OP_RENDERBUFFER_STORAGE = 95,    /* u32 target, u32 internalformat, i32 w, i32 h */
+    ALR_OP_FRAMEBUFFER_RENDERBUFFER = 96 /* u32 target, u32 attachment, u32 rbtarget, u32 vrb_id */
 };
 
 /* ---------------------------------------------------------------------------

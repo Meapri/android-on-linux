@@ -690,6 +690,97 @@ void glDeleteProgram(GLuint program){ alr_shim_program_reset((uint32_t)program);
 void glDeleteBuffers(GLsizei n, const GLuint *buffers)   { (void)n; (void)buffers; }
 void glDeleteTextures(GLsizei n, const GLuint *textures) { (void)n; (void)textures; }
 
+/* ---- framebuffer / renderbuffer objects (render-to-texture). Virtual ids via new
+ * counters (gen returns immediately, no round-trip); the host maps virtual->real. A
+ * framebuffer id of 0 stays 0 on the wire — the host maps it to its default (AHB)
+ * target. glCheckFramebufferStatus is optimistic (no round-trip): returns COMPLETE. ---- */
+static void build_gen_framebuffer(AlrEncoder *e, void *p) {
+    alr_enc_u8(e, ALR_OP_GEN_FRAMEBUFFER); alr_enc_u32(e, ((struct VidArgs*)p)->vid);
+}
+void glGenFramebuffers(GLsizei n, GLuint *framebuffers) {
+    if (n <= 0 || !framebuffers) return;
+    AlrShimState *s = alr_shim();
+    for (GLsizei i = 0; i < n; ++i) {
+        uint32_t vid = alloc_id(&s->next_framebuffer);
+        struct VidArgs a = { vid };
+        alr_shim_emit(build_gen_framebuffer, &a);
+        framebuffers[i] = (GLuint)vid;
+    }
+}
+struct BindFbArgs { uint32_t target, vid; };
+static void build_bind_framebuffer(AlrEncoder *e, void *p) {
+    struct BindFbArgs *a = (struct BindFbArgs*)p;
+    alr_enc_u8(e, ALR_OP_BIND_FRAMEBUFFER); alr_enc_u32(e, a->target); alr_enc_u32(e, a->vid);
+}
+void glBindFramebuffer(GLenum target, GLuint framebuffer) {
+    struct BindFbArgs a = { (uint32_t)target, (uint32_t)framebuffer };  /* 0 stays 0 (host default) */
+    alr_shim_emit(build_bind_framebuffer, &a);
+}
+struct FbTex2DArgs { uint32_t target, attachment, textarget, vtex; int32_t level; };
+static void build_framebuffer_texture2d(AlrEncoder *e, void *p) {
+    struct FbTex2DArgs *a = (struct FbTex2DArgs*)p;
+    alr_enc_u8(e, ALR_OP_FRAMEBUFFER_TEXTURE2D);
+    alr_enc_u32(e, a->target); alr_enc_u32(e, a->attachment);
+    alr_enc_u32(e, a->textarget); alr_enc_u32(e, a->vtex); alr_enc_i32(e, a->level);
+}
+void glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget,
+                            GLuint texture, GLint level) {
+    struct FbTex2DArgs a = { (uint32_t)target, (uint32_t)attachment, (uint32_t)textarget,
+                             (uint32_t)texture, (int32_t)level };
+    alr_shim_emit(build_framebuffer_texture2d, &a);
+}
+static void build_gen_renderbuffer(AlrEncoder *e, void *p) {
+    alr_enc_u8(e, ALR_OP_GEN_RENDERBUFFER); alr_enc_u32(e, ((struct VidArgs*)p)->vid);
+}
+void glGenRenderbuffers(GLsizei n, GLuint *renderbuffers) {
+    if (n <= 0 || !renderbuffers) return;
+    AlrShimState *s = alr_shim();
+    for (GLsizei i = 0; i < n; ++i) {
+        uint32_t vid = alloc_id(&s->next_renderbuffer);
+        struct VidArgs a = { vid };
+        alr_shim_emit(build_gen_renderbuffer, &a);
+        renderbuffers[i] = (GLuint)vid;
+    }
+}
+struct BindRbArgs { uint32_t target, vid; };
+static void build_bind_renderbuffer(AlrEncoder *e, void *p) {
+    struct BindRbArgs *a = (struct BindRbArgs*)p;
+    alr_enc_u8(e, ALR_OP_BIND_RENDERBUFFER); alr_enc_u32(e, a->target); alr_enc_u32(e, a->vid);
+}
+void glBindRenderbuffer(GLenum target, GLuint renderbuffer) {
+    struct BindRbArgs a = { (uint32_t)target, (uint32_t)renderbuffer };
+    alr_shim_emit(build_bind_renderbuffer, &a);
+}
+struct RbStorageArgs { uint32_t target, ifmt; int32_t w, h; };
+static void build_renderbuffer_storage(AlrEncoder *e, void *p) {
+    struct RbStorageArgs *a = (struct RbStorageArgs*)p;
+    alr_enc_u8(e, ALR_OP_RENDERBUFFER_STORAGE);
+    alr_enc_u32(e, a->target); alr_enc_u32(e, a->ifmt); alr_enc_i32(e, a->w); alr_enc_i32(e, a->h);
+}
+void glRenderbufferStorage(GLenum target, GLenum internalformat, GLsizei width, GLsizei height) {
+    struct RbStorageArgs a = { (uint32_t)target, (uint32_t)internalformat, (int32_t)width, (int32_t)height };
+    alr_shim_emit(build_renderbuffer_storage, &a);
+}
+struct FbRbArgs { uint32_t target, attachment, rbtarget, vrb; };
+static void build_framebuffer_renderbuffer(AlrEncoder *e, void *p) {
+    struct FbRbArgs *a = (struct FbRbArgs*)p;
+    alr_enc_u8(e, ALR_OP_FRAMEBUFFER_RENDERBUFFER);
+    alr_enc_u32(e, a->target); alr_enc_u32(e, a->attachment);
+    alr_enc_u32(e, a->rbtarget); alr_enc_u32(e, a->vrb);
+}
+void glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget,
+                               GLuint renderbuffer) {
+    struct FbRbArgs a = { (uint32_t)target, (uint32_t)attachment, (uint32_t)renderbuffertarget,
+                          (uint32_t)renderbuffer };
+    alr_shim_emit(build_framebuffer_renderbuffer, &a);
+}
+/* Optimistic (no round-trip): assume the host FBO is complete. A real incomplete FBO
+ * surfaces host-side (logged) as a failed draw, matching the glGetError/compile-status
+ * optimism elsewhere. GL_FRAMEBUFFER_COMPLETE = 0x8CD5. */
+GLenum glCheckFramebufferStatus(GLenum target) { (void)target; return 0x8CD5; }
+void glDeleteFramebuffers(GLsizei n, const GLuint *framebuffers)   { (void)n; (void)framebuffers; }
+void glDeleteRenderbuffers(GLsizei n, const GLuint *renderbuffers) { (void)n; (void)renderbuffers; }
+
 /* ---- optimistic queries (no round-trip) ---- */
 GLenum glGetError(void) {
     AlrShimState *s = alr_shim();

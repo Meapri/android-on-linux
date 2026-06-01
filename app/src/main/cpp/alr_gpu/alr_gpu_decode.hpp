@@ -90,6 +90,15 @@ enum Op : uint8_t {
     OP_VERTEX_ATTRIB_POINTER_NAMED = 81,// u32 vprog, blob(name), i32 size, u32 type, u8 norm, i32 stride, u32 offset
     // --- indexed draw (meshes) ---
     OP_DRAW_ELEMENTS = 82,      // u32 mode, i32 count, u32 type, u32 offset (into bound ELEMENT_ARRAY_BUFFER)
+    // --- framebuffer / renderbuffer objects (render-to-texture scenes). Virtual FBO/RBO
+    //     ids like buffers/textures; vfb 0 = the executor's default (AHB) target. ---
+    OP_GEN_FRAMEBUFFER = 90,         // u32 vfb_id
+    OP_BIND_FRAMEBUFFER = 91,        // u32 target, u32 vfb_id (0 -> default_fbo)
+    OP_FRAMEBUFFER_TEXTURE2D = 92,   // u32 target, u32 attachment, u32 textarget, u32 vtex_id, i32 level
+    OP_GEN_RENDERBUFFER = 93,        // u32 vrb_id
+    OP_BIND_RENDERBUFFER = 94,       // u32 target, u32 vrb_id
+    OP_RENDERBUFFER_STORAGE = 95,    // u32 target, u32 internalformat, i32 w, i32 h
+    OP_FRAMEBUFFER_RENDERBUFFER = 96,// u32 target, u32 attachment, u32 rbtarget, u32 vrb_id
 };
 
 // Host-side decode state: the virtual->real GL name translation tables. The guest
@@ -99,13 +108,34 @@ struct HostState {
     std::map<uint32_t, GLuint> programs;  // vprog_id   -> real program
     std::map<uint32_t, GLuint> buffers;   // vbuf_id    -> real buffer
     std::map<uint32_t, GLuint> textures;  // vtex_id    -> real texture
+    std::map<uint32_t, GLuint> framebuffers;   // vfb_id -> real FBO
+    std::map<uint32_t, GLuint> renderbuffers;  // vrb_id -> real RBO
     GLuint cur_program = 0;               // real program currently in use (for uniforms)
+    // The guest's framebuffer 0 is its "default" target. In this marshalling executor
+    // the default target is the AHB-backed FBO, NOT GL's window framebuffer 0 — so the
+    // caller (GpuExecutorService) sets default_fbo = the AHB FBO before decode, and a
+    // guest glBindFramebuffer(.,0) binds that. 0 here (the header default) means GL's
+    // real default framebuffer, which is correct for the host-only probes / harness.
+    GLuint default_fbo = 0;
     bool ok = true;                       // decode integrity (bad opcode / short read)
     int decoded = 0;                      // ops successfully dispatched
 
     GLuint real_prog(uint32_t v) const {
         auto it = programs.find(v);
         return it == programs.end() ? 0 : it->second;
+    }
+    GLuint real_tex(uint32_t v) const {
+        auto it = textures.find(v);
+        return it == textures.end() ? 0 : it->second;
+    }
+    GLuint real_fb(uint32_t v) const {            // vfb 0 -> the executor's default target
+        if (v == 0) return default_fbo;
+        auto it = framebuffers.find(v);
+        return it == framebuffers.end() ? 0 : it->second;
+    }
+    GLuint real_rb(uint32_t v) const {
+        auto it = renderbuffers.find(v);
+        return it == renderbuffers.end() ? 0 : it->second;
     }
 };
 
@@ -433,6 +463,44 @@ inline bool decode_batch(const uint8_t* data, size_t len, HostState& st) {
                 // + OP_BUFFER_DATA on that target); offset is a byte offset into it.
                 glDrawElements(mode, count, type,
                                reinterpret_cast<const void*>(static_cast<uintptr_t>(offset)));
+                ++st.decoded; break;
+            }
+            case OP_GEN_FRAMEBUFFER: {
+                uint32_t vid; if (!r.u32(vid)) { st.ok = false; break; }
+                GLuint f = 0; glGenFramebuffers(1, &f); st.framebuffers[vid] = f; ++st.decoded; break;
+            }
+            case OP_BIND_FRAMEBUFFER: {
+                uint32_t target, vid;
+                if (!r.u32(target) || !r.u32(vid)) { st.ok = false; break; }
+                glBindFramebuffer(target, st.real_fb(vid));  // vid 0 -> default (AHB) target
+                ++st.decoded; break;
+            }
+            case OP_FRAMEBUFFER_TEXTURE2D: {
+                uint32_t target, attachment, textarget, vtex; int32_t level;
+                if (!r.u32(target) || !r.u32(attachment) || !r.u32(textarget) ||
+                    !r.u32(vtex) || !r.i32(level)) { st.ok = false; break; }
+                glFramebufferTexture2D(target, attachment, textarget, st.real_tex(vtex), level);
+                ++st.decoded; break;
+            }
+            case OP_GEN_RENDERBUFFER: {
+                uint32_t vid; if (!r.u32(vid)) { st.ok = false; break; }
+                GLuint rb = 0; glGenRenderbuffers(1, &rb); st.renderbuffers[vid] = rb; ++st.decoded; break;
+            }
+            case OP_BIND_RENDERBUFFER: {
+                uint32_t target, vid;
+                if (!r.u32(target) || !r.u32(vid)) { st.ok = false; break; }
+                glBindRenderbuffer(target, st.real_rb(vid)); ++st.decoded; break;
+            }
+            case OP_RENDERBUFFER_STORAGE: {
+                uint32_t target, ifmt; int32_t w, h;
+                if (!r.u32(target) || !r.u32(ifmt) || !r.i32(w) || !r.i32(h)) { st.ok = false; break; }
+                glRenderbufferStorage(target, ifmt, w, h); ++st.decoded; break;
+            }
+            case OP_FRAMEBUFFER_RENDERBUFFER: {
+                uint32_t target, attachment, rbtarget, vrb;
+                if (!r.u32(target) || !r.u32(attachment) || !r.u32(rbtarget) ||
+                    !r.u32(vrb)) { st.ok = false; break; }
+                glFramebufferRenderbuffer(target, attachment, rbtarget, st.real_rb(vrb));
                 ++st.decoded; break;
             }
             default:

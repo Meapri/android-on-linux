@@ -64,6 +64,8 @@ typedef struct AlrShimState {
     uint32_t        next_program;
     uint32_t        next_buffer;
     uint32_t        next_texture;
+    uint32_t        next_framebuffer;
+    uint32_t        next_renderbuffer;
 
     /* per-program uniform-name tables (the glGetUniformLocation backing store) */
     AlrProgramUniforms progs[ALR_SHIM_MAX_PROGRAMS];

@@ -31,6 +31,7 @@ AlrShimState *alr_shim(void) {
     if (!inited) {
         memset(&g_state, 0, sizeof(g_state));
         g_state.next_shader = g_state.next_program = g_state.next_buffer = g_state.next_texture = 1;
+        g_state.next_framebuffer = g_state.next_renderbuffer = 1;
         g_state.gl_error = GL_NO_ERROR;
         g_state.doorbell_fd = -1;
         g_state.ring_ok = 1;            /* pretend attached so emits are captured, not dropped */
@@ -223,6 +224,19 @@ int main(int argc, char **argv) {
     glEnableVertexAttribArray(a_nrm);
     glVertexAttribPointer(a_nrm, 3, GL_FLOAT, GL_FALSE, 24, (const void *)12);
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, (const void *)0);
+
+    /* --- FBO/renderbuffer (render-to-texture): attach the existing texture as color +
+     *     a depth renderbuffer, then bind framebuffer 0 to return to the default target. --- */
+    GLuint fbo, rbo;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    glGenRenderbuffers(1, &rbo);
+    glBindRenderbuffer(GL_RENDERBUFFER, rbo);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, 64, 64);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rbo);
+    (void)glCheckFramebufferStatus(GL_FRAMEBUFFER);  /* optimistic, no wire op */
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);            /* back to default (host: AHB FBO) */
 
     FILE *f = fopen(argv[1], "wb");
     if (!f) { fprintf(stderr, "wc_emit: cannot open %s\n", argv[1]); return 2; }
