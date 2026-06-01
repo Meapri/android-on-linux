@@ -280,3 +280,31 @@ python -m tools.deb_closure --minimal --package netsurf-gtk --base <base.tar> \
 **TODO:** `sdl2-stage.tar` / `qt6-stage.tar` were first built from Debian bookworm —
 rebuild them from noble with the command above (`--package libsdl2-2.0-0` /
 `qt6-wayland`) before device-staging.
+
+---
+
+## 10. GUI overlay = C.UTF-8 locale + SVG pixbuf loader (device-evidence-driven)
+
+Device drain v127 (`docs/evidence/2026-06-01-batch-drain-cp2-progress-svg-locale-cp3baseline.md`)
+pinned the REAL gtk3-widget-factory abort: **`gdk-pixbuf` cannot dlopen
+`loaders/libpixbufloader_svg.so` → Gtk:ERROR loading image-missing.svg → abort(6)**.
+The C.UTF-8 `setlocale` failure is a non-fatal Gtk-WARNING (secondary).
+
+Host investigation: the current base tar DOES ship the svg loader + `librsvg-2.so.2`
++ a complete `loaders.cache` (svg stanza, correct underscore path) with NO missing
+DT_NEEDED dep (`elf_needed` confirms). So the device rootfs is **stale** — the svg
+loader was added to the base by a prior "ALR gtk3-fix" but the rootfs version marker
+didn't bump, so RootfsInstaller skipped re-extraction. An OVERLAY (own `.staged`
+marker) lands regardless → delivers the svg loader directly.
+
+`tools/build_gui_overlay.py` assembles the single wired **`xkb-gegl-stage.tar`** slot:
+- C.utf8 (+ C.UTF-8 symlink) from **Ubuntu noble** libc-bin (matching glibc 2.39), and
+- `libpixbufloader_svg.so` + `librsvg-2.so.2` + `loaders.cache`, lifted from the base
+  tar (their core deps libcairo/libxml2/… predate the svg fix → already on device).
+
+Result: **~6.16 MB**, stage_tar_spec CONFORMANT, overlay_guard 0 BLOCK (1 WARN: the
+librsvg re-ship is byte-identical to base — harmless). Build:
+`python -m tools.build_gui_overlay --out /tmp/xkb-gegl-stage.tar --base <base.tar>`.
+
+DEVICE-REQ: push this `xkb-gegl-stage.tar` → cold-start gtk3-widget-factory →
+no SIGABRT (svg loader opens, icons render) + setlocale C.UTF-8 OK (noble C.utf8).
