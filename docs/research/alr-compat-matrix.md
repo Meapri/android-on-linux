@@ -31,7 +31,7 @@
 
 → 이 집합이 **회귀 게이트**(`bench/regression_gate.py`)의 기준선. mediation 불변식: `pcgate=1 interpose=1 traps=0 rewrites=0`.
 
-**성능 (device, v127 WS-1 M2):** 일반 CLI native-exec wall-clock(`exec_ms`) ~**18-20ms**(`dynhello`/`env`/`id`/`dash`/`alr-png-test`) = native 프로세스 수준. path-mediation은 **traps=0 device-verified**(in-process translate, supervisor 라운드트립 0). path-xlate cold 4334.7 ns/op(≈19.9 syscall units, raw getppid 218.3 ns/op 대비; 256-entry cache로 분할 상환). 단, native/PRoot baseline 미측정 → **% 오버헤드 비율은 아직 미산출(PENDING)**. 상세: `docs/evidence/2026-06-01-ws5-cpu-overhead-quantified.md`(WS-1 원본: `2026-06-01-ws1-m2-cpu-mediation-overhead.md`).
+**성능 (device, v127 WS-1 M2):** 일반 CLI native-exec wall-clock(`exec_ms`) ~**18-20ms**(`dynhello`/`env`/`id`/`dash`/`alr-png-test`) = native 프로세스 수준. path-mediation은 **traps=0 device-verified**(in-process translate, supervisor 라운드트립 0). path-xlate cold 4334.7 ns/op(≈19.9 syscall units, raw getppid 218.3 ns/op 대비; 256-entry cache로 분할 상환). **native baseline 랜딩**(microbench static arm64, adb shell 직접): compute **4.06 ns/op**, syscall(getpid) **200.36 ns/op**. 근사 raw-syscall 오버헤드 **~9%**(native getpid 200.36 vs ALR getppid 218.34 — **apples-to-apples 아님**: getpid/getppid·wrapper/raw). **정밀 same-binary ratio는 여전히 PENDING**(WS-1이 동일 microbench를 ALR guest로 실행해야; ALR compute 측정 없음; PRoot는 SELinux로 보류). 상세: `docs/evidence/2026-06-01-ws5-cpu-overhead-quantified.md`(원본 `2026-06-01-ws1-m2-cpu-mediation-overhead.md`, baseline `2026-06-01-batch-drain-cp2-progress-svg-locale-cp3baseline.md`).
 
 ## GUI 툴킷 (L2/L3)
 | 앱 | 툴킷 | 결과 | exec_ms | Evidence | 비고 |
