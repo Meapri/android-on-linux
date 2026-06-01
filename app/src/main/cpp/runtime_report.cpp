@@ -2467,6 +2467,31 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         }
     }
 
+    // WS-1 / CP-3: same-binary CPU-overhead capture. When the guest is the microbench
+    // (its single output line is "MICROBENCH mode=<m> iters=<n> ns=<t> ns_per_op=<x>"),
+    // lift that line verbatim into logcat under the alr_loader tag with an
+    // `alr-microbench:` prefix. This is the ALR-path counterpart to the device-native
+    // baseline (`adb shell <microbench> compute|syscall`), so the integration drain can
+    // diff the two ns_per_op values into a true apples-to-apples CP-3 overhead %
+    // (`python -m bench overhead`), replacing the earlier ALR-getppid≈218ns proxy. The
+    // guest's own MICROBENCH line is what's emitted, so the ALR and native sides parse
+    // identically. The `exec_ms` (loader fork→reap wall-clock) is appended for context.
+    // This block runs for ANY guest whose stdout carries a MICROBENCH line (the static
+    // musl/glibc microbench), independent of the GIMP-gated is_dyn logging above.
+    {
+        const std::size_t mb = guest_stdout.find("MICROBENCH ");
+        if (mb != std::string::npos) {
+            std::size_t eol = guest_stdout.find('\n', mb);
+            if (eol == std::string::npos) eol = guest_stdout.size();
+            const std::string mb_line = guest_stdout.substr(mb, eol - mb);
+            const long long exec_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t_exec_start).count();
+            __android_log_print(ANDROID_LOG_INFO, "alr_loader",
+                                "alr-microbench: guest=%s exit=%d sig=%d exec_ms=%lld %s",
+                                guest_rel.c_str(), code, sig, exec_ms, mb_line.c_str());
+        }
+    }
+
     // WS-1 ↔ WS-2 (CP-0): guest reaped → stop the Mali executor + free ring/doorbell.
     if (gpu_ring_attached) alr::gpu::alr_loader_detach_gpu_ring();
     return out.str();
