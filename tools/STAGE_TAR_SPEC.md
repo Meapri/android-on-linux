@@ -352,3 +352,31 @@ rootfs). **WS-1 (L1 loader/mediation):** either ensure the path-mediation covers
 glibc's locale `open()`/`openat()` for `/usr/lib/locale`, or set `LOCPATH=/usr/lib/locale`
 in `guest_env` (§5-D). Non-fatal (Gtk-WARNING; falls back to C) — the gtk3 abort was
 the svg `.so` (§10.1), already fixed.
+
+---
+
+## 13. §10(c) apt/dpkg — reconstructed dpkg admin DB
+
+The base ships apt/dpkg binaries + Ubuntu-noble apt sources, but
+`var/lib/dpkg/status` is **empty** (built by file-extraction, not `dpkg -i`) → apt
+thinks NOTHING is installed → `apt install X` would re-fetch the entire dep tree.
+
+`tools/build_dpkg_db.py` reconstructs the dpkg admin DB from the base's files via the
+Ubuntu noble **Contents** index (file→package) + the Packages index (control fields):
+- Maps base files → packages, with **SONAME mapping** (the base flattens
+  `libgtk-3.so.0` while Contents lists `libgtk-3.so.0.2409.x`) and **merged-usr
+  aliasing** (`/lib`↔`/usr/lib`) — without these, glib/gtk/gcc/stdc++ go unmapped.
+- Emits `./var/lib/dpkg/status` (one `Status: install ok installed` stanza per pkg,
+  carrying Version/Depends/…) + `./var/lib/dpkg/info/<pkg>.list`.
+
+Built `/tmp/dpkg-db-stage.tar` (~700 KB): **194 packages** reconstructed incl.
+`libc6`, `libgtk-3-0t64`, `libglib2.0-0t64` (Ubuntu noble t64 names), `libgcc-s1`,
+`libstdc++6`, gimp, gdk-pixbuf, pango, cairo. CONFORMANT. Wired into the MainActivity
+toolkit-stage loop (guarded extractOverlayTar). Build:
+`python -m tools.build_dpkg_db --base <base.tar> --out /tmp/dpkg-db-stage.tar`.
+
+DEVICE-REQ: push dpkg-db-stage.tar → `dpkg -l` shows ~194 pkgs; `apt-get update`
+(noble); `apt-get install --no-install-recommends <leaf>` fetches only NEW deps (not
+the base stack). NOTE: actually RUNNING dpkg (maintainer-script fork/exec) under the
+ALR loader is the L1/device gate (PRoot clone3 KNOWN_FAIL; native-loader path
+untested) — the reconstructed DB is the rootfs-side prerequisite.
