@@ -380,3 +380,33 @@ DEVICE-REQ: push dpkg-db-stage.tar → `dpkg -l` shows ~194 pkgs; `apt-get updat
 the base stack). NOTE: actually RUNNING dpkg (maintainer-script fork/exec) under the
 ALR loader is the L1/device gate (PRoot clone3 KNOWN_FAIL; native-loader path
 untested) — the reconstructed DB is the rootfs-side prerequisite.
+
+---
+
+## 14. §3 M4 — Xwayland (X11 apps), rootful
+
+X11-only apps via Xwayland. The ALR compositor has **no XWM** → only **rootful**
+Xwayland works (one root X window as a single xdg_toplevel; an in-rootfs WM, or a
+single fullscreen app, arranges windows inside it). Rootless needs the compositor to
+be the X window manager — not viable.
+
+Overlay built from noble (`--minimal`, device-pending):
+- `/tmp/x11-stage.tar` (~11.8 MB) = `Xwayland` + `xterm` + `x11-apps` (xeyes/oclock/…)
+  + the 23 deps the noble base lacks. missing_soname=0, CONFORMANT. Wired into the
+  MainActivity toolkit-stage loop (`x11`).  (`/tmp/xwayland-stage.tar` = server only, 6.2MB.)
+- Build: `python -m tools.deb_closure --minimal --package xwayland --package x11-apps
+  --package xterm --base <base.tar> --out /tmp/x11-stage.tar --mirror
+  http://ports.ubuntu.com/ubuntu-ports --suite noble --component main --component universe`.
+
+Launch recipe (rootful; xkb-data already in base):
+```sh
+export XDG_RUNTIME_DIR=/tmp/xdg; mkdir -p $XDG_RUNTIME_DIR; chmod 700 $XDG_RUNTIME_DIR
+mkdir -p /tmp/.X11-unix; chmod 1777 /tmp/.X11-unix      # FILESYSTEM socket (NOT abstract — untrusted_app)
+Xwayland :0 -ac -shm -retro -noreset &                  # -shm=pixman→wl_shm present; -ac=no X auth
+export DISPLAY=:0 LIBGL_ALWAYS_SOFTWARE=1
+xeyes    # or: xterm
+```
+DEVICE-REQ: push x11-stage.tar → launch Xwayland rootful on the compositor →
+`xeyes`/`xterm` renders (wl_shm). NOTE: the rootful launch wiring (Xwayland as a
+Wayland client + the X filesystem socket under the rootfs-mediated /tmp) is L2/L3 +
+integration; this overlay is the WS-4 rootfs prerequisite.
