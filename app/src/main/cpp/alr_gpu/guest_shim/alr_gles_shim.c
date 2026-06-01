@@ -916,6 +916,212 @@ void glVertexAttribDivisor(GLuint index, GLuint divisor) {
 }
 
 /* ===========================================================================
+ * GLES3 core: uniform buffer objects (UBO), sampler objects, MRT / read-buffer /
+ * framebuffer invalidation. The host runs these on the GLES3 context the executor
+ * requests (Mali-G615 is ES3.2); a GLES2 fallback context never sees them because a
+ * GLES2 guest never calls them. ABI signatures are the standard GLES3 prototypes
+ * (alr_khr_gles2.h supplies all the scalar types, ABI-identical to <GLES2/gl2.h>;
+ * GLES3 entry-point prototypes aren't in that header, so they're declared here).
+ *
+ * Design fidelity — NO ROUND-TRIPS:
+ *   - UBO bindings carry the EXISTING virtual buffer id (glGenBuffers already returns
+ *     one); the host maps virtual->real, exactly like glBindBuffer.
+ *   - glGetUniformBlockIndex returns a CLIENT handle (a per-program name-table index,
+ *     reusing the uniform intern table); glUniformBlockBinding looks the block NAME
+ *     back up and emits it, and the host resolves the real block index BY NAME — no
+ *     guest round-trip, identical to the glGetUniformLocation/glUniform* scheme.
+ *   - sampler objects get their own client-side virtual ids (like VAOs).
+ * =========================================================================== */
+
+/* GLES3 prototypes (not in alr_khr_gles2.h, which is GLES2-only). Declared with the
+ * exact GLES3 ABI so a guest calling through the real prototype links cleanly. */
+void   glBindBufferBase(GLenum target, GLuint index, GLuint buffer);
+void   glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offset, GLsizeiptr size);
+GLuint glGetUniformBlockIndex(GLuint program, const GLchar *uniformBlockName);
+void   glUniformBlockBinding(GLuint program, GLuint uniformBlockIndex, GLuint uniformBlockBinding);
+void   glGenSamplers(GLsizei count, GLuint *samplers);
+void   glBindSampler(GLuint unit, GLuint sampler);
+void   glSamplerParameteri(GLuint sampler, GLenum pname, GLint param);
+void   glSamplerParameterf(GLuint sampler, GLenum pname, GLfloat param);
+void   glDeleteSamplers(GLsizei count, const GLuint *samplers);
+void   glDrawBuffers(GLsizei n, const GLenum *bufs);
+void   glReadBuffer(GLenum src);
+void   glInvalidateFramebuffer(GLenum target, GLsizei numAttachments, const GLenum *attachments);
+void   glInvalidateSubFramebuffer(GLenum target, GLsizei numAttachments, const GLenum *attachments,
+                                  GLint x, GLint y, GLsizei width, GLsizei height);
+void  *glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access);
+GLboolean glUnmapBuffer(GLenum target);
+void   glFlushMappedBufferRange(GLenum target, GLintptr offset, GLsizeiptr length);
+const GLubyte *glGetStringi(GLenum name, GLuint index);
+void   glGetIntegeri_v(GLenum target, GLuint index, GLint *data);
+
+/* ---- UBO binding (reuses the virtual buffer id from glGenBuffers) ---- */
+struct BindBufBaseArgs { uint32_t target, index, vid; };
+static void build_bind_buffer_base(AlrEncoder *e, void *p) {
+    struct BindBufBaseArgs *a = (struct BindBufBaseArgs*)p;
+    alr_enc_u8(e, ALR_OP_BIND_BUFFER_BASE);
+    alr_enc_u32(e, a->target); alr_enc_u32(e, a->index); alr_enc_u32(e, a->vid);
+}
+void glBindBufferBase(GLenum target, GLuint index, GLuint buffer) {
+    struct BindBufBaseArgs a = { (uint32_t)target, (uint32_t)index, (uint32_t)buffer };
+    alr_shim_emit(build_bind_buffer_base, &a);
+}
+struct BindBufRangeArgs { uint32_t target, index, vid, offset, size; };
+static void build_bind_buffer_range(AlrEncoder *e, void *p) {
+    struct BindBufRangeArgs *a = (struct BindBufRangeArgs*)p;
+    alr_enc_u8(e, ALR_OP_BIND_BUFFER_RANGE);
+    alr_enc_u32(e, a->target); alr_enc_u32(e, a->index); alr_enc_u32(e, a->vid);
+    alr_enc_u32(e, a->offset); alr_enc_u32(e, a->size);
+}
+void glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offset, GLsizeiptr size) {
+    struct BindBufRangeArgs a = { (uint32_t)target, (uint32_t)index, (uint32_t)buffer,
+                                  (uint32_t)offset, (uint32_t)(size > 0 ? size : 0) };
+    alr_shim_emit(build_bind_buffer_range, &a);
+}
+
+/* glGetUniformBlockIndex — by-NAME client handle (NO round-trip): intern the block name
+ * into the per-program uniform name table and return the packed (vprog<<16 | idx) handle,
+ * the SAME scheme as glGetUniformLocation. glUniformBlockBinding recovers the program +
+ * name and emits the NAME; the host resolves the real block index by name at decode time.
+ * GL_INVALID_INDEX (0xFFFFFFFF) is returned when the table is full / program is bad. */
+GLuint glGetUniformBlockIndex(GLuint program, const GLchar *uniformBlockName) {
+    if (!uniformBlockName) return 0xFFFFFFFFu;          /* GL_INVALID_INDEX */
+    int idx = alr_shim_uniform_intern((uint32_t)program, uniformBlockName);
+    if (idx < 0) return 0xFFFFFFFFu;
+    return (GLuint)ALR_UNIFORM_PACK((uint32_t)program, idx);
+}
+struct UboBindingArgs { uint32_t vprog; const char *name; uint32_t binding; };
+static void build_uniform_block_binding(AlrEncoder *e, void *p) {
+    struct UboBindingArgs *a = (struct UboBindingArgs*)p;
+    alr_enc_u8(e, ALR_OP_UNIFORM_BLOCK_BINDING);
+    alr_enc_u32(e, a->vprog);
+    alr_enc_str(e, a->name);            /* blob(block_name) — host resolves the real index */
+    alr_enc_u32(e, a->binding);
+}
+void glUniformBlockBinding(GLuint program, GLuint uniformBlockIndex, GLuint uniformBlockBinding) {
+    if (uniformBlockIndex == 0xFFFFFFFFu) return;        /* GL_INVALID_INDEX -> no-op */
+    /* uniformBlockIndex is the packed handle returned by glGetUniformBlockIndex. The
+     * vprog inside it is authoritative; the `program` arg must match (it always does for
+     * a correct caller). Recover the block name and emit it. */
+    uint32_t vprog = ALR_UNIFORM_VPROG(uniformBlockIndex);
+    const char *name = alr_shim_uniform_name(vprog, ALR_UNIFORM_IDX(uniformBlockIndex));
+    if (!name) return;                                   /* unknown handle -> no-op (defensive) */
+    (void)program;
+    struct UboBindingArgs a = { vprog, name, (uint32_t)uniformBlockBinding };
+    alr_shim_emit(build_uniform_block_binding, &a);
+}
+
+/* ---- sampler objects (own virtual-id counter, like VAOs; id 0 = "no sampler") ---- */
+static void build_gen_sampler(AlrEncoder *e, void *p) {
+    alr_enc_u8(e, ALR_OP_GEN_SAMPLER); alr_enc_u32(e, ((struct VidArgs*)p)->vid);
+}
+void glGenSamplers(GLsizei count, GLuint *samplers) {
+    if (count <= 0 || !samplers) return;
+    AlrShimState *s = alr_shim();
+    for (GLsizei i = 0; i < count; ++i) {
+        uint32_t vid = alloc_id(&s->next_sampler);
+        struct VidArgs a = { vid };
+        alr_shim_emit(build_gen_sampler, &a);
+        samplers[i] = (GLuint)vid;             /* virtual id, no round-trip */
+    }
+}
+struct BindSamplerArgs { uint32_t unit, vid; };
+static void build_bind_sampler(AlrEncoder *e, void *p) {
+    struct BindSamplerArgs *a = (struct BindSamplerArgs*)p;
+    alr_enc_u8(e, ALR_OP_BIND_SAMPLER); alr_enc_u32(e, a->unit); alr_enc_u32(e, a->vid);
+}
+void glBindSampler(GLuint unit, GLuint sampler) {
+    struct BindSamplerArgs a = { (uint32_t)unit, (uint32_t)sampler };  /* 0 stays 0 (no sampler) */
+    alr_shim_emit(build_bind_sampler, &a);
+}
+struct SamplerParamArgs { uint32_t vid, pname; int32_t param; };
+static void build_sampler_parameteri(AlrEncoder *e, void *p) {
+    struct SamplerParamArgs *a = (struct SamplerParamArgs*)p;
+    alr_enc_u8(e, ALR_OP_SAMPLER_PARAMETERI);
+    alr_enc_u32(e, a->vid); alr_enc_u32(e, a->pname); alr_enc_i32(e, a->param);
+}
+void glSamplerParameteri(GLuint sampler, GLenum pname, GLint param) {
+    struct SamplerParamArgs a = { (uint32_t)sampler, (uint32_t)pname, (int32_t)param };
+    alr_shim_emit(build_sampler_parameteri, &a);
+}
+void glSamplerParameterf(GLuint sampler, GLenum pname, GLfloat param) {
+    /* route to the integer op (sampler params are enums/ints; LOD bias is the only float
+     * and is rarely used — the integer path covers wrap/filter/compare). */
+    glSamplerParameteri(sampler, pname, (GLint)param);
+}
+void glDeleteSamplers(GLsizei count, const GLuint *samplers) { (void)count; (void)samplers; /* no opcode; advisory */ }
+
+/* ---- MRT draw-buffers + read-buffer + framebuffer invalidation ---- */
+struct DrawBuffersArgs { uint32_t n; const GLenum *bufs; };
+static void build_draw_buffers(AlrEncoder *e, void *p) {
+    struct DrawBuffersArgs *a = (struct DrawBuffersArgs*)p;
+    alr_enc_u8(e, ALR_OP_DRAW_BUFFERS);
+    alr_enc_u32(e, a->n);
+    for (uint32_t i = 0; i < a->n; ++i) alr_enc_u32(e, (uint32_t)a->bufs[i]);
+}
+void glDrawBuffers(GLsizei n, const GLenum *bufs) {
+    if (n < 0 || (n > 0 && !bufs)) return;
+    struct DrawBuffersArgs a = { (uint32_t)n, bufs };
+    alr_shim_emit(build_draw_buffers, &a);
+}
+struct ReadBufferArgs { uint32_t mode; };
+static void build_read_buffer(AlrEncoder *e, void *p) {
+    alr_enc_u8(e, ALR_OP_READ_BUFFER); alr_enc_u32(e, ((struct ReadBufferArgs*)p)->mode);
+}
+void glReadBuffer(GLenum src) {
+    struct ReadBufferArgs a = { (uint32_t)src }; alr_shim_emit(build_read_buffer, &a);
+}
+struct InvalidateFbArgs { uint32_t target, n; const GLenum *att; };
+static void build_invalidate_framebuffer(AlrEncoder *e, void *p) {
+    struct InvalidateFbArgs *a = (struct InvalidateFbArgs*)p;
+    alr_enc_u8(e, ALR_OP_INVALIDATE_FRAMEBUFFER);
+    alr_enc_u32(e, a->target);
+    alr_enc_u32(e, a->n);
+    for (uint32_t i = 0; i < a->n; ++i) alr_enc_u32(e, (uint32_t)a->att[i]);
+}
+void glInvalidateFramebuffer(GLenum target, GLsizei numAttachments, const GLenum *attachments) {
+    if (numAttachments < 0 || (numAttachments > 0 && !attachments)) return;
+    struct InvalidateFbArgs a = { (uint32_t)target, (uint32_t)numAttachments, attachments };
+    alr_shim_emit(build_invalidate_framebuffer, &a);
+}
+void glInvalidateSubFramebuffer(GLenum target, GLsizei numAttachments, const GLenum *attachments,
+                                GLint x, GLint y, GLsizei width, GLsizei height) {
+    /* The host invalidates the whole attachment (a discard hint; the region is advisory).
+     * Drop the rect and route to the full-attachment op so the hint still reaches the GPU. */
+    (void)x; (void)y; (void)width; (void)height;
+    glInvalidateFramebuffer(target, numAttachments, attachments);
+}
+
+/* ---- glMapBufferRange / glUnmapBuffer: an HONEST round-trip limit. Returning a real
+ *      mapped pointer would require a host round-trip (the design forbids that on the
+ *      hot path) AND a shared mapping of the GPU buffer the guest doesn't have. So we
+ *      return NULL (GL "map failed"), which makes a well-written ES3 app fall back to
+ *      glBufferSubData (already a real wire op) — same contract as the existing
+ *      glMapBufferOES NULL path. NOT a silent wrong-pixels case: the app sees the failure
+ *      and takes its fallback. ---- */
+void *glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) {
+    (void)target; (void)offset; (void)length; (void)access;
+    return (void*)0;                                     /* -> app uses glBufferSubData fallback */
+}
+GLboolean glUnmapBuffer(GLenum target) { (void)target; return GL_FALSE; }
+void glFlushMappedBufferRange(GLenum target, GLintptr offset, GLsizeiptr length) {
+    (void)target; (void)offset; (void)length;            /* no mapped region in this design */
+}
+
+/* ---- glGetStringi / glGetIntegeri_v: optimistic LOCAL responses (NO round-trip). The
+ *      indexed extension string is empty (the ES3 GL_EXTENSIONS-by-index query), matching
+ *      the non-indexed glGetString(GL_EXTENSIONS) empty answer; GL_NUM_EXTENSIONS reads 0
+ *      via glGetIntegerv, so an app that iterates 0..num-1 makes no glGetStringi call. ---- */
+const GLubyte *glGetStringi(GLenum name, GLuint index) {
+    (void)name; (void)index;
+    return (const GLubyte*)"";                           /* no indexed extension advertised */
+}
+void glGetIntegeri_v(GLenum target, GLuint index, GLint *data) {
+    (void)target; (void)index;
+    if (data) data[0] = 0;
+}
+
+/* ===========================================================================
  * GLES2 dispatch-surface completion. glmark2 builds a FULL gl* dispatch table via
  * dlsym; a name the shim doesn't export = a NULL slot that crashes if CALLED. These
  * define every remaining gl* glmark2 references with semantics that are CORRECT for

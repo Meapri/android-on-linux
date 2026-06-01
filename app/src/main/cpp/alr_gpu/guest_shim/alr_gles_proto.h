@@ -136,7 +136,24 @@ enum AlrOp {
     ALR_OP_STENCIL_MASK_SEPARATE = 125,  /* u32 face, u32 mask */
     ALR_OP_POLYGON_OFFSET = 126,         /* f32 factor, f32 units */
     ALR_OP_LINE_WIDTH = 127,             /* f32 width */
-    ALR_OP_SAMPLE_COVERAGE = 128         /* f32 value, u8 invert */
+    ALR_OP_SAMPLE_COVERAGE = 128,        /* f32 value, u8 invert */
+    /* --- GLES3 core: uniform buffer objects (UBO), sampler objects, MRT / read-buffer /
+     *     framebuffer invalidation. The host runs these on the GLES3 context
+     *     GpuExecutorService requests (Mali-G615 is ES3.2); a GLES2 fallback context
+     *     never sees them because a GLES2 guest never emits them. UBOs reuse the existing
+     *     virtual buffer ids (OP_GEN_BUFFER); sampler objects get their own virtual ids
+     *     (like VAOs). Uniform-BLOCK ops carry the block NAME as a blob — the host resolves
+     *     the real block index by name at decode time (no guest round-trip), exactly like
+     *     the uniform/attribute by-name scheme. --- */
+    ALR_OP_BIND_BUFFER_BASE = 130,       /* u32 target, u32 index, u32 vbuf_id */
+    ALR_OP_BIND_BUFFER_RANGE = 131,      /* u32 target, u32 index, u32 vbuf_id, u32 offset, u32 size */
+    ALR_OP_UNIFORM_BLOCK_BINDING = 132,  /* u32 vprog, blob(block_name), u32 binding */
+    ALR_OP_GEN_SAMPLER = 133,            /* u32 vsampler_id */
+    ALR_OP_BIND_SAMPLER = 134,           /* u32 unit, u32 vsampler_id (0 -> none) */
+    ALR_OP_SAMPLER_PARAMETERI = 135,     /* u32 vsampler_id, u32 pname, i32 param */
+    ALR_OP_DRAW_BUFFERS = 136,           /* u32 n, u32 bufs[n] (MRT draw-buffer enums) */
+    ALR_OP_READ_BUFFER = 137,            /* u32 mode */
+    ALR_OP_INVALIDATE_FRAMEBUFFER = 138  /* u32 target, u32 n, u32 attachments[n] */
 };
 
 /* ---------------------------------------------------------------------------

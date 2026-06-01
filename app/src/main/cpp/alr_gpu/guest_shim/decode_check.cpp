@@ -57,6 +57,23 @@ struct VadPlain { GLuint index; GLuint divisor; };
 struct VadNamed { std::string name; GLuint divisor; };
 static std::vector<VadPlain> vad_plain;
 static std::vector<VadNamed> vad_named;
+// GLES3 core: UBO binding, sampler objects, MRT / read-buffer / invalidate
+struct BufBaseRec { GLenum target; GLuint index; GLuint buffer; };
+struct BufRangeRec { GLenum target; GLuint index; GLuint buffer; GLintptr offset; GLsizeiptr size; };
+struct UboBindingRec { std::string name; GLuint binding; };
+struct SamplerParamRec { GLuint sampler; GLenum pname; GLint param; };
+struct BindSamplerRec { GLuint unit; GLuint sampler; };
+struct InvalidateRec { GLenum target; std::vector<GLenum> attachments; };
+static std::vector<BufBaseRec> buf_bases;            // glBindBufferBase
+static std::vector<BufRangeRec> buf_ranges;          // glBindBufferRange
+static std::vector<UboBindingRec> ubo_bindings;      // glUniformBlockBinding (by name)
+static std::vector<BindSamplerRec> bind_samplers;    // glBindSampler
+static std::vector<SamplerParamRec> sampler_params;  // glSamplerParameteri
+static std::vector<std::vector<GLenum>> draw_buffers_lists;  // glDrawBuffers
+static std::vector<GLenum> read_buffers;             // glReadBuffer
+static std::vector<InvalidateRec> invalidates;       // glInvalidateFramebuffer
+static std::map<GLuint, std::string> block_idx_name; // glGetUniformBlockIndex -> name
+static GLuint next_block_idx = 0;
 // per-fragment / raster state setters
 struct Blend2 { GLenum a, b; };
 struct Blend4 { GLenum a, b, c, d; };
@@ -257,6 +274,34 @@ void glStencilMaskSeparate(GLenum face, GLuint m) { rec::stencil_mask_seps.push_
 void glPolygonOffset(GLfloat factor, GLfloat units) { rec::polygon_offsets.push_back({factor, units}); }
 void glLineWidth(GLfloat w) { rec::line_widths.push_back(w); }
 void glSampleCoverage(GLclampf v, GLboolean inv) { rec::sample_coverages.push_back({v, inv}); }
+// GLES3 core: UBO binding, sampler objects, MRT / read-buffer / invalidate
+void glBindBufferBase(GLenum target, GLuint index, GLuint buffer) {
+    rec::buf_bases.push_back({target, index, buffer});
+}
+void glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offset, GLsizeiptr size) {
+    rec::buf_ranges.push_back({target, index, buffer, offset, size});
+}
+GLuint glGetUniformBlockIndex(GLuint, const GLchar *name) {
+    GLuint idx = rec::next_block_idx++;
+    rec::block_idx_name[idx] = name ? std::string(name) : std::string();
+    return idx;
+}
+void glUniformBlockBinding(GLuint, GLuint blockIndex, GLuint binding) {
+    auto it = rec::block_idx_name.find(blockIndex);
+    if (it != rec::block_idx_name.end()) rec::ubo_bindings.push_back({it->second, binding});
+}
+void glGenSamplers(GLsizei n, GLuint *s) { for (GLsizei i = 0; i < n; ++i) s[i] = rec::next_obj++; }
+void glBindSampler(GLuint unit, GLuint sampler) { rec::bind_samplers.push_back({unit, sampler}); }
+void glSamplerParameteri(GLuint sampler, GLenum pname, GLint param) {
+    rec::sampler_params.push_back({sampler, pname, param});
+}
+void glDrawBuffers(GLsizei n, const GLenum *bufs) {
+    rec::draw_buffers_lists.push_back(std::vector<GLenum>(bufs, bufs + (n > 0 ? n : 0)));
+}
+void glReadBuffer(GLenum src) { rec::read_buffers.push_back(src); }
+void glInvalidateFramebuffer(GLenum target, GLsizei n, const GLenum *att) {
+    rec::invalidates.push_back({target, std::vector<GLenum>(att, att + (n > 0 ? n : 0))});
+}
 }  // extern "C"
 
 // GL tokens the assertions compare against (not all in the minimal stub header).
@@ -305,11 +350,12 @@ int main(int argc, char **argv) {
 
     // --- the stream decoded into exactly the cube + mesh GL calls. ---
     check(ok && st.ok, "decode_batch returned true (well-formed, no bad/unknown opcode)");
-    check(st.decoded == 87, "decoded op count == 87 (+19 per-fragment/raster state setters)");
+    check(st.decoded == 99, "decoded op count == 99 (+12 GLES3 core: UBO/sampler/MRT)");
     check(st.shaders.size() == 2, "2 shaders mapped");
     check(st.programs.size() == 1, "1 program mapped");
-    check(st.buffers.size() == 2, "2 buffers mapped (vbo + ebo)");
+    check(st.buffers.size() == 3, "3 buffers mapped (vbo + ebo + ubo)");
     check(st.textures.size() == 1, "1 texture mapped");
+    check(st.samplers.size() == 1, "1 sampler object mapped (GLES3)");
 
     bool ba_ok = rec::bind_attribs.size() == 2;
     for (auto &b : rec::bind_attribs) {
@@ -440,6 +486,46 @@ int main(int argc, char **argv) {
           "glVertexAttribDivisor plain index 0 -> divisor 1");
     check(rec::vad_named.size() == 1 && rec::vad_named[0].name == "position" && rec::vad_named[0].divisor == 2,
           "glVertexAttribDivisor BY NAME (position) -> divisor 2");
+
+    // ---- GLES3 core: UBO binding, sampler objects, MRT / read-buffer / invalidate ----
+    static constexpr unsigned kGL_UNIFORM_BUFFER  = 0x8A11;
+    static constexpr unsigned kGL_COLOR_ATTACH0   = 0x8CE0;
+    static constexpr unsigned kGL_COLOR_ATTACH1   = 0x8CE1;
+    static constexpr unsigned kGL_DEPTH_ATTACH    = 0x8D00;
+    static constexpr unsigned kGL_FRAMEBUFFER     = 0x8D40;
+    static constexpr unsigned kGL_TEX_MIN_FILTER  = 0x2801;
+    static constexpr unsigned kGL_LINEAR          = 0x2601;
+    // glBindBufferBase(UNIFORM_BUFFER, 0, ubo): virtual ubo id resolved to a real buffer.
+    check(rec::buf_bases.size() == 1 && rec::buf_bases[0].target == kGL_UNIFORM_BUFFER &&
+              rec::buf_bases[0].index == 0 && rec::buf_bases[0].buffer != 0,
+          "glBindBufferBase(UNIFORM_BUFFER, 0) <- mapped UBO buffer");
+    check(rec::buf_ranges.size() == 1 && rec::buf_ranges[0].target == kGL_UNIFORM_BUFFER &&
+              rec::buf_ranges[0].index == 1 && rec::buf_ranges[0].buffer != 0 &&
+              rec::buf_ranges[0].offset == 0 && rec::buf_ranges[0].size == 16,
+          "glBindBufferRange(UNIFORM_BUFFER, 1, off0, size16) <- mapped UBO buffer");
+    // glUniformBlockBinding resolved BY NAME ("Matrices") -> binding 0.
+    check(rec::ubo_bindings.size() == 1 && rec::ubo_bindings[0].name == "Matrices" &&
+              rec::ubo_bindings[0].binding == 0,
+          "glUniformBlockBinding(\"Matrices\") -> binding 0 (resolved BY NAME, no round-trip)");
+    // sampler object: bound to unit 0 (resolved to a real id), MIN_FILTER=LINEAR.
+    check(rec::bind_samplers.size() == 1 && rec::bind_samplers[0].unit == 0 &&
+              rec::bind_samplers[0].sampler != 0,
+          "glBindSampler(unit 0) <- mapped sampler object");
+    check(rec::sampler_params.size() == 1 && rec::sampler_params[0].sampler != 0 &&
+              rec::sampler_params[0].pname == kGL_TEX_MIN_FILTER &&
+              (unsigned)rec::sampler_params[0].param == kGL_LINEAR,
+          "glSamplerParameteri(MIN_FILTER, LINEAR) <- mapped sampler object");
+    // MRT draw-buffers [COLOR_ATTACHMENT0, COLOR_ATTACHMENT1].
+    bool db_ok = rec::draw_buffers_lists.size() == 1 && rec::draw_buffers_lists[0].size() == 2 &&
+                 rec::draw_buffers_lists[0][0] == kGL_COLOR_ATTACH0 &&
+                 rec::draw_buffers_lists[0][1] == kGL_COLOR_ATTACH1;
+    check(db_ok, "glDrawBuffers([COLOR_ATTACHMENT0, COLOR_ATTACHMENT1])");
+    check(rec::read_buffers.size() == 1 && rec::read_buffers[0] == kGL_COLOR_ATTACH0,
+          "glReadBuffer(COLOR_ATTACHMENT0)");
+    bool inv_ok = rec::invalidates.size() == 1 && rec::invalidates[0].target == kGL_FRAMEBUFFER &&
+                  rec::invalidates[0].attachments.size() == 1 &&
+                  rec::invalidates[0].attachments[0] == kGL_DEPTH_ATTACH;
+    check(inv_ok, "glInvalidateFramebuffer(FRAMEBUFFER, [DEPTH_ATTACHMENT])");
 
     // ---- per-fragment / raster state setters (the new wire ops) ----
     check(rec::blend_funcs.size() == 1 && rec::blend_funcs[0].a == kGL_SRC_ALPHA &&
