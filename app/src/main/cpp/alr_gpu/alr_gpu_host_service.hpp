@@ -381,6 +381,10 @@ private:
                 // from build_triangle_stream) resolve identically every frame.
                 glBindFramebuffer(GL_FRAMEBUFFER, rt.fbo);
                 HostState st;
+                // The guest's framebuffer 0 (its "default") must resolve to THIS AHB-FBO,
+                // not GL's window framebuffer — so a guest that renders to its own FBO then
+                // binds 0 to composite the final frame lands back on the AHB we present.
+                st.default_fbo = rt.fbo;
                 if (!frame_bytes.empty()) {
                     decode_batch(frame_bytes.data(), frame_bytes.size(), st);
                 }

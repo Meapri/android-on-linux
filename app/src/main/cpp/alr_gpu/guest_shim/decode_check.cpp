@@ -36,6 +36,13 @@ static std::vector<DrawArr> draws;
 static std::vector<DrawElem> draw_elems;
 static std::vector<TexImg> teximgs;
 static std::vector<GLenum> cull_modes, front_modes;
+struct FbTex { GLenum attachment, textarget; GLuint texture; GLint level; };
+struct RbStore { GLenum ifmt; GLsizei w, h; };
+struct FbRb { GLenum attachment, rbtarget; };
+static std::vector<GLuint> fb_binds;     // real fb id per glBindFramebuffer (0 = default)
+static std::vector<FbTex> fb_texs;
+static std::vector<RbStore> rb_stores;
+static std::vector<FbRb> fb_rbs;
 static std::map<GLint, std::string> uniform_loc_name;  // glGetUniformLocation -> name
 static std::map<GLint, std::string> attrib_loc_name;   // glGetAttribLocation  -> name
 static std::map<std::string, std::vector<float>> mat_by_name;   // glUniformMatrix4fv
@@ -143,6 +150,19 @@ void glTexImage2D(GLenum, GLint, GLint, GLsizei w, GLsizei h, GLint, GLenum fmt,
 void glPixelStorei(GLenum pname, GLint param) {
     if (pname == GL_UNPACK_ALIGNMENT && param == 1) rec::unpack_align1 = true;
 }
+void glGenFramebuffers(GLsizei n, GLuint *f) { for (GLsizei i = 0; i < n; ++i) f[i] = rec::next_obj++; }
+void glBindFramebuffer(GLenum, GLuint fb) { rec::fb_binds.push_back(fb); }
+void glFramebufferTexture2D(GLenum, GLenum att, GLenum tt, GLuint tex, GLint lvl) {
+    rec::fb_texs.push_back({att, tt, tex, lvl});
+}
+void glGenRenderbuffers(GLsizei n, GLuint *r) { for (GLsizei i = 0; i < n; ++i) r[i] = rec::next_obj++; }
+void glBindRenderbuffer(GLenum, GLuint) {}
+void glRenderbufferStorage(GLenum, GLenum ifmt, GLsizei w, GLsizei h) {
+    rec::rb_stores.push_back({ifmt, w, h});
+}
+void glFramebufferRenderbuffer(GLenum, GLenum att, GLenum rbt, GLuint) {
+    rec::fb_rbs.push_back({att, rbt});
+}
 }  // extern "C"
 
 // GL tokens the assertions compare against (not all in the minimal stub header).
@@ -180,7 +200,7 @@ int main(int argc, char **argv) {
 
     // --- the stream decoded into exactly the cube + mesh GL calls. ---
     check(ok && st.ok, "decode_batch returned true (well-formed, no bad/unknown opcode)");
-    check(st.decoded == 48, "decoded op count == 48 (34 cube + 4 uniform-variants + 10 mesh)");
+    check(st.decoded == 56, "decoded op count == 56 (34 cube + 4 uniform-var + 10 mesh + 8 fbo)");
     check(st.shaders.size() == 2, "2 shaders mapped");
     check(st.programs.size() == 1, "1 program mapped");
     check(st.buffers.size() == 2, "2 buffers mapped (vbo + ebo)");
@@ -262,6 +282,27 @@ int main(int argc, char **argv) {
 
     check(rec::cull_modes.size() == 1 && rec::cull_modes[0] == kGL_BACK, "glCullFace(GL_BACK)");
     check(rec::front_modes.size() == 1 && rec::front_modes[0] == kGL_CCW, "glFrontFace(GL_CCW)");
+
+    // FBO/renderbuffer family
+    check(st.framebuffers.size() == 1, "1 framebuffer mapped");
+    check(st.renderbuffers.size() == 1, "1 renderbuffer mapped");
+    bool fbind_ok = rec::fb_binds.size() == 2;
+    if (fbind_ok) {
+        bool any_nonzero = (rec::fb_binds[0] != 0) || (rec::fb_binds[1] != 0);
+        bool any_zero = (rec::fb_binds[0] == 0) || (rec::fb_binds[1] == 0);
+        fbind_ok = any_nonzero && any_zero;  // bound the FBO, then back to default (0)
+    }
+    check(fbind_ok, "glBindFramebuffer: real FBO then default(0) (vfb 0 -> host default)");
+    bool ft_ok = rec::fb_texs.size() == 1 && rec::fb_texs[0].attachment == 0x8CE0 /*COLOR_ATTACHMENT0*/ &&
+                 rec::fb_texs[0].textarget == 0x0DE1 /*TEXTURE_2D*/ && rec::fb_texs[0].level == 0 &&
+                 rec::fb_texs[0].texture != 0;  // virtual tex resolved to a real id
+    check(ft_ok, "glFramebufferTexture2D COLOR_ATTACHMENT0 <- mapped texture, level 0");
+    bool rs_ok = rec::rb_stores.size() == 1 && rec::rb_stores[0].ifmt == 0x81A5 /*DEPTH_COMPONENT16*/ &&
+                 rec::rb_stores[0].w == 64 && rec::rb_stores[0].h == 64;
+    check(rs_ok, "glRenderbufferStorage DEPTH_COMPONENT16 64x64");
+    check(rec::fb_rbs.size() == 1 && rec::fb_rbs[0].attachment == 0x8D00 /*DEPTH_ATTACHMENT*/ &&
+              rec::fb_rbs[0].rbtarget == 0x8D41 /*RENDERBUFFER*/,
+          "glFramebufferRenderbuffer DEPTH_ATTACHMENT <- renderbuffer");
 
     std::printf("\nALR GPU WIRE-FORMAT CHECK: %s\n", g_fail ? "FAIL" : "PASS");
     return g_fail;
