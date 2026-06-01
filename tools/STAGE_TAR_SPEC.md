@@ -422,9 +422,9 @@ extractOverlayTar). The integration session adb-pushes these and re-drains.
 | overlay | size | provides |
 |---|---|---|
 | `xkb-gegl-stage.tar` | 6.2 MB | C.UTF-8 locale + svg pixbuf loader (0755) |
-| `netsurf-stage.tar` | 7.1 MB | netsurf-gtk (GTK3 browser) |
-| `sdl2-stage.tar` | 8.2 MB | libSDL2 + wayland/audio deps |
-| `qt6-stage.tar` | 74.2 MB | Qt6 + qtwayland plugins + ICU |
+| `netsurf-stage.tar` | 6.8 MB | netsurf-gtk (GTK3 browser) + binary (§16) |
+| `sdl2-stage.tar` | 17.2 MB | libSDL2 + wayland/audio deps + SDL2 test bins (§16) |
+| `qt6-stage.tar` | 74.5 MB | Qt6 + qtwayland plugins + ICU + qtpaths6 CLI (§16) |
 | `x11-stage.tar` | 11.8 MB | Xwayland (rootful) + xterm + x11-apps |
 | `foot-stage.tar` | 1.1 MB | foot (wayland terminal) |
 | `gtk3demo-stage.tar` | 14.9 MB | gtk3-demo / gtk3-widget-factory |
@@ -437,3 +437,55 @@ maintainer-script fork/exec under the loader (L1); toolkit/Xwayland launch-on-
 compositor wiring (L2/L3); and the base `.so` exec-bit fix (RootfsInstaller, ws-4
 3649725) applies on the next base re-extraction (prepareBundledTinyRootfs re-extracts
 every cold start).
+
+---
+
+## 16. Toolkit overlays carry a LAUNCHABLE binary (fix for "missing" probe)
+
+A device drain found the toolkit-launch probe (`MainActivity.launchToolkitProbes`,
+owned by the integration session) reporting **qt6 / sdl2 "missing"**: the overlays
+were built from the *library* leaf packages (`qt6-wayland` = libs+plugins only,
+`libsdl2-2.0-0` = a pure `.so`) so they carried no binary to exec. `netsurf` did
+ship its binary (`/usr/bin/netsurf-gtk`, the probe's 2nd candidate); it only looked
+missing if probed before the overlay finished extracting.
+
+`tools/build_toolkit_overlays.py` rebuilds all three from Ubuntu noble with each
+leaf set extended to include a package that ships a **display-free runnable binary**.
+It delegates to `deb_closure.build_minimal_overlay` (leaf files kept entirely +
+DT_NEEDED libs the base lacks), then validates with overlay_guard + stage_tar_spec.
+
+| toolkit | leaf packages | **in-rootfs exec path (probe THIS)** | launch arg | marker |
+|---|---|---|---|---|
+| netsurf | `netsurf-gtk` | `/usr/bin/netsurf-gtk` | `-v` | `NetSurf` |
+| qt6 | `qt6-wayland` + `qt6-base-dev-tools` | `/usr/lib/qt6/bin/qtpaths6` | `--version` | `Qt` |
+| sdl2 | `libsdl2-2.0-0` + `libsdl2-tests` | `/usr/libexec/installed-tests/SDL2/testver` | (none) | `SDL` |
+
+**qt6 gotcha:** the deb's `/usr/bin/qtpaths6` is a `-> ../lib/qt6/bin/qtpaths6`
+*escaping* (`..`) symlink → dropped by the §5-E safe-symlink rule. The overlay ships
+ONLY the real binary at `/usr/lib/qt6/bin/qtpaths6` (so probe THAT, not `/usr/bin`).
+DT_NEEDED (host-verified): qtpaths6 → libQt6Core (overlay) + libstdc++/libgcc/libc
+(base); testver → libSDL2 (overlay) + libc/ld (base); netsurf-gtk → base GTK3 +
+libcurl/libssh (overlay). All `--version`/no-arg paths exit without a display.
+
+Built host-verified (base = `payloads/tiny-rootfs.tar`, noble main+universe):
+
+| overlay | files | size | exec in overlay | guard | stage_tar_spec |
+|---|---|---|---|---|---|
+| `netsurf-stage.tar` | 6 | 6.8 MB | `/usr/bin/netsurf-gtk` ✓ | 0 violation | CONFORMANT |
+| `qt6-stage.tar` | 70 | 74.5 MB | `/usr/lib/qt6/bin/qtpaths6` ✓ | 0 violation | CONFORMANT |
+| `sdl2-stage.tar` | 120 | 17.2 MB | `/usr/libexec/installed-tests/SDL2/testver` ✓ | 0 violation | CONFORMANT |
+
+Build: `python -m tools.build_toolkit_overlays --base <base.tar> --out-dir /tmp`
+(`--toolkit netsurf|qt6|sdl2` to build one; `--selftest` is offline). Host test:
+`tests/test_build_toolkit_overlays.py`.
+
+**INTEGRATION hand-off (MainActivity, NOT WS-4 — `launchToolkitProbes` candidate
+lists):** point each toolkit probe at the exec path above. netsurf already matches
+(`/usr/bin/netsurf-gtk` is in its candidate list). For qt6 add
+`/usr/lib/qt6/bin/qtpaths6` to the candidates (current list checks `qtdiag6`/`qmake6`
+— neither is in this overlay). For sdl2 replace the `/usr/bin/sdl2-config` candidate
+(absent — it's a `libsdl2-dev` script) with `/usr/libexec/installed-tests/SDL2/testver`.
+
+DEVICE-REQ (on the ws-4 commit): adb-push the three rebuilt `*-stage.tar` →
+re-drain → toolkit-netsurf / toolkit-qt6 / toolkit-sdl2 each log `ok=true` (binary
+execs through the ALR native loader and prints its banner), no more "missing".
