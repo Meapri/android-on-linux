@@ -163,6 +163,15 @@ static void build_shader_source(AlrEncoder *e, void *p) {
     alr_enc_u8(e, ALR_OP_SHADER_SOURCE); alr_enc_u32(e, a->vid);
     alr_enc_blob(e, a->src, a->len);
 }
+/* Record the per-shader source byte count so glGetShaderiv(GL_SHADER_SOURCE_LENGTH) can
+ * report len+1 (GL spec incl. null) — glmark2's Shader::init compares it to
+ * source.length()+1 and rejects the shader otherwise. Indexed by virtual shader id. */
+static void record_shader_src_len(GLuint shader, uint32_t len) {
+    AlrShimState *s = alr_shim();
+    size_t cap = sizeof(s->shader_src_len) / sizeof(s->shader_src_len[0]);
+    if ((size_t)shader < cap) s->shader_src_len[shader] = len;
+}
+
 void glShaderSource(GLuint shader, GLsizei count, const GLchar *const *string, const GLint *length) {
     /* Concatenate the `count` source chunks into the shim scratch is unnecessary:
      * the cube passes count==1. To be robust we coalesce into a small local buffer
@@ -171,6 +180,7 @@ void glShaderSource(GLuint shader, GLsizei count, const GLchar *const *string, c
     if (count == 1) {
         const char *src = string[0] ? string[0] : "";
         uint32_t len = (length && length[0] >= 0) ? (uint32_t)length[0] : (uint32_t)strlen(src);
+        record_shader_src_len(shader, len);
         struct ShaderSourceArgs a = { (uint32_t)shader, src, len };
         alr_shim_emit(build_shader_source, &a);
         return;
@@ -190,6 +200,7 @@ void glShaderSource(GLuint shader, GLsizei count, const GLchar *const *string, c
         memcpy(joined + off, s, n); off += n;
     }
     joined[off] = '\0';
+    record_shader_src_len(shader, (uint32_t)off);
     struct ShaderSourceArgs a = { (uint32_t)shader, joined, (uint32_t)off };
     alr_shim_emit(build_shader_source, &a);
     free(joined);
@@ -1051,11 +1062,21 @@ GLenum glGetError(void) {
 }
 
 void glGetShaderiv(GLuint shader, GLenum pname, GLint *params) {
-    (void)shader;
     if (!params) return;
-    if (pname == GL_COMPILE_STATUS)      *params = GL_TRUE;   /* optimistic */
-    else if (pname == GL_INFO_LOG_LENGTH) *params = 0;
-    else                                  *params = 0;
+    if (pname == GL_COMPILE_STATUS) {
+        *params = GL_TRUE;                  /* optimistic (no round-trip) */
+    } else if (pname == GL_SHADER_SOURCE_LENGTH) {
+        /* GL spec: length of the source INCLUDING the null terminator (0 if none set).
+         * glmark2 requires this == source.length()+1 or it rejects the shader. */
+        AlrShimState *s = alr_shim();
+        size_t cap = sizeof(s->shader_src_len) / sizeof(s->shader_src_len[0]);
+        uint32_t l = ((size_t)shader < cap) ? s->shader_src_len[shader] : 0u;
+        *params = l ? (GLint)(l + 1u) : 0;
+    } else if (pname == GL_INFO_LOG_LENGTH) {
+        *params = 0;
+    } else {
+        *params = 0;
+    }
 }
 void glGetProgramiv(GLuint program, GLenum pname, GLint *params) {
     (void)program;

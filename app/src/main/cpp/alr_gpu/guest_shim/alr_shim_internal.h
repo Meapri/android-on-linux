@@ -61,6 +61,13 @@ typedef struct AlrShimState {
     size_t          ring_region_sz; /* bytes mapped */
     int             doorbell_fd;    /* eventfd to signal the host on flush, or -1 */
 
+    /* Per-shader source length (the byte count glShaderSource was given), indexed by
+     * the shader's virtual id. glGetShaderiv(GL_SHADER_SOURCE_LENGTH) returns len+1
+     * (GL spec: includes the null terminator) — glmark2's Shader::init compares it to
+     * source.length()+1 and REJECTS the shader on mismatch (it read 0 before this). The
+     * virtual id is monotonic from 1; a generous fixed cap (entries beyond it report 0). */
+    uint32_t        shader_src_len[4096];
+
     /* virtual-ID allocators — monotonic per type, START AT 1 (0 reserved). */
     uint32_t        next_shader;
     uint32_t        next_program;
