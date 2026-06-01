@@ -160,7 +160,7 @@ class MainActivity : Activity() {
         // is wired separately. Device test = CP-5.
         Thread {
             try {
-                for (name in listOf("sdl2", "netsurf")) {
+                for (name in listOf("sdl2", "netsurf", "microbench")) {
                     val tar = java.io.File("/data/local/tmp/$name-stage.tar")
                     val marker = java.io.File(rootfsStatus.rootfsDir, ".$name-staged-${tar.length()}")
                     if (tar.isFile && !marker.isFile) {
