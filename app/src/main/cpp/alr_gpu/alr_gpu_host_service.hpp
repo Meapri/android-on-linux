@@ -209,8 +209,18 @@ private:
         }
         const EGLint pb[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
         EGLSurface surf = eglCreatePbufferSurface(dpy, cfg, pb);
-        const EGLint ctx_attribs[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
+        // Request a GLES3 context (Mali-G615 is GLES3.2) so GLES3-class guests — VAOs,
+        // instanced draws, UBOs — run on the real GPU; fall back to GLES2 if ES3 is
+        // unavailable. GLES3 is a superset of GLES2, so the existing GLES2 op streams
+        // (triangle/cube) are unaffected. ctx_attribs[1] holds the version that won, so
+        // the optional window context below is created at the SAME version (a share
+        // group must not mix ES versions).
+        EGLint ctx_attribs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
         EGLContext ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, ctx_attribs);
+        if (ctx == EGL_NO_CONTEXT) {
+            ctx_attribs[1] = 2;  // GLES3 unavailable -> GLES2 (preserves prior behavior)
+            ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, ctx_attribs);
+        }
         if (surf == EGL_NO_SURFACE || ctx == EGL_NO_CONTEXT ||
             eglMakeCurrent(dpy, surf, surf, ctx) != EGL_TRUE) {
             fail_setup("make-current " + egl_err_hex_local());

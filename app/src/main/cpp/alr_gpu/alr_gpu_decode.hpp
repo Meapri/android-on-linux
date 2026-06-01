@@ -32,6 +32,20 @@
 #include <string>
 #include <vector>
 
+// GLES3 entry points the decoder replays. Declared here (rather than pulling
+// <GLES3/gl3.h>) so this header stays GLES2-include-only and free of header-version
+// clashes; the executor links libGLESv2 (which exports the GLES3 core symbols) and
+// runs them on the GLES3 context GpuExecutorService requests (fallback GLES2). On a
+// GLES2-only fallback these decode to no-effect calls on unsupported entry points —
+// only reached if a guest actually emits GLES3 ops, which a GLES2 guest never does.
+extern "C" {
+void glGenVertexArrays(GLsizei n, GLuint* arrays);
+void glBindVertexArray(GLuint array);
+void glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instancecount);
+void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void* indices,
+                             GLsizei instancecount);
+}
+
 namespace alr::gpu {
 
 // ---- The op-stream opcode set. A superset of the original 7-op marshalling
@@ -102,6 +116,11 @@ enum Op : uint8_t {
     OP_BIND_RENDERBUFFER = 94,       // u32 target, u32 vrb_id
     OP_RENDERBUFFER_STORAGE = 95,    // u32 target, u32 internalformat, i32 w, i32 h
     OP_FRAMEBUFFER_RENDERBUFFER = 96,// u32 target, u32 attachment, u32 rbtarget, u32 vrb_id
+    // --- GLES3: vertex array objects + instanced draws (vva 0 = default VAO). ---
+    OP_GEN_VERTEX_ARRAY = 100,       // u32 vva_id
+    OP_BIND_VERTEX_ARRAY = 101,      // u32 vva_id (0 -> default VAO)
+    OP_DRAW_ARRAYS_INSTANCED = 102,  // u32 mode, i32 first, i32 count, i32 instancecount
+    OP_DRAW_ELEMENTS_INSTANCED = 103,// u32 mode, i32 count, u32 type, u32 offset, i32 instancecount
 };
 
 // Host-side decode state: the virtual->real GL name translation tables. The guest
@@ -113,6 +132,7 @@ struct HostState {
     std::map<uint32_t, GLuint> textures;  // vtex_id    -> real texture
     std::map<uint32_t, GLuint> framebuffers;   // vfb_id -> real FBO
     std::map<uint32_t, GLuint> renderbuffers;  // vrb_id -> real RBO
+    std::map<uint32_t, GLuint> vertex_arrays;  // vva_id -> real VAO (GLES3)
     GLuint cur_program = 0;               // real program currently in use (for uniforms)
     // The guest's framebuffer 0 is its "default" target. In this marshalling executor
     // the default target is the AHB-backed FBO, NOT GL's window framebuffer 0 — so the
@@ -139,6 +159,11 @@ struct HostState {
     GLuint real_rb(uint32_t v) const {
         auto it = renderbuffers.find(v);
         return it == renderbuffers.end() ? 0 : it->second;
+    }
+    GLuint real_va(uint32_t v) const {            // vva 0 -> the default VAO (real 0)
+        if (v == 0) return 0;
+        auto it = vertex_arrays.find(v);
+        return it == vertex_arrays.end() ? 0 : it->second;
     }
 };
 
@@ -525,6 +550,30 @@ inline bool decode_batch(const uint8_t* data, size_t len, HostState& st) {
                 if (!r.u32(target) || !r.u32(attachment) || !r.u32(rbtarget) ||
                     !r.u32(vrb)) { st.ok = false; break; }
                 glFramebufferRenderbuffer(target, attachment, rbtarget, st.real_rb(vrb));
+                ++st.decoded; break;
+            }
+            case OP_GEN_VERTEX_ARRAY: {
+                uint32_t vid; if (!r.u32(vid)) { st.ok = false; break; }
+                GLuint va = 0; glGenVertexArrays(1, &va); st.vertex_arrays[vid] = va; ++st.decoded; break;
+            }
+            case OP_BIND_VERTEX_ARRAY: {
+                uint32_t vid; if (!r.u32(vid)) { st.ok = false; break; }
+                glBindVertexArray(st.real_va(vid)); ++st.decoded; break;
+            }
+            case OP_DRAW_ARRAYS_INSTANCED: {
+                uint32_t mode; int32_t first, count, inst;
+                if (!r.u32(mode) || !r.i32(first) || !r.i32(count) || !r.i32(inst)) {
+                    st.ok = false; break;
+                }
+                glDrawArraysInstanced(mode, first, count, inst); ++st.decoded; break;
+            }
+            case OP_DRAW_ELEMENTS_INSTANCED: {
+                uint32_t mode, type, offset; int32_t count, inst;
+                if (!r.u32(mode) || !r.i32(count) || !r.u32(type) || !r.u32(offset) ||
+                    !r.i32(inst)) { st.ok = false; break; }
+                glDrawElementsInstanced(mode, count, type,
+                                        reinterpret_cast<const void*>(static_cast<uintptr_t>(offset)),
+                                        inst);
                 ++st.decoded; break;
             }
             default:

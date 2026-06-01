@@ -95,3 +95,23 @@ gcfg.frame_sink = [](AHardwareBuffer* ahb, int w, int h, uint64_t serial) {
    assert it's Mali (not swiftshader/llvmpipe) — `gpu_ring_frames_presented()` exposes liveness.
 4. **First light target:** `glmark2 -b build:use-vbo=true` (mat4-only uniforms, no FBO) is the
    simplest scene fully covered by the wire ops; bring that up before the render-to-texture scenes.
+
+## (a) glmark2 launch wiring (integration session → MainActivity)
+
+WS-2's GPU side is ready; the only missing piece is a MainActivity entry that launches glmark2
+through the loader (like the existing GIMP/foot launch). It needs nothing GPU-specific — the
+loader auto-attaches the ring when `config.program` contains `glmark2` (WS-1, runtime_report.cpp).
+So the launch just calls the native loader with `program` = the rootfs path to the staged binary,
+e.g. `/usr/bin/glmark2-es2-wayland` (WS-4 installs `glmark2-stage.tar`). Suggested args for a
+headless score run: `glmark2-es2-wayland -b build:use-vbo=true --off-screen` (or default scenes).
+On-screen needs WS-3's present (see note 2 above). `gpu_ring_frames_presented()` exposes liveness.
+
+## GLES3 (WS-2 §10-(c), this round)
+
+The executor now requests a **GLES3 context** (EGL_CONTEXT_CLIENT_VERSION 3, fallback to 2 — Mali-
+G615 is GLES3.2); GLES2 op streams are unaffected (superset). Added GLES3 wire ops: VAOs
+(`glGen/BindVertexArray`, virtual ids, vao 0 = default) + instanced draws
+(`glDrawArrays/ElementsInstanced`). Harness PASS (40 assertions). **DEVICE-REQ for the integration
+session:** confirm the existing GPU probes (`ALR GPU LIVE INTEGRATION: PASS`, `gpu-screen-cube`)
+still pass on the GLES3 context, alongside CP-2 glmark2. Deferred (next): `glVertexAttribDivisor`
+(per-instance attribs, needs the by-name attrib path), UBOs, GLES3 texture formats.
