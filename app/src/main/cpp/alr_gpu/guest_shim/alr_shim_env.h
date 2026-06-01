@@ -49,4 +49,11 @@
 #define ALR_ENV_RING_BYTES       "ALR_GPU_RING_BYTES"
 #define ALR_ENV_RING_DOORBELL_FD "ALR_GPU_RING_DOORBELL_FD"
 
+/* Optional: the host render-target (AHB-FBO) size the executor renders into. The
+ * loader sets these (= GpuRingAttachConfig.fb_w/fb_h, via gpu_ring_guest_env) so the
+ * shim's eglQuerySurface reports a drawable size that MATCHES where the host draws,
+ * letting the guest set a correct glViewport. If unset, the shim uses a default. */
+#define ALR_ENV_FB_W             "ALR_GPU_FB_W"
+#define ALR_ENV_FB_H             "ALR_GPU_FB_H"
+
 #endif /* ALR_SHIM_ENV_H */

@@ -94,6 +94,8 @@ struct GpuRing {
     int ring_fd = -1;          // inheritable memfd of the ring_init'd shared region
     uint32_t ring_bytes = 0;   // data-region size (power of two); the guest maps 48 + ring_bytes
     int doorbell_fd = -1;      // inheritable eventfd the guest signals on flush (-1 = none)
+    int fb_w = 0;              // host AHB render-target size; advertised so the guest shim's
+    int fb_h = 0;              // eglQuerySurface reports a drawable size matching where the host draws
 };
 
 // Tuning + present wiring for attach(). Defaults give the executor's own
@@ -200,6 +202,14 @@ inline std::vector<std::string> gpu_ring_guest_env(const GpuRing& r) {
         std::snprintf(buf, sizeof(buf), "ALR_GPU_RING_DOORBELL_FD=%d", r.doorbell_fd);
         env.emplace_back(buf);
     }
+    // AHB render-target size (= guest_shim/alr_shim_env.h ALR_ENV_FB_W/H): lets the guest
+    // shim's eglQuerySurface report a drawable size matching where the host draws.
+    if (r.fb_w > 0 && r.fb_h > 0) {
+        std::snprintf(buf, sizeof(buf), "ALR_GPU_FB_W=%d", r.fb_w);
+        env.emplace_back(buf);
+        std::snprintf(buf, sizeof(buf), "ALR_GPU_FB_H=%d", r.fb_h);
+        env.emplace_back(buf);
+    }
     return env;
 }
 
@@ -230,6 +240,8 @@ inline bool alr_loader_attach_gpu_ring(GpuRing& out, const GpuRingAttachConfig& 
     size_t region_sz = 0;
     GpuRing ring{};
     if (!create_shared_gpu_ring(cfg.ring_bytes, ring, &region, &region_sz)) return false;
+    ring.fb_w = cfg.fb_w;  // advertised to the guest shim (eglQuerySurface) so its viewport
+    ring.fb_h = cfg.fb_h;  // matches the AHB render target the host draws into
 
     // Present adapter: hand each finished AHB to WS-3's sink (§5-B) with a running
     // serial. If frame_sink is null the executor's optional window-present path (when

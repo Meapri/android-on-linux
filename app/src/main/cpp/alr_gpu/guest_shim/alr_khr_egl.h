@@ -63,6 +63,12 @@ typedef void       (*__eglMustCastToProperFunctionPointerType)(void);
 #define EGL_WIDTH                  0x3057
 #define EGL_CLIENT_APIS            0x308D
 #define EGL_CONTEXT_CLIENT_VERSION 0x3098
+#define EGL_CONFIG_ID              0x3028
+#define EGL_CONTEXT_CLIENT_TYPE    0x3097
+#define EGL_BACK_BUFFER            0x3084
+#define EGL_SINGLE_BUFFER          0x3085
+#define EGL_RENDER_BUFFER          0x3086
+#define EGL_OPENGL_ES_API          0x30A0
 
 #define EGL_PBUFFER_BIT            0x0001
 #define EGL_WINDOW_BIT             0x0004
@@ -92,6 +98,15 @@ const char *eglQueryString(EGLDisplay dpy, EGLint name);
 EGLBoolean eglDestroyContext(EGLDisplay dpy, EGLContext ctx);
 EGLBoolean eglDestroySurface(EGLDisplay dpy, EGLSurface surface);
 EGLBoolean eglTerminate(EGLDisplay dpy);
+EGLBoolean eglQuerySurface(EGLDisplay dpy, EGLSurface surface, EGLint attribute, EGLint *value);
+EGLBoolean eglQueryContext(EGLDisplay dpy, EGLContext ctx, EGLint attribute, EGLint *value);
+EGLenum    eglQueryAPI(void);
+EGLBoolean eglWaitClient(void);
+EGLBoolean eglWaitGL(void);
+EGLBoolean eglWaitNative(EGLint engine);
+EGLBoolean eglReleaseThread(void);
+EGLBoolean eglSurfaceAttrib(EGLDisplay dpy, EGLSurface surface, EGLint attribute, EGLint value);
+EGLBoolean eglGetConfigs(EGLDisplay dpy, EGLConfig *configs, EGLint config_size, EGLint *num_config);
 
 #ifdef __cplusplus
 }
