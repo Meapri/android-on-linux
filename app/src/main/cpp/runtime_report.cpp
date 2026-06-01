@@ -1611,6 +1611,7 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         return out.str();
     }
 
+    const auto t_exec_start = std::chrono::steady_clock::now();  // WS-1 M2: native-exec wall-clock (fork→reap)
     const pid_t pid = ::fork();
     if (pid == 0) {
         ::close(out_pipe[0]);
@@ -2394,13 +2395,15 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
             guest_stdout.size() > kHeadTail
                 ? guest_stdout.substr(guest_stdout.size() - kHeadTail)
                 : std::string();
+        const long long exec_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t_exec_start).count();  // WS-1 M2: native-exec wall-clock
         __android_log_print(ANDROID_LOG_INFO, "alr_loader",
                             "gimp-probe guest=%s exit=%d sig=%d pcgate=%d interpose=%d "
-                            "traps=%d rewrites=%d first_rewrite=%s stdout_bytes=%zu",
+                            "traps=%d rewrites=%d first_rewrite=%s stdout_bytes=%zu exec_ms=%lld",
                             guest_rel.c_str(), code, sig, pcgate_on ? 1 : 0,
                             interpose_off ? 0 : 1, path_traps, path_rewrites,
                             first_rewrite.empty() ? "(none)" : first_rewrite.c_str(),
-                            guest_stdout.size());
+                            guest_stdout.size(), exec_ms);
         __android_log_print(ANDROID_LOG_INFO, "alr_loader",
                             "gimp-probe stdout-head: %s", head.c_str());
         if (!tail.empty()) {

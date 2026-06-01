@@ -24,6 +24,14 @@ ALR의 CPU mediation 오버헤드 구성:
 - **non-path syscall**: seccomp **ALLOW**(0 오버헤드).
 - → 일반 앱은 PRoot의 ptrace-every-syscall(~µs/syscall) 대비 근본적 우위. path-mediation 부분의 "제로 오버헤드"는 일반 앱에서 device-verified.
 
+## 측정 3 — native-exec wall-clock per guest (신규 `exec_ms`, device)
+gimp-probe 라인에 fork→reap wall-clock(`exec_ms`)을 추가:
+- 일반 CLI: `/bin/dynhello` 19ms, `/usr/bin/env` 19, `/usr/bin/id` 20, `/bin/dash` 18-19, `/bin/alr-png-test` 23 — fork + ELF맵 + ld.so + 실행 + exit + supervisor **전체가 ~18-20ms**(native 프로세스 수준).
+- 무거운 lib 로드: `gimp-console-3.0 --version` 48ms, `alr-wl-test` 40, `alr-pixman-test` 38, `alr-gtk3-test` 197, `gtk3-widget-factory` 145, `gimp-3.0` 135.
+- `alr-input-test`/`alr-interactive-test` 6048/6053ms = **의도된 dispatch 대기**(오버헤드 아님).
+- 전부 `traps=0`(gimp-3.0만 1) → supervisor 라운드트립 0인 상태의 실행 시간.
+→ 일반 CLI ~18-20ms는 native 프로세스 수준. PRoot(trap-every-syscall, ptrace ~µs × 수천 syscall)는 같은 워크로드에서 수백ms대가 예상되며, NativeCommandRunner(현재 `ProcessBuilder`+`waitFor`만, wall-clock 없음)에 측정을 넣어 실측하는 게 WS-1 M2 완성의 다음.
+
 ## WS-1 M2 다음
 1. **PRoot baseline 실측** (`run_perf_comparison`의 `proot_device_baseline_pending=true` 해소) → ALR vs PRoot 정량 비교.
 2. **실제 CPU-bound 워크로드 wall-clock** (native-exec vs PRoot vs adb-shell) → 전체(syscall 외) 오버헤드.
