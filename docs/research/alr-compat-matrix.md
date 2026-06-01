@@ -27,6 +27,8 @@
 
 → 이 집합이 **회귀 게이트**(`bench/regression_gate.py`)의 기준선. mediation 불변식: `pcgate=1 interpose=1 traps=0 rewrites=0`.
 
+**성능 (device, v127 WS-1 M2):** 일반 CLI native-exec wall-clock(신규 `exec_ms`) ~**18-20ms**(`dynhello`/`env`/`id`/`dash`/`alr-png-test`) = native 프로세스 수준. path-mediation은 **traps=0 device-verified**(in-process translate, supervisor 라운드트립 0). path-xlate cold 4334.7 ns/op(≈19.9 syscall units, 256-entry cache로 분할 상환). 단, native/PRoot baseline 미측정 → **% 오버헤드 비율은 아직 미산출(PENDING)**. 상세: `docs/evidence/2026-06-01-ws5-cpu-overhead-quantified.md`(WS-1 원본: `2026-06-01-ws1-m2-cpu-mediation-overhead.md`).
+
 ## GUI 툴킷 (L2/L3)
 | 앱 | 툴킷 | 결과 | Evidence | 비고 |
 |----|------|------|----------|------|
