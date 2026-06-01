@@ -74,8 +74,21 @@ EGLBoolean eglChooseConfig(EGLDisplay dpy, const EGLint *attrib_list,
                            EGLConfig *configs, EGLint config_size, EGLint *num_config) {
     (void)attrib_list;
     if (dpy != ALR_EGL_DISPLAY) { egl_set_error(EGL_BAD_PARAMETER); return EGL_FALSE; }
-    if (configs && config_size > 0) configs[0] = ALR_EGL_CONFIG;
-    if (num_config) *num_config = (config_size > 0) ? 1 : 0;
+    if (!num_config) { egl_set_error(EGL_BAD_PARAMETER); return EGL_FALSE; }  /* EGL: required */
+    /* We advertise exactly ONE config. EGL semantics: when `configs` is NULL the call is
+     * a COUNT query (config_size is ignored) and must report the number of matching
+     * configs in *num_config. glmark2 (libmatrix GLStateEGL) does this FIRST — count,
+     * allocate, then fill — so returning 0 on the count query made it abort with
+     * "eglChooseConfig() didn't return any configs" / "Couldn't get GL visual config!"
+     * (CP-2 drain). Return the real count (1) on the count query; fill on the real query. */
+    if (configs == NULL) {
+        *num_config = 1;                                   /* count of available configs */
+    } else if (config_size > 0) {
+        configs[0] = ALR_EGL_CONFIG;
+        *num_config = 1;                                   /* one config written */
+    } else {
+        *num_config = 0;                                   /* zero-length output array */
+    }
     egl_set_error(EGL_SUCCESS);
     return EGL_TRUE;
 }

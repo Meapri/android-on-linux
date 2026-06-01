@@ -21,7 +21,13 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="${OUT:-$HERE/out}"
-TARGET="aarch64-linux-gnu"
+# Pin glibc 2.34 so pthread/dl are FOLDED INTO libc.so.6 (glibc >= 2.34 merged
+# libpthread + libdl into libc). Without the version suffix the .so's get
+# DT_NEEDED libpthread.so.0 (and libdl.so.2), which the tiny ALR rootfs does NOT
+# ship -> the guest ld.so can't resolve the EGL dlopen chain ("Error loading EGL
+# library", CP-2 drain#2). With .2.34 the only NEEDED is libc.so.6. DO NOT drop
+# the version suffix.
+TARGET="aarch64-linux-gnu.2.34"
 CC=(zig cc -target "$TARGET")
 CFLAGS=(-std=c11 -O2 -fPIC -Wall -Wextra -fvisibility=default -I"$HERE")
 
@@ -39,11 +45,12 @@ echo "== compile EGL shim =="
 "${CC[@]}" "${CFLAGS[@]}" -c "$HERE/alr_egl_shim.c" -o "$OUT/alr_egl_shim.o"
 
 echo "== link libGLESv2.so.2 (SONAME libGLESv2.so.2) =="
-# pthread for the once/mutex; the runtime lives here so EGL can import it.
+# NO -lpthread: the glibc-2.34 TARGET pin folds pthread into libc, so the once/mutex
+# symbols resolve from libc.so.6 and the ONLY DT_NEEDED is libc.so.6. A libpthread.so.0
+# NEEDED would break the guest EGL dlopen chain in the tiny rootfs (CP-2 drain#2).
 "${CC[@]}" -shared -fPIC \
     -Wl,-soname,libGLESv2.so.2 \
     "$OUT/alr_gles_shim.o" "$OUT/alr_shim_runtime.o" \
-    -lpthread \
     -o "$OUT/libGLESv2.so.2"
 # Dev symlinks so -lGLESv2 / -lEGL find the libs at link time.
 ln -sf libGLESv2.so.2 "$OUT/libGLESv2.so"
@@ -54,7 +61,6 @@ echo "== link libEGL.so.1 (SONAME libEGL.so.1, NEEDED libGLESv2.so.2) =="
     -Wl,-soname,libEGL.so.1 \
     "$OUT/alr_egl_shim.o" \
     -L"$OUT" -lGLESv2 \
-    -lpthread \
     -o "$OUT/libEGL.so.1"
 ln -sf libEGL.so.1 "$OUT/libEGL.so"
 
