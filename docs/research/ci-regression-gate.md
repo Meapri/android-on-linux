@@ -159,10 +159,38 @@ device 빌드가 바뀌어도 **이미 증명된 동작은 깨지면 안 된다*
 - **foot** (terminal) — RENDERS 유지(`rendered=true`).
 - **gtk3demo** (`/bin/alr-gtk3-test`) — RENDERS 유지(렌더 루프 정상, frames↑).
 - **CLI 집합** (§3.2) — expected-exit + traps=0 유지.
-- **glmark2-es2** — RUN(Mali, software=false) 유지. drain#9 regression-check Score 1052
-  (drain#8 1163 대비 dip 은 thermal/run-to-run, 기능 회귀 아님 — 여전히 GPU-class ~1000+ FPS).
+- **glmark2-es2** — RUN(Mali, software=false) 유지. drain#9 regression-check Score 1052,
+  drain#10(v132) Score 1009 (drain#8 1163 대비 dip 은 thermal/run-to-run, 기능 회귀 아님 —
+  여전히 GPU-class ~1000+ FPS).
 
 (상세는 `docs/research/alr-compat-matrix.md` — 이 게이트의 SSOT 행들.)
+
+### 3.5 device 마커 체크리스트 (드레인마다 확인 — no-regression)
+
+위 RUN-유지 게이트(§3.3)는 "프로세스가 산다"를 넓게 잡는다. 그 위에, **각 device drain 의
+logcat 캡처에서 통합 세션이 직접 눈으로 확인**해야 하는 **PASS 마커 / 비-증가 불변식**을 못박는다.
+하나라도 **사라지거나(absent) FAIL 로 바뀌거나 악화**되면 회귀 — 머지/스탬프 bump 금지.
+(아래는 전부 device-수동; 새 측정이 아니라 기존 drain#10 evidence
+`docs/evidence/2026-06-02-breadth-fanout-drain.md` 가 통과를 보인 항목들.)
+
+| 마커 / 불변식 | 기대 | 깨지면 |
+|--------------|------|--------|
+| `ALR GPU LIVE INTEGRATION: PASS` | 매 drain present | 회귀(파이프라인 깨짐) |
+| **`ALR GPU THROUGHPUT: PASS`** (drain#10 신규) | 매 drain present | 회귀(ring/decoder throughput 회귀) |
+| `ALR GPU SCREEN CUBE: PASS` | 매 drain present | 회귀(loader-fork present 깨짐) |
+| glmark2 `software renderer=false` + Score ~GPU-class | software=false, Score 1000+ (≥ ~1000) | software=true 또는 Score 급락 = 회귀 |
+| **GLES2 커버리지 (shim/wire-check)** | `build-wire-check.sh` round-trip assert PASS (host, off-device); 19개 state-setter(blend/depth/color/stencil 등) wire 인코딩 + decode replay 유지 | wire-check 실패 = 게스트 인코더↔host 디코더 정합 깨짐 = host 게이트 FAIL(§1.3) |
+| **per-guest `traps` 비-증가** | CLI/dpkg/apt/Xwayland/foot = **0**; gtk3-widget-factory ≤ 99(drain#10 기준선, 135 에서 내려옴); glmark2 ≤ 31; `gimp-3.0` traps≤1 허용 | 기준선 초과(traps↑) = mediation 라운드트립 회귀 |
+
+- **THROUGHPUT 마커**는 drain#10 에서 LIVE/SCREEN-CUBE 와 나란히 추가된 device 체크포인트다
+  (WS-2 GLES2 19-op 커버리지 + decode 변경이 GPU 파이프라인을 회귀시키지 않았음을 증명).
+- **GLES coverage(shim/wire-check)** 는 device 가 못 닿는 seam 이라 **host 게이트(§1.3)에서 자동**으로
+  잡힌다 — 게스트 shim 의 실제 와이어 바이트가 host 디코더가 읽는 바이트인지 off-device round-trip
+  assert. device drain 에서는 GPU self-test PASS 가 그 보강 증거.
+- **traps 비-증가**는 §3.1 의 불변식(일반 게스트 traps=0)을 드레인-대-드레인 *방향성*으로 확장한다.
+  drain#10 은 gtk3-widget-factory 를 135→99 로 **낮췄다**(WS-1 CP-6 M2 opendir 트램폴린 + credential
+  캐시). 새 drain 이 이 기준선을 **올리면** 회귀로 본다. (동일-빌드 A/B 격리는 아님 — 방향성 + targeted
+  메커니즘으로 정직 보고.)
 
 ### 3.4 version-stamp 핀
 - 모든 device evidence/회귀 판정은 **빌드 stamp 와 함께** 기록(`build: <stamp>` 라인).
@@ -178,7 +206,7 @@ device 빌드가 바뀌어도 **이미 증명된 동작은 깨지면 안 된다*
 |-----------|--------------------|------------------------|
 | pytest 432 green | ✅ `uvx pytest tests/ -q` | — |
 | native 4-ABI 컴파일 | ✅ `gradlew externalNativeBuildDebug` | — |
-| guest-shim 빌드 + wire-check | ✅ `build-shim.sh` + `build-wire-check.sh` (zig, off-device) | — |
+| guest-shim 빌드 + wire-check (GLES coverage seam) | ✅ `build-shim.sh` + `build-wire-check.sh` (zig, off-device; 19-op state-setter wire round-trip) | — |
 | version-stamp drift 없음 | ✅ (핀 정합 검사; bump 은 통합만) | — |
 | bench 모델(gate/overhead/gpu/display/present) | ✅ 순수함수 단위테스트 | 입력 숫자 = device 캡처에서 |
 | no-regression `bench gate` PASS | (모델은 host 테스트) | ✅ 실제 device 리포트로 평가 |
@@ -187,6 +215,8 @@ device 빌드가 바뀌어도 **이미 증명된 동작은 깨지면 안 된다*
 | CP-3 CPU 오버헤드 < 5% | — | ✅ `bench overhead` (same-binary) |
 | CP-4 dmabuf zero-copy present | — | ✅ present 마커 파싱 |
 | GIMP/foot/gtk3demo/CLI/glmark2 RUN 유지 | — | ✅ device 리포트 회귀 검사 |
+| GPU LIVE/**THROUGHPUT**/SCREEN-CUBE PASS 마커 (§3.5) | — | ✅ drain logcat 마커 체크리스트 |
+| per-guest traps 비-증가 (§3.5; gtk3-widget-factory ≤99) | — | ✅ drain 마커 체크리스트 |
 
 **한 줄:** CI = host 게이트(pytest + NDK 4-ABI + zig shim/wire)만 자동. device(단일
 하드웨어)는 통합 세션이 §9 로 직렬 수동. no-regression = `bench gate`(mediation 불변식 +
