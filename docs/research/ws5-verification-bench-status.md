@@ -66,8 +66,10 @@ WS-5는 전 WS 산출물을 **측정**한다. 계약 자체는 제공하지 않�
 | `bench/__main__.py` `verify` 서브커맨드 | 리포트 1개로 gate + CP-1 display + 마커 요약 통합 | host-done, 테스트됨 |
 | CP-3/M1 **device 실측 (ALR 절대값)** | M1 | **PARTIAL** — WS-1 M2가 device 캡처(APK v127); WS-5가 정량화 (`docs/evidence/2026-06-01-ws5-cpu-overhead-quantified.md`): 일반 CLI exec_ms ~18-20ms, path-xlate 4334.7 ns/op, **traps=0 device-verified**. native/PRoot baseline는 **DEVICE-REQ (outstanding, merge 커밋에 filed)** → % 오버헤드 비율 미산출 |
 | CP-1 **display** device 실측 | (L3) | **DONE (device-VERIFIED)** — 통합(merge) 빌드 리포트의 `display: 1920x1200 @ 90000mHz` 마커로 WS-5가 해상도+90Hz를 검증. host-only 모델이 아니라 실제 device 마커 소비로 닫힘 |
-| CP-3 native/PRoot **baseline** | M1/M3 | **DEVICE-REQ (outstanding)** — ALR 절대값은 device-verified(traps=0, exec_ms ~18-20ms)이나 native/PRoot baseline 미측정 → % 오버헤드 비율 미산출. merge 커밋에 DEVICE-REQ로 filed; 통합 세션 device 리스 대기 |
-| CP-2 **glmark2** device 실측 | M2 | **DEVICE-REQ (outstanding)** — host 모델/파서 done; WS-2 glmark2 산출 후 통합 빌드에서 device 런. merge 커밋에 DEVICE-REQ로 filed |
+| CP-4 **dmabuf/AHB present** device 실측 | M2 (L3) | **DONE (device-VERIFIED)** — WS-5가 drain#5 소비(`bench`/present_verify): `ALR AHB ZEROCOPY IMPORT: PASS` + `gtkdemo-result: rendered=true frames=12→13`(ws-3 WaylandPresenter, 단일 게이트 후 회귀 0). AHB→external-OES zero-copy present는 device-verified. evidence: `docs/evidence/2026-06-01-drain5-cp4-dmabuf-present-single-gate.md`. 남은 nuance: guest-side dmabuf 프로토콜 광고는 WS-3 M2 잔여 |
+| CP-2 **infra** device 실측 | M2 | **DONE (device-VERIFIED, infra only)** — loader ring attach + EGL library dlopen(libpthread 수정 후) + Mali self-test `software renderer=false` 전부 device-verified. evidence: `docs/evidence/2026-06-01-cp2-glmark2-egl-dlopen-resolved.md`. **Score는 아래 PENDING** |
+| CP-3 native/PRoot **baseline** | M1/M3 | **DEVICE-REQ (outstanding)** — ALR 절대값은 device-verified(traps=0, exec_ms ~18-20ms)이나 native/PRoot baseline 미측정 → % 오버헤드 비율 미산출. 현재 유일하게 남은 DEVICE-REQ. merge 커밋에 DEVICE-REQ로 filed; 통합 세션 device 리스 대기 |
+| CP-2 **glmark2 Score** device 실측 | M2 | **PENDING (WS-2)** — CP-2 infra는 device-verified(위)이나 Score는 `eglChooseConfig() didn't return any configs`로 막힘 = WS-2 shim eglChooseConfig (0 configs). WS-2 M3가 EGL config/surface/GLES-via-ring 구현 후 통합 빌드에서 device 런 |
 | 나머지 **device 실측** | M2/M3 | pending (통합 빌드 + 디바이스 점유 조율) |
 
 ## 운영 모드 (플랜 §9 / §10 적용 중)
@@ -78,4 +80,4 @@ WS-5는 전 WS 산출물을 **측정**한다. 계약 자체는 제공하지 않�
 **DEVICE-REQ**로 merge 커밋에 filed되어 있고, §9 리스 프로토콜에 따라 통합 세션이 device를 점유 조율한 뒤 캡처한 리포트를
 WS-5가 파서/게이트로 닫는다. CP-1 display는 이 경로로 이미 **device-VERIFIED**로 닫혔다.
 
-baseline: `ws-5`는 현재 main **v127** 기준 (clean; APK `0.4.127-cp1-gui-baseline-v127`). host 테스트: `cd /Users/naen/Documents/alr-ws5 && uvx pytest tests/ -q` (pytest 미설치 → `uvx`) — 현재 host 테스트 ~**386+** 수집. 단일 진입점: `scripts/run-host-tests.sh`; pre-merge 게이트: `scripts/ws5-premerge-check.sh`. CLI: `python -m bench {gate,verify,overhead,gpu,index}`.
+baseline: `ws-5`는 현재 origin/main **`c009063`** (통합 트리 v127; APK `0.4.127-cp1-gui-baseline-v127`) 기준 (clean). host 테스트: `cd /Users/naen/Documents/alr-ws5 && uvx pytest tests/ -q` (pytest 미설치 → `uvx`) — 현재 host 테스트 ~**386+** 수집. 단일 진입점: `scripts/run-host-tests.sh`; pre-merge 게이트: `scripts/ws5-premerge-check.sh`. CLI: `python -m bench {gate,verify,overhead,gpu,index}`.

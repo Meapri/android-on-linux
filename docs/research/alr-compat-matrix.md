@@ -64,7 +64,8 @@ host 백본(decode/ring/AHB-FBO/zero-copy present)은 Mali-G615 MC2에 픽셀 �
 | GPU live producer→ring→executor→AHB present | Mali-verified (8 frames presented+verified, two-thread) | v118-gpu-native-live-integration | loader fork(STEP B)만 남음 |
 | guest libEGL/libGLESv2 shim (M3) | wire-verified (소스) | v118-gpu-native-live-integration | device 연결 pending (WS-2 M2) |
 | 화면 cube present (M4 STEP B, loader fork) | PENDING | v119-gpu-screen-cube-present | guest fork + ring fd 상속 |
-| glmark2-es2 (ALR, software=false) score | PENDING | — | WS-2 M3 / CP-2 |
+| CP-2 INFRA: loader ring attach + EGL dlopen + Mali software=false | **DEVICE-VERIFIED** | 2026-06-01-cp2-glmark2-egl-dlopen-resolved | `alr_loader_attach_gpu_ring`(glmark2 감지)+ring/doorbell+GpuExecutorService; libpthread 수정 후 EGL library dlopen 성공; Mali self-test 전부 `software renderer=false`(Mali-G615). 인프라만 검증 — Score는 아래 행에서 여전히 PENDING |
+| glmark2-es2 (ALR, software=false) score | PENDING | 2026-06-01-cp2-glmark2-egl-dlopen-resolved | WS-2 shim eglChooseConfig (0 configs) — `eglChooseConfig() didn't return any configs`. WS-2 M3가 EGL config/surface/GLES-via-ring 구현해야 Score 산출 (CP-2) |
 
 ## 디스플레이/입력 (L3)
 | 항목 | 결과 | Evidence | 비고 |
@@ -72,7 +73,7 @@ host 백본(decode/ring/AHB-FBO/zero-copy present)은 Mali-G615 MC2에 픽셀 �
 | 해상도/주사율 device-exact (1200×1920@90Hz, density=213) | RENDERS | v126-harfbuzz-fix-display-90hz, v127-xkb-config-root-gui-keymap-segv-fixed | `Display.getRealSize`+`refreshRate` JNI → wl_output mode+timerfd 90Hz |
 | 입력 (touch/pointer/key) | USABLE (GIMP 경로) | v86-input-injection, v111-gimp-fully-usable-drawing | wl_pointer/wl_keyboard/wl_touch 전달; IME/wl_seat 갭은 WS-3 M4 |
 | guest-GUI XKB 키맵 | 수정됨 (SIGSEGV fix, v127) | v127-xkb-config-root-gui-keymap-segv-fixed | `XKB_CONFIG_ROOT`를 rootfs-absolute 경로로 설정 → sig=11 카운트 0 |
-| `zwp_linux_dmabuf` zero-copy present (guest→AHB-backed shm pool) | PENDING | v114-ahb-zerocopy-present-live (M3 deferred note) | WS-3 M2 / CP-4 (현재 compositor가 wl_shm→AHB로 1 CPU copy) |
+| `zwp_linux_dmabuf` zero-copy present (AHB→external-OES) | **DEVICE-VERIFIED** (`ALR AHB ZEROCOPY IMPORT: PASS`; gtk3demo rendered=true frames 12→13, ws-3 WaylandPresenter, 단일 게이트 후 회귀 0) | 2026-06-01-drain5-cp4-dmabuf-present-single-gate, v114-ahb-zerocopy-present-live | CP-4 / ws-3 M2. AHB→EGLImage→external-OES import는 device 검증됨. 남은 정직한 nuance: guest-side dmabuf 프로토콜 광고(zwp_linux_dmabuf 게스트 advertise)는 WS-3 M2 잔여 디테일 |
 
 ## 미지원 (현재 불가)
 | 항목 | 상태 | 비고 |
