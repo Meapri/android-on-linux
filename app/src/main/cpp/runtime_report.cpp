@@ -91,6 +91,7 @@
 // context, dodging the v117 same-context black-AHB hazard). run_screen_cube_demo()
 // streams a spinning textured cube to the SurfaceView (in-process, no fork/rootfs).
 #include "alr_gpu/alr_gpu_screen.hpp"
+#include "alr_gpu/alr_gpu_ring_hook.hpp"  // WS-1↔WS-2 CP-0 §5-A: GPU ring hook (GLES guest → Mali)
 // alr_jit_probe.hpp: V8-style iterative W^X (RW<->RX) executable-memory cycle probe —
 // decides whether Chromium (V8/SwiftShader JIT) can run WITHOUT --jitless on this
 // untrusted_app domain. Pure anonymous mmap/mprotect; no memfd-exec (that's EACCES).
@@ -1611,6 +1612,25 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         return out.str();
     }
 
+    // WS-1 ↔ WS-2 (CP-0 §5-A): for a GLES guest (glmark2), attach the GPU command ring
+    // BEFORE fork so the guest's libGLESv2 shim drives the host Mali executor. The
+    // ring/doorbell fds are inheritable (non-CLOEXEC) → the forked guest keeps them.
+    // present_window=null → executor renders headless (glmark2 fps = real Mali); on-
+    // screen present lands with WS-3's PresentSource (§5-C). Non-GPU guests skip this
+    // (no executor / Mali-thread cost). attach failure → CPU-only (no env pushed; the
+    // shim then runs ring-less = quiet no-op).
+    alr::gpu::GpuRing gpu_ring{};
+    bool gpu_ring_attached = false;
+    if (config.program.find("glmark2") != std::string::npos) {
+        alr::gpu::GpuRingAttachConfig gcfg;
+        gcfg.fb_w = 1280;
+        gcfg.fb_h = 720;
+        if (alr::gpu::alr_loader_attach_gpu_ring(gpu_ring, gcfg)) {
+            gpu_ring_attached = true;
+            for (const auto& kv : alr::gpu::gpu_ring_guest_env(gpu_ring))
+                guest_env.push_back(kv);
+        }
+    }
     const auto t_exec_start = std::chrono::steady_clock::now();  // WS-1 M2: native-exec wall-clock (fork→reap)
     const pid_t pid = ::fork();
     if (pid == 0) {
@@ -2439,6 +2459,8 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         }
     }
 
+    // WS-1 ↔ WS-2 (CP-0): guest reaped → stop the Mali executor + free ring/doorbell.
+    if (gpu_ring_attached) alr::gpu::alr_loader_detach_gpu_ring();
     return out.str();
 }
 
