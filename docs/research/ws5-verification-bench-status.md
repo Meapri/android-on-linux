@@ -59,6 +59,11 @@ WS-5는 전 WS 산출물을 **측정**한다. 계약 자체는 제공하지 않�
 | `docs/evidence/CAPTURE-RUNBOOK.md` | 공유 디바이스 안전 캡처 런북 | done |
 | `docs/research/alr-compat-matrix.md` | M4 앱×결과 호환 매트릭스 | seeded (기존 evidence 기반) |
 | `.github/workflows/ws5-host-ci.yml` + `scripts/run-host-tests.sh` | M5 host CI 게이트 (device는 수동) | done |
+| `bench/display_verify.py` | CP-1 device-exact 디스플레이 검증 (1200×1920@90Hz; refresh는 마커 생기기 전까지 unverified) | host-done, 테스트됨 |
+| `bench/report_parse.py` 일반화 | 제네릭 `ALR X: status` 마커 맵 + `wl_output` 파싱 (future-proof) | host-done, 테스트됨 |
+| `docs/research/ws5-premerge-gate.md` + `scripts/ws5-premerge-check.sh` | §5 게이트 기준 (통합 세션 pre-merge 게이트, CP별) | done |
+| `bench/microbench/` (`microbench.c` + README) | M1 same-binary native-vs-ALR 측정 타깃 (compute/syscall 모드) | source-done (cross-compile/stage는 WS-4) |
+| `bench/__main__.py` `verify` 서브커맨드 | 리포트 1개로 gate + CP-1 display + 마커 요약 통합 | host-done, 테스트됨 |
 | 위 전부의 **device 실측** | M1/M2/M3 | pending (통합 빌드 + 디바이스 점유 조율) |
 
-host 테스트: `cd /Users/naen/Documents/alr-ws5 && uvx pytest tests/ -q` (pytest 미설치 → `uvx` 사용) → **315 passed** (baseline 277 + WS-5 38). 단일 진입점: `scripts/run-host-tests.sh`.
+baseline: `ws-5`는 **v127** 위로 rebase됨 (clean). host 테스트: `cd /Users/naen/Documents/alr-ws5 && uvx pytest tests/ -q` (pytest 미설치 → `uvx`) → **345 passed** (baseline 277 + WS-5 68). 단일 진입점: `scripts/run-host-tests.sh`; pre-merge 게이트: `scripts/ws5-premerge-check.sh`. CLI: `python -m bench {gate,verify,overhead,gpu,index}`.

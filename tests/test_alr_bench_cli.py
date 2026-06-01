@@ -93,3 +93,29 @@ def test_index_default_dir_lists_corpus(capsys):
 
 def test_no_subcommand_prints_help_returns_2():
     assert main([]) == 2
+
+
+_VERIFY_REPORT = (
+    "build: 0.4.127-x\n"
+    + "\n".join(f"gimp-probe guest={g} exit={e}" for g, e in _PASSING_PROBES)
+    + "\nall: pcgate=1 interpose=1 traps=0 rewrites=0\n"
+    + "client bound: wl_output v2 (1200x1920 px, 70x111 mm, scale=2, dpi=440)\n"
+    + "ALR NATIVE LOADER GUEST EXEC: PASS\n"
+    + "ALR PERF HARNESS: PASS\n"
+)
+
+
+def test_verify_passing_report(tmp_path, capsys):
+    p = tmp_path / "rep.txt"
+    p.write_text(_VERIFY_REPORT, encoding="utf-8")
+    assert main(["verify", str(p)]) == 0
+    out = capsys.readouterr().out
+    assert "Regression gate" in out
+    assert "ALR markers" in out
+
+
+def test_verify_regressed_report_fails(tmp_path):
+    bad = _VERIFY_REPORT.replace("guest=/usr/bin/id exit=0", "guest=/usr/bin/id exit=1")
+    p = tmp_path / "bad.txt"
+    p.write_text(bad, encoding="utf-8")
+    assert main(["verify", str(p)]) == 1

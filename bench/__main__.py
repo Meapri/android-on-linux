@@ -5,6 +5,7 @@ the relative `from .` imports resolve as the `bench` package.
 
 Subcommands:
 - gate REPORT      — parse a captured device report and run the no-regression gate.
+- verify REPORT    — full report check: gate + CP-1 display + ALR marker summary.
 - overhead ...     — compute native-vs-ALR CPU overhead from two wall-clock samples.
 - gpu ...          — compute glmark2 ALR-vs-Mali-direct ratio against the §0 target.
 - index [--dir]    — index the docs/evidence corpus as a markdown table.
@@ -20,8 +21,10 @@ from pathlib import Path
 
 from .cpu_overhead import Measurement, compute_overhead
 from .evidence_index import build_index_markdown, scan_evidence_dir
+from .display_verify import verify_from_report
 from .gpu_bench import GPU_ACCEL_MIN_RATIO, GpuScore, compute_gpu_ratio
-from .regression_gate import evaluate_text
+from .regression_gate import evaluate_report, evaluate_text
+from .report_parse import parse_report
 
 _DEFAULT_EVIDENCE_DIR = Path(__file__).resolve().parents[1] / "docs" / "evidence"
 
@@ -69,6 +72,34 @@ def _cmd_index(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_verify(args: argparse.Namespace) -> int:
+    """One-shot check of a captured device report: no-regression gate + CP-1 display
+    + an ALR PASS/FAIL marker summary. Exit 0 only if the gate and (when present) the
+    display verdict both pass."""
+    text = _read_report(args.report)
+    parsed = parse_report(text)
+
+    gate = evaluate_report(parsed)
+    print(gate.to_markdown())
+
+    disp = verify_from_report(text)
+    if disp is not None:
+        print()
+        print(disp.to_markdown())
+
+    markers = parsed.alr_markers
+    if markers:
+        passed = sum(1 for v in markers.values() if v.upper() == "PASS")
+        print()
+        print(f"### ALR markers — {passed}/{len(markers)} PASS")
+        non_pass = [k for k, v in markers.items() if v.upper() != "PASS"]
+        if non_pass:
+            print("non-PASS: " + ", ".join(sorted(non_pass)))
+
+    ok = gate.passed and (disp is None or disp.passed)
+    return 0 if ok else 1
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="bench",
@@ -82,6 +113,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     gate.add_argument("report", help="path to a captured report, or '-' for stdin")
     gate.set_defaults(func=_cmd_gate)
+
+    verify = sub.add_parser(
+        "verify",
+        help="full report check: no-regression gate + CP-1 display + ALR marker summary",
+    )
+    verify.add_argument("report", help="path to a captured report, or '-' for stdin")
+    verify.set_defaults(func=_cmd_verify)
 
     over = sub.add_parser(
         "overhead",
