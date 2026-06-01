@@ -160,7 +160,7 @@ class MainActivity : Activity() {
         // is wired separately. Device test = CP-5.
         Thread {
             try {
-                for (name in listOf("sdl2", "netsurf", "microbench", "interpose", "dpkg-db", "x11", "apt-config")) {
+                for (name in listOf("sdl2", "netsurf", "qt6", "xwayland", "babl-gegl", "microbench", "interpose", "dpkg-db", "x11", "apt-config")) {
                     val tar = java.io.File("/data/local/tmp/$name-stage.tar")
                     val marker = java.io.File(rootfsStatus.rootfsDir, ".$name-staged-${tar.length()}")
                     if (tar.isFile && !marker.isFile) {
@@ -206,6 +206,13 @@ class MainActivity : Activity() {
         // ALR native loader and emits version/exit/summary to logcat tag alr_loader, so the
         // integration device drain can capture functional evidence (not just "staged").
         launchPackageManagerProbes(rootfsStatus.rootfsDir, rootfsManifest.name)
+        // WS-4 §10(b) toolkit launch FUNCTIONAL probes: run a lightweight smoke of the
+        // SDL2 / Qt6 / netsurf binaries (from the sdl2/qt6/netsurf overlays staged above)
+        // through the ALR native loader and Log.i(tag=alr_loader, "toolkit-<name>: ...") the
+        // result, so the integration device drain captures GUEST EXEC PASS + a version
+        // marker — without needing a display (the GUI bodies are launched on the compositor
+        // by the integration drain). Same pkgfunc pattern as launchPackageManagerProbes.
+        launchToolkitProbes(rootfsStatus.rootfsDir, rootfsManifest.name)
         val nativeCommandRunner = NativeCommandRunner(
             File(applicationInfo.nativeLibraryDir),
             File(cacheDir, "proot-tmp"),
@@ -1615,6 +1622,93 @@ class MainActivity : Activity() {
                 probe("xwayland-version", "/usr/bin/Xwayland\n-version", "Xwayland")
             } catch (e: Throwable) {
                 android.util.Log.e("alr_loader", "pkgfunc EXC: ${android.util.Log.getStackTraceString(e)}")
+            }
+        }.start()
+    }
+
+    // WS-4 §10(b): toolkit launch FUNCTIONAL probes. The sdl2/qt6/netsurf overlays stage
+    // above; this RUNS a lightweight, display-free smoke of each toolkit's binary through
+    // the ALR native loader (the SAME newline-delimited-argv probe foot/gtkdemo/glmark2 +
+    // launchPackageManagerProbes use) and emits the result to logcat tag alr_loader with a
+    // stable "toolkit-<name>" marker the integration device drain greps. The GUI bodies
+    // (real windows on the compositor) are launched by the integration drain — here we only
+    // prove the binary loads its closure + runs (GUEST EXEC PASS) and prints its version.
+    // Robust: each toolkit lists candidate binary paths; the first that exists is probed,
+    // else we log "toolkit-<name>: missing" (the SDL2 runtime-lib overlay may ship no CLI
+    // binary, and the minimal Qt6 closure may omit qtdiag — never a hard failure here).
+    private fun launchToolkitProbes(rootfsDir: File, rootfsName: String) {
+        Thread {
+            try {
+                // Wait (bounded) for the concurrent toolkit-stage thread to extract the
+                // overlays before probing, so we don't race the extract.
+                val netsurfBin = File(rootfsDir, "usr/bin/netsurf-gtk3")
+                val sdl2Marker = File(rootfsDir, ".sdl2-staged-${File("/data/local/tmp/sdl2-stage.tar").length()}")
+                val qt6Marker = File(rootfsDir, ".qt6-staged-${File("/data/local/tmp/qt6-stage.tar").length()}")
+                var waited = 0
+                while (waited < 20000 &&
+                    !(netsurfBin.isFile || sdl2Marker.isFile || qt6Marker.isFile)
+                ) {
+                    Thread.sleep(500)
+                    waited += 500
+                }
+                // Run the first existing candidate binary through the loader (display-free
+                // --version / -v / immediate-exit path) and log toolkit-<name>.
+                fun probe(name: String, candidates: List<String>, args: String, okMarker: String) {
+                    val bin = candidates.firstOrNull { File(rootfsDir, it.removePrefix("/")).isFile }
+                    if (bin == null) {
+                        android.util.Log.i(
+                            "alr_loader",
+                            "toolkit-$name: missing (none of ${candidates.joinToString(",")} present)",
+                        )
+                        return
+                    }
+                    val program = if (args.isEmpty()) bin else "$bin\n$args"
+                    val out = nativeAlrNativeLoaderProbe(
+                        packageName,
+                        applicationInfo.nativeLibraryDir,
+                        filesDir.absolutePath,
+                        cacheDir.absolutePath,
+                        rootfsName,
+                        program,
+                    )
+                    val exec = out.lineStartingWith("ALR NATIVE LOADER GUEST EXEC:")
+                    val ok = out.contains(okMarker)
+                    android.util.Log.i(
+                        "alr_loader",
+                        "toolkit-$name: bin=[$bin] ok=$ok exec=[$exec] marker=[$okMarker]",
+                    )
+                    android.util.Log.i("alr_loader", "toolkit-$name-out:\n$out")
+                }
+                // (t1) netsurf-gtk3: the GTK3 browser. -v prints the version banner and the
+                // help path exits without opening a window — proves its closure (libcurl/
+                // libssh + base GTK3) links and runs through the loader.
+                probe(
+                    "netsurf",
+                    listOf("/usr/bin/netsurf-gtk3", "/usr/bin/netsurf-gtk", "/usr/bin/netsurf"),
+                    "-v",
+                    "NetSurf",
+                )
+                // (t2) Qt6: the minimal qt6-wayland closure keeps the qtwayland plugins but
+                // may omit CLI tools; probe whichever diagnostic/utility binary survives. A
+                // QT_QPA_PLATFORM=minimal-style --version path exits without a display.
+                probe(
+                    "qt6",
+                    listOf("/usr/bin/qtdiag6", "/usr/lib/qt6/bin/qtdiag", "/usr/bin/qmake6", "/usr/lib/qt6/bin/qmake"),
+                    "--version",
+                    "Qt",
+                )
+                // (t3) SDL2: the libsdl2-2.0-0 runtime overlay is a pure shared lib (no CLI
+                // binary in the runtime package). If a config/test binary happens to be
+                // present, version-probe it; otherwise the candidate list is empty -> the
+                // helper logs "toolkit-sdl2: missing", which the drain reads as lib-only.
+                probe(
+                    "sdl2",
+                    listOf("/usr/bin/sdl2-config"),
+                    "--version",
+                    ".",
+                )
+            } catch (e: Throwable) {
+                android.util.Log.e("alr_loader", "toolkit EXC: ${android.util.Log.getStackTraceString(e)}")
             }
         }.start()
     }
