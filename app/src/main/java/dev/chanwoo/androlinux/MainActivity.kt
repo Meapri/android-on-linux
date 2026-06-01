@@ -720,7 +720,7 @@ class MainActivity : Activity() {
             alrSeccompPathTrapProbe.lineStartingWith("alr sc PATH_MEDIATION_VIABLE=")
                 .substringAfter("PATH_MEDIATION_VIABLE=", "") == "yes"
 
-        val executionSummary = "build: 0.4.132-breadth-fanout-v132" +
+        val executionSummary = "build: 0.4.133-breadth-r3-v133" +
             "\nexecution summary" +
             "\nROOTFS EXECUTION: ${if (rootfsExecutionPassed) "PASS" else "FAIL"}" +
             "\nSHELL SCRIPT EXECUTION: ${if (shellScriptExecutionPassed) "PASS" else "FAIL"}" +
@@ -1693,19 +1693,20 @@ class MainActivity : Activity() {
                 // QT_QPA_PLATFORM=minimal-style --version path exits without a display.
                 probe(
                     "qt6",
-                    listOf("/usr/bin/qtdiag6", "/usr/lib/qt6/bin/qtdiag", "/usr/bin/qmake6", "/usr/lib/qt6/bin/qmake"),
+                    // WS-4 build_toolkit_overlays ships qtpaths6 (real file; /usr/bin/qtpaths6 is a
+                    // `..`-escaping symlink dropped by §5-E safe-symlink, so use the lib path).
+                    listOf("/usr/lib/qt6/bin/qtpaths6", "/usr/bin/qtdiag6", "/usr/lib/qt6/bin/qtdiag", "/usr/bin/qmake6", "/usr/lib/qt6/bin/qmake"),
                     "--version",
                     "Qt",
                 )
-                // (t3) SDL2: the libsdl2-2.0-0 runtime overlay is a pure shared lib (no CLI
-                // binary in the runtime package). If a config/test binary happens to be
-                // present, version-probe it; otherwise the candidate list is empty -> the
-                // helper logs "toolkit-sdl2: missing", which the drain reads as lib-only.
+                // (t3) SDL2: WS-4 build_toolkit_overlays adds libsdl2-tests, whose `testver`
+                // links only libSDL2 + libc (no display) and prints the SDL version — a real
+                // launchable SDL2 binary. Fall back to sdl2-config if a -dev overlay is present.
                 probe(
                     "sdl2",
-                    listOf("/usr/bin/sdl2-config"),
+                    listOf("/usr/libexec/installed-tests/SDL2/testver", "/usr/bin/sdl2-config"),
                     "--version",
-                    ".",
+                    "SDL",
                 )
             } catch (e: Throwable) {
                 android.util.Log.e("alr_loader", "toolkit EXC: ${android.util.Log.getStackTraceString(e)}")
