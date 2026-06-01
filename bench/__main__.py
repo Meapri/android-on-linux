@@ -24,7 +24,12 @@ from .cp_status import build_cp_dashboard_markdown, scan_cp_status
 from .cpu_overhead import Measurement, compute_overhead
 from .evidence_index import build_index_markdown, scan_evidence_dir
 from .display_verify import verify_from_report
-from .gpu_bench import GPU_ACCEL_MIN_RATIO, GpuScore, compute_gpu_ratio
+from .gpu_bench import (
+    GPU_ACCEL_MIN_RATIO,
+    GpuScore,
+    compute_gpu_ratio,
+    gpu_result_from_reports,
+)
 from .regression_gate import evaluate_report, evaluate_text
 from .report_parse import parse_report
 
@@ -61,9 +66,25 @@ def _cmd_overhead(args: argparse.Namespace) -> int:
 
 
 def _cmd_gpu(args: argparse.Namespace) -> int:
-    alr = GpuScore(label="alr", score=args.alr_score, renderer=args.alr_renderer)
-    mali = GpuScore(label="mali-direct", score=args.mali_score)
-    result = compute_gpu_ratio(alr, mali, min_ratio=args.min_ratio)
+    # Two input modes: explicit scores, or captured glmark2 logs (--*-report),
+    # which parse `glmark2 Score: N` + `GL_RENDERER:` directly — the path for the
+    # moment a CP-2 device drain produces a Score (WS-2 shim eglChooseConfig).
+    if args.alr_report and args.mali_report:
+        result = gpu_result_from_reports(
+            _read_report(args.alr_report),
+            _read_report(args.mali_report),
+            min_ratio=args.min_ratio,
+        )
+    elif args.alr_score is not None and args.mali_score is not None:
+        alr = GpuScore(label="alr", score=args.alr_score, renderer=args.alr_renderer)
+        mali = GpuScore(label="mali-direct", score=args.mali_score)
+        result = compute_gpu_ratio(alr, mali, min_ratio=args.min_ratio)
+    else:
+        print(
+            "gpu: provide --alr-score/--mali-score, or --alr-report/--mali-report",
+            file=sys.stderr,
+        )
+        return 2
     print(result.to_markdown())
     return 0 if result.passes_target else 1
 
@@ -152,9 +173,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "gpu",
         help="compute glmark2 ALR-vs-Mali-direct ratio against the §0 target",
     )
-    gpu.add_argument("--alr-score", type=int, required=True, help="ALR glmark2 score")
-    gpu.add_argument("--mali-score", type=int, required=True, help="native Mali-direct glmark2 score")
+    gpu.add_argument("--alr-score", type=int, default=None, help="ALR glmark2 score (or --alr-report)")
+    gpu.add_argument("--mali-score", type=int, default=None, help="native Mali-direct glmark2 score (or --mali-report)")
     gpu.add_argument("--alr-renderer", default="", help="GL_RENDERER of the ALR run (software gate)")
+    gpu.add_argument("--alr-report", default=None, help="captured ALR glmark2 log (parses Score + GL_RENDERER)")
+    gpu.add_argument("--mali-report", default=None, help="captured Mali-direct glmark2 log")
     gpu.add_argument(
         "--min-ratio",
         type=float,
