@@ -24,7 +24,7 @@ def test_main_activity_reports_android_perf_harness_and_pending_comparison():
     assert "ALR PERF PROOT VS ALR DEVICE COMPARISON: " in text
     assert "alr perf harness ran=" in text
     assert "ALR PRoot-vs-ALR perf comparison probe:" in text
-    assert "build: 0.4.124-seize-mt-supervisor-v124" in text
+    assert "build: 0.4.126-gui-native-perf-v126" in text
 
 
 def test_execution_backend_docs_require_perf_scaffolding_probe():

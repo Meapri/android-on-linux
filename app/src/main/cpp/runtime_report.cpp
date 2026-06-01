@@ -1834,7 +1834,12 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         // Dynamic GUI guests (GIMP) must persist long enough to be USED
         // interactively (touch -> redraw), not just rendered once; a tiny static
         // probe keeps a short leash. 1800s ~= 30 min of live, interactive GIMP.
-        ::alarm(dynamic ? 1800 : 5);
+        // Verification flow runs several long-lived GUI apps in sequence; each would
+        // otherwise block the loader for the full interactive budget. 25s is enough to
+        // map + render + measure (frame counter) each one, then SIGALRM ends it so the
+        // next app runs (also bounds foot's interactive-shell wait). Was 1800 for a live
+        // interactive GIMP session — parameterize per-launch when returning to that.
+        ::alarm(dynamic ? 25 : 5);
         alr_enter_guest(reinterpret_cast<void*>(start), reinterpret_cast<void*>(jump_entry),
                         reinterpret_cast<void*>(tcb));
         _exit(99);  // unreachable
@@ -5181,7 +5186,10 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandCompositorStart(
     jobject surface,
     jint density_dpi,
     jfloat xdpi,
-    jfloat ydpi) {
+    jfloat ydpi,
+    jint out_width_px,
+    jint out_height_px,
+    jint refresh_mhz) {
 #ifdef ALR_HAVE_WAYLAND
     const std::string cache = jstring_to_string(env, cache_dir);
     ANativeWindow* window = surface != nullptr ? ANativeWindow_fromSurface(env, surface) : nullptr;
@@ -5192,6 +5200,12 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandCompositorStart(
         cfg.output_width = ANativeWindow_getWidth(window);
         cfg.output_height = ANativeWindow_getHeight(window);
     }
+    // Device-exact panel size + refresh from Kotlin (Display.getRealSize / refreshRate)
+    // override the SurfaceView-derived size, so wl_output advertises the TRUE resolution
+    // and refresh (1200x1920 @ 90Hz here) instead of a ~size / hardcoded-60Hz default.
+    if (out_width_px > 0) cfg.output_width = out_width_px;
+    if (out_height_px > 0) cfg.output_height = out_height_px;
+    if (refresh_mhz > 0) cfg.output_refresh_mhz = refresh_mhz;
     // Device display metrics -> Wayland output resolution + DPI + integer scale,
     // so the guest GUI renders at the device's real resolution/density.
     cfg.density_dpi = density_dpi;
@@ -5218,6 +5232,9 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandCompositorStart(
     (void)density_dpi;
     (void)xdpi;
     (void)ydpi;
+    (void)out_width_px;
+    (void)out_height_px;
+    (void)refresh_mhz;
     return env->NewStringUTF("ALR WAYLAND COMPOSITOR: not-built");
 #endif
 }

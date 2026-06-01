@@ -45,7 +45,13 @@ class MainActivity : Activity() {
         // native loader — headless, single-process, no sandbox (sidesteps the 6 gaps).
         // The 517MB tar is adb-push'd to /data/local/tmp (app-readable). Heavy (extract +
         // Chromium boot) → off the UI thread. Verified via logcat tag alr_loader.
-        Thread {
+        // Chromium DEFERRED (user: 크로미움 보류). Critically, chromium-stage.tar also
+        // ships libharfbuzz.so.0.60000.0 (6.0.0) which OVERWROTE the rootfs's matched
+        // harfbuzz 8.3.0 → pango 1.52.1 lost `hb_ot_color_has_paint` → all GTK apps +
+        // GIMP exit=127. Keeping this overlay off preserves the rootfs's 8.3.0 stack
+        // (and avoids re-extracting the 517MB tar on every cold start).
+        @Suppress("ConstantConditionIf")
+        if (false) Thread {
             try {
                 val crTar = java.io.File("/data/local/tmp/chromium-stage.tar")
                 // Marker keyed on tar size so re-pushing a fixed/updated stage tar
@@ -72,6 +78,46 @@ class MainActivity : Activity() {
                 android.util.Log.i("alr_loader", "chromium-boot:\n$crReport")
             } catch (e: Throwable) {
                 android.util.Log.e("alr_loader", "chromium-boot EXC: ${android.util.Log.getStackTraceString(e)}")
+            }
+        }.start()
+        // Goal-2 universality: stage `foot` (a Wayland-native terminal, ~1-2 threads —
+        // it clears the multithread ptrace wall that blocks Chromium's render) as a
+        // one-time ~1.5MB overlay. foot binds wl_compositor/wl_subcompositor/wl_shm/
+        // xdg_wm_base (all advertised) and CPU-renders glyphs into wl_shm, exactly the
+        // path the WaylandPresenter already uploads to the SurfaceView for GIMP. The
+        // launch happens later on the compositor (in the GUI thread, before GIMP).
+        Thread {
+            try {
+                val footTar = java.io.File("/data/local/tmp/foot-stage.tar")
+                val footMarker = java.io.File(rootfsStatus.rootfsDir, ".foot-staged-${footTar.length()}")
+                if (footTar.isFile && !footMarker.isFile) {
+                    android.util.Log.i("alr_loader", "foot-stage: extracting overlay (${footTar.length()} bytes)")
+                    RootfsInstaller(this@MainActivity).extractVerifiedTar(footTar, rootfsStatus.rootfsDir)
+                    footMarker.writeText("staged\n")
+                    android.util.Log.i("alr_loader", "foot-stage: overlay done")
+                }
+            } catch (e: Throwable) {
+                android.util.Log.e("alr_loader", "foot-stage EXC: ${android.util.Log.getStackTraceString(e)}")
+            }
+        }.start()
+        // Goal-2 universality: also stage gtk3-widget-factory / gtk3-demo (lightweight
+        // GTK3 demo apps, pty-free) as a ~3.6MB overlay. Their entire DT_NEEDED closure
+        // is the GTK3 set the rootfs already ships for GIMP — only the demo binaries are
+        // new. A second, DIFFERENT lightweight app rendering on the same compositor
+        // broadens the "universal native GUI" proof beyond foot (and is the pty-free
+        // safety net should foot's terminal pty be blocked under untrusted_app).
+        Thread {
+            try {
+                val gtkDemoTar = java.io.File("/data/local/tmp/gtk3demo-stage.tar")
+                val gtkDemoMarker = java.io.File(rootfsStatus.rootfsDir, ".gtk3demo-staged-${gtkDemoTar.length()}")
+                if (gtkDemoTar.isFile && !gtkDemoMarker.isFile) {
+                    android.util.Log.i("alr_loader", "gtk3demo-stage: extracting overlay (${gtkDemoTar.length()} bytes)")
+                    RootfsInstaller(this@MainActivity).extractVerifiedTar(gtkDemoTar, rootfsStatus.rootfsDir)
+                    gtkDemoMarker.writeText("staged\n")
+                    android.util.Log.i("alr_loader", "gtk3demo-stage: overlay done")
+                }
+            } catch (e: Throwable) {
+                android.util.Log.e("alr_loader", "gtk3demo-stage EXC: ${android.util.Log.getStackTraceString(e)}")
             }
         }.start()
         val nativeCommandRunner = NativeCommandRunner(
@@ -545,7 +591,7 @@ class MainActivity : Activity() {
             alrSeccompPathTrapProbe.lineStartingWith("alr sc PATH_MEDIATION_VIABLE=")
                 .substringAfter("PATH_MEDIATION_VIABLE=", "") == "yes"
 
-        val executionSummary = "build: 0.4.124-seize-mt-supervisor-v124" +
+        val executionSummary = "build: 0.4.126-gui-native-perf-v126" +
             "\nexecution summary" +
             "\nROOTFS EXECUTION: ${if (rootfsExecutionPassed) "PASS" else "FAIL"}" +
             "\nSHELL SCRIPT EXECUTION: ${if (shellScriptExecutionPassed) "PASS" else "FAIL"}" +
@@ -1064,8 +1110,21 @@ class MainActivity : Activity() {
                     // loader. Its committed buffer is uploaded by the compositor's
                     // EGL presenter and drawn onto this SurfaceView.
                     val dm = resources.displayMetrics
+                    // Device-exact resolution + refresh for the guest's wl_output, so GUI
+                    // apps see the real panel (1200x1920 @ 90Hz here) — not the hardcoded
+                    // 60Hz / SurfaceView-derived approximation. getRealSize is rotation-
+                    // aware (matches the fullscreen surface); refreshRate is the active mode.
+                    val disp = if (android.os.Build.VERSION.SDK_INT >= 30) display
+                        else @Suppress("DEPRECATION") windowManager.defaultDisplay
+                    val realSize = android.graphics.Point()
+                    @Suppress("DEPRECATION") disp?.getRealSize(realSize)
+                    val outW = if (realSize.x > 0) realSize.x else dm.widthPixels
+                    val outH = if (realSize.y > 0) realSize.y else dm.heightPixels
+                    val refreshMhz = Math.round((disp?.refreshRate ?: 60f) * 1000f)
+                    android.util.Log.i("alr_loader", "display: ${outW}x${outH} @ ${refreshMhz}mHz density=${dm.densityDpi}")
                     val wlStart = nativeWaylandCompositorStart(
-                        cacheDir.absolutePath, holder.surface, dm.densityDpi, dm.xdpi, dm.ydpi)
+                        cacheDir.absolutePath, holder.surface, dm.densityDpi, dm.xdpi, dm.ydpi,
+                        outW, outH, refreshMhz)
                     val wlClient = nativeAlrNativeLoaderProbe(
                         packageName,
                         applicationInfo.nativeLibraryDir,
@@ -1190,6 +1249,78 @@ class MainActivity : Activity() {
                                 )
                                 view.append("\n\n--- ALR Wayland compositor (after GTK3) ---\n$gtkStatus")
                                 view.append("\n\n--- ALR guest GTK3 client ---\n$gtkClient")
+                            }
+
+                            // Goal-2 universality HEADLINE: a LIGHTWEIGHT real Linux
+                            // GUI app — `foot`, a Wayland-native terminal. Only ~1-2
+                            // threads (vs Chromium's ~22), so it clears the multithread
+                            // ptrace-overhead wall that blocks Chromium's render. First
+                            // the cheap `--version` (proves ld.so resolves libfcft4 +
+                            // libutf8proc + the rootfs libs and the binary links), then
+                            // `foot -e /bin/dash` opens a REAL terminal running the
+                            // rootfs shell: foot binds the compositor globals, CPU-renders
+                            // glyphs into wl_shm → the WaylandPresenter uploads to the
+                            // SurfaceView. Success = a frame committed (counter advances).
+                            val footVersion = nativeAlrNativeLoaderProbe(
+                                packageName,
+                                applicationInfo.nativeLibraryDir,
+                                filesDir.absolutePath,
+                                cacheDir.absolutePath,
+                                rootfsManifest.name,
+                                "/usr/bin/foot\n--version",
+                            )
+                            val footVersionOk = footVersion.contains("foot version")
+                            val framesBeforeFoot = nativeWaylandCompositorStatus().intFieldAfter("alr wl frames=")
+                            val footGuiClient = nativeAlrNativeLoaderProbe(
+                                packageName,
+                                applicationInfo.nativeLibraryDir,
+                                filesDir.absolutePath,
+                                cacheDir.absolutePath,
+                                rootfsManifest.name,
+                                "/usr/bin/foot\n-e\n/bin/dash",
+                            )
+                            val footStatus = nativeWaylandCompositorStatus()
+                            val framesAfterFoot = footStatus.intFieldAfter("alr wl frames=")
+                            val footRendered = framesAfterFoot > framesBeforeFoot
+                            android.util.Log.i("alr_loader", "foot-result: rendered=$footRendered frames=$framesBeforeFoot->$framesAfterFoot ver=$footVersionOk")
+                            android.util.Log.i("alr_loader", "foot-version:\n$footVersion")
+                            android.util.Log.i("alr_loader", "foot-terminal:\n$footGuiClient")
+                            android.util.Log.i("alr_loader", "foot-status:\n$footStatus")
+                            runOnUiThread {
+                                view.append(
+                                    "\nALR FOOT TERMINAL (lightweight Wayland app: foot -e dash → wl_shm → SurfaceView): " +
+                                        "${gate(footRendered)} (frames $framesBeforeFoot→$framesAfterFoot, ver=${gate(footVersionOk)})",
+                                )
+                                view.append("\n\n--- ALR guest foot --version ---\n$footVersion")
+                                view.append("\n\n--- ALR guest foot terminal (foot -e /bin/dash) ---\n$footGuiClient")
+                            }
+
+                            // Goal-2 universality 2nd lightweight app: gtk3-widget-factory,
+                            // a real GTK3 showcase (every widget type). Different code path
+                            // than foot, pty-free, Wayland-native via GDK. Renders its
+                            // toplevel into wl_shm → SurfaceView, same as GIMP but far
+                            // lighter — proving the universal path isn't foot-specific.
+                            val framesBeforeGtkDemo = nativeWaylandCompositorStatus().intFieldAfter("alr wl frames=")
+                            val gtkDemoClient = nativeAlrNativeLoaderProbe(
+                                packageName,
+                                applicationInfo.nativeLibraryDir,
+                                filesDir.absolutePath,
+                                cacheDir.absolutePath,
+                                rootfsManifest.name,
+                                "/usr/bin/gtk3-widget-factory",
+                            )
+                            val gtkDemoStatus = nativeWaylandCompositorStatus()
+                            val framesAfterGtkDemo = gtkDemoStatus.intFieldAfter("alr wl frames=")
+                            val gtkDemoRendered = framesAfterGtkDemo > framesBeforeGtkDemo
+                            android.util.Log.i("alr_loader", "gtkdemo-result: rendered=$gtkDemoRendered frames=$framesBeforeGtkDemo->$framesAfterGtkDemo")
+                            android.util.Log.i("alr_loader", "gtkdemo-client:\n$gtkDemoClient")
+                            android.util.Log.i("alr_loader", "gtkdemo-status:\n$gtkDemoStatus")
+                            runOnUiThread {
+                                view.append(
+                                    "\nALR GTK3 WIDGET-FACTORY (lightweight GTK3 app → wl_shm → SurfaceView): " +
+                                        "${gate(gtkDemoRendered)} (frames $framesBeforeGtkDemo→$framesAfterGtkDemo)",
+                                )
+                                view.append("\n\n--- ALR guest gtk3-widget-factory ---\n$gtkDemoClient")
                             }
 
                             // Phase 6 FINAL: run real GIMP 3.0 on the compositor.
@@ -1710,6 +1841,9 @@ class MainActivity : Activity() {
         densityDpi: Int,
         xdpi: Float,
         ydpi: Float,
+        outWidthPx: Int,
+        outHeightPx: Int,
+        refreshMilliHz: Int,
     ): String
 
     private external fun nativeWaylandCompositorStatus(): String

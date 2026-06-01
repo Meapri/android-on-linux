@@ -1470,12 +1470,17 @@ bool Compositor::setup() {
         ALR_WL_LOGE("%s", status_.c_str());
         return false;
     }
-    // A ~60 Hz repeating timer paces frame callbacks (see surface_commit).
+    // A repeating timer paces frame callbacks (see surface_commit) at the PANEL's
+    // refresh rate (config_.output_refresh_mhz), so a 90Hz device drives 90 frame
+    // callbacks/s and presents at 90Hz instead of a hardcoded 60.
     frame_timer_fd_ = ::timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
     if (frame_timer_fd_ >= 0) {
+        long refresh_mhz = config_.output_refresh_mhz > 0 ? config_.output_refresh_mhz : 60000;
+        long period_ns = 1'000'000'000'000LL / refresh_mhz;  // mHz -> ns (90000 -> 11'111'111)
+        if (period_ns < 1'000'000 || period_ns > 1'000'000'000LL) period_ns = 16'666'667;  // sane bounds -> 60Hz
         struct itimerspec its{};
-        its.it_interval.tv_nsec = 16'666'667;  // ~60 Hz
-        its.it_value.tv_nsec = 16'666'667;
+        its.it_interval.tv_nsec = period_ns;
+        its.it_value.tv_nsec = period_ns;
         ::timerfd_settime(frame_timer_fd_, 0, &its, nullptr);
     }
 
