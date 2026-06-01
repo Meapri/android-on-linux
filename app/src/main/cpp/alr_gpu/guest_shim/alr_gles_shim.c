@@ -885,6 +885,34 @@ void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void
     alr_shim_emit(build_draw_elements_instanced, &a);
 }
 
+/* per-instance attribute divisor — same packed-handle by-name scheme as the VAA/VAP
+ * path: a glGetAttribLocation handle (high 16 bits set) carries the NAME; a literal
+ * index uses the plain op. */
+struct VadArgs { uint32_t index, divisor; };
+static void build_vad(AlrEncoder *e, void *p) {
+    struct VadArgs *a = (struct VadArgs*)p;
+    alr_enc_u8(e, ALR_OP_VERTEX_ATTRIB_DIVISOR); alr_enc_u32(e, a->index); alr_enc_u32(e, a->divisor);
+}
+struct VadNamedArgs { uint32_t vprog; const char *name; uint32_t divisor; };
+static void build_vad_named(AlrEncoder *e, void *p) {
+    struct VadNamedArgs *a = (struct VadNamedArgs*)p;
+    alr_enc_u8(e, ALR_OP_VERTEX_ATTRIB_DIVISOR_NAMED);
+    alr_enc_u32(e, a->vprog); alr_enc_str(e, a->name); alr_enc_u32(e, a->divisor);
+}
+void glVertexAttribDivisor(GLuint index, GLuint divisor) {
+    if ((index >> 16) != 0) {
+        uint32_t vprog = ALR_UNIFORM_VPROG(index);
+        const char *name = alr_shim_attrib_name(vprog, ALR_UNIFORM_IDX(index));
+        if (name) {
+            struct VadNamedArgs a = { vprog, name, (uint32_t)divisor };
+            alr_shim_emit(build_vad_named, &a);
+            return;
+        }
+    }
+    struct VadArgs a = { (uint32_t)index, (uint32_t)divisor };
+    alr_shim_emit(build_vad, &a);
+}
+
 /* ---- optimistic queries (no round-trip) ---- */
 GLenum glGetError(void) {
     AlrShimState *s = alr_shim();

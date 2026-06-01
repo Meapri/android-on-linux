@@ -53,6 +53,10 @@ struct DrawElemInst { GLenum mode; GLsizei count; GLenum type; GLsizei inst; };
 static std::vector<GLuint> va_binds;     // real VAO id per glBindVertexArray (0 = default)
 static std::vector<DrawArrInst> draw_arr_inst;
 static std::vector<DrawElemInst> draw_elem_inst;
+struct VadPlain { GLuint index; GLuint divisor; };
+struct VadNamed { std::string name; GLuint divisor; };
+static std::vector<VadPlain> vad_plain;
+static std::vector<VadNamed> vad_named;
 static std::map<GLint, std::string> uniform_loc_name;  // glGetUniformLocation -> name
 static std::map<GLint, std::string> attrib_loc_name;   // glGetAttribLocation  -> name
 static std::map<std::string, std::vector<float>> mat_by_name;   // glUniformMatrix4fv
@@ -187,6 +191,11 @@ void glDrawArraysInstanced(GLenum m, GLint, GLsizei c, GLsizei inst) {
 void glDrawElementsInstanced(GLenum m, GLsizei c, GLenum t, const void *, GLsizei inst) {
     rec::draw_elem_inst.push_back({m, c, t, inst});
 }
+void glVertexAttribDivisor(GLuint index, GLuint divisor) {
+    auto it = rec::attrib_loc_name.find(static_cast<GLint>(index));
+    if (it != rec::attrib_loc_name.end()) rec::vad_named.push_back({it->second, divisor});
+    else rec::vad_plain.push_back({index, divisor});
+}
 }  // extern "C"
 
 // GL tokens the assertions compare against (not all in the minimal stub header).
@@ -224,7 +233,7 @@ int main(int argc, char **argv) {
 
     // --- the stream decoded into exactly the cube + mesh GL calls. ---
     check(ok && st.ok, "decode_batch returned true (well-formed, no bad/unknown opcode)");
-    check(st.decoded == 66, "decoded op count == 66 (34 cube + 4 uniform-var + 10 mesh + 8 fbo + 5 completeness + 5 gles3)");
+    check(st.decoded == 68, "decoded op count == 68 (+2 vertex-attrib-divisor)");
     check(st.shaders.size() == 2, "2 shaders mapped");
     check(st.programs.size() == 1, "1 program mapped");
     check(st.buffers.size() == 2, "2 buffers mapped (vbo + ebo)");
@@ -355,6 +364,10 @@ int main(int argc, char **argv) {
               rec::draw_elem_inst[0].count == 6 && rec::draw_elem_inst[0].type == kGL_UNSIGNED_SHORT &&
               rec::draw_elem_inst[0].inst == 4,
           "glDrawElementsInstanced(GL_TRIANGLES, 6, UNSIGNED_SHORT, 4 instances)");
+    check(rec::vad_plain.size() == 1 && rec::vad_plain[0].index == 0 && rec::vad_plain[0].divisor == 1,
+          "glVertexAttribDivisor plain index 0 -> divisor 1");
+    check(rec::vad_named.size() == 1 && rec::vad_named[0].name == "position" && rec::vad_named[0].divisor == 2,
+          "glVertexAttribDivisor BY NAME (position) -> divisor 2");
 
     std::printf("\nALR GPU WIRE-FORMAT CHECK: %s\n", g_fail ? "FAIL" : "PASS");
     return g_fail;

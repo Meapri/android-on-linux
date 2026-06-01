@@ -254,6 +254,8 @@ int main(int argc, char **argv) {
     glBindVertexArray(vao);
     glDrawArraysInstanced(GL_TRIANGLES, 0, 36, 4);
     glDrawElementsInstanced(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, (const void *)0, 4);
+    glVertexAttribDivisor(0, 1);        /* plain index path */
+    glVertexAttribDivisor(a_pos, 2);    /* by-name path (a_pos is a packed glGetAttribLocation handle) */
     glBindVertexArray(0);                            /* back to default VAO */
 
     FILE *f = fopen(argv[1], "wb");
