@@ -301,6 +301,12 @@ std::vector<struct wl_resource*> g_touches;
 struct wl_resource* g_focus_surface = nullptr;
 bool g_pointer_entered = false;
 bool g_keyboard_entered = false;
+// P0-3: a popup (menu) that took a keyboard grab — while set, keys route here instead
+// of the focused toplevel so menu keyboard navigation (arrows/Enter/Escape) works.
+// null => no grab (keys go to g_focus_surface, unchanged). Cleared on the popup's
+// teardown; leaves are sent at the grab transitions (popup_grab/popup_resource_destroy)
+// where the surfaces are known alive, so no dangling-resource tracking is needed.
+struct wl_resource* g_keyboard_grab_surface = nullptr;
 
 // Pointer/touch target tracking. Distinct from g_focus_surface (keyboard focus,
 // always the top toplevel): a mapped xdg_popup (GTK menu/combobox/tooltip) steals
@@ -1123,7 +1129,24 @@ void positioner_resource_destroy(struct wl_resource* r) {
 }
 
 void popup_destroy(struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); }
-void popup_grab(struct wl_client*, struct wl_resource*, struct wl_resource*, uint32_t) {}
+void popup_grab(struct wl_client*, struct wl_resource* resource, struct wl_resource*,
+                uint32_t) {
+    // P0-3: the popup (menu) takes a keyboard grab -> route keys to it so the user can
+    // navigate with arrows/Enter/Escape. Leave the previous keyboard holder (the prior
+    // grab popup, or the toplevel — both alive here) now; the grab popup gets enter on
+    // the next key. The grab is cleared on the popup's teardown.
+    auto* s = static_cast<SurfaceState*>(wl_resource_get_user_data(resource));
+    if (!s || !s->surface) return;
+    struct wl_resource* prev =
+        g_keyboard_grab_surface ? g_keyboard_grab_surface : g_focus_surface;
+    Compositor* comp = instance();
+    if (g_keyboard_entered && prev && prev != s->surface && comp) {
+        for (auto* k : g_keyboards)
+            wl_keyboard_send_leave(k, wl_display_next_serial(comp->display()), prev);
+    }
+    g_keyboard_grab_surface = s->surface;
+    g_keyboard_entered = false;
+}
 void popup_reposition(struct wl_client*, struct wl_resource*, struct wl_resource*, uint32_t) {}
 const struct xdg_popup_interface kPopupImpl = {popup_destroy, popup_grab, popup_reposition};
 
@@ -1138,6 +1161,18 @@ void popup_resource_destroy(struct wl_resource* r) {
         if (g_input_target_surface == s->surface) {
             g_input_target_surface = nullptr;
             g_pointer_entered = false;
+        }
+        // P0-3: release the keyboard grab if this menu held it; leave the menu (alive
+        // here) so the next key re-enters the toplevel (g_focus_surface).
+        if (g_keyboard_grab_surface == s->surface) {
+            Compositor* comp = instance();
+            if (g_keyboard_entered && comp) {
+                for (auto* k : g_keyboards)
+                    wl_keyboard_send_leave(k, wl_display_next_serial(comp->display()),
+                                           s->surface);
+            }
+            g_keyboard_grab_surface = nullptr;
+            g_keyboard_entered = false;
         }
         s->is_popup = false;
         s->mapped = false;
@@ -1782,7 +1817,11 @@ void Compositor::drain_input_queue() {
             for (auto* t : g_touches) wl_touch_send_frame(t);
             break;
         case InjectKind::Key: {
-            if (!g_focus_surface) break;
+            // P0-3: route keys to a grabbing popup (menu) if any, else the focused
+            // toplevel. No grab => g_keyboard_grab_surface null => unchanged behaviour.
+            struct wl_resource* tgt_kbd =
+                g_keyboard_grab_surface ? g_keyboard_grab_surface : g_focus_surface;
+            if (!tgt_kbd) break;
             // M4: update real-modifier state so the client's xkb_state matches and
             // Shift/Ctrl/Alt apply to the keys that follow.
             const uint32_t mbit = evdev_to_mod_bit(e.button);
@@ -1801,7 +1840,7 @@ void Compositor::drain_input_queue() {
                     struct wl_array keys;
                     wl_array_init(&keys);
                     wl_keyboard_send_enter(k, wl_display_next_serial(display_),
-                                           g_focus_surface, &keys);
+                                           tgt_kbd, &keys);
                     wl_array_release(&keys);
                     // Initial modifier state for the newly-focused surface.
                     wl_keyboard_send_modifiers(k, wl_display_next_serial(display_),
