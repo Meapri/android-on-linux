@@ -271,6 +271,23 @@ std::vector<InjectEvent> g_inject_queue;  // guarded by g_inject_mutex
 struct GpuSubmit { void* ahb = nullptr; int32_t w = 0, h = 0; uint64_t serial = 0; };
 std::mutex g_gpu_mutex;
 std::vector<GpuSubmit> g_gpu_queue;  // guarded by g_gpu_mutex
+
+// M4: real-modifier state derived from injected key events so wl_keyboard.modifiers
+// tells the client which mods are held (Shift/Ctrl/Alt/Super/AltGr) + Caps lock —
+// without it, modified keys never register on the client. Bit positions = the US
+// pc105 xkb default real-modifier indices (matching the keymap the compositor sends).
+uint32_t g_mods_depressed = 0;  // momentary mods currently held
+uint32_t g_mods_locked = 0;     // locking mods (CapsLock)
+inline uint32_t evdev_to_mod_bit(uint32_t code) {
+    switch (code) {
+        case 42: case 54:   return 1u << 0;  // KEY_LEFT/RIGHTSHIFT -> Shift
+        case 29: case 97:   return 1u << 2;  // KEY_LEFT/RIGHTCTRL  -> Control
+        case 56:            return 1u << 3;  // KEY_LEFTALT         -> Mod1
+        case 100:           return 1u << 7;  // KEY_RIGHTALT (AltGr)-> Mod5
+        case 125: case 126: return 1u << 6;  // KEY_LEFT/RIGHTMETA  -> Mod4
+        default:            return 0;
+    }
+}
 std::vector<struct wl_resource*> g_pointers;
 std::vector<struct wl_resource*> g_keyboards;
 std::vector<struct wl_resource*> g_touches;
@@ -1692,6 +1709,19 @@ void Compositor::drain_input_queue() {
             break;
         case InjectKind::Key: {
             if (!g_focus_surface) break;
+            // M4: update real-modifier state so the client's xkb_state matches and
+            // Shift/Ctrl/Alt apply to the keys that follow.
+            const uint32_t mbit = evdev_to_mod_bit(e.button);
+            bool mods_changed = false;
+            if (mbit) {
+                const uint32_t before = g_mods_depressed;
+                if (e.state) g_mods_depressed |= mbit; else g_mods_depressed &= ~mbit;
+                mods_changed = (g_mods_depressed != before);
+            }
+            if (e.button == 58 /*KEY_CAPSLOCK*/ && e.state) {
+                g_mods_locked ^= (1u << 1);  // Lock
+                mods_changed = true;
+            }
             for (auto* k : g_keyboards) {
                 if (!g_keyboard_entered) {
                     struct wl_array keys;
@@ -1699,11 +1729,18 @@ void Compositor::drain_input_queue() {
                     wl_keyboard_send_enter(k, wl_display_next_serial(display_),
                                            g_focus_surface, &keys);
                     wl_array_release(&keys);
+                    // Initial modifier state for the newly-focused surface.
+                    wl_keyboard_send_modifiers(k, wl_display_next_serial(display_),
+                                               g_mods_depressed, 0, g_mods_locked, 0);
                 }
                 // e.button carries the evdev keycode directly.
                 wl_keyboard_send_key(k, wl_display_next_serial(display_), e.time_ms,
                     e.button, e.state ? WL_KEYBOARD_KEY_STATE_PRESSED
                                       : WL_KEYBOARD_KEY_STATE_RELEASED);
+                if (mods_changed) {
+                    wl_keyboard_send_modifiers(k, wl_display_next_serial(display_),
+                                               g_mods_depressed, 0, g_mods_locked, 0);
+                }
             }
             g_keyboard_entered = true;
             break;
