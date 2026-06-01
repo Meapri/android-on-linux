@@ -79,10 +79,13 @@ overlay is the conformant shape and may be a legitimate restore/upgrade, e.g.
 
 | Tool | Purpose | CLI |
 |---|---|---|
+| `deb_closure.py` | **M2/M4 build engine**: resolve a Debian Depends closure, subtract the base, download .debs, emit a §5-E overlay | `--package <name> --base <tar\|dir> --out <tar> [--suite bookworm] [--cache <dir>]` / `--selftest` |
 | `overlay_guard.py` | base-lib downgrade gate (frozen-SONAME + sidecar) | `--base <tar\|dir> --overlay <tar> [--strict]` / `--selftest` |
 | `stage_tar_spec.py` | §5-E convention validator (composes overlay_guard) | `--overlay <tar> [--base ...] [--strict]` / `--selftest` |
 | `build_stage_tar.py` | extracted Debian root → flat-SONAME `./`-tar + sidecar | `--src <dir> --out <tar> [--versions <json>]` / `--selftest` |
-| `compat_matrix.py` | M5 app×toolkit×result matrix + universality gate | `--demo` / `--selftest` |
+| `base_inventory.py` | inventory base SONAMEs/binaries + `diff_against()` subtraction | `--rootfs <tar\|dir> [--json]` / `--selftest` |
+| `compat_matrix.py` | M5 app×toolkit×result matrix model + universality gate | `--demo` / `--selftest` |
+| `alr_compat.py` | M5 ALR current-state matrix (real data, attributed) | `--report` / `--json` / `--selftest` |
 | `xkb_probe.py` | rootfs xkb-data completeness probe (§6) | `--rootfs <dir\|tar>` / `--selftest` |
 | `safe_tar.py` | tar member inspection + safety validation | (library) |
 
@@ -106,10 +109,38 @@ Grounded in `alr_wayland/alr_compositor.cpp`: advertises wl_compositor v4, wl_sh
 xdg_wm_base v2, wl_seat v5, wl_output v2, wl_subcompositor, wl_data_device_manager.
 **No `zwp_linux_dmabuf`/`wl_drm`** (non-wl_shm buffers rejected) and **no XWM**.
 
-**Build blocker:** this dev host has no docker/debootstrap/dpkg-deb/qemu, so the
-arm64 overlays can't be built here — build them in a Debian arm64 env with
-`build_stage_tar.py`. (arch-`all` packages, and downloadable arm64 `.deb`s, can be
-flattened from host — see §4 evidence.)
+**Build path (no Debian env needed for these):** the host has no
+docker/debootstrap/dpkg-deb/qemu, but `tools/deb_closure.py` builds the overlays
+straight from the Debian mirror:
+
+```
+python -m tools.deb_closure --package libsdl2-2.0-0 \
+    --base app/src/main/assets/rootfs/payloads/tiny-rootfs.tar \
+    --out /tmp/sdl2-stage.tar --cache /tmp/deb-cache
+```
+
+It resolves the runtime closure, downloads the `.deb`s, **subtracts everything the
+base already provides** — by SONAME (downgrade-frozen) AND by path with merged-usr
+aliasing (`/lib` ≡ `/usr/lib`), so libc6 / the core runtime is never shadowed — and
+flattens the remainder into a §5-E overlay (validated by stage_tar_spec +
+overlay_guard). The produced `.tar` is device-pending (runtime = CP-1 gate).
+
+Closure sizes (bookworm arm64, full download before base subtraction):
+
+| target | closure pkgs | download | notes |
+|---|---|---|---|
+| `libsdl2-2.0-0` | 55 | ~11 MB | smallest; **built+validated** (see evidence below) |
+| `xwayland` | 89 | ~60 MB | M4; pulls xkb-data, libxcb, xfonts |
+| `qt6-wayland` | 132 | ~74 MB | largest; libqt6* + ICU |
+| `netsurf-gtk` | 180 | ~77 MB | closure incl. full GTK3 (mostly base → subtracted) |
+
+**SDL2 overlay — built + validated (evidence):** `deb_closure` built
+`/tmp/sdl2-stage.tar` over the network — closure 55 pkgs, 351 base files subtracted,
+0 unsupported/missing. The overlay carries only the NEW libs (libSDL2-2.0.so.0,
+libdecor, libpulse, libwayland-server, libgbm, libdrm, audio codecs …) and ships
+**no libc.so.6 / ld-linux / libstdc++** (base runtime intact). `stage_tar_spec`:
+CONFORMANT (0 errors/warnings); `overlay_guard`: 0 violations. Runtime device test
+is the CP-1 gate.
 
 **M2 order (easiest→hardest), all software-raster via wl_shm:**
 1. `netsurf-gtk` (GTK3 frontend; reuses the base GTK3 closure → ~free). `GDK_BACKEND=wayland`.
