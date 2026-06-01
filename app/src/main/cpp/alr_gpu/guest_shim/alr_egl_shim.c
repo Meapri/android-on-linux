@@ -113,7 +113,12 @@ EGLBoolean eglGetConfigAttrib(EGLDisplay dpy, EGLConfig config, EGLint attribute
         case EGL_LUMINANCE_SIZE:     *value = 0; break;
         case EGL_ALPHA_MASK_SIZE:    *value = 0; break;
         case EGL_DEPTH_SIZE:         *value = 24; break;
-        case EGL_STENCIL_SIZE:       *value = 8; break;
+        /* STENCIL=0: the executor's AHB-FBO has a depth renderbuffer but NO stencil, so 0 is
+         * accurate — AND it's required for glmark2 2023.01: its default target stencil=0, and
+         * GLVisualConfig::score_component returns -1000 when (component>0 && target==0); a
+         * stencil=8 config scored -802 (<=0) and select_best_config rejected it ("Failed to
+         * find suitable EGL config"). With stencil=0 the score is +230 -> selected. */
+        case EGL_STENCIL_SIZE:       *value = 0; break;
         case EGL_SAMPLES:            *value = 0; break;
         case EGL_SAMPLE_BUFFERS:     *value = 0; break;
         case EGL_CONFIG_CAVEAT:      *value = EGL_NONE; break;
