@@ -1088,6 +1088,7 @@ struct PositionerState {
     int32_t width = 0, height = 0;
     int32_t anchor_x = 0, anchor_y = 0;
     int32_t offset_x = 0, offset_y = 0;
+    uint32_t gravity = 0;  // xdg_positioner gravity (P1 popup placement)
 };
 void positioner_destroy(struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); }
 void positioner_set_size(struct wl_client*, struct wl_resource* r, int32_t w, int32_t h) {
@@ -1100,7 +1101,10 @@ void positioner_set_anchor_rect(struct wl_client*, struct wl_resource* r,
     if (p) { p->anchor_x = x; p->anchor_y = y; }
 }
 void positioner_set_anchor(struct wl_client*, struct wl_resource*, uint32_t) {}
-void positioner_set_gravity(struct wl_client*, struct wl_resource*, uint32_t) {}
+void positioner_set_gravity(struct wl_client*, struct wl_resource* r, uint32_t gravity) {
+    auto* p = static_cast<PositionerState*>(wl_resource_get_user_data(r));
+    if (p) p->gravity = gravity;
+}
 void positioner_set_constraint_adjustment(struct wl_client*, struct wl_resource*, uint32_t) {}
 void positioner_set_offset(struct wl_client*, struct wl_resource* r, int32_t x, int32_t y) {
     auto* p = static_cast<PositionerState*>(wl_resource_get_user_data(r));
@@ -1179,8 +1183,16 @@ void xdg_surface_get_popup(struct wl_client* client, struct wl_resource* resourc
         : nullptr;
     const int32_t w = (p && p->width > 0) ? p->width : 1;
     const int32_t h = (p && p->height > 0) ? p->height : 1;
-    const int32_t x = p ? p->anchor_x + p->offset_x : 0;
-    const int32_t y = p ? p->anchor_y + p->offset_y : 0;
+    int32_t x = p ? p->anchor_x + p->offset_x : 0;
+    int32_t y = p ? p->anchor_y + p->offset_y : 0;
+    // P1: apply positioner gravity. Default (NONE/BOTTOM/RIGHT/BOTTOM_RIGHT) keeps the
+    // popup top-left at the anchor (extends down-right) = prior behaviour; LEFT/TOP
+    // gravity shifts it by its size so edge submenus open the correct direction.
+    const uint32_t g = p ? p->gravity : 0u;
+    if (g == XDG_POSITIONER_GRAVITY_LEFT || g == XDG_POSITIONER_GRAVITY_TOP_LEFT ||
+        g == XDG_POSITIONER_GRAVITY_BOTTOM_LEFT) x -= w;
+    if (g == XDG_POSITIONER_GRAVITY_TOP || g == XDG_POSITIONER_GRAVITY_TOP_LEFT ||
+        g == XDG_POSITIONER_GRAVITY_TOP_RIGHT) y -= h;
 
     if (s) {
         s->is_popup = true;
