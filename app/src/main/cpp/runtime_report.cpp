@@ -313,6 +313,12 @@ std::string build_perf_comparison_report(const alr::RuntimeReportInput& input) {
     const auto config = alr_runtime_config_from_input(input, launch);
     const auto comparison = alr::runtime::run_perf_comparison(config, 100000);
     out << "\n" << comparison.report;
+    // WS-1 M2: surface the CPU-overhead microbench in logcat (path-xlate vs syscall-
+    // roundtrip ns) so the near-zero-overhead claim is device-measurable, not just on
+    // the report screen. Pairs with the per-guest traps/rewrites counters (=0 for the
+    // in-process interposer path) to quantify ALR's CPU mediation cost.
+    __android_log_print(ANDROID_LOG_INFO, "alr_loader", "perf-overhead:\n%s",
+                        comparison.report.c_str());
     return out.str();
 }
 
