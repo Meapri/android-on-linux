@@ -9,6 +9,7 @@ Subcommands:
 - overhead ...     — compute native-vs-ALR CPU overhead from two wall-clock samples.
 - gpu ...          — compute glmark2 ALR-vs-Mali-direct ratio against the §0 target.
 - index [--dir]    — index the docs/evidence corpus as a markdown table.
+- cp-status [--dir] — print the CP-0..6 device-evidence dashboard (keyword heuristic).
 
 main(argv) returns the process exit code (0 pass / 1 fail / 2 usage) so it is
 directly unit-testable without spawning a subprocess.
@@ -19,6 +20,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from .cp_status import build_cp_dashboard_markdown, scan_cp_status
 from .cpu_overhead import Measurement, compute_overhead
 from .evidence_index import build_index_markdown, scan_evidence_dir
 from .display_verify import verify_from_report
@@ -69,6 +71,11 @@ def _cmd_gpu(args: argparse.Namespace) -> int:
 def _cmd_index(args: argparse.Namespace) -> int:
     docs = scan_evidence_dir(args.dir)
     print(build_index_markdown(docs))
+    return 0
+
+
+def _cmd_cp_status(args: argparse.Namespace) -> int:
+    print(build_cp_dashboard_markdown(scan_cp_status(args.dir)))
     return 0
 
 
@@ -163,6 +170,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="evidence directory (default: docs/evidence)",
     )
     index.set_defaults(func=_cmd_index)
+
+    cp_status = sub.add_parser(
+        "cp-status",
+        help="print the CP-0..6 device-evidence dashboard (keyword heuristic)",
+    )
+    cp_status.add_argument(
+        "--dir",
+        default=str(_DEFAULT_EVIDENCE_DIR),
+        help="evidence directory (default: docs/evidence)",
+    )
+    cp_status.set_defaults(func=_cmd_cp_status)
 
     return parser
 

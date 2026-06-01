@@ -59,12 +59,23 @@ WS-5는 전 WS 산출물을 **측정**한다. 계약 자체는 제공하지 않�
 | `docs/evidence/CAPTURE-RUNBOOK.md` | 공유 디바이스 안전 캡처 런북 | done |
 | `docs/research/alr-compat-matrix.md` | M4 앱×결과 호환 매트릭스 | seeded (기존 evidence 기반) |
 | `.github/workflows/ws5-host-ci.yml` + `scripts/run-host-tests.sh` | M5 host CI 게이트 (device는 수동) | done |
-| `bench/display_verify.py` | CP-1 device-exact 디스플레이 검증 (1200×1920@90Hz; refresh는 마커 생기기 전까지 unverified) | host-done, 테스트됨 |
+| `bench/display_verify.py` | CP-1 device-exact 디스플레이 검증 (1200×1920@90Hz) | **device-VERIFIED** — 통합 빌드의 `display: 1920x1200 @ 90000mHz density=213` 마커로 해상도+90Hz refresh 둘 다 검증 (`docs/evidence/2026-06-01-ws5-cp1-display-verified.md`); 더 이상 host-only/unverified 아님 |
 | `bench/report_parse.py` 일반화 | 제네릭 `ALR X: status` 마커 맵 + `wl_output` 파싱 (future-proof) | host-done, 테스트됨 |
 | `docs/research/ws5-premerge-gate.md` + `scripts/ws5-premerge-check.sh` | §5 게이트 기준 (통합 세션 pre-merge 게이트, CP별) | done |
 | `bench/microbench/` (`microbench.c` + README) | M1 same-binary native-vs-ALR 측정 타깃 (compute/syscall 모드) | source-done (cross-compile/stage는 WS-4) |
 | `bench/__main__.py` `verify` 서브커맨드 | 리포트 1개로 gate + CP-1 display + 마커 요약 통합 | host-done, 테스트됨 |
-| CP-3/M1 **device 실측 (ALR 절대값)** | M1 | **PARTIAL** — WS-1 M2가 device 캡처(APK v127); WS-5가 정량화 (`docs/evidence/2026-06-01-ws5-cpu-overhead-quantified.md`): 일반 CLI exec_ms ~18-20ms, path-xlate 4334.7 ns/op, **traps=0 device-verified**. native/PRoot baseline는 **PENDING** → % 오버헤드 비율 미산출 |
+| CP-3/M1 **device 실측 (ALR 절대값)** | M1 | **PARTIAL** — WS-1 M2가 device 캡처(APK v127); WS-5가 정량화 (`docs/evidence/2026-06-01-ws5-cpu-overhead-quantified.md`): 일반 CLI exec_ms ~18-20ms, path-xlate 4334.7 ns/op, **traps=0 device-verified**. native/PRoot baseline는 **DEVICE-REQ (outstanding, merge 커밋에 filed)** → % 오버헤드 비율 미산출 |
+| CP-1 **display** device 실측 | (L3) | **DONE (device-VERIFIED)** — 통합(merge) 빌드 리포트의 `display: 1920x1200 @ 90000mHz` 마커로 WS-5가 해상도+90Hz를 검증. host-only 모델이 아니라 실제 device 마커 소비로 닫힘 |
+| CP-3 native/PRoot **baseline** | M1/M3 | **DEVICE-REQ (outstanding)** — ALR 절대값은 device-verified(traps=0, exec_ms ~18-20ms)이나 native/PRoot baseline 미측정 → % 오버헤드 비율 미산출. merge 커밋에 DEVICE-REQ로 filed; 통합 세션 device 리스 대기 |
+| CP-2 **glmark2** device 실측 | M2 | **DEVICE-REQ (outstanding)** — host 모델/파서 done; WS-2 glmark2 산출 후 통합 빌드에서 device 런. merge 커밋에 DEVICE-REQ로 filed |
 | 나머지 **device 실측** | M2/M3 | pending (통합 빌드 + 디바이스 점유 조율) |
 
-baseline: `ws-5`는 현재 main **v127** 기준 (clean; APK `0.4.127-cp1-gui-baseline-v127`). host 테스트: `cd /Users/naen/Documents/alr-ws5 && uvx pytest tests/ -q` (pytest 미설치 → `uvx`). 단일 진입점: `scripts/run-host-tests.sh`; pre-merge 게이트: `scripts/ws5-premerge-check.sh`. CLI: `python -m bench {gate,verify,overhead,gpu,index}`.
+## 운영 모드 (플랜 §9 / §10 적용 중)
+
+플랜(`docs/research/orchestration-5session-plan.md`) **§9 Device Lease Protocol**과 **§10 reassignment**이
+이제 발효 중이다. WS-5의 역할은 **merge된 통합 빌드 evidence를 소비/검증**하는 것이며, **자체 APK install은 하지 않는다**
+(공유 디바이스 `R5KL20B6S3X` clobber 방지). device가 필요한 측정(CP-2 glmark2, CP-3 native/PRoot baseline)은
+**DEVICE-REQ**로 merge 커밋에 filed되어 있고, §9 리스 프로토콜에 따라 통합 세션이 device를 점유 조율한 뒤 캡처한 리포트를
+WS-5가 파서/게이트로 닫는다. CP-1 display는 이 경로로 이미 **device-VERIFIED**로 닫혔다.
+
+baseline: `ws-5`는 현재 main **v127** 기준 (clean; APK `0.4.127-cp1-gui-baseline-v127`). host 테스트: `cd /Users/naen/Documents/alr-ws5 && uvx pytest tests/ -q` (pytest 미설치 → `uvx`) — 현재 host 테스트 ~**386+** 수집. 단일 진입점: `scripts/run-host-tests.sh`; pre-merge 게이트: `scripts/ws5-premerge-check.sh`. CLI: `python -m bench {gate,verify,overhead,gpu,index}`.
