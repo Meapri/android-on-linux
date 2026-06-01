@@ -410,3 +410,30 @@ DEVICE-REQ: push x11-stage.tar → launch Xwayland rootful on the compositor →
 `xeyes`/`xterm` renders (wl_shm). NOTE: the rootful launch wiring (Xwayland as a
 Wayland client + the X filesystem socket under the rootfs-mediated /tmp) is L2/L3 +
 integration; this overlay is the WS-4 rootfs prerequisite.
+
+---
+
+## 15. WS-4 overlay roster — host-complete (all device-pending in /tmp, noble-built)
+
+All §5-E, base-subtracted, .so 0o755, missing_soname=0, overlay_guard 0 BLOCK,
+CONFORMANT. Built from Ubuntu noble (ports). Wired into MainActivity (guarded
+extractOverlayTar). The integration session adb-pushes these and re-drains.
+
+| overlay | size | provides |
+|---|---|---|
+| `xkb-gegl-stage.tar` | 6.2 MB | C.UTF-8 locale + svg pixbuf loader (0755) |
+| `netsurf-stage.tar` | 7.1 MB | netsurf-gtk (GTK3 browser) |
+| `sdl2-stage.tar` | 8.2 MB | libSDL2 + wayland/audio deps |
+| `qt6-stage.tar` | 74.2 MB | Qt6 + qtwayland plugins + ICU |
+| `x11-stage.tar` | 11.8 MB | Xwayland (rootful) + xterm + x11-apps |
+| `foot-stage.tar` | 1.1 MB | foot (wayland terminal) |
+| `gtk3demo-stage.tar` | 14.9 MB | gtk3-demo / gtk3-widget-factory |
+| `dpkg-db-stage.tar` | 0.7 MB | reconstructed dpkg admin DB (194 pkgs) |
+| `apt-config-stage.tar` | <1 KB | neutralize third-party apt sources (noble-only) |
+
+WS-4 milestones M1–M5 + §10(a)(b)(c) host-complete. Device/L1-gated remainders
+(integration/other WS): C.UTF-8 `setlocale` path-mediation (WS-1, §12); dpkg
+maintainer-script fork/exec under the loader (L1); toolkit/Xwayland launch-on-
+compositor wiring (L2/L3); and the base `.so` exec-bit fix (RootfsInstaller, ws-4
+3649725) applies on the next base re-extraction (prepareBundledTinyRootfs re-extracts
+every cold start).
