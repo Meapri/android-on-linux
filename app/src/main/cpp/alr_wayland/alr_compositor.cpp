@@ -321,9 +321,18 @@ struct wl_resource* g_keyboard_grab_surface = nullptr;
 // wl_surface that the LAST pointer/touch event was sent to; when the target
 // changes we send leave-to-old / enter-to-new so GTK updates hover correctly.
 struct wl_resource* g_input_target_surface = nullptr;
-// Monotonic stamp bumped each time a popup MAPS, so input_target_surface() can
+// Monotonic stamp bumped each time a popup MAPS, so input_target_at() can
 // pick the most-recently-mapped popup (the innermost open submenu) deterministically.
 uint64_t g_next_map_serial = 1;
+
+// Touch grab: per Wayland a wl_touch sequence belongs to the surface named at
+// wl_touch.down; every later motion/up for that touch-id stays with it (an implicit
+// grab) regardless of where the finger moves. g_touch_target is that surface and
+// g_touch_active counts the touch-ids currently down on it. When the grabbed surface
+// is unmapped/destroyed mid-sequence we wl_touch.cancel (the only correct way to end
+// it — no up will ever arrive) and clear these. Compositor-thread-only.
+struct wl_resource* g_touch_target = nullptr;
+int g_touch_active = 0;
 
 uint32_t now_ms() {
     struct timespec ts{};
@@ -355,6 +364,27 @@ void release_buffer(struct wl_resource* buffer) {
     if (buffer) {
         wl_buffer_send_release(buffer);
     }
+}
+
+// ---- wl_touch cancel helper ----
+// If a touch sequence is in progress on `surface` (the grabbed touch target), end it
+// with wl_touch.cancel: the protocol's only way to terminate a grab when no up will
+// arrive (the surface is being unmapped/destroyed under the finger). Per spec, cancel
+// drops ALL active touch points and is followed by a frame. Clears the grab state.
+// Safe to call with a still-ALIVE `surface` resource; callers invoke it before the
+// surface goes away. No-op if `surface` isn't the current touch target.
+void cancel_touch_if_targeting(struct wl_resource* surface) {
+    if (!surface || g_touch_target != surface || g_touch_active <= 0) {
+        if (g_touch_target == surface) { g_touch_target = nullptr; g_touch_active = 0; }
+        return;
+    }
+    for (auto* t : g_touches) {
+        wl_touch_send_cancel(t);
+        if (wl_resource_get_version(t) >= WL_TOUCH_FRAME_SINCE_VERSION)
+            wl_touch_send_frame(t);
+    }
+    g_touch_target = nullptr;
+    g_touch_active = 0;
 }
 
 // ---- multi-surface compositing: forward declarations (definitions below, after
@@ -457,7 +487,7 @@ void surface_commit(struct wl_client*, struct wl_resource* resource) {
                         g_pointer_entered = false;
                         g_keyboard_entered = false;
                     } else if (s->is_popup) {
-                        // Stamp the popup so input_target_surface() can prefer the
+                        // Stamp the popup so input_target_at() can prefer the
                         // most-recently-mapped (innermost) popup when submenus stack.
                         s->map_serial = g_next_map_serial++;
                     }
@@ -510,6 +540,9 @@ void surface_commit(struct wl_client*, struct wl_resource* resource) {
             g_input_target_surface = nullptr;
             g_pointer_entered = false;
         }
+        // End a touch grab on the now-hidden surface (still ALIVE here) so an
+        // in-flight tap doesn't dangle without an up.
+        cancel_touch_if_targeting(s->surface);
         composite_dirty = true;
         ALR_WL_LOGI("surface unmapped (null buffer) key=%llu",
                     static_cast<unsigned long long>(s->key));
@@ -582,6 +615,10 @@ void surface_resource_destroy(struct wl_resource* resource) {
             g_input_target_surface = nullptr;
             g_pointer_entered = false;
         }
+        // End any touch grab held by this surface. The wl_surface is still ALIVE in
+        // this destroy listener, so a wl_touch.cancel is well-formed; without it a
+        // client whose window vanishes mid-tap never sees an up and stays stuck.
+        cancel_touch_if_targeting(s->surface);
         // And for the keyboard grab (a menu popup that grabbed keys): if the surface
         // is torn down BEFORE its xdg_popup destroy listener runs (client disconnect
         // gives no resource-destroy order guarantee), drain_input_queue's Key path
@@ -945,30 +982,6 @@ void present_composited() {
     return true;
 }
 
-// The surface that injected pointer/touch should target THIS event. GTK menus,
-// comboboxes and tooltips are xdg_popups that grab the pointer, so when one (or a
-// stack of submenus) is mapped, input must go to the TOP-MOST popup rather than
-// the focused toplevel — otherwise menu items can't be clicked. Picks the mapped
-// popup with the highest map_serial (the most-recently-mapped / innermost open
-// submenu); if no popup is mapped, falls back to the focused toplevel's
-// SurfaceState (resolved from g_focus_surface against the live registry, never a
-// dangling pointer). Returns null only if there is nothing to send to.
-SurfaceState* input_target_surface() {
-    SurfaceState* best_popup = nullptr;
-    for (SurfaceState* s : g_all_surfaces) {
-        if (!s || !s->is_popup || !s->mapped || s->pixels.empty()) continue;
-        if (!best_popup || s->map_serial > best_popup->map_serial) best_popup = s;
-    }
-    if (best_popup) return best_popup;
-    // No popup mapped: target the TOP-MOST mapped toplevel. GIMP's dialogs (e.g.
-    // "Create a New Image") are child TOPLEVELS, not popups — they map above the
-    // main window in g_zorder, so input must follow the z-order top, otherwise a
-    // tap on the dialog's OK button lands on the main window underneath. Fall back
-    // to the focused surface only if the z-order is empty.
-    if (SurfaceState* top = zorder_top()) return top;
-    return surface_state_for_wl(g_focus_surface);
-}
-
 // On-screen placement rect of `tgt` (a toplevel or a popup), matching EXACTLY how
 // present_composited() positions it. For a popup we resolve the parent chain by
 // KEY against the live registry (never dereferencing a possibly-dangling parent
@@ -1000,6 +1013,49 @@ Rect surface_screen_rect(SurfaceState* tgt, int32_t out_w, int32_t out_h) {
     if (r.h > 0 && r.y + r.h > out_h) r.y = out_h - r.h;
     if (r.y < 0) r.y = 0;
     return r;
+}
+
+// Coordinate-aware hit-test: the top-most MAPPED TOPLEVEL whose on-screen rect
+// actually contains (in_x,in_y). Reuses surface_screen_rect() — the SAME placement
+// helper present_composited() draws with — so a pointer/touch lands on whatever
+// window is visibly under it. Walks g_zorder top->bottom (back->front of the vector)
+// so an overlapping dialog drawn on top of the main window wins when both cover the
+// point, but a tap OUTSIDE a smaller dialog (over the exposed main window) correctly
+// targets the main window instead of always hijacking to z-order top. Returns null
+// if no mapped toplevel covers the point (caller can then fall back to z-order top).
+SurfaceState* toplevel_at(double in_x, double in_y, int32_t out_w, int32_t out_h) {
+    for (auto it = g_zorder.rbegin(); it != g_zorder.rend(); ++it) {
+        SurfaceState* s = *it;
+        if (!s || !s->mapped || s->buf_w <= 0 || s->buf_h <= 0) continue;
+        const Rect r = surface_screen_rect(s, out_w, out_h);
+        if (r.w <= 0 || r.h <= 0) continue;
+        if (in_x >= r.x && in_x < r.x + r.w && in_y >= r.y && in_y < r.y + r.h)
+            return s;
+    }
+    return nullptr;
+}
+
+// The surface a pointer/touch at (in_x,in_y) should target. A mapped popup (GTK menu/
+// combobox/tooltip) holds an implicit grab, so while one is open ALL pointer/touch go
+// to the innermost popup regardless of coordinate (a tap outside dismisses it via the
+// client's grab-broken handling) — this preserves the existing menu behaviour. With no
+// popup open, hit-test the coordinate against the placed toplevels (toplevel_at) so a
+// tap lands on the window actually drawn under the finger (e.g. the main window when
+// you tap beside a smaller centred dialog), falling back to z-order top only if the
+// point misses every window. Never dereferences a dangling resource (key/value only).
+SurfaceState* input_target_at(double in_x, double in_y) {
+    SurfaceState* best_popup = nullptr;
+    for (SurfaceState* s : g_all_surfaces) {
+        if (!s || !s->is_popup || !s->mapped || s->pixels.empty()) continue;
+        if (!best_popup || s->map_serial > best_popup->map_serial) best_popup = s;
+    }
+    if (best_popup) return best_popup;
+    int32_t ow = 0, oh = 0;
+    SurfaceState* top = zorder_top();
+    output_size(top ? top->buf_w : 0, top ? top->buf_h : 0, &ow, &oh);
+    if (SurfaceState* hit = toplevel_at(in_x, in_y, ow, oh)) return hit;
+    if (top) return top;
+    return surface_state_for_wl(g_focus_surface);
 }
 
 // Map an output/SurfaceView pixel coordinate to surface-local pixels for an
@@ -1129,6 +1185,8 @@ void toplevel_destroy(struct wl_client*, struct wl_resource* resource) {
             g_input_target_surface = nullptr;
             g_pointer_entered = false;
         }
+        // End a touch grab on the unmapped toplevel (wl_surface still ALIVE here).
+        cancel_touch_if_targeting(s->surface);
         if (g_keyboard_grab_surface == s->surface) {
             if (g_keyboard_entered && comp) {
                 for (auto* k : g_keyboards)
@@ -1281,6 +1339,10 @@ void popup_resource_destroy(struct wl_resource* r) {
             g_input_target_surface = nullptr;
             g_pointer_entered = false;
         }
+        // End a touch grab on the dismissed popup (wl_surface still ALIVE here): a
+        // tap-and-hold on a menu item that closes the menu must not leave the touch
+        // dangling.
+        cancel_touch_if_targeting(s->surface);
         // P0-3: release the keyboard grab if this menu held it; leave the menu (alive
         // here) so the next key re-enters the toplevel (g_focus_surface).
         if (g_keyboard_grab_surface == s->surface) {
@@ -1845,38 +1907,41 @@ void Compositor::drain_input_queue() {
     // touches arrive in device px. With buffer scale S, logical = px / S. (S=1 on
     // most phones/tablets, so this is a no-op there but correct for HiDPI.)
     const double sc = config_.output_scale > 0 ? config_.output_scale : 1;
-    // Pointer/touch go to the input TARGET (top-most mapped popup if any, else the
-    // focused toplevel); keyboard always goes to g_focus_surface. Resolve once per
-    // drain so every event in this batch agrees on the target.
-    SurfaceState* tgt = input_target_surface();
-    struct wl_resource* tgt_surf = tgt ? tgt->surface : nullptr;
-    // If the target changed since the last batch, send leave to the old surface and
-    // (lazily, on the next motion/down) enter to the new one so GTK updates hover.
-    if (tgt_surf != g_input_target_surface) {
-        if (g_pointer_entered && g_input_target_surface) {
-            for (auto* p : g_pointers) {
-                wl_pointer_send_leave(p, wl_display_next_serial(display_),
-                                      g_input_target_surface);
-                // wl_pointer v5+ groups enter/leave/motion into a frame; without the
-                // terminating frame GTK/SDL buffers the leave and the OLD surface
-                // keeps its hover/prelight until an unrelated frame arrives. Pair the
-                // leave with a frame exactly as the unmap path (surface_commit) does.
-                if (wl_resource_get_version(p) >= WL_POINTER_FRAME_SINCE_VERSION)
-                    wl_pointer_send_frame(p);
-            }
-        }
-        g_input_target_surface = tgt_surf;
-        g_pointer_entered = false;  // force a fresh enter to the new target
-    }
-    ALR_WL_LOGI("drain_input n=%zu focus=%p target=%p target_kind=%s pointers=%zu touches=%zu keyboards=%zu scale=%g",
+    // Pointer target is now resolved PER pointer event against the touch/cursor
+    // COORDINATE (input_target_at): a popup grab still wins, but with no popup open the
+    // event lands on whatever toplevel is actually drawn under the point (the main
+    // window vs. a smaller centred dialog), using the same placement helper the
+    // presenter draws with. Keyboard still goes to g_focus_surface (or a popup grab).
+    ALR_WL_LOGI("drain_input n=%zu focus=%p target=%p pointers=%zu touches=%zu keyboards=%zu scale=%g",
                 local.size(), static_cast<void*>(g_focus_surface),
-                static_cast<void*>(tgt_surf),
-                tgt ? (tgt->is_popup ? "popup" : "toplevel") : "none",
+                static_cast<void*>(g_input_target_surface),
                 g_pointers.size(), g_touches.size(), g_keyboards.size(), sc);
+    // Re-point the pointer at the surface under (x,y); leave the old hover target
+    // (paired with a frame, like the unmap path) so GTK clears its prelight before the
+    // new surface gets enter. Returns the resolved target's wl_surface (or null).
+    auto retarget_pointer = [&](double x, double y) -> struct wl_resource* {
+        SurfaceState* t = input_target_at(x, y);
+        struct wl_resource* surf = t ? t->surface : nullptr;
+        if (surf != g_input_target_surface) {
+            if (g_pointer_entered && g_input_target_surface) {
+                for (auto* p : g_pointers) {
+                    wl_pointer_send_leave(p, wl_display_next_serial(display_),
+                                          g_input_target_surface);
+                    if (wl_resource_get_version(p) >= WL_POINTER_FRAME_SINCE_VERSION)
+                        wl_pointer_send_frame(p);
+                }
+            }
+            g_input_target_surface = surf;
+            g_pointer_entered = false;  // force a fresh enter to the new target
+        }
+        return surf;
+    };
     for (const InjectEvent& e : local) {
         switch (e.kind) {
         case InjectKind::PointerMotion: {
-            if (!tgt_surf) break;
+            SurfaceState* tgt = input_target_at(e.x, e.y);
+            struct wl_resource* tgt_surf = retarget_pointer(e.x, e.y);
+            if (!tgt_surf || !tgt) break;
             double mx = e.x, my = e.y;
             if (!map_input_to_surface(tgt, e.x, e.y, &mx, &my)) break;
             const wl_fixed_t fx = wl_fixed_from_double(mx);
@@ -1894,7 +1959,9 @@ void Compositor::drain_input_queue() {
             break;
         }
         case InjectKind::PointerButton: {
-            if (!tgt_surf || !g_pointer_entered) break;
+            // Button stays with the surface the pointer last entered (an implicit
+            // pointer grab); we do NOT re-hit-test here, matching Wayland semantics.
+            if (!g_input_target_surface || !g_pointer_entered) break;
             const uint32_t serial = wl_display_next_serial(display_);
             for (auto* p : g_pointers) {
                 wl_pointer_send_button(p, serial, e.time_ms, e.button,
@@ -1906,7 +1973,7 @@ void Compositor::drain_input_queue() {
             break;
         }
         case InjectKind::PointerAxis: {
-            if (!tgt_surf || !g_pointer_entered) break;
+            if (!g_input_target_surface || !g_pointer_entered) break;
             const uint32_t a = e.axis == 1 ? WL_POINTER_AXIS_HORIZONTAL_SCROLL
                                            : WL_POINTER_AXIS_VERTICAL_SCROLL;
             for (auto* p : g_pointers) {
@@ -1917,18 +1984,36 @@ void Compositor::drain_input_queue() {
             break;
         }
         case InjectKind::TouchDown: {
+            // A touch sequence is grabbed by the surface named at down: hit-test the
+            // DOWN coordinate so a tap lands on the window drawn under the finger, then
+            // keep that surface for the whole sequence (motion/up below).
+            SurfaceState* tgt = input_target_at(e.x, e.y);
+            struct wl_resource* tgt_surf = tgt ? tgt->surface : nullptr;
             if (!tgt_surf) break;
+            // A new first touch establishes the grab; additional fingers join the same
+            // grabbed surface (multi-touch on one window). A down arriving on a
+            // DIFFERENT surface while a grab is active is ignored for grab purposes
+            // (single-surface grab) but still delivered to the grabbed surface so the
+            // client's touch-id bookkeeping stays consistent.
+            if (g_touch_active == 0) g_touch_target = tgt_surf;
+            struct wl_resource* deliver = g_touch_target ? g_touch_target : tgt_surf;
             double mx = e.x, my = e.y;
-            if (!map_input_to_surface(tgt, e.x, e.y, &mx, &my)) break;
+            SurfaceState* dtgt = surface_state_for_wl(deliver);
+            if (!map_input_to_surface(dtgt ? dtgt : tgt, e.x, e.y, &mx, &my)) break;
             const uint32_t serial = wl_display_next_serial(display_);
             for (auto* t : g_touches)
-                wl_touch_send_down(t, serial, e.time_ms, tgt_surf, e.touch_id,
+                wl_touch_send_down(t, serial, e.time_ms, deliver, e.touch_id,
                                    wl_fixed_from_double(mx), wl_fixed_from_double(my));
+            ++g_touch_active;
             break;
         }
         case InjectKind::TouchMotion: {
+            // Stay with the grabbed surface; map the coordinate into ITS rect so a
+            // drag that leaves the window still reports sensible (possibly negative)
+            // surface-local coords to the owning client.
+            SurfaceState* dtgt = surface_state_for_wl(g_touch_target);
             double mx = e.x, my = e.y;
-            map_input_to_surface(tgt, e.x, e.y, &mx, &my);
+            map_input_to_surface(dtgt, e.x, e.y, &mx, &my);
             for (auto* t : g_touches)
                 wl_touch_send_motion(t, e.time_ms, e.touch_id,
                                      wl_fixed_from_double(mx), wl_fixed_from_double(my));
@@ -1937,6 +2022,8 @@ void Compositor::drain_input_queue() {
         case InjectKind::TouchUp: {
             const uint32_t serial = wl_display_next_serial(display_);
             for (auto* t : g_touches) wl_touch_send_up(t, serial, e.time_ms, e.touch_id);
+            if (g_touch_active > 0 && --g_touch_active == 0)
+                g_touch_target = nullptr;  // last finger up: release the grab
             break;
         }
         case InjectKind::TouchFrame:
@@ -2112,6 +2199,8 @@ void Compositor::teardown() {
     g_focus_surface = nullptr;
     g_input_target_surface = nullptr;
     g_keyboard_grab_surface = nullptr;  // stale-pointer guard on restart (UAF discipline)
+    g_touch_target = nullptr;           // drop any in-flight touch grab on restart
+    g_touch_active = 0;
     g_pointer_entered = false;
     g_keyboard_entered = false;
     g_mods_depressed = 0;  // don't leak held mods / CapsLock into a re-created compositor
