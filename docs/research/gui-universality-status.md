@@ -9,7 +9,7 @@
 > `docs/research/alr-compat-matrix.md`. 이 문서는 그중 **GUI(창이 뜨는) 앱**만 추려
 > 범용성(어떤 toolkit/앱군이 device 에서 뜨는지)을 한눈에 보인다.
 
-baseline: 통합 트리 v135 (round-4 drain#13). 디바이스 `R5KL20B6S3X`
+baseline: 통합 트리 v137 (round-6 진행; GUI 셋은 round-5 drain#14 무회귀 재확인). 디바이스 `R5KL20B6S3X`
 (SM-X236N, mt6878 SoC, Mali-G615 MC2, Android 16, 1200×1920@90Hz, untrusted_app).
 공통 경로: **glibc 게스트 → ALR native loader(비root, public Android API only) →
 GDK/toolkit → wl_shm(소프트웨어 픽셀) → Wayland-on-SurfaceView 컴포지터 → Android SurfaceView**.
@@ -61,14 +61,15 @@ GPU(glmark2)는 별도 shim→ring→host Mali executor 경로(아래 §3).
 
 | toolkit | 현재 도달점 | 남은 일 | evidence |
 |---------|-----------|--------|----------|
-| **Qt6** (qtwayland) | overlay STAGED(extracted=289). round-4 drain#13 에서 `analogclock` 바이너리는 staged + `QT_QPA_PLATFORM=wayland` 설정됐으나 **fork 된 게스트 child 가 Qt init 에서 SIGSEGV**(`signal 11 SEGV_MAPERR`, pid 21297) → `qt6gui-result: rendered=false`. **앱 회귀 아님**(app pid 21224 생존, 이후 모든 probe 정상). 105MB overlay + wayland QPA plugin 만으로는 Qt platform init 클로저 부족 | **Qt6 wayland closure 보강**(libQt6WaylandClient + integration plugins + 그 deps) → SIGSEGV 해소 후 display-backed launch (round-5) | `2026-06-02-round4-milestones-drain` |
+| **Qt6** (qtwayland) | overlay STAGED + **클로저 완전**(round-5: 35 reachable libs, `QT_QPA_PLATFORM=wayland`). `analogclock` 바이너리 staged 되나 **fork 된 게스트 child 가 Qt init 에서 SIGSEGV**(`signal 11`, round-4 pid 21297 / round-5 pid 24125) → `qt6gui-result: rendered=false`. **앱 회귀 아님**(app 생존, 이후 모든 probe 정상). round-5 가 원인을 **EGL hwintegration** 으로 device-규명 — overlay 미완이 아니라 Qt 가 wayland **EGL** client-buffer integration 을 골라 ICD 없는 `eglGetDisplay` 호출(ALR shim 은 GLES-마샬링이지 Qt 가 쓸 EGL platform 아님). machine-id 주입 + `QT_WAYLAND_DISABLE_WINDOWDECORATION` 으로도 안 고쳐짐 | **Qt EGL hwintegration 회피 → `wl_shm` 소프트웨어 client-buffer 강제**(env 또는 overlay 에서 EGL 플러그인 제외) → SIGSEGV 해소 후 다른 toolkit 과 같은 cairo/SW→wl_shm 경로로 display-backed launch (round-6 `EGL→SHM` 전환중) | `2026-06-02-round4-milestones-drain`, `2026-06-02-round5-vulkan-device-marshal` |
 
 > netsurf 도 round-3(drain#11)에서는 "GTK init 까지 실행되나 headless 라 `cannot open display` exit"
 > 단계였고, drain#12 에서 컴포지터에 display-backed launch 하자 **RENDERS** 로 올라갔다(§1).
 > SDL2 도 round-4 drain#13 에서 같은 한 발(컴포지터 launch)을 디뎌 RENDERS 로 승급됐다(§1).
-> qt6 는 launch 한 발 전에 **Qt init SIGSEGV(closure 부족)** 벽이 하나 더 있다 — round-5 에서
-> wayland closure 를 보강해 게스트 child crash 를 먼저 없애야 한다. 잠긴 큰 로더 기능들의
-> SSOT 는 `docs/research/loader-feature-gaps.md`.
+> qt6 는 launch 한 발 전에 **Qt init SIGSEGV** 벽이 하나 더 있다 — round-4 는 이를 "closure 부족"으로
+> 보았으나 **round-5 가 device 로 원인을 EGL hwintegration 으로 좁혔다**(closure 는 완전). 따라서
+> round-6 의 한 발은 closure 보강이 아니라 **EGL→wl_shm 백엔드 강제**다. 잠긴 큰 로더 기능들의
+> SSOT 는 `docs/research/loader-feature-gaps.md`(G2), CP-6 진행은 `docs/research/cp6-status.md`.
 
 ---
 
@@ -77,8 +78,10 @@ GPU(glmark2)는 별도 shim→ring→host Mali executor 경로(아래 §3).
 GUI 앱의 창은 §1 의 cairo SW→wl_shm 경로로 뜨지만, **GPU 렌더(GL/GLES)**는 별도로
 guest shim → SPSC ring → host Mali executor 로 가속된다. glmark2-es2 가 실 Mali 에 렌더
 (`software renderer=false`, build+texture Score ~1000+, GL_RENDERER=Mali-G615 MC2 passthrough).
-상세/숫자는 `docs/research/alr-compat-matrix.md` §GPU 와 `cp2-gpu-ratio-glmark2.md`. GTK4 GL
-렌더러/실앱 GL → Mali 연결은 WS-2 M4(진행).
+round-5 에서 **게스트 Vulkan enumerate/props 마샬링이 실 Mali libvulkan 에 device-verified**됐다
+(`ALR VK ENUM MARSHAL: PASS`, VK 1.3, `2026-06-02-round5-vulkan-device-marshal`) — 게스트 자체 3D 의
+backbone(다음은 VK-M2 명령 body). 상세/숫자는 `docs/research/alr-compat-matrix.md` §GPU 와
+`cp2-gpu-ratio-glmark2.md`. GTK4 GL 렌더러/실앱 GL → Mali 연결은 WS-2 M4(진행).
 
 ---
 
@@ -86,9 +89,10 @@ guest shim → SPSC ring → host Mali executor 로 가속된다. glmark2-es2 �
 
 **device-증명 범용 GUI 셋(창이 실제로 뜸): GIMP 3.0.2(USABLE) · gtk3-widget-factory ·
 gtk3-demo · foot · netsurf-gtk(웹브라우저, 5 threads) · SDL2(testdraw2) —
-GTK3/native-Wayland/멀티스레드 브라우저/SDL2 를 가로지름.** 진행 중: qt6(overlay STAGED,
-Qt-init SIGSEGV → wayland closure 보강 round-5). 잠긴 큰 로더 기능 SSOT =
-`docs/research/loader-feature-gaps.md`.
+GTK3/native-Wayland/멀티스레드 브라우저/SDL2 를 가로지름.** 진행 중: qt6(overlay STAGED + 클로저 완전,
+Qt-init SIGSEGV → round-5 가 원인을 **EGL hwintegration** 으로 device-규명 → round-6 `EGL→wl_shm`
+백엔드 강제 전환중). 잠긴 큰 로더 기능 SSOT = `docs/research/loader-feature-gaps.md`,
+CP-6(chromium storm/exec-re-entry) 진행 = `docs/research/cp6-status.md`.
 
 *갱신 규칙:* device evidence 추가 시에만 RENDERS/USABLE 로 승급(evidence 파일명 명기).
 host-only 진전(overlay stage, 로더가 entry 도달)만으로는 §1 으로 올리지 않고 §2 에 둔다.
