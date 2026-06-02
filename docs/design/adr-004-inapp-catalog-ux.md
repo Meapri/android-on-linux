@@ -31,13 +31,13 @@ ADR의 핵심은 _결정의 기록_이다. 아래 5개는 본 UX 레이어의 �
 - **좌우범위**: Compose 화면 = T3(런처/카탈로그/설정). View `RunningSurface` = 본 ADR(경계) + 통합/런타임 트랙(블록 이전, §8-개선-3).
 - **미해결**: 없음(스택 결정은 host-닫힘 — 코드 위치/래핑은 §8 이전 계획에서).
 
-### D3 — 카탈로그: apt 인덱스 기반 (v1 stage-tar 풀기, v2 인-게스트 apt)
-- **채택안**: 카탈로그 = **apt 저장소 인덱스**로 목록 구성. **v1 = 인덱스로 목록을 보이되, 의존성 closure를 host(또는 빌드 시) 풀어 `stage-tar` overlay로 설치**(dpkg fork-exec 우회) — 인-게스트 dpkg/apt가 요구하는 exec re-entry 벽(ADR-003)을 _회피_. **v2 = exec re-entry가 풀린 뒤 인-게스트 apt/dpkg**로 직접 설치.
-- **근거**: ADR-003이 fresh-execve 자식(dpkg가 부르는 maintainer script·`ldconfig` 등)이 device 미검증 벽임을 기록. v1에서 인-게스트 dpkg를 돌리면 그 벽에 정면 충돌 → 대신 `deb_closure`(`tools/deb_closure.py`)가 이미 `.deb` closure를 base-subtract해 **§5-E `./`-rooted overlay tar**로 평탄화하므로, "설치" = 그 stage-tar를 `RootfsInstaller.extractOverlayTar`로 푸는 것(fork-exec 0)으로 닫힘. 인덱스(apt `Packages`)는 _목록·메타·버전·크기_의 출처로만 v1에 쓰고, 트랜잭션(dpkg)은 v2로 미룸.
-- **v1**: 카탈로그 인덱스 → 후보 목록. 설치 = `InstallSpec(stage-tar)` → `extractOverlayTar` + `.{name}-staged-<size>` 마커. closure 풀기는 host/빌드 측(`deb_closure`), device는 푼 tar만 받음. → **B 트랙(카탈로그 파이프라인) 신규 문서**가 인덱스→closure→stage-tar 파이프라인을 SSOT로 소유(상호참조 §13).
-- **v2**: ADR-003 exec re-entry가 device-증명(M-R4-*)되면 인-게스트 `apt-get install`을 트랜잭션으로 래핑(`runProotRootfsAptGet*` 경로, `NativeCommandRunner` L72~). v1 stage-tar 경로는 오프라인/번들 설치로 잔존.
-- **좌우범위**: v1 closure→stage-tar 파이프라인 = B 트랙 + WS-4(overlay 빌드). 인덱스 파싱/카탈로그 목록 = T2(매니페스트·카탈로그 모델)·T3(화면). v2 인-게스트 apt = WS-1 exec re-entry(ADR-003) 선결.
-- **미해결**: v2 인-게스트 apt는 ADR-003 §4 미검증 가정(envp 전파·TRACEEXEC 자동추적)이 device로 닫혀야 착수. v1은 그 벽과 _무관_(fork-exec 0).
+### D3 — 카탈로그: apt 인덱스 기반 (v1 stage-tar 풀기, v2 인-게스트 dpkg/apt — **v2 device 달성**)
+- **채택안**: 카탈로그 = **apt 저장소 인덱스**로 목록 구성. **v1 = 인덱스로 목록을 보이되, 의존성 closure를 host(또는 빌드 시) 풀어 `stage-tar` overlay로 설치**(dpkg fork-exec 우회) — 인-게스트 dpkg/apt가 요구하는 exec re-entry 벽(ADR-003)을 _회피_. **v2 = exec re-entry가 풀린 뒤 인-게스트 apt/dpkg**로 직접 설치. **(개정 R2, 2026-06-03)**: v2의 핵심 길목인 **인-게스트 비root `dpkg -i`가 device로 달성됨**(ws-1 `7f45def`, v163) — D3은 더 이상 "v2=미래 가정"이 아니라 **v2=달성(범위 한정)**으로 갱신한다.
+- **근거**: ADR-003이 fresh-execve 자식(dpkg가 부르는 maintainer script·`ldconfig` 등)이 device 미검증 벽임을 기록했다. v1은 그 벽을 `deb_closure`(`tools/deb_closure.py`)의 closure→§5-E stage-tar 평탄화로 _회피_했다(fork-exec 0). **v2에서 그 벽 자체가 device로 뚫렸다**: `dpkg -i hello.deb`가 **unpacked=true configured=true installed=true**(이전 `configured=false`)에 도달 — maintainer script("Setting up hello")가 실제로 실행되고 바이너리가 `<rootfs>/usr/bin/hello`에 안착, dpkg status="install ok installed". 두 근본 수정: (1) fakeroot가 link→copy-fallback + `utimes()/lutimes()` 경로재작성 래퍼(dpkg가 `.dpkg-new` 타임스탬프를 utimes로 찍는데 base literal 경로가 ENOENT로 unpack을 중단시키던 것)를 닫고, (2) exec-child in-process re-map 워커가 B-3 augmented envp를 x21에 미러해 재진입 자식이 interposer/fakeroot 없이 도는 것을 막음. 인덱스(apt `Packages`)는 여전히 _목록·메타·버전·크기_ 출처로 쓴다.
+- **v1**: 카탈로그 인덱스 → 후보 목록. 설치 = `InstallSpec(stage-tar)` → `extractOverlayTar` + `.{name}-staged-<size>` 마커. closure 풀기는 host/빌드 측(`deb_closure`), device는 푼 tar만 받음. → **B 트랙(카탈로그 파이프라인) 신규 문서**가 인덱스→closure→stage-tar 파이프라인을 SSOT로 소유(상호참조 §13). **v2 달성 후에도 v1 stage-tar는 오프라인/번들/회피 경로로 강등 잔존**(네트워크 없이 푼 tar만으로 설치 가능, fork-exec 0).
+- **v2 (달성, 범위 한정)**: 인-게스트 비root `dpkg -i <local.deb>` = unpacked+configured+installed **device-증명**(`7f45def`, R5KL20B6S3X v163). 실 `AlrRuntime.install()`은 이 경로(`NativeCommandRunner`의 dpkg/`runProotRootfsAptGet*` 호출)를 트랜잭션으로 래핑한다(§5 계약). **정직한 잔존 벽**: (a) `dpkg -i hello`처럼 _얕은_ maintainer script는 통과하나 **galculator류 깊은 fork+exec 체인**(다단 helper/ldconfig/트리거 폭주)은 device supervisor 40s watchdog 벽이 잔존(별도 로더 마일스톤). (b) 네트워크 `apt-get install <pkg>`(원격 fetch+다중 패키지 트랜잭션)은 아직 device 미증명(PENDING) — 증명된 것은 _로컬 .deb_ 단일 설치다. 상세·범위: `docs/research/alr-compat-matrix.md`, `loader-feature-gaps.md`.
+- **좌우범위**: v1 closure→stage-tar 파이프라인 = B 트랙 + WS-4(overlay 빌드). 인덱스 파싱/카탈로그 목록 = T2(매니페스트·카탈로그 모델)·T3(화면). v2 인-게스트 dpkg/apt = WS-1 exec re-entry(ADR-003) — **`dpkg -i` 길목은 device로 닫힘**(`7f45def`); 깊은 체인·네트워크 apt는 WS-1 후속.
+- **미해결**: 깊은 fork+exec 체인(galculator)·네트워크 `apt install` 다중 트랜잭션이 device supervisor watchdog/exec-re-entry 잔여 벽 — `7f45def`가 얕은 단일 .deb 길을 닫았고 후속은 그 위에서 진행. v1 stage-tar는 그 벽과 _무관_(fork-exec 0).
 
 ### D4 — 파일연동: SAF 직통 프록시(최종 목표) + copy-in/out(중간 폴백)
 - **채택안**: 최종 목표 = **SAF 직통 프록시**(`ContentResolver` fd를 게스트 경로에 _진짜 마운트_처럼 노출, 무복사). 중간단계 폴백 = **copy-in/out**(SAF로 고른 문서를 앱-private로 복사 후 게스트가 사본을 봄, 변경분은 명시 export).
@@ -60,7 +60,7 @@ ADR의 핵심은 _결정의 기록_이다. 아래 5개는 본 UX 레이어의 �
 |---|---|---|---|---|
 | D1 | 멀티앱 | 단일 포그라운드(RENDERING 0..1) | 동시-멀티 데스크탑(별 ADR) | WS-1/§5-F; v2=WS-3 |
 | D2 | UI 스택 | Compose 신규화면 + View RunningSurface | (RunningSurface AndroidView 검토) | T3 + 통합 |
-| D3 | 카탈로그 | apt-인덱스 목록 + stage-tar 설치 | 인-게스트 apt/dpkg | B 트랙·WS-4; v2=ADR-003 |
+| D3 | 카탈로그 | apt-인덱스 목록 + stage-tar 설치 | 인-게스트 dpkg/apt — **v2 달성(로컬 `dpkg -i` device, `7f45def`)**; 깊은 체인·네트워크 apt PENDING | B 트랙·WS-4; v2=WS-1(ADR-003) |
 | D4 | 파일연동 | copy-in/out 폴백 | SAF-fd 직통 프록시 | T5; v2=C 트랙·WS-1 |
 | D5 | 백그라운드 | 보류/정지(잠정) | suspend 확정(측정 후) | M-UX 게이트(범위 밖) |
 
@@ -311,20 +311,27 @@ interface AlrRuntime {
    │ device: RootfsInstaller.extractOverlayTar(tar, rootfsDir)   │
    │   + .{name}-staged-<size> 마커  ← fork-exec 0, dpkg 우회    │
    └─────────────────────────────────────────────────────────────┘
-        │   exec re-entry(ADR-003 M-R4-*) device-증명 시 졸업
+        │   exec re-entry 길목이 device로 뚫림 → v2 졸업(7f45def, v163)
         ▼
-   ┌──────────── v2: 인-게스트 apt/dpkg (exec 벽 해소 후) ───────┐
-   │ device 게스트 내: apt-get install <pkg>                     │
-   │   (dpkg maintainer script·ldconfig = fresh-execve 자식)     │
-   │   ← ADR-003 §4 envp전파/TRACEEXEC 가정이 device로 닫혀야    │
-   │   runProotRootfsAptGet* 경로(NativeCommandRunner L72~)를    │
-   │   InstallSpec(apt) 트랜잭션으로 래핑                         │
+   ┌──────────── v2: 인-게스트 dpkg/apt (device 달성, 범위 한정) ─┐
+   │ device 게스트 내: dpkg -i <local.deb>  ✅ DEVICE-PROVEN      │
+   │   unpacked=true configured=true installed=true              │
+   │   (maintainer script "Setting up ..." 실제 실행;            │
+   │    바이너리 <rootfs>/usr/bin/* 안착; status=install ok)     │
+   │   fix: fakeroot link→copy-fallback + utimes/lutimes 경로재작성│
+   │        + exec-child re-map 워커의 B-3 envp x21 미러          │
+   │   runProotRootfsAptGet*/dpkg 경로(NativeCommandRunner L72~)를│
+   │   InstallSpec(apt/dpkg) 트랜잭션으로 래핑 → AlrRuntime.install│
+   │ ── 정직한 잔존 벽(PENDING, 별도 로더 마일스톤) ──            │
+   │   • galculator류 깊은 fork+exec 체인 = supervisor 40s        │
+   │     watchdog 벽 잔존(얕은 hello 와 달리 다단 helper 폭주)    │
+   │   • 네트워크 apt-get install(원격 fetch+다중 트랜잭션) 미증명│
    └─────────────────────────────────────────────────────────────┘
 ```
 
-- **v1이 dpkg를 우회하는 이유**: 인-게스트 dpkg는 maintainer script·`ldconfig`를 `fork+execve`로 부르는데, 이게 ADR-003이 기록한 _device 미검증 exec 벽_이다. `deb_closure`가 이미 closure→§5-E stage-tar 평탄화를 수행하므로, "설치 = overlay 풀기"로 fork-exec 0에 도달 → v1은 그 벽과 **무관**.
-- **인덱스의 역할 분리**: v1에서 apt 인덱스는 _목록·의존성 그래프·메타_까지만 쓰고(closure 해결 입력), 실제 _트랜잭션_(설정·트리거·스크립트)은 v2로 미룬다. 따라서 v1 카탈로그는 "apt 기반"이되 "apt 실행"은 아니다.
-- **소유**: 인덱스→closure→stage-tar 파이프라인 = **B 트랙(카탈로그 파이프라인) 신규 문서**가 SSOT(상호참조 §13), `deb_closure`/`overlay_guard`/§5-E가 그 엔진. 카탈로그 _목록·검색·정렬_ 모델 = T2/T3(host-검증). v2 인-게스트 apt = WS-1 exec re-entry(ADR-003) 선결.
+- **v1이 dpkg를 우회하는 이유**: 인-게스트 dpkg는 maintainer script·`ldconfig`를 `fork+execve`로 부르는데, 이게 ADR-003이 기록한 _device 미검증 exec 벽_이었다. `deb_closure`가 이미 closure→§5-E stage-tar 평탄화를 수행하므로, "설치 = overlay 풀기"로 fork-exec 0에 도달 → v1은 그 벽과 **무관**. **v2(`7f45def`)에서 그 벽 자체가 로컬 `dpkg -i` 범위로 device-증명되어**, stage-tar는 이제 _오프라인/번들/회피_ 폴백으로 강등된다(여전히 유효).
+- **인덱스의 역할 분리**: apt 인덱스는 _목록·의존성 그래프·메타_의 출처다(v1=closure 해결 입력, v2=트랜잭션 타깃 선택). v2에서 실제 _트랜잭션_(설정·트리거·스크립트)은 로컬 `dpkg -i`로 device-증명됐고, 네트워크 다중-패키지 `apt install`은 후속(PENDING).
+- **소유**: 인덱스→closure→stage-tar 파이프라인 = **B 트랙(카탈로그 파이프라인) 신규 문서**가 SSOT(상호참조 §13), `deb_closure`/`overlay_guard`/§5-E가 그 엔진. 카탈로그 _목록·검색·정렬_ 모델 = T2/T3(host-검증). v2 인-게스트 dpkg/apt = WS-1 exec re-entry(ADR-003) — 로컬 `dpkg -i` 길목 device-닫힘(`7f45def`), 깊은 체인·네트워크 apt는 WS-1 후속.
 
 ### 7-B. 파일연동: SAF 프록시(목표) + copy-in/out(폴백) (D4 반영)
 

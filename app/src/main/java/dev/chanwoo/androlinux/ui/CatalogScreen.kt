@@ -683,11 +683,12 @@ private fun previewCatalog(): List<CatalogApp> = listOf(
     ),
 )
 
-/** 설치 진행을 흉내내는 Preview/데모용 install Flow(단조 증가 → Done). */
+/** 설치 진행을 흉내내는 Preview/데모용 install Flow(v2 dpkg 단계: 단조 증가 → Done). */
 private fun fakeInstallFlow(appId: String): Flow<InstallProgress> = flow {
     emit(InstallProgress.Running(appId, 15, dev.chanwoo.androlinux.runtime.InstallStage.RESOLVING))
-    emit(InstallProgress.Running(appId, 60, dev.chanwoo.androlinux.runtime.InstallStage.DOWNLOADING))
-    emit(InstallProgress.Running(appId, 90, dev.chanwoo.androlinux.runtime.InstallStage.EXTRACTING))
+    emit(InstallProgress.Running(appId, 55, dev.chanwoo.androlinux.runtime.InstallStage.DOWNLOADING))
+    emit(InstallProgress.Running(appId, 80, dev.chanwoo.androlinux.runtime.InstallStage.UNPACKING))
+    emit(InstallProgress.Running(appId, 95, dev.chanwoo.androlinux.runtime.InstallStage.CONFIGURING))
     emit(InstallProgress.Done(appId))
 }
 

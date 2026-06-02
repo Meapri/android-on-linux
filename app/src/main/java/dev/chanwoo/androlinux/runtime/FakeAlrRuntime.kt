@@ -146,6 +146,16 @@ class FakeAlrRuntime(
      * 재시도 시뮬: pendingFailures 에 있으면 첫 시도는 Failed 로 끝나고(슬롯 반납) 그 appId 를
      *   집합에서 지운다 → 같은 Flow 를 다시 collect(재시도)하면 성공한다.
      *
+     * §5 계약(ADR-004 §5/D3, v2): 실 AlrRuntime.install() 은 진행 단계를
+     *   RESOLVING→DOWNLOADING→UNPACKING→CONFIGURING→REGISTERING 으로 흘리되, 이를
+     *   NativeCommandRunner 의 비root `dpkg -i <local.deb>` 트랜잭션에 매핑한다 —
+     *   UNPACKING=dpkg unpack(unpacked=true), CONFIGURING=dpkg configure(maintainer
+     *   script "Setting up …" → configured=true), 완료=installed. v2 device-증명
+     *   (ws-1 7f45def, v163: hello.deb unpacked+configured+installed). 깊은 fork+exec
+     *   체인(galculator)·네트워크 다중-패키지 apt 는 잔존 벽(PENDING). v1 stage-tar
+     *   (extractOverlayTar) 는 오프라인/번들 폴백으로 같은 단계열을 재사용.
+     *   이 mock 은 device 없이 그 단계열만 코루틴 타이머로 시뮬레이션한다.
+     *
      * INV 와 무관(설치는 세션 불변식 임계구역과 별개) — 단 active/queue StateFlow 로 UI 가시.
      */
     override fun install(appId: String): Flow<InstallProgress> = flow {
@@ -169,18 +179,26 @@ class FakeAlrRuntime(
                 emit(InstallProgress.Failed(appId, "오버레이 적용 실패 (재시도하세요)"))
                 return@flow
             }
-            // 단계별 진행률(단조 증가): RESOLVING→DOWNLOADING→EXTRACTING→REGISTERING.
+            // 단계별 진행률(단조 증가) — v2 dpkg/apt 파이프라인 반영:
+            //   RESOLVING(의존성/closure) → DOWNLOADING(.deb 수신) →
+            //   UNPACKING(dpkg unpack: unpacked=true) →
+            //   CONFIGURING(dpkg configure: maintainer script → configured=true) →
+            //   REGISTERING(installed; status="install ok installed").
+            // 실 AlrRuntime 은 §5 계약대로 이 단계들을 NativeCommandRunner 의
+            // 비root `dpkg -i <local.deb>` 진행에 매핑한다(device-증명 7f45def, v163:
+            // unpacked=true configured=true installed=true). mock 은 타이머로 흘린다.
             val stages = listOf(
                 InstallStage.RESOLVING to 15,
-                InstallStage.DOWNLOADING to 60,
-                InstallStage.EXTRACTING to 90,
+                InstallStage.DOWNLOADING to 55,
+                InstallStage.UNPACKING to 80,    // dpkg unpack → unpacked=true
+                InstallStage.CONFIGURING to 95,  // dpkg configure → configured=true
                 InstallStage.REGISTERING to 99,
             )
             for ((stage, pct) in stages) {
                 emit(InstallProgress.Running(appId, pct, stage))
                 delay(stepMillis)
             }
-            // 설치 완료 → installedApps 에 등록(카탈로그 메타에서 InstalledApp 합성).
+            // 설치 완료(installed) → installedApps 에 등록(카탈로그 메타에서 InstalledApp 합성).
             _installedApps.value = _installedApps.value + catalogApp.toInstalledApp()
             emit(InstallProgress.Done(appId))
         } finally {

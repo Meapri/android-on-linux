@@ -226,14 +226,24 @@ sealed interface InstallProgress {
 }
 
 /**
- * 설치 진행 단계 — install_plan v1(stage-tar) 파이프라인의 사용자-가시 페이즈.
- * RESOLVING(closure 해결) → DOWNLOADING(stage-tar 수신) → EXTRACTING(extractOverlayTar)
- * → REGISTERING(매니페스트 등록). 제거는 REMOVING 단일.
+ * 설치 진행 단계 — v2(인-게스트 dpkg/apt) 파이프라인의 사용자-가시 페이즈.
+ * RESOLVING(의존성/closure 해결) → DOWNLOADING(.deb/stage-tar 수신) →
+ * UNPACKING(dpkg unpack: `.dpkg-new` 전개 → unpacked=true) →
+ * CONFIGURING(dpkg configure: maintainer script "Setting up …" → configured=true) →
+ * REGISTERING(설치 완료 등록 → installed; status="install ok installed").
+ * 제거는 REMOVING 단일.
+ *
+ * v2 device 달성(ws-1 `7f45def`, v163): 비root `dpkg -i hello.deb`가
+ * unpacked=true configured=true installed=true 도달 — UNPACKING/CONFIGURING 페이즈가
+ * 실제 dpkg unpack/configure 단계에 대응한다. v1(stage-tar) 폴백 경로는 UNPACKING을
+ * extractOverlayTar 로, CONFIGURING 을 no-op(설정 불요)로 흘린다. (EXTRACTING 은
+ * UNPACKING 으로 명칭 통합 — v1 stage-tar 의 "오버레이 적용"도 unpack 의미.)
  */
 enum class InstallStage(val label: String) {
     RESOLVING("의존성 해결 중"),
     DOWNLOADING("내려받는 중"),
-    EXTRACTING("오버레이 적용 중"),
+    UNPACKING("푸는 중"),
+    CONFIGURING("설정 중"),
     REGISTERING("등록 중"),
     REMOVING("제거 중"),
 }
