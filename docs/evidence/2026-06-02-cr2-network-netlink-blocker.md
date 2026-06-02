@@ -80,10 +80,26 @@ non-determinism (a one-off), NOT a deterministic bind-fix regression. CR-1 is no
 short-circuit is still the right CR-2 robustness step (reduce that init-hang probability),
 but it is NOT a CR-1 regression.
 
+## DNS vs connect — ISOLATED (IP-literal drain, 360s window)
+Switched the CR-2 probe to `https://1.1.1.1/` (IP literal → no DNS) and re-drained:
+- example.com (hostname): hangs **180–200s** → **DNS is the hostname blocker** (Android blocks
+  apps' raw UDP-53 to arbitrary nameservers like 8.8.8.8; chromium's resolv.conf DNS hangs).
+  Fix path: DoH-over-443 (`--dns-over-https-*`, give the DoH server an IP) or a resolver shim.
+- 1.1.1.1 (IP literal): does NOT hang — runs only **~6s** then `exit=-1 sig=5` = a `brk`/CHECK
+  crash (SIGTRAP si_code=1 TRAP_BRKPT, pc=0x77b22bc290). So the connect/TLS path hits a
+  fatal CHECK fast (a SECOND, distinct blocker from DNS). The specific CHECK is inside
+  chromium's 5192-byte stderr, which the loader only logs as truncated head/tail — so
+  diagnosing it needs better capture (write the guest stdout/stderr to a file, not logcat).
+
+## CR-2 has TWO layers (both open)
+1. DNS: hostname resolution hangs (Android UDP-53 block) → DoH/resolver.
+2. connect/TLS: even IP-literal crashes at a `brk`/CHECK in ~6s → root-cause needs full
+   (un-truncated) chromium stderr capture.
+
 ## Status
 - CR-1 (engine + DOM render in-process): **ACHIEVED + reproduced 3/3**, confirmed safe WITH
-  the netlink bind fix on device.
-- CR-2 (network fetch): NETLINK connectivity bind blocker **addressed** (chromium now issues
-  the request); remaining = the request's network layer (DNS/connect) + a netlink recvmsg
-  short-circuit to cut chromium's init-hang probability. A deeper network-layer effort, rungs
-  clear (see candidates above).
+  the netlink bind fix on device. THE landmark.
+- CR-2 (network fetch): NETLINK connectivity **addressed**; then isolated into DNS (hostname
+  hang → DoH) + a connect/TLS `brk` (IP-literal, ~6s → needs full stderr capture to
+  root-cause). A genuine multi-step network-layer effort; next concrete move = capture
+  chromium's full stderr to a file, then attack DNS (DoH) and the connect CHECK.
