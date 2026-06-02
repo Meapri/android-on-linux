@@ -1494,6 +1494,10 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     guest_env.push_back("WAYLAND_DISPLAY=wayland-0");
     guest_env.push_back("GDK_BACKEND=wayland");
     guest_env.push_back("SDL_VIDEODRIVER=wayland");
+    // Qt6 apps: select the wayland QPA plugin (libqwayland-generic.so, shipped 0755 in
+    // the qt6 demo overlay) instead of Qt's compiled-in default (xcb → no X server →
+    // abort). Harmless for non-Qt guests. Pairs with the r4 qt6 analogclock launch.
+    guest_env.push_back("QT_QPA_PLATFORM=wayland");
     // GTK/GIMP startup: render with cairo (no client GL yet), an in-memory
     // GSettings backend (no dconf/D-Bus), a UTF-8 locale, and rootfs-relative XDG
     // dirs. Service-file paths (fontconfig, gdk-pixbuf loaders, gschemas) are

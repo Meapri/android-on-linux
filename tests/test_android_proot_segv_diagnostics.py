@@ -24,7 +24,7 @@ def test_runner_probes_proot_with_multiple_entrypoints():
 
 def test_activity_reports_success_summary_without_default_direct_crash_probes():
     text = MAIN.read_text()
-    assert "build: 0.4.134-netsurf-launch-v134" in text
+    assert "build: 0.4.135-r4-milestones-v135" in text
     assert "ROOTFS EXECUTION:" in text
     assert "probe dlopen talloc" in text
     assert "linker64 proot --version exit" in text

@@ -14,4 +14,4 @@ def test_termux_proot_prebuilts_are_excluded_from_gradle_strip():
 
 def test_build_stamp_identifies_unstripped_proot_package():
     text = BUILD.read_text()
-    assert 'versionName = "0.4.134-netsurf-launch-v134"' in text
+    assert 'versionName = "0.4.135-r4-milestones-v135"' in text
