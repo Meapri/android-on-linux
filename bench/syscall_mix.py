@@ -69,9 +69,17 @@ TOP_HIST = 16
 # also generate ctxt switches and blur the signal (ADR-002 §2 risk note, §5.2).
 ROUNDTRIP_DOMINATED_MIN = 1.5  # >= this -> round-trip dominated
 SYSCALL_WEIGHT_MAX = 0.5  # <= this -> syscall-weight (24ns×N) dominated
+# A single ptrace/SIGSYS round-trip produces ~2 context switches (tracee->supervisor
+# ->tracee), with scheduling jitter at most ~this many. If nonvol_ctxt exceeds
+# ROUNDTRIP_CTXT_MAX × (traps+emul), the excess switches CANNOT come from our
+# round-trips — they are the guest's OWN blocking (futex/epoll). Without this ceiling
+# the ratio degenerates when round-trips are negligible (e.g. chromium --version:
+# traps=0 emul=1 nonvol_ctxt=379 -> ratio 379 falsely read as "roundtrip-dominated").
+ROUNDTRIP_CTXT_MAX = 4.0
 
 STORM_ROUNDTRIP = "roundtrip-dominated"
 STORM_SYSCALL_WEIGHT = "syscall-weight-dominated"
+STORM_MEDIATION_NEGLIGIBLE = "mediation-negligible"
 STORM_AMBIGUOUS = "ambiguous"
 
 
@@ -198,6 +206,13 @@ def classify_storm(mix: SyscallMix) -> str:
     # we cannot positively attribute stime to syscall weight either -> ambiguous.
     if mix.traps + mix.emul == 0:
         return STORM_AMBIGUOUS
+    # Round-trips too few to account for the ctxt-switch budget: a round-trip causes
+    # ~2 switches, so ratio > ROUNDTRIP_CTXT_MAX means the switches are the guest's OWN
+    # blocking, not our mediation -> a round-trip fix (USER_NOTIF/svc-rewrite) removes
+    # ~nothing. (Catches the chromium --version case: traps=0 emul=1 -> the 917ms stime
+    # is chromium's init, not ALR overhead — same ADR-002 conclusion as syscall-weight.)
+    if ratio > ROUNDTRIP_CTXT_MAX:
+        return STORM_MEDIATION_NEGLIGIBLE
     if ratio >= ROUNDTRIP_DOMINATED_MIN:
         return STORM_ROUNDTRIP
     if ratio <= SYSCALL_WEIGHT_MAX:

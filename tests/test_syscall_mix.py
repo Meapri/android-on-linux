@@ -17,6 +17,7 @@ from bench.report_parse import (
 from bench.syscall_mix import (
     PATH_NRS,
     STORM_AMBIGUOUS,
+    STORM_MEDIATION_NEGLIGIBLE,
     STORM_ROUNDTRIP,
     STORM_SYSCALL_WEIGHT,
     TOP_HIST,
@@ -25,6 +26,21 @@ from bench.syscall_mix import (
     parse_syscall_mix,
     summarize_markdown,
 )
+
+
+def test_classify_mediation_negligible_chromium_init():
+    # Real device data (CP-6 M-R2 drain#15, chromium-headless-shell --version):
+    # traps=0 emul=1 nonvol_ctxt=379 -> ratio 379 >> ROUNDTRIP_CTXT_MAX. A single
+    # round-trip cannot cause 379 ctxt switches; they are chromium's own init blocking.
+    # Must NOT be misread as 'roundtrip-dominated' (the pre-fix degenerate-ratio bug).
+    text = (
+        "alr sc trace_hist\n"
+        "alr sc emul_hist 99:1\n"
+        "alr sc stime_us=917552 utime_us=292542 nonvol_ctxt=379 traps=0 emul=1\n"
+    )
+    mix = parse_syscall_mix(text)
+    assert mix.traps == 0 and mix.emul == 1 and mix.nonvol_ctxt == 379
+    assert classify_storm(mix) == STORM_MEDIATION_NEGLIGIBLE
 
 
 # --------------------------------------------------------------------------- #
