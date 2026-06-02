@@ -26,11 +26,14 @@ from tools.build_gui_demo_overlays import (
     APT_DEMO_PACKAGE,
     APT_DEMO_README,
     AptDemoBuild,
+    ClosureCheck,
     GUI_DEMOS,
     GuiDemo,
     GuiDemoBuild,
     _add_bytes,
+    check_plugin_closure,
     force_so_executable,
+    inject_machine_id,
     overlay_has_exec,
 )
 
@@ -53,6 +56,112 @@ def test_qt6gui_carries_window_binary_and_wayland_plugin():
     assert "qt6-base-examples" in qt.leaf_packages
     assert "qt6-wayland" in qt.leaf_packages
     assert qt.exec_path.endswith("/analogclock/analogclock")
+
+
+def test_qt6gui_declares_the_dlopened_plugin_closure():
+    """The round-4 SIGSEGV(rendered=false) class is a dlopen'd-plugin gap: a QPA
+    platform plugin (loaded by name at init) whose private deps are absent, or a
+    non-executable plugin .so. Those files are in NO DT_NEEDED graph, so the recipe
+    must declare them explicitly — this pins the closure so an overlay regression
+    can never silently drop them again."""
+    qt = GUI_DEMOS["qt6gui"]
+    # the dlopen'd plugin dirs a Qt wayland window needs (platforms = the QPA plugin;
+    # shell-integration = xdg-shell, the surface role the ALR compositor speaks).
+    assert "platforms" in qt.require_plugin_dirs
+    assert "wayland-shell-integration" in qt.require_plugin_dirs
+    # the private libs those plugins pull in (the "plugin loaded but
+    # libQt6WaylandClient unresolved" crash).
+    assert "libQt6WaylandClient.so.6" in qt.require_sonames
+    assert {"libQt6Gui.so.6", "libQt6Widgets.so.6", "libQt6Core.so.6"} <= set(
+        qt.require_sonames
+    )
+    # Qt's D-Bus init needs a machine-id the noble base does not ship.
+    assert qt.inject_machine_id is True
+
+
+def test_inject_machine_id_adds_both_dbus_locations(tmp_path: Path):
+    tar_path = tmp_path / "mi.tar"
+    with tarfile.open(tar_path, "w") as t:
+        ti = tarfile.TarInfo("./usr/bin/x")
+        ti.size = 4
+        ti.mode = 0o755
+        t.addfile(ti, io.BytesIO(b"\x7fELF"))
+    added = inject_machine_id(tar_path)
+    assert set(added) == {"./etc/machine-id", "./var/lib/dbus/machine-id"}
+    with tarfile.open(tar_path, "r:*") as t:
+        names = set(t.getnames())
+        mid = t.extractfile("./etc/machine-id").read().decode().strip()
+    assert "./etc/machine-id" in names and "./var/lib/dbus/machine-id" in names
+    assert len(mid) == 32 and all(c in "0123456789abcdef" for c in mid)
+    # idempotent: a second pass adds nothing
+    assert inject_machine_id(tar_path) == []
+
+
+def _write_tar(path: Path, members):
+    with tarfile.open(path, "w") as t:
+        for arc, mode in members:
+            payload = b"\x7fELF"
+            ti = tarfile.TarInfo(arc)
+            ti.size = len(payload)
+            ti.mode = mode
+            t.addfile(ti, io.BytesIO(payload))
+
+
+def test_check_plugin_closure_complete(tmp_path: Path):
+    """A complete overlay: plugin dirs present, plugin .so 0o755, the overlay private
+    soname present, and a base-provided soname satisfied by the base (not re-shipped)."""
+    base = tmp_path / "base.tar"
+    _write_tar(base, [("./usr/lib/aarch64-linux-gnu/libwayland-client.so.0", 0o755)])
+    good = tmp_path / "good.tar"
+    _write_tar(good, [
+        ("./usr/lib/aarch64-linux-gnu/qt6/plugins/platforms/libqwayland-generic.so", 0o755),
+        ("./usr/lib/aarch64-linux-gnu/qt6/plugins/wayland-shell-integration/libxdg-shell.so", 0o755),
+        ("./usr/lib/aarch64-linux-gnu/libQt6WaylandClient.so.6", 0o755),
+    ])
+    cc = check_plugin_closure(
+        good, base,
+        require_plugin_dirs=("platforms", "wayland-shell-integration"),
+        require_sonames=("libQt6WaylandClient.so.6", "libwayland-client.so.0"),
+    )
+    assert not cc.plugin_dirs_missing
+    assert "libQt6WaylandClient.so.6" in cc.sonames_reachable     # overlay
+    assert "libwayland-client.so.0" in cc.sonames_reachable       # base wins
+    assert not cc.plugins_non_exec
+    assert cc.ok
+
+
+def test_check_plugin_closure_detects_gaps(tmp_path: Path):
+    """Each failure mode is reported: a missing plugin dir, an unresolved private
+    soname, and a non-executable plugin .so (the three round-4 crash causes)."""
+    base = tmp_path / "base.tar"
+    _write_tar(base, [("./usr/lib/aarch64-linux-gnu/libc.so.6", 0o755)])
+    bad = tmp_path / "bad.tar"
+    _write_tar(bad, [
+        # plugin .so left 0o644 → ALR file-backed PROT_EXEC dlopen would reject it
+        ("./usr/lib/aarch64-linux-gnu/qt6/plugins/platforms/libqwayland-generic.so", 0o644),
+    ])
+    cc = check_plugin_closure(
+        bad, base,
+        require_plugin_dirs=("platforms", "wayland-shell-integration"),
+        require_sonames=("libQt6WaylandClient.so.6",),
+    )
+    assert "wayland-shell-integration" in cc.plugin_dirs_missing
+    assert "libQt6WaylandClient.so.6" in cc.sonames_unreachable
+    assert any(p.endswith("libqwayland-generic.so") for p in cc.plugins_non_exec)
+    assert not cc.ok
+
+
+def test_closure_check_feeds_gui_demo_build_ok():
+    """A complete plugin closure leaves GuiDemoBuild.ok True; an incomplete one
+    forces it False even when DT_NEEDED/guard/spec are all clean."""
+    complete = ClosureCheck(("platforms",), (), ("libQt6Core.so.6",), (), ())
+    incomplete = ClosureCheck((), ("platforms",), (), ("libQt6Core.so.6",), ())
+    assert GuiDemoBuild(
+        "x", "/tmp/x.tar", "/usr/bin/x", 3, ("liba",), (), (), 1, True, True, complete
+    ).ok
+    assert not GuiDemoBuild(
+        "x", "/tmp/x.tar", "/usr/bin/x", 3, ("liba",), (), (), 1, True, True, incomplete
+    ).ok
 
 
 def test_sdl2gui_is_a_windowing_demo_not_the_headless_testver():
