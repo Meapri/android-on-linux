@@ -1996,6 +1996,45 @@ class MainActivity : Activity() {
             ),
             configuredMarker = "Setting up galculator",
         )
+        // v2 breadth (generalization): arbitrary catalog CLI/X11 apps installed via dpkg.
+        // Each rides its own <pkg>-stage.tar (built by tools/build_install_stage.py) which
+        // carries BOTH the leaf .deb at var/cache/apt/archives/<pkg>_<ver>_<arch>.deb (the
+        // dpkg -i TARGET) AND the base-subtracted unpacked closure (so the binary + its
+        // non-base libs are present for a launch attempt). Same descriptor shape as
+        // galculator — only the package name / deb filename / launch class differ.
+        "htop" -> AptDrainTarget(
+            pkg = "htop",
+            debCachePath = "var/cache/apt/archives/htop_3.3.0-4build1_arm64.deb",
+            stageTar = "htop",
+            unpackedMarkers = listOf(
+                "Unpacking htop",
+                "Preparing to unpack",
+                "Selecting previously unselected package htop",
+            ),
+            configuredMarker = "Setting up htop",
+        )
+        "nano" -> AptDrainTarget(
+            pkg = "nano",
+            debCachePath = "var/cache/apt/archives/nano_7.2-2build1_arm64.deb",
+            stageTar = "nano",
+            unpackedMarkers = listOf(
+                "Unpacking nano",
+                "Preparing to unpack",
+                "Selecting previously unselected package nano",
+            ),
+            configuredMarker = "Setting up nano",
+        )
+        "xterm" -> AptDrainTarget(
+            pkg = "xterm",
+            debCachePath = "var/cache/apt/archives/xterm_390-1ubuntu3_arm64.deb",
+            stageTar = "xterm",
+            unpackedMarkers = listOf(
+                "Unpacking xterm",
+                "Preparing to unpack",
+                "Selecting previously unselected package xterm",
+            ),
+            configuredMarker = "Setting up xterm",
+        )
         // default: the original v2 hello.deb proof (its deb rides apt-dpkg-stage.tar,
         // so no extra stage tar is needed).
         else -> AptDrainTarget(
