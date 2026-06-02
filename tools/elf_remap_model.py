@@ -1,0 +1,520 @@
+#!/usr/bin/env python3
+# tools/elf_remap_model.py — host (device-less) verification model for the
+# in-process ELF re-map mapper used by the exec-re-entry trampoline.
+#
+# WHY THIS EXISTS
+# ===============
+# The ALR exec-re-entry trampoline (app/src/main/cpp/alr_inproc_reexec.c) maps a
+# guest ELF into anonymous memory and jumps to it WITHOUT execve. For a full
+# static glibc binary (dpkg's zstd helper, a maintainer-script /bin/sh, ldconfig,
+# chromium/GIMP static helpers) the re-mapped guest dies in its own startup
+# (R12 evidence: SIGILL/SIGSEGV). The device is unavailable to this session, so
+# this module is a PURE, deterministic host model of what a CORRECT re-map mapper
+# must do, expressed against synthetic ELF program/section-header fixtures. It:
+#
+#   1. computes the single-reservation [min_vaddr, max_vaddr) span + page-rounding
+#      and the per-page UNION of PT_LOAD permissions (the R11 single-span model),
+#   2. identifies the PT_GNU_RELRO segment and asserts its pages END read-only,
+#   3. classifies every dynamic relocation by the CORRECT AArch64 ABI constant
+#      (R_AARCH64_RELATIVE=1027, R_AARCH64_IRELATIVE=1032) and flags the
+#      trampoline's constant swap (it #defines IRELATIVE as 1027),
+#   4. checks the auxv tag set the static glibc __libc_start_main path needs,
+#   5. models the thread-pointer (TPIDR_EL0) handoff: a re-map that jumps with
+#      TP=NULL (xzr) vs. a clean zeroed-TCB region (the working loader's pattern).
+#
+# It is NOT an emulator. It does not run guest code. It encodes the INVARIANTS a
+# correct mapper must satisfy and exposes, as failing assertions, exactly where
+# the current trampoline deviates from the proven-working loader
+# (app/src/main/cpp/runtime_report.cpp). Fixing the model's flagged deviations in
+# the C is the本체's job; this file is read-only diagnosis + a host gate.
+#
+# SOURCES (verified 2026-06-02):
+#   * ARM AAELF64 (github.com/ARM-software/abi-aa, aaelf64): R_AARCH64_RELATIVE=1027,
+#     R_AARCH64_IRELATIVE=1032, R_AARCH64_RELR=1029.
+#   * glibc csu/libc-start.c __libc_start_main_impl !SHARED order (codebrowser.dev):
+#     __tunables_init -> ARCH_INIT_CPU_FEATURES -> _dl_relocate_static_pie (L274)
+#     -> ARCH_SETUP_IREL/apply_irel (L277) -> ARCH_SETUP_TLS/TLS_INIT_TP (L280)
+#     -> _dl_setup_stack_chk_guard (L288, canary written INTO the TCB, AFTER TLS).
+#   * glibc sysdeps/.../dl-early_allocate.c: __sbrk first, MMAP fallback on failure
+#     (so brk-unset does NOT hard-fault on glibc >= 2.34 / Ubuntu noble 2.39).
+#   * Default glibc/Ubuntu stack-protector reads the GLOBAL __stack_chk_guard
+#     (adrp/ldr), not the sysreg TP-relative form (opt-in -mstack-protector-guard=sysreg).
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Optional
+
+# --------------------------------------------------------------------------
+# AArch64 ELF ABI constants — the CANONICAL values (ARM AAELF64).
+# The trampoline's bug is that it #defines R_AARCH64_IRELATIVE as 1027, which is
+# actually R_AARCH64_RELATIVE. The proven-working loader (runtime_report.cpp:36)
+# correctly uses 1032. These are the ground-truth values the model checks against.
+# --------------------------------------------------------------------------
+R_AARCH64_RELATIVE = 1027
+R_AARCH64_IRELATIVE = 1032
+R_AARCH64_RELR = 1029  # packed RELR relocs (DT_RELR); a static-PIE may emit these
+
+# p_type
+PT_LOAD = 1
+PT_DYNAMIC = 2
+PT_INTERP = 3
+PT_PHDR = 6
+PT_TLS = 7
+PT_GNU_RELRO = 0x6474E552
+
+# p_flags
+PF_X = 1
+PF_W = 2
+PF_R = 4
+
+# d_tag
+DT_NULL = 0
+DT_RELA = 7
+DT_RELASZ = 8
+DT_RELAENT = 9
+DT_JMPREL = 23
+DT_PLTRELSZ = 2
+DT_RELR = 36
+DT_RELRSZ = 35
+
+# e_type
+ET_EXEC = 2
+ET_DYN = 3
+
+# auxv tags the static glibc startup path consumes (csu/libc-start.c, _dl_aux_init)
+AT_PHDR = 3
+AT_PHENT = 4
+AT_PHNUM = 5
+AT_PAGESZ = 6
+AT_BASE = 7
+AT_ENTRY = 9
+AT_HWCAP = 16
+AT_RANDOM = 25
+AT_HWCAP2 = 26
+
+# The minimal set a re-map MUST synthesize for a static glibc binary to come up.
+# AT_PHDR/PHENT/PHNUM let _dl_relocate_static_pie find its own phdrs; AT_ENTRY is
+# the program entry; AT_PAGESZ sizes TLS/mmap; AT_RANDOM seeds the stack canary
+# (NULL-tolerated by _dl_setup_stack_chk_guard but should be present); AT_HWCAP
+# feeds IFUNC resolvers + ARCH_INIT_CPU_FEATURES. AT_BASE is required for the
+# DYNAMIC (ld.so) case; for a pure static target it is 0.
+REQUIRED_AUXV_STATIC = frozenset(
+    {AT_PHDR, AT_PHENT, AT_PHNUM, AT_ENTRY, AT_PAGESZ, AT_RANDOM, AT_HWCAP}
+)
+REQUIRED_AUXV_DYNAMIC = REQUIRED_AUXV_STATIC | {AT_BASE}
+
+PAGE = 0x1000
+
+
+def _page_down(v: int, page: int = PAGE) -> int:
+    return v & ~(page - 1)
+
+
+def _page_up(v: int, page: int = PAGE) -> int:
+    return (v + page - 1) & ~(page - 1)
+
+
+# --------------------------------------------------------------------------
+# Synthetic ELF fixtures (no real ELF bytes — just the headers the mapper reads).
+# --------------------------------------------------------------------------
+@dataclass(frozen=True)
+class Phdr:
+    p_type: int
+    p_flags: int
+    p_vaddr: int
+    p_filesz: int
+    p_memsz: int
+    p_offset: int = 0
+    p_align: int = PAGE
+
+
+@dataclass(frozen=True)
+class Reloc:
+    r_offset: int
+    r_type: int
+    r_addend: int = 0
+
+
+@dataclass(frozen=True)
+class ElfImage:
+    e_type: int
+    e_entry: int
+    phdrs: tuple[Phdr, ...]
+    # Dynamic relocations as they would be reached via PT_DYNAMIC DT_RELA / DT_JMPREL,
+    # plus any DT_RELR-packed RELATIVE relocs. The model treats these as the ground
+    # truth set the mapper is supposed to apply.
+    rela: tuple[Reloc, ...] = ()
+    jmprel: tuple[Reloc, ...] = ()
+    relr: tuple[Reloc, ...] = ()
+    page: int = PAGE
+
+    def loads(self) -> list[Phdr]:
+        return [p for p in self.phdrs if p.p_type == PT_LOAD]
+
+
+# --------------------------------------------------------------------------
+# (1) Single-reservation span + per-page UNION permissions (R11 model).
+# --------------------------------------------------------------------------
+@dataclass
+class PageProt:
+    vaddr: int
+    prot: int  # bitmask of PF_R/PF_W/PF_X (we reuse PF_* as the "final" perms)
+
+
+@dataclass
+class SpanModel:
+    min_v: int
+    max_v: int
+    span: int
+    pages: list[PageProt] = field(default_factory=list)
+    rwx_pages: list[int] = field(default_factory=list)  # W^X violations (PF_W & PF_X)
+
+
+def model_span(img: ElfImage) -> SpanModel:
+    """Single anonymous reservation [min_v, max_v), per-page UNION of covering
+    PT_LOAD flags — exactly what alr_inproc_reexec.c:map_elf_image does post-R11.
+    Records any page that ends up both writable AND executable (W^X reject)."""
+    loads = img.loads()
+    if not loads:
+        return SpanModel(0, 0, 0)
+    min_v = min(_page_down(p.p_vaddr, img.page) for p in loads)
+    max_v = max(p.p_vaddr + p.p_memsz for p in loads)
+    span = _page_up(max_v - min_v, img.page)
+    m = SpanModel(min_v=min_v, max_v=max_v, span=span)
+    v = min_v
+    while v < _page_up(max_v, img.page):
+        prot = 0
+        for p in loads:
+            s = _page_down(p.p_vaddr, img.page)
+            e = _page_up(p.p_vaddr + p.p_memsz, img.page)
+            if s <= v < e:
+                prot |= p.p_flags & (PF_R | PF_W | PF_X)
+        m.pages.append(PageProt(vaddr=v, prot=prot))
+        if (prot & PF_W) and (prot & PF_X):
+            m.rwx_pages.append(v)
+        v += img.page
+    return m
+
+
+# --------------------------------------------------------------------------
+# (2) PT_GNU_RELRO identification + "must end RO" invariant.
+# --------------------------------------------------------------------------
+@dataclass
+class RelroModel:
+    present: bool
+    pages: list[int] = field(default_factory=list)  # page vaddrs the RELRO covers
+    # After the mapper runs, is each RELRO page read-only (no PF_W)?  The current
+    # trampoline NEVER mprotects RELRO RO, so model_relro(applies_relro=False) leaves
+    # them writable -> not_ro_pages non-empty. With the fix, applies_relro=True.
+    not_ro_pages: list[int] = field(default_factory=list)
+
+
+def model_relro(img: ElfImage, span: SpanModel, applies_relro: bool) -> RelroModel:
+    """Identify the PT_GNU_RELRO range and check whether its pages are finally RO.
+    `applies_relro` models whether the mapper has the RELRO mprotect(RO) step.
+    Note (severity): for a NON-PIE static ET_EXEC glibc, _dl_relocate_static_pie /
+    _dl_protect_relro are not invoked, so a missing RELRO mprotect is a HARDENING
+    gap, NOT a startup-correctness fault. The model reports it but the test suite
+    classifies it as low-severity (does not by itself crash startup)."""
+    relro = [p for p in img.phdrs if p.p_type == PT_GNU_RELRO]
+    if not relro:
+        return RelroModel(present=False)
+    rm = RelroModel(present=True)
+    for seg in relro:
+        s = _page_down(seg.p_vaddr, img.page)
+        e = _page_up(seg.p_vaddr + seg.p_memsz, img.page)
+        v = s
+        while v < e:
+            rm.pages.append(v)
+            # Find this page's final union prot from the span model.
+            pp = next((x for x in span.pages if x.vaddr == v), None)
+            final_w = bool(pp and (pp.prot & PF_W))
+            # The mapper leaves the page writable unless it explicitly re-mprotects
+            # the RELRO range RO after applying relocations.
+            if final_w and not applies_relro:
+                rm.not_ro_pages.append(v)
+            v += img.page
+    return rm
+
+
+# --------------------------------------------------------------------------
+# (3) Relocation classification + application-order model.
+# --------------------------------------------------------------------------
+@dataclass
+class RelocModel:
+    n_relative: int = 0
+    n_irelative: int = 0
+    n_relr: int = 0
+    # What the CURRENT trampoline (IRELATIVE #defined as 1027) actually does:
+    #   - treats every reloc whose type == 1027 as "IRELATIVE" and CALLS
+    #     base+addend as an ifunc resolver — but 1027 is really RELATIVE, whose
+    #     addend is a DATA bias, not a function. Calling it = jump into data.
+    #   - skips real IRELATIVE (1032) entirely -> unresolved ifunc slot.
+    misclassified_relative_called_as_ifunc: int = 0  # RELATIVE wrongly invoked
+    irelative_skipped: int = 0  # real IRELATIVE left unresolved
+    # Reads DT_JMPREL / .rela.plt (PLT relocs) at all?  The trampoline only reads
+    # DT_RELA; static-PIE / DT_JMPREL-only ifuncs are missed.
+    reads_jmprel: bool = False
+    # Handles DT_RELR packed RELATIVE relocs?  Neither mapper does today.
+    reads_relr: bool = False
+
+
+def model_reloc_truth(img: ElfImage) -> RelocModel:
+    """Ground-truth relocation inventory (correct ABI constants)."""
+    m = RelocModel(reads_jmprel=True, reads_relr=True)
+    for r in img.rela + img.jmprel:
+        if r.r_type == R_AARCH64_RELATIVE:
+            m.n_relative += 1
+        elif r.r_type == R_AARCH64_IRELATIVE:
+            m.n_irelative += 1
+    for r in img.relr:
+        if r.r_type == R_AARCH64_RELATIVE:
+            m.n_relr += 1
+    return m
+
+
+def model_reloc_trampoline(img: ElfImage, irelative_define: int) -> RelocModel:
+    """Model the trampoline's reloc loop given the constant it uses for what it
+    THINKS is IRELATIVE. With the bug, irelative_define == 1027 (== RELATIVE).
+    It only scans DT_RELA (no DT_JMPREL, no DT_RELR)."""
+    m = RelocModel(reads_jmprel=False, reads_relr=False)
+    for r in img.rela:  # only DT_RELA is scanned by the trampoline
+        if r.r_type == irelative_define:
+            # The loop CALLS base+addend as a resolver for everything matching the
+            # (mis)define. If the define is 1027, real RELATIVE relocs get called.
+            if r.r_type == R_AARCH64_RELATIVE and irelative_define == R_AARCH64_RELATIVE:
+                m.misclassified_relative_called_as_ifunc += 1
+            m.n_irelative += 1  # what the trampoline counts as "irel"
+    # Whatever real IRELATIVE relocs exist but don't match the (mis)define are skipped.
+    for r in img.rela:
+        if r.r_type == R_AARCH64_IRELATIVE and irelative_define != R_AARCH64_IRELATIVE:
+            m.irelative_skipped += 1
+    return m
+
+
+# --------------------------------------------------------------------------
+# (4) auxv completeness.
+# --------------------------------------------------------------------------
+def missing_auxv(present_tags: set[int], dynamic: bool) -> set[int]:
+    required = REQUIRED_AUXV_DYNAMIC if dynamic else REQUIRED_AUXV_STATIC
+    return set(required) - set(present_tags)
+
+
+# --------------------------------------------------------------------------
+# (5) Thread-pointer (TPIDR_EL0) handoff model — the S1 primary.
+# --------------------------------------------------------------------------
+@dataclass
+class TpModel:
+    tp_is_null: bool  # trampoline: msr tpidr_el0, xzr  -> True
+    has_zeroed_tcb_region: bool  # working loader: mmap(16384)+8192 -> True
+    # Does any code run with TP at the (foreign/NULL) entry value before glibc's
+    # ARCH_SETUP_TLS installs its own TP?  YES on aarch64: __tunables_init,
+    # _dl_relocate_static_pie, ARCH_SETUP_IREL all run BEFORE ARCH_SETUP_TLS
+    # (csu/libc-start.c L267..L280). Any of those that touch the thread pointer
+    # (errno, __libc_tsd, a TP-relative canary on a sysreg-guard build) fault if
+    # TP==NULL. The working loader hands a zeroed, mapped 16 KiB TCB region so a
+    # ±offset TP load lands on mapped-zero rather than NULL.
+    code_runs_before_tls_init: bool = True
+
+
+def model_tp(tp_is_null: bool, has_zeroed_tcb_region: bool) -> TpModel:
+    return TpModel(tp_is_null=tp_is_null, has_zeroed_tcb_region=has_zeroed_tcb_region)
+
+
+def tp_fault_risk(tp: TpModel) -> bool:
+    """A re-map that jumps with TP==NULL and provides no zeroed TCB region risks a
+    fault on any TP-relative access during the pre-TLS-init startup window. The
+    working loader avoids it by giving a mapped zeroed 16 KiB region centered on TP.
+    Returns True if the configuration is the risky one (trampoline) and False if it
+    matches the proven-working loader."""
+    if not tp.tp_is_null and tp.has_zeroed_tcb_region:
+        return False  # working loader: TP -> middle of a mapped zeroed region
+    if tp.tp_is_null and not tp.has_zeroed_tcb_region:
+        return True  # trampoline: TP == NULL, nothing mapped near 0
+    # Mixed/odd configs: risky unless a zeroed region backs the TP.
+    return not tp.has_zeroed_tcb_region
+
+
+# --------------------------------------------------------------------------
+# Top-level diagnosis aggregator — one call that surfaces every deviation of a
+# given mapper configuration from the correct invariants, for a given target ELF.
+# --------------------------------------------------------------------------
+@dataclass
+class MapperConfig:
+    irelative_define: int  # the constant the mapper uses for IRELATIVE
+    applies_relro: bool  # does it mprotect PT_GNU_RELRO RO after relocs?
+    reads_jmprel: bool  # does it scan DT_JMPREL / .rela.plt?
+    reads_relr: bool  # does it apply DT_RELR packed RELATIVE relocs?
+    tp_is_null: bool  # msr tpidr_el0, xzr (True) vs zeroed-TCB region (False)
+    has_zeroed_tcb_region: bool
+    present_auxv: frozenset[int]
+
+
+# The current trampoline (alr_inproc_reexec.c) as of v150/base.
+TRAMPOLINE_CONFIG = MapperConfig(
+    irelative_define=1027,  # BUG: 1027 is R_AARCH64_RELATIVE; IRELATIVE is 1032
+    applies_relro=False,  # no PT_GNU_RELRO handling
+    reads_jmprel=False,  # only DT_RELA
+    reads_relr=False,  # no DT_RELR
+    tp_is_null=True,  # enter_guest: msr tpidr_el0, xzr
+    has_zeroed_tcb_region=False,  # no mmap'd zeroed TCB
+    present_auxv=frozenset(
+        {AT_PHDR, AT_PHENT, AT_PHNUM, AT_PAGESZ, AT_BASE, AT_ENTRY, AT_HWCAP,
+         AT_HWCAP2, AT_RANDOM}
+    ),
+)
+
+# The proven-working in-process loader (runtime_report.cpp) — the reference.
+WORKING_LOADER_CONFIG = MapperConfig(
+    irelative_define=1032,  # correct
+    applies_relro=False,  # also doesn't (hardening gap, not a crash) — matched
+    reads_jmprel=False,  # uses SHT_RELA fallback instead for static (see notes)
+    reads_relr=False,
+    tp_is_null=False,  # alr_enter_guest: msr tpidr_el0, x2 (x2 = zeroed TCB)
+    has_zeroed_tcb_region=True,  # mmap(16384)+8192
+    present_auxv=frozenset(
+        {AT_PHDR, AT_PHENT, AT_PHNUM, AT_PAGESZ, AT_BASE, AT_ENTRY, AT_HWCAP,
+         AT_HWCAP2, AT_RANDOM}
+    ),
+)
+
+
+@dataclass
+class Diagnosis:
+    span: SpanModel
+    relro: RelroModel
+    reloc_truth: RelocModel
+    reloc_actual: RelocModel
+    missing_auxv: set[int]
+    tp: TpModel
+    tp_risky: bool
+    # Severity-ranked findings (str), highest first.
+    findings: list[str] = field(default_factory=list)
+
+
+def diagnose(img: ElfImage, cfg: MapperConfig, dynamic: bool) -> Diagnosis:
+    span = model_span(img)
+    relro = model_relro(img, span, applies_relro=cfg.applies_relro)
+    truth = model_reloc_truth(img)
+    actual = model_reloc_trampoline(img, cfg.irelative_define)
+    miss = missing_auxv(set(cfg.present_auxv), dynamic=dynamic)
+    tp = model_tp(cfg.tp_is_null, cfg.has_zeroed_tcb_region)
+    risky = tp_fault_risk(tp)
+
+    findings: list[str] = []
+
+    # [PRIMARY] TP handoff (the single decisive delta vs the working loader for the
+    # observed ET_EXEC /bin/sh that has IREL=0 yet still crashes after the jump).
+    if risky:
+        findings.append(
+            "PRIMARY[TP]: jumps with TPIDR_EL0=NULL (xzr) and no zeroed-TCB region; "
+            "csu code (__tunables_init/_dl_relocate_static_pie/ARCH_SETUP_IREL) runs "
+            "BEFORE ARCH_SETUP_TLS installs the real TP — a TP-relative access in that "
+            "window faults. Working loader hands TP=mmap(16384)+8192 (zeroed)."
+        )
+
+    # [PRIMARY/CO] IRELATIVE constant swap — active whenever the target has DT_RELA
+    # relocations (static-PIE / DT_RELA-bearing). Masked for plain ET_EXEC w/ no
+    # PT_DYNAMIC (IREL=0), which is why the observed /bin/sh did not trip it.
+    if cfg.irelative_define != R_AARCH64_IRELATIVE:
+        if actual.misclassified_relative_called_as_ifunc:
+            findings.append(
+                f"PRIMARY[reloc]: IRELATIVE #defined as {cfg.irelative_define} "
+                f"(== R_AARCH64_RELATIVE); {actual.misclassified_relative_called_as_ifunc} "
+                "RELATIVE reloc(s) get CALLED as ifunc resolvers (jump into data → "
+                "SIGILL/SIGSEGV). Correct value is 1032."
+            )
+        if actual.irelative_skipped:
+            findings.append(
+                f"PRIMARY[reloc]: {actual.irelative_skipped} real R_AARCH64_IRELATIVE "
+                "reloc(s) skipped (never == the wrong define) → unresolved ifunc slot "
+                "→ indirect call through 0/garbage."
+            )
+
+    # [SECONDARY] missing PLT/RELR coverage (only bites static-PIE / DT_JMPREL-only).
+    if not cfg.reads_jmprel and (truth.n_irelative or img.jmprel):
+        findings.append(
+            "SECONDARY[reloc]: mapper does not scan DT_JMPREL/.rela.plt; an ifunc "
+            "carried only in the PLT relocs is unresolved (static-PIE / DT_JMPREL-only "
+            "targets). Working loader falls back to SHT_RELA for the static case."
+        )
+    if not cfg.reads_relr and img.relr:
+        findings.append(
+            "SECONDARY[reloc]: DT_RELR packed RELATIVE relocs are ignored; a "
+            "DT_RELR-linked static-PIE leaves those RELATIVE fixups unapplied."
+        )
+
+    # [SECONDARY] brk note — modeled as informational, NOT a hard fault on noble.
+    # glibc 2.34+ _dl_early_allocate falls back to mmap when __sbrk fails, so the
+    # BZ2066147 brk-unset crash does NOT reproduce on Ubuntu noble glibc 2.39.
+
+    # auxv completeness.
+    if miss:
+        findings.append(
+            f"AUXV: missing required tags {sorted(miss)} for the "
+            f"{'dynamic' if dynamic else 'static'} startup path."
+        )
+
+    # [LOW] RELRO hardening gap (NOT a startup crash for non-PIE ET_EXEC).
+    if relro.present and relro.not_ro_pages:
+        findings.append(
+            f"LOW[relro]: PT_GNU_RELRO present but {len(relro.not_ro_pages)} page(s) "
+            "stay writable (no mprotect RO). Hardening gap only; non-PIE ET_EXEC never "
+            "calls _dl_protect_relro, so this does not by itself crash startup."
+        )
+
+    return Diagnosis(
+        span=span,
+        relro=relro,
+        reloc_truth=truth,
+        reloc_actual=actual,
+        missing_auxv=miss,
+        tp=tp,
+        tp_risky=risky,
+        findings=findings,
+    )
+
+
+# --------------------------------------------------------------------------
+# Canonical fixtures used by the tests + any device-prep tooling.
+# --------------------------------------------------------------------------
+def fixture_static_etexec_relro() -> ElfImage:
+    """A plausible full static glibc /bin/sh: ET_EXEC, fixed vaddr 0x400000, RX
+    text + RW data + a PT_GNU_RELRO covering the RW head, NO PT_DYNAMIC (IREL=0).
+    This mirrors the device-observed target (entry=0x400640, IREL=0x0) that still
+    SIGILLs after the jump — so for THIS fixture the only live defect is TP."""
+    base = 0x400000
+    return ElfImage(
+        e_type=ET_EXEC,
+        e_entry=base + 0x640,
+        phdrs=(
+            Phdr(PT_PHDR, PF_R, base + 0x40, 0x1F8, 0x1F8, 0x40),
+            Phdr(PT_LOAD, PF_R | PF_X, base, 0x9081, 0x9081, 0x0),  # RX text
+            Phdr(PT_LOAD, PF_R | PF_W, base + 0xF000, 0x1100, 0x10A8 + 0x1000, 0xF000),  # RW data+bss
+            Phdr(PT_GNU_RELRO, PF_R, base + 0xF000, 0x800, 0x800, 0xF000),  # RELRO head of data
+        ),
+        rela=(),  # no PT_DYNAMIC → no DT_RELA → IREL=0 (matches device)
+    )
+
+
+def fixture_static_pie_relative_irelative() -> ElfImage:
+    """A static-PIE (ET_DYN, no PT_INTERP) carrying both R_AARCH64_RELATIVE and
+    R_AARCH64_IRELATIVE in DT_RELA — the case where the constant swap turns active:
+    the trampoline calls the RELATIVE relocs as ifuncs and skips the real IRELATIVE."""
+    return ElfImage(
+        e_type=ET_DYN,
+        e_entry=0x1640,
+        phdrs=(
+            Phdr(PT_PHDR, PF_R, 0x40, 0x230, 0x230, 0x40),
+            Phdr(PT_LOAD, PF_R | PF_X, 0x0, 0x9000, 0x9000, 0x0),
+            Phdr(PT_LOAD, PF_R | PF_W, 0xF000, 0x1200, 0x2000, 0xF000),
+            Phdr(PT_DYNAMIC, PF_R | PF_W, 0xF100, 0x100, 0x100, 0xF100),
+            Phdr(PT_GNU_RELRO, PF_R, 0xF000, 0x400, 0x400, 0xF000),
+        ),
+        rela=(
+            Reloc(0xF800, R_AARCH64_RELATIVE, 0x1234),  # data bias — must NOT be called
+            Reloc(0xF808, R_AARCH64_RELATIVE, 0x5678),
+            Reloc(0xF810, R_AARCH64_IRELATIVE, 0x1500),  # real ifunc resolver
+        ),
+    )
