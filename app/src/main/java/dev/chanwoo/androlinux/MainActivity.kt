@@ -86,6 +86,21 @@ class MainActivity : Activity() {
                     "/usr/lib/chromium/chromium-headless-shell\n--no-sandbox\n--version",
                 )
                 android.util.Log.i("alr_loader", "chromium-boot:\n$crReport")
+                // CP-6 storm re-diagnosis (PR #2 measure-first): run the HEAVY --dump-dom
+                // render path under the chromium 120s alarm window (runtime_report gives a
+                // chromium guest the larger window). The supervisor's clone_events line then
+                // device-decides whether chromium reaches its first worker clone (>0 = the
+                // "1-thread deadlock" was a misdiagnosis = the 25s window; still 0 = a real
+                // stall). about:blank keeps the closure to the chromium binary itself.
+                val crStorm = nativeAlrNativeLoaderProbe(
+                    packageName,
+                    applicationInfo.nativeLibraryDir,
+                    filesDir.absolutePath,
+                    cacheDir.absolutePath,
+                    rootfsManifest.name,
+                    "/usr/lib/chromium/chromium-headless-shell\n--no-sandbox\n--headless\n--dump-dom\nabout:blank",
+                )
+                android.util.Log.i("alr_loader", "chromium-storm (--dump-dom):\n$crStorm")
             } catch (e: Throwable) {
                 android.util.Log.e("alr_loader", "chromium-boot EXC: ${android.util.Log.getStackTraceString(e)}")
             }

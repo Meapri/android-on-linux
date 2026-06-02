@@ -1936,7 +1936,14 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         // map + render + measure (frame counter) each one, then SIGALRM ends it so the
         // next app runs (also bounds foot's interactive-shell wait). Was 1800 for a live
         // interactive GIMP session — parameterize per-launch when returning to that.
-        ::alarm(dynamic ? 25 : 5);
+        // CP-6 storm re-diagnosis (PR #2 measure-first): chromium's 186MB+~200-.so
+        // dynamic link + V8 bootstrap is a HEAVY single-init that the 25s window can
+        // kill BEFORE the first worker clone — which would masquerade as a "1-thread
+        // deadlock". Give a chromium guest a much larger window so a device drain can
+        // read clone_events: >0 = it reached worker clones (the deadlock was a
+        // misdiagnosis, it was the window); still 0 at 120s = a real stall to chase.
+        const bool is_chromium = host_path.find("chrom") != std::string::npos;
+        ::alarm(dynamic ? (is_chromium ? 120u : 25u) : 5u);
         alr_enter_guest(reinterpret_cast<void*>(start), reinterpret_cast<void*>(jump_entry),
                         reinterpret_cast<void*>(tcb));
         _exit(99);  // unreachable
