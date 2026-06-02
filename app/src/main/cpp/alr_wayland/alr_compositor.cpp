@@ -1043,16 +1043,31 @@ SurfaceState* toplevel_at(double in_x, double in_y, int32_t out_w, int32_t out_h
 // tap lands on the window actually drawn under the finger (e.g. the main window when
 // you tap beside a smaller centred dialog), falling back to z-order top only if the
 // point misses every window. Never dereferences a dangling resource (key/value only).
+//
+// Multi-GUI correctness: a popup's implicit grab is scoped to the client/toplevel that
+// opened it, NOT global. With several apps up at once (e.g. a GIMP window leaving a
+// tooltip popup mapped while the user taps a separate Qt window), an UNQUALIFIED
+// "highest map_serial popup wins" would hijack EVERY tap to the unrelated app's popup.
+// So only a popup OWNED by the focused (top-most) toplevel grabs input; a popup
+// belonging to a different toplevel is ignored for grab purposes and the tap falls
+// through to coordinate hit-testing. Ownership is resolved by KEY via
+// popup_owning_toplevel (never dereferencing a possibly-dangling parent resource).
 SurfaceState* input_target_at(double in_x, double in_y) {
-    SurfaceState* best_popup = nullptr;
-    for (SurfaceState* s : g_all_surfaces) {
-        if (!s || !s->is_popup || !s->mapped || s->pixels.empty()) continue;
-        if (!best_popup || s->map_serial > best_popup->map_serial) best_popup = s;
-    }
-    if (best_popup) return best_popup;
     int32_t ow = 0, oh = 0;
     SurfaceState* top = zorder_top();
     output_size(top ? top->buf_w : 0, top ? top->buf_h : 0, &ow, &oh);
+    // Prefer the innermost (highest map_serial) mapped popup owned by the focused
+    // toplevel — that is the only popup whose grab should steal this app's input.
+    SurfaceState* best_popup = nullptr;
+    for (SurfaceState* s : g_all_surfaces) {
+        if (!s || !s->is_popup || !s->mapped || s->pixels.empty()) continue;
+        // Only honour the grab when this popup's tree roots at the focused toplevel.
+        // (top == null => no toplevel mapped; a popup with no owning toplevel can't be
+        // placed/grabbed sensibly, so it is skipped here and erased on its teardown.)
+        if (!top || popup_owning_toplevel(s, nullptr, nullptr) != top) continue;
+        if (!best_popup || s->map_serial > best_popup->map_serial) best_popup = s;
+    }
+    if (best_popup) return best_popup;
     if (SurfaceState* hit = toplevel_at(in_x, in_y, ow, oh)) return hit;
     if (top) return top;
     return surface_state_for_wl(g_focus_surface);
