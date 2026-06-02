@@ -75,6 +75,13 @@ static uint32_t alloc_id(uint32_t *counter) {
  * memcpys/encodes them in the exact field order the host Reader expects. The
  * builder runs under alr_shim_emit's scratch+ring lock. */
 
+/* Texture-upload helpers (defined lower, near glTexImage2D) — forward-declared so the
+ * TEX_IMAGE_2D / TEX_SUBIMAGE_2D builders above them can repack to tight rows. */
+static uint32_t gl_type_bytes(GLenum type);
+static uint32_t gl_format_components(GLenum fmt);
+static void enc_pixels_tight(AlrEncoder *e, const void *pixels,
+                             int width, int height, uint32_t comp, uint32_t ts);
+
 /* ---- state ops ---- */
 struct ViewportArgs { int32_t x, y, w, h; };
 static void build_viewport(AlrEncoder *e, void *p) {
@@ -657,7 +664,12 @@ static void build_tex_image_2d(AlrEncoder *e, void *p) {
     alr_enc_i32(e, a->h);
     alr_enc_u32(e, a->fmt);
     alr_enc_u32(e, a->type);
-    alr_enc_blob(e, a->pixels, a->bytes);   /* blob(pixels) LAST */
+    /* blob(pixels) LAST — repacked to TIGHT rows from the (possibly UNPACK-padded) source. */
+    if (a->bytes)
+        enc_pixels_tight(e, a->pixels, a->w, a->h,
+                         gl_format_components(a->fmt), gl_type_bytes(a->type));
+    else
+        alr_enc_blob(e, NULL, 0);
 }
 static uint32_t gl_type_bytes(GLenum type) {
     switch (type) {
@@ -676,15 +688,81 @@ static uint32_t gl_format_components(GLenum fmt) {
         default:                 return 4;
     }
 }
+
+/* ---- client-side UNPACK pixel-store state (the source-layout side of an upload) ----
+ *
+ * The host ALWAYS replays uploads with UNPACK_ALIGNMENT=1 / no ROW_LENGTH (it forces
+ * glPixelStorei(GL_UNPACK_ALIGNMENT,1) before OP_TEX_IMAGE_2D / OP_TEX_SUBIMAGE_2D), so
+ * the WIRE must always carry TIGHT rows (row bytes = width*comp*typesize, no padding).
+ * But the GUEST's source buffer may be laid out with the GL default alignment 4 (PNG/RGB
+ * decoders pad each row to a 4-byte boundary) or an explicit ROW_LENGTH (glmark2's
+ * terrain/desktop/ideas scenes load RGB images). The old shim assumed the source was
+ * always tight and copied `width*height*comp*ts` bytes verbatim — for an RGB image whose
+ * row isn't a multiple of 4 that reads the WRONG bytes (rows slip), corrupting the texture.
+ *
+ * Fix WITHOUT a new opcode or a round-trip: track UNPACK_ALIGNMENT / UNPACK_ROW_LENGTH /
+ * UNPACK_SKIP_{ROWS,PIXELS} here, compute the SOURCE row stride, and repack row-by-row
+ * into the wire as TIGHT rows. The host stays oblivious (it always gets alignment-1 data).
+ * GL state is per-context; glmark2 drives GL from one thread, so a single global is correct
+ * (a multi-context guest would need TLS — out of scope, same as the rest of the shim). */
+#ifndef GL_UNPACK_ROW_LENGTH
+#define GL_UNPACK_ROW_LENGTH  0x0CF2   /* GLES3 token (not in the GLES2 khr header) */
+#endif
+#ifndef GL_UNPACK_SKIP_ROWS
+#define GL_UNPACK_SKIP_ROWS   0x0CF3
+#endif
+#ifndef GL_UNPACK_SKIP_PIXELS
+#define GL_UNPACK_SKIP_PIXELS 0x0CF4
+#endif
+static int g_unpack_alignment  = 4;   /* GL default */
+static int g_unpack_row_length = 0;   /* 0 = use width */
+static int g_unpack_skip_rows  = 0;
+static int g_unpack_skip_pixels= 0;
+
+/* Source byte stride of one image row given the active UNPACK_* state, for a `width`-wide
+ * image of `comp` components of `ts` bytes each. Rounds the row up to UNPACK_ALIGNMENT. */
+static size_t unpack_src_stride(int width, uint32_t comp, uint32_t ts) {
+    int row_pixels = (g_unpack_row_length > 0) ? g_unpack_row_length : width;
+    size_t row_bytes = (size_t)row_pixels * comp * ts;
+    int a = (g_unpack_alignment > 0) ? g_unpack_alignment : 1;
+    if (a > 1) { size_t rem = row_bytes % (size_t)a; if (rem) row_bytes += (size_t)a - rem; }
+    return row_bytes;
+}
+/* Byte offset of the first transferred pixel (SKIP_ROWS*stride + SKIP_PIXELS*pixel). */
+static size_t unpack_src_offset(size_t src_stride, uint32_t comp, uint32_t ts) {
+    return (size_t)g_unpack_skip_rows * src_stride + (size_t)g_unpack_skip_pixels * comp * ts;
+}
+
+/* Emit a tightly-packed pixel blob from a (possibly padded / row-length'd / skip-offset)
+ * SOURCE. `tight_row` = width*comp*ts; `src_stride` = bytes between source rows. When the
+ * two are equal AND there's no skip offset, this is a single contiguous blob (the common
+ * cube/RGBA-tight case); otherwise it copies each row, dropping the source padding. */
+static void enc_pixels_tight(AlrEncoder *e, const void *pixels,
+                             int width, int height, uint32_t comp, uint32_t ts) {
+    if (!pixels || width <= 0 || height <= 0) { alr_enc_blob(e, NULL, 0); return; }
+    size_t tight_row = (size_t)width * comp * ts;
+    size_t src_stride = unpack_src_stride(width, comp, ts);
+    size_t base = unpack_src_offset(src_stride, comp, ts);
+    const uint8_t *src = (const uint8_t*)pixels + base;
+    uint64_t total = (uint64_t)tight_row * (uint64_t)height;
+    if (total > 0xFFFFFFFFull) { alr_enc_blob(e, NULL, 0); return; }   /* >4GiB: drop (caps elsewhere) */
+    if (src_stride == tight_row && base == 0) {
+        alr_enc_blob(e, src, (uint32_t)total);                        /* contiguous fast path */
+        return;
+    }
+    alr_enc_u32(e, (uint32_t)total);                                  /* blob length, then tight rows */
+    for (int row = 0; row < height; ++row)
+        alr_enc_raw(e, src + (size_t)row * src_stride, tight_row);
+}
+
 void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width,
                   GLsizei height, GLint border, GLenum format, GLenum type, const void *pixels) {
     (void)border;   /* GLES2 requires border==0; the host passes 0 unconditionally */
+    /* Repack to tight rows (host forces UNPACK_ALIGNMENT=1); bytes==0 signals "no pixels". */
     uint32_t bytes = 0;
-    if (pixels && width > 0 && height > 0) {
-        /* Tightly-packed (host sets UNPACK_ALIGNMENT=1): w*h*comp*typesize bytes. */
+    if (pixels && width > 0 && height > 0)
         bytes = (uint32_t)width * (uint32_t)height *
                 gl_format_components(format) * gl_type_bytes(type);
-    }
     struct TexImage2DArgs a = { (uint32_t)target, (int32_t)level, (uint32_t)internalformat,
                                 (int32_t)width, (int32_t)height, (uint32_t)format,
                                 (uint32_t)type, pixels, bytes };
@@ -692,10 +770,16 @@ void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei widt
 }
 
 void glPixelStorei(GLenum pname, GLint param) {
-    /* No PIXEL_STORE opcode; the host forces UNPACK_ALIGNMENT=1 before every upload
-     * (see decoder OP_TEX_IMAGE_2D), which is what the cube's tight RGBA needs.
-     * Accept + drop. */
-    (void)pname; (void)param;
+    /* Track the UNPACK_* source-layout state so glTexImage2D/glTexSubImage2D can repack
+     * the guest's (possibly padded) rows into the TIGHT rows the host expects. PACK_* (the
+     * glReadPixels DESTINATION layout) is irrelevant here — readback is a local zero-fill. */
+    switch (pname) {
+        case GL_UNPACK_ALIGNMENT:   g_unpack_alignment   = (int)param; break;
+        case GL_UNPACK_ROW_LENGTH:  g_unpack_row_length  = (int)param; break;
+        case GL_UNPACK_SKIP_ROWS:   g_unpack_skip_rows   = (int)param; break;
+        case GL_UNPACK_SKIP_PIXELS: g_unpack_skip_pixels = (int)param; break;
+        default: break;   /* PACK_* and others: no upload effect, drop */
+    }
 }
 
 struct GenMipmapArgs { uint32_t target; };
@@ -721,7 +805,11 @@ static void build_tex_subimage_2d(AlrEncoder *e, void *p) {
     alr_enc_i32(e, a->h);
     alr_enc_u32(e, a->fmt);
     alr_enc_u32(e, a->type);
-    alr_enc_blob(e, a->pixels, a->bytes);
+    if (a->bytes)
+        enc_pixels_tight(e, a->pixels, a->w, a->h,
+                         gl_format_components(a->fmt), gl_type_bytes(a->type));
+    else
+        alr_enc_blob(e, NULL, 0);
 }
 void glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width,
                      GLsizei height, GLenum format, GLenum type, const void *pixels) {
@@ -1334,13 +1422,36 @@ void glGetShaderPrecisionFormat(GLenum st, GLenum pt, GLint *range, GLint *preci
     if (range) { range[0] = 127; range[1] = 127; }
     if (precision) *precision = 23;
 }
+/* glGetActiveUniform/Attrib — LOCAL response from the interned name table (no round-trip).
+ * `index` selects the i-th name the app has requested via glGet{Uniform,Attrib}Location.
+ * We return the real NAME (the load-bearing field — apps build a name->slot map from it) and
+ * size=1. `type` is UNKNOWN without a host query, so we report 0 (GL_NONE); apps that switch
+ * on type need a real GL — out of scope, same as glReadPixels. This is strictly better than
+ * the prior hard-empty no-op for apps that intern then enumerate (e.g. SDL2/toolkit GL).
+ * Honors `buf` (truncates the copy) and writes `len` = chars written (excl. NUL), per spec. */
+static void active_name_common(const char *nm, GLsizei buf, GLsizei *len, GLint *size,
+                               GLenum *type, GLchar *name) {
+    if (size) *size = nm ? 1 : 0;
+    if (type) *type = 0;                          /* GL_NONE: type unknown without a host query */
+    GLsizei written = 0;
+    if (name && buf > 0) {
+        if (nm) {
+            size_t n = strlen(nm);
+            if (n > (size_t)(buf - 1)) n = (size_t)(buf - 1);
+            memcpy(name, nm, n); name[n] = '\0'; written = (GLsizei)n;
+        } else {
+            name[0] = '\0';
+        }
+    }
+    if (len) *len = written;
+}
 void glGetActiveAttrib(GLuint p, GLuint i, GLsizei buf, GLsizei *len, GLint *size, GLenum *type, GLchar *name) {
-    (void)p; (void)i; if (len) *len = 0; if (size) *size = 0; if (type) *type = 0;
-    if (name && buf > 0) name[0] = '\0';
+    const char *nm = alr_shim_attrib_name((uint32_t)p, (int)i);
+    active_name_common(nm, buf, len, size, type, name);
 }
 void glGetActiveUniform(GLuint p, GLuint i, GLsizei buf, GLsizei *len, GLint *size, GLenum *type, GLchar *name) {
-    (void)p; (void)i; if (len) *len = 0; if (size) *size = 0; if (type) *type = 0;
-    if (name && buf > 0) name[0] = '\0';
+    const char *nm = alr_shim_uniform_name((uint32_t)p, (int)i);
+    active_name_common(nm, buf, len, size, type, name);
 }
 void glGetAttachedShaders(GLuint p, GLsizei maxc, GLsizei *count, GLuint *shaders) {
     (void)p; (void)maxc; (void)shaders; if (count) *count = 0;
@@ -1399,11 +1510,36 @@ void glGetShaderiv(GLuint shader, GLenum pname, GLint *params) {
     }
     else                                  *params = 0;
 }
+/* GLES enums needed for glGetProgramiv / glGetActiveUniform (not all in the GLES2 khr
+ * header): the ACTIVE_* counts and max-name-lengths. */
+#ifndef GL_ACTIVE_UNIFORMS
+#define GL_ACTIVE_UNIFORMS              0x8B86
+#endif
+#ifndef GL_ACTIVE_UNIFORM_MAX_LENGTH
+#define GL_ACTIVE_UNIFORM_MAX_LENGTH    0x8B87
+#endif
+#ifndef GL_ACTIVE_ATTRIBUTES
+#define GL_ACTIVE_ATTRIBUTES            0x8B89
+#endif
+#ifndef GL_ACTIVE_ATTRIBUTE_MAX_LENGTH
+#define GL_ACTIVE_ATTRIBUTE_MAX_LENGTH  0x8B8A
+#endif
+
 void glGetProgramiv(GLuint program, GLenum pname, GLint *params) {
-    (void)program;
     if (!params) return;
     if (pname == GL_LINK_STATUS)         *params = GL_TRUE;   /* optimistic */
     else if (pname == GL_INFO_LOG_LENGTH) *params = 0;
+    else if (pname == GL_ACTIVE_UNIFORMS) {
+        /* Local answer: count of uniform names the app has interned for this program. */
+        *params = alr_shim_uniform_count((uint32_t)program);
+    }
+    else if (pname == GL_ACTIVE_ATTRIBUTES) {
+        *params = alr_shim_attrib_count((uint32_t)program);
+    }
+    else if (pname == GL_ACTIVE_UNIFORM_MAX_LENGTH ||
+             pname == GL_ACTIVE_ATTRIBUTE_MAX_LENGTH) {
+        *params = ALR_SHIM_MAX_UNIFORM_NAME;   /* upper bound incl. NUL (table name cap) */
+    }
     else                                  *params = 0;
 }
 void glGetShaderInfoLog(GLuint shader, GLsizei bufSize, GLsizei *length, GLchar *infoLog) {

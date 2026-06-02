@@ -135,6 +135,12 @@ void alr_shim_program_reset(uint32_t vprog);                    /* clear a progr
 int  alr_shim_attrib_intern(uint32_t vprog, const char *name);  /* -> handle (index), or -1 */
 const char *alr_shim_attrib_name(uint32_t vprog, int handle);   /* handle -> name, or NULL */
 
+/* Count of interned names for a program (backs glGetActiveUniform/Attrib enumeration and
+ * glGetProgramiv(GL_ACTIVE_UNIFORMS/ATTRIBUTES)). This is "names the app has requested via
+ * glGet{Uniform,Attrib}Location", answered locally (no round-trip); see alr_shim_runtime.c. */
+int  alr_shim_uniform_count(uint32_t vprog);
+int  alr_shim_attrib_count(uint32_t vprog);
+
 /* Per-shader source-length cache (backs glGetShaderiv(GL_SHADER_SOURCE_LENGTH)). */
 void alr_shim_shader_set_srclen(uint32_t vshader, uint32_t src_len); /* record/replace */
 int  alr_shim_shader_srclen(uint32_t vshader, uint32_t *out);        /* 1+*out if known, else 0 */

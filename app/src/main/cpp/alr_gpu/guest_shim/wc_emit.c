@@ -124,6 +124,14 @@ const char *alr_shim_attrib_name(uint32_t vprog, int handle) {
     if (p && handle < p->count) return p->names[handle].name;
     return NULL;
 }
+int alr_shim_uniform_count(uint32_t vprog) {
+    AlrProgramUniforms *p = find_prog(alr_shim(), vprog, 0);
+    return p ? p->count : 0;
+}
+int alr_shim_attrib_count(uint32_t vprog) {
+    AlrProgramUniforms *p = find_attr(alr_shim(), vprog, 0);
+    return p ? p->count : 0;
+}
 void alr_shim_program_reset(uint32_t vprog) {
     AlrShimState *s = alr_shim();
     AlrProgramUniforms *p = find_prog(s, vprog, 0);
@@ -161,6 +169,11 @@ void   glSamplerParameteri(GLuint sampler, GLenum pname, GLint param);
 void   glDrawBuffers(GLsizei n, const GLenum *bufs);
 void   glReadBuffer(GLenum src);
 void   glInvalidateFramebuffer(GLenum target, GLsizei numAttachments, const GLenum *attachments);
+/* glGetActiveUniform/Attrib aren't in the GLES2-only khr header; declare for the driver. */
+void   glGetActiveUniform(GLuint program, GLuint index, GLsizei bufSize, GLsizei *length,
+                          GLint *size, GLenum *type, GLchar *name);
+void   glGetActiveAttrib(GLuint program, GLuint index, GLsizei bufSize, GLsizei *length,
+                         GLint *size, GLenum *type, GLchar *name);
 
 /* ----- the cube GL sequence (drives the REAL shim entry points) ----- */
 static const char *kVS =
@@ -337,6 +350,51 @@ int main(int argc, char **argv) {
     glPolygonOffset(1.0f, 2.0f);                                /* OP_POLYGON_OFFSET */
     glLineWidth(2.0f);                                          /* OP_LINE_WIDTH */
     glSampleCoverage(0.5f, GL_TRUE);                            /* OP_SAMPLE_COVERAGE */
+
+    /* --- UNPACK row-alignment repack: a 3x2 RGB image at the GL DEFAULT alignment 4 has
+     *     row = 3*3 = 9 source bytes padded UP to 12; the shim must repack to TIGHT 9-byte
+     *     rows (the host always replays with UNPACK_ALIGNMENT=1). Source row 0 = bytes
+     *     [10..18], row 1 = [20..28]; the pad bytes (0xEE) must be DROPPED. decode_check
+     *     asserts the decoded blob is exactly {10..18, 20..28} (no 0xEE). This is the
+     *     terrain/desktop/ideas RGB-texture path the old tight-only shim corrupted. --- */
+    unsigned char rgb_padded[2 * 12];      /* 2 rows, 12-byte stride (9 data + 3 pad) */
+    memset(rgb_padded, 0xEE, sizeof(rgb_padded));               /* pad sentinel */
+    for (int c = 0; c < 9; ++c) { rgb_padded[0 * 12 + c] = (unsigned char)(10 + c);
+                                  rgb_padded[1 * 12 + c] = (unsigned char)(20 + c); }
+    GLuint tex_rgb;
+    glGenTextures(1, &tex_rgb);
+    glBindTexture(GL_TEXTURE_2D, tex_rgb);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);                      /* GL default; pads rows */
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 3, 2, 0, GL_RGB, GL_UNSIGNED_BYTE, rgb_padded);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);                      /* restore tight for later ops */
+
+    /* --- glGetActiveUniform / glGetActiveAttrib + glGetProgramiv(GL_ACTIVE_*): LOCAL
+     *     responses from the interned name tables (no wire op). These don't go through the
+     *     ring, so they're checked HERE against the real shim. The uniform name table holds
+     *     uMVP, uTex, uColor, uTime, uMode2, uNormalMatrix (6 via glGetUniformLocation) PLUS
+     *     "Matrices" (interned by glGetUniformBlockIndex, which reuses the same by-name table)
+     *     = 7; the attrib table holds position, normal = 2. The count is "interned names",
+     *     answered locally; index 0 is the FIRST interned (uMVP / position). --- */
+    GLint n_uni = 0, n_att = 0;
+    glGetProgramiv(prog, 0x8B86 /*GL_ACTIVE_UNIFORMS*/, &n_uni);
+    glGetProgramiv(prog, 0x8B89 /*GL_ACTIVE_ATTRIBUTES*/, &n_att);
+    int qfail = 0;
+    if (n_uni != 7) { fprintf(stderr, "wc_emit: GL_ACTIVE_UNIFORMS=%d, want 7\n", n_uni); qfail = 1; }
+    if (n_att != 2) { fprintf(stderr, "wc_emit: GL_ACTIVE_ATTRIBUTES=%d, want 2\n", n_att); qfail = 1; }
+    char nm[64]; GLsizei wl = 0; GLint sz = 0; GLenum ty = 0;
+    glGetActiveUniform(prog, 0, sizeof(nm), &wl, &sz, &ty, nm);   /* index 0 = uMVP */
+    if (strcmp(nm, "uMVP") != 0 || wl != 4 || sz != 1) {
+        fprintf(stderr, "wc_emit: glGetActiveUniform(0)='%s' len=%d size=%d, want uMVP/4/1\n", nm, wl, sz);
+        qfail = 1;
+    }
+    glGetActiveAttrib(prog, 0, sizeof(nm), &wl, &sz, &ty, nm);    /* index 0 = position */
+    if (strcmp(nm, "position") != 0 || wl != 8 || sz != 1) {
+        fprintf(stderr, "wc_emit: glGetActiveAttrib(0)='%s' len=%d size=%d, want position/8/1\n", nm, wl, sz);
+        qfail = 1;
+    }
+    if (qfail) { fprintf(stderr, "wc_emit: LOCAL-QUERY CHECK FAILED\n"); return 3; }
+    fprintf(stderr, "wc_emit: local-query check ok (ACTIVE_UNIFORMS=7, ACTIVE_ATTRIBUTES=2, "
+                    "glGetActiveUniform(0)=uMVP, glGetActiveAttrib(0)=position)\n");
 
     FILE *f = fopen(argv[1], "wb");
     if (!f) { fprintf(stderr, "wc_emit: cannot open %s\n", argv[1]); return 2; }

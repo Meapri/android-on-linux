@@ -210,6 +210,29 @@ const char *alr_shim_attrib_name(uint32_t vprog, int handle) {
     return out;
 }
 
+/* Count of names interned so far for a program (backs glGetActiveUniform/Attrib +
+ * glGetProgramiv(GL_ACTIVE_UNIFORMS/ATTRIBUTES)). NOTE: this is the set of names the app
+ * has REQUESTED via glGetUniformLocation/glGetAttribLocation, not necessarily every active
+ * symbol the linker kept — without a host round-trip the shim can't know the full set, so
+ * the count is "names seen". Apps that intern-then-enumerate (and the wire-check) get a
+ * faithful, terminating local answer; the old behavior was a hard 0. */
+int alr_shim_uniform_count(uint32_t vprog) {
+    AlrShimState *s = alr_shim();
+    pthread_mutex_lock(&g_lock);
+    AlrProgramUniforms *p = find_in(s->progs, vprog, 0);
+    int n = p ? p->count : 0;
+    pthread_mutex_unlock(&g_lock);
+    return n;
+}
+int alr_shim_attrib_count(uint32_t vprog) {
+    AlrShimState *s = alr_shim();
+    pthread_mutex_lock(&g_lock);
+    AlrProgramUniforms *p = find_in(s->attribs, vprog, 0);
+    int n = p ? p->count : 0;
+    pthread_mutex_unlock(&g_lock);
+    return n;
+}
+
 void alr_shim_program_reset(uint32_t vprog) {
     AlrShimState *s = alr_shim();
     pthread_mutex_lock(&g_lock);

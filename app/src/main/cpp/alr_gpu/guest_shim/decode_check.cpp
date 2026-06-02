@@ -25,7 +25,7 @@ struct VapNamed { std::string name; GLint size; uint32_t offset; };
 struct BufData { GLenum target; GLsizeiptr size; };
 struct DrawArr { GLenum mode; GLsizei count; };
 struct DrawElem { GLenum mode; GLsizei count; GLenum type; uint32_t offset; };
-struct TexImg { GLsizei w, h; GLenum fmt, type; };
+struct TexImg { GLsizei w, h; GLenum fmt, type; std::vector<uint8_t> pixels; };
 
 static std::vector<BindAttrib> bind_attribs;
 static std::vector<VapIndexed> vaps_idx;     // cube path (glBindAttribLocation index)
@@ -44,7 +44,7 @@ static std::vector<FbTex> fb_texs;
 static std::vector<RbStore> rb_stores;
 static std::vector<FbRb> fb_rbs;
 struct BufSub { GLenum target; GLintptr offset; GLsizeiptr size; };
-struct TexSub { GLint xoff, yoff, w, h; GLenum fmt, type; };
+struct TexSub { GLint xoff, yoff, w, h; GLenum fmt, type; std::vector<uint8_t> pixels; };
 static std::vector<BufSub> buf_subs;
 static std::vector<GLenum> mipmaps;
 static std::vector<TexSub> tex_subs;
@@ -205,8 +205,24 @@ void glGenTextures(GLsizei n, GLuint *t) { for (GLsizei i = 0; i < n; ++i) t[i] 
 void glActiveTexture(GLenum) {}
 void glBindTexture(GLenum, GLuint) {}
 void glTexParameteri(GLenum, GLenum, GLint) {}
+// Capture the bytes the decoder hands us so the wire-check can assert the guest repacked
+// a (possibly UNPACK-padded) source into TIGHT rows. The decoder forces UNPACK_ALIGNMENT=1,
+// so the blob it passes is exactly w*h*comp*ts tight bytes.
+static size_t tight_bytes(GLsizei w, GLsizei h, GLenum fmt, GLenum type) {
+    // GL token values inline (the minimal stub header doesn't define these names).
+    size_t comp = (fmt == 0x1908) ? 4 : (fmt == 0x1907) ? 3        // RGBA / RGB
+                : (fmt == 0x190A) ? 2 : (fmt == 0x1909) ? 1 : 4;   // LUMINANCE_ALPHA / LUMINANCE
+    size_t ts = (type == 0x1401 || type == 0x1400) ? 1             // UNSIGNED_BYTE / BYTE
+              : (type == 0x1403 || type == 0x1402) ? 2 : 4;        // UNSIGNED_SHORT / SHORT
+    return (size_t)w * (size_t)h * comp * ts;
+}
 void glTexImage2D(GLenum, GLint, GLint, GLsizei w, GLsizei h, GLint, GLenum fmt, GLenum type,
-                  const void *) { rec::teximgs.push_back({w, h, fmt, type}); }
+                  const void *px) {
+    rec::TexImg t{w, h, fmt, type, {}};
+    if (px) { size_t n = tight_bytes(w, h, fmt, type);
+              t.pixels.assign((const uint8_t*)px, (const uint8_t*)px + n); }
+    rec::teximgs.push_back(std::move(t));
+}
 void glPixelStorei(GLenum pname, GLint param) {
     if (pname == GL_UNPACK_ALIGNMENT && param == 1) rec::unpack_align1 = true;
 }
@@ -228,7 +244,12 @@ void glBufferSubData(GLenum t, GLintptr off, GLsizeiptr sz, const void *) {
 }
 void glGenerateMipmap(GLenum t) { rec::mipmaps.push_back(t); }
 void glTexSubImage2D(GLenum, GLint, GLint xo, GLint yo, GLsizei w, GLsizei h, GLenum f, GLenum ty,
-                     const void *) { rec::tex_subs.push_back({xo, yo, w, h, f, ty}); }
+                     const void *px) {
+    rec::TexSub t{xo, yo, w, h, f, ty, {}};
+    if (px) { size_t n = tight_bytes(w, h, f, ty);
+              t.pixels.assign((const uint8_t*)px, (const uint8_t*)px + n); }
+    rec::tex_subs.push_back(std::move(t));
+}
 void glGenVertexArrays(GLsizei n, GLuint *a) { for (GLsizei i = 0; i < n; ++i) a[i] = rec::next_obj++; }
 void glBindVertexArray(GLuint va) { rec::va_binds.push_back(va); }
 void glDrawArraysInstanced(GLenum m, GLint, GLsizei c, GLsizei inst) {
@@ -350,11 +371,11 @@ int main(int argc, char **argv) {
 
     // --- the stream decoded into exactly the cube + mesh GL calls. ---
     check(ok && st.ok, "decode_batch returned true (well-formed, no bad/unknown opcode)");
-    check(st.decoded == 99, "decoded op count == 99 (+12 GLES3 core: UBO/sampler/MRT)");
+    check(st.decoded == 102, "decoded op count == 102 (+3 RGB UNPACK-repack: gen/bind/teximg)");
     check(st.shaders.size() == 2, "2 shaders mapped");
     check(st.programs.size() == 1, "1 program mapped");
     check(st.buffers.size() == 3, "3 buffers mapped (vbo + ebo + ubo)");
-    check(st.textures.size() == 1, "1 texture mapped");
+    check(st.textures.size() == 2, "2 textures mapped (RGBA cube + RGB padded)");
     check(st.samplers.size() == 1, "1 sampler object mapped (GLES3)");
 
     bool ba_ok = rec::bind_attribs.size() == 2;
@@ -368,10 +389,24 @@ int main(int argc, char **argv) {
     check(has_buf(kGL_ARRAY_BUFFER, 36 * 5 * 4), "glBufferData ARRAY_BUFFER 720 bytes (vbo)");
     check(has_buf(kGL_ELEMENT_ARRAY_BUFFER, 6 * 2), "glBufferData ELEMENT_ARRAY_BUFFER 12 bytes (ebo)");
 
-    bool tex_ok = rec::teximgs.size() == 1 && rec::teximgs[0].w == 8 && rec::teximgs[0].h == 8 &&
-                  rec::teximgs[0].fmt == kGL_RGBA && rec::teximgs[0].type == kGL_UNSIGNED_BYTE;
-    check(tex_ok, "glTexImage2D 8x8 RGBA/UNSIGNED_BYTE (256-byte upload)");
+    bool tex_ok = rec::teximgs.size() == 2 && rec::teximgs[0].w == 8 && rec::teximgs[0].h == 8 &&
+                  rec::teximgs[0].fmt == kGL_RGBA && rec::teximgs[0].type == kGL_UNSIGNED_BYTE &&
+                  rec::teximgs[0].pixels.size() == 256;
+    check(tex_ok, "glTexImage2D[0] 8x8 RGBA/UNSIGNED_BYTE (256-byte tight upload)");
     check(rec::unpack_align1, "host forced UNPACK_ALIGNMENT=1 before upload");
+
+    // RGB 3x2 uploaded with source UNPACK_ALIGNMENT=4 (rows padded 9->12) must arrive
+    // TIGHT: 9-byte rows back-to-back = {10..18, 20..28}, with the 0xEE pad bytes DROPPED.
+    static constexpr unsigned kGL_RGB = 0x1907;
+    bool rgb_ok = rec::teximgs.size() == 2 && rec::teximgs[1].w == 3 && rec::teximgs[1].h == 2 &&
+                  rec::teximgs[1].fmt == kGL_RGB && rec::teximgs[1].type == kGL_UNSIGNED_BYTE &&
+                  rec::teximgs[1].pixels.size() == 18;     // 3*2*3, NOT 24 (no padding)
+    if (rgb_ok) {
+        const auto &px = rec::teximgs[1].pixels;
+        for (int c = 0; c < 9 && rgb_ok; ++c) rgb_ok = rgb_ok && (px[c] == (uint8_t)(10 + c));
+        for (int c = 0; c < 9 && rgb_ok; ++c) rgb_ok = rgb_ok && (px[9 + c] == (uint8_t)(20 + c));
+    }
+    check(rgb_ok, "glTexImage2D[1] 3x2 RGB repacked to TIGHT 18 bytes (UNPACK align-4 pad dropped)");
 
     auto mvp = rec::mat_by_name.find("uMVP");
     bool mvp_ok = mvp != rec::mat_by_name.end() && mvp->second.size() == 16;
