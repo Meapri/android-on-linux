@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.22.1)
-project(androlinux_runtime_lab LANGUAGES CXX)
+# C is enabled project-wide (not just inside the arm64-v8a compositor block) so the
+# resident in-process re-exec trampoline (alr_inproc_reexec.c, a freestanding .c
+# file) links into alr_loader for ALL 4 NDK ABIs. The compositor block's
+# enable_language(C) further down is now redundant but harmless (idempotent).
+project(androlinux_runtime_lab LANGUAGES CXX C)
 
 add_library(alr_runtime STATIC
     alr_runtime/alr_config.cpp
@@ -15,7 +19,13 @@ add_library(alr_runtime STATIC
     alr_runtime/alr_hook.cpp
     alr_runtime/alr_interposer.cpp
 )
-add_library(alr_loader SHARED runtime_report.cpp runtime_plan.cpp)
+# alr_inproc_reexec.c — resident trampoline (ADR-003-v3, R10 step2). Freestanding,
+# raw-syscall aarch64 (arm64-v8a runs it; other ABIs get a __builtin_trap stub so
+# the 4-ABI APK still compiles+links). Compiled INTO alr_loader so the supervisor
+# can PC-redirect the tracee into it at the execve trap. Built under the loader's
+# strict flags (-Wall -Wextra -Werror -fstack-protector-strong -D_FORTIFY_SOURCE=2);
+# it calls no libc, so FORTIFY has nothing to instrument and --no-undefined is met.
+add_library(alr_loader SHARED runtime_report.cpp runtime_plan.cpp alr_inproc_reexec.c)
 add_library(alr_runtime_launcher SHARED alr_runtime_launcher.cpp runtime_plan.cpp)
 add_library(alr_runtime_hook SHARED alr_runtime_hook.cpp)
 add_library(alr_runtime_interposer SHARED alr_runtime_interposer.cpp)
@@ -37,6 +47,13 @@ target_compile_features(alr_runtime_trampoline PRIVATE cxx_std_20)
 
 target_include_directories(alr_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(alr_loader PRIVATE alr_runtime log android EGL GLESv2 GLESv3 vulkan)
+
+# Gate the resident trampoline under the SAME strictness as the loader's C++ TUs.
+# The defaultConfig cppFlags (-Wall -Wextra -Werror) only apply to C++ sources; the
+# NDK already adds -fstack-protector-strong/-D_FORTIFY_SOURCE=2 to C compiles, so we
+# add the warning gate here to ensure alr_inproc_reexec.c compiles clean under -Werror.
+set_source_files_properties(alr_inproc_reexec.c PROPERTIES
+    COMPILE_OPTIONS "-std=c11;-Wall;-Wextra;-Werror")
 target_link_libraries(alr_runtime_launcher PRIVATE alr_runtime)
 target_link_libraries(alr_runtime_hook PRIVATE alr_runtime)
 target_link_libraries(alr_runtime_interposer PRIVATE alr_runtime)
