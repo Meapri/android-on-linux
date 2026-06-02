@@ -6082,6 +6082,18 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeAlrGpuVkRenderProbe(
     return env->NewStringUTF(report.c_str());
 }
 
+// R12-G3: VK render BREADTH — a real graphics-pipeline vkCmdDraw (shader modules +
+// vertex buffer + draw), not just a clear, marshalled to real Mali and read back
+// from the AHB. Gating line: "ALR VK DRAW MARSHAL: PASS".
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeAlrGpuVkDrawProbe(
+    JNIEnv* env,
+    jobject /* thiz */) {
+    const auto report = alr::gpu::run_vk_draw_mali_probe();
+    __android_log_print(ANDROID_LOG_INFO, "alr_loader", "vk-draw:\n%s", report.c_str());
+    return env->NewStringUTF(report.c_str());
+}
+
 extern "C" JNIEXPORT jstring JNICALL
 Java_dev_chanwoo_androlinux_MainActivity_nativeProbeVulkanSurface(
     JNIEnv* env,
