@@ -278,7 +278,7 @@ class MainActivity : Activity() {
         // is wired separately. Device test = CP-5.
         Thread {
             try {
-                for (name in listOf("sdl2", "netsurf", "qt6", "xwayland", "babl-gegl", "microbench", "interpose", "dpkg-db", "x11", "apt-config", "chromium-net", "nss")) {
+                for (name in listOf("sdl2", "netsurf", "qt6", "xwayland", "babl-gegl", "microbench", "interpose", "dpkg-db", "x11", "apt-config", "chromium-net", "nss", "chromium-gui")) {
                     val tar = java.io.File("/data/local/tmp/$name-stage.tar")
                     val marker = java.io.File(rootfsStatus.rootfsDir, ".$name-staged-${tar.length()}")
                     if (tar.isFile && !marker.isFile) {
@@ -1786,23 +1786,66 @@ class MainActivity : Activity() {
                             // GIMP committed at least one frame (the compositor's
                             // frame counter advances) before then.
                             val framesBeforeGimp = gtkStatus.intFieldAfter("alr wl frames=")
-                            val gimpGuiClient = nativeAlrNativeLoaderProbe(
-                                packageName,
-                                applicationInfo.nativeLibraryDir,
-                                filesDir.absolutePath,
-                                cacheDir.absolutePath,
-                                rootfsManifest.name,
-                                "/usr/bin/gimp-3.0",
-                            )
+                            // CR-4 demo (gated /data/local/tmp/.alr-crwin): launch the full GUI
+                            // Chromium browser (ozone-wayland) on the compositor INSTEAD of GIMP
+                            // — the SAME persistent-client path that renders GIMP's window into
+                            // wl_shm → SurfaceView. Strict no-regression: a normal cold start
+                            // still launches GIMP. Binary + 0-missing-.so closure ride
+                            // chromium-gui-stage.tar (/usr/lib/chromium/chromium, ozone-wayland
+                            // statically linked, T1). Offline demo.html (no network).
+                            val crWinMarker = java.io.File("/data/local/tmp/.alr-crwin")
+                            val crWin = crWinMarker.isFile
+                            val gimpGuiClient = if (crWin) {
+                                val rootfsDirF = java.io.File(java.io.File(filesDir, "rootfs"), rootfsManifest.name)
+                                // wait (bounded) for the 337MB chromium-gui overlay to extract
+                                val chromiumBin = java.io.File(rootfsDirF, "usr/lib/chromium/chromium")
+                                var waited = 0
+                                while (waited < 120000 && !chromiumBin.isFile) { Thread.sleep(1000); waited += 1000 }
+                                try {
+                                    val demoSrc = java.io.File("/data/local/tmp/alr-demo.html")
+                                    val demoDst = java.io.File(rootfsDirF, "root/demo.html")
+                                    demoDst.parentFile?.mkdirs()
+                                    if (demoSrc.isFile) demoSrc.copyTo(demoDst, overwrite = true)
+                                    else demoDst.writeText("<!doctype html><meta charset=utf-8><body style='margin:0;background:#10101e;color:#fff;font-family:sans-serif;text-align:center'><h1 style='padding-top:30vh'>ALR - Chromium on Android</h1><p>ALR-CR4-OK</p></body>")
+                                } catch (e: Throwable) {
+                                    android.util.Log.e("alr_loader", "crwin demo.html EXC: ${android.util.Log.getStackTraceString(e)}")
+                                }
+                                android.util.Log.i("alr_loader", "crwin: chromium bin=${chromiumBin.isFile} (waited ${waited}ms); launching ozone-wayland window")
+                                android.system.Os.setenv("ALR_REEXEC_INPROC", "1", true)
+                                nativeAlrNativeLoaderProbe(
+                                    packageName,
+                                    applicationInfo.nativeLibraryDir,
+                                    filesDir.absolutePath,
+                                    cacheDir.absolutePath,
+                                    rootfsManifest.name,
+                                    "/usr/lib/chromium/chromium\n--ozone-platform=wayland" +
+                                        "\n--no-sandbox\n--no-zygote\n--renderer-process-limit=1\n--disable-gpu" +
+                                        "\n--disable-dev-shm-usage\n--user-data-dir=/tmp/cr4-profile" +
+                                        "\n--no-first-run\n--no-default-browser-check" +
+                                        "\n--disable-crash-reporter\n--start-maximized" +
+                                        "\n--window-size=1200,1920\n--enable-logging=stderr\n--v=1" +
+                                        "\nfile:///root/demo.html",
+                                )
+                            } else {
+                                nativeAlrNativeLoaderProbe(
+                                    packageName,
+                                    applicationInfo.nativeLibraryDir,
+                                    filesDir.absolutePath,
+                                    cacheDir.absolutePath,
+                                    rootfsManifest.name,
+                                    "/usr/bin/gimp-3.0",
+                                )
+                            }
                             val gimpStatus = nativeWaylandCompositorStatus()
                             val framesAfterGimp = gimpStatus.intFieldAfter("alr wl frames=")
                             val gimpRendered = framesAfterGimp > framesBeforeGimp
+                            val crWinLabel = if (crWin) "CR-4 Chromium window (ozone-wayland)" else "GIMP 3.0 GUI"
                             runOnUiThread {
                                 view.append(
-                                    "\nALR GIMP 3.0 GUI (gimp-3.0 → main window → SurfaceView): " +
+                                    "\nALR $crWinLabel (→ main window → SurfaceView): " +
                                         "${gate(gimpRendered)} (frames $framesBeforeGimp→$framesAfterGimp)",
                                 )
-                                view.append("\n\n--- ALR guest GIMP 3.0 GUI ---\n$gimpGuiClient")
+                                view.append("\n\n--- ALR guest $crWinLabel ---\n$gimpGuiClient")
                             }
                         }.start()
                     }, 14000)
