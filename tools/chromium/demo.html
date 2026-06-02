@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<!--
+  ALR CR-4 on-screen demo page — "Chromium browser WINDOW on Android".
+  ZERO network. Self-contained: every byte is inline. No <link rel>, no
+  <script src>, no <img src>, no @import url(), no web-font fetch. Renders with
+  networking entirely absent (or the net stage tar unstaged), so CR-4 (on-screen
+  ozone-wayland window) can be demonstrated with DNS/TLS still broken.
+
+  Difference from cr-test.html (CR-1):
+    * cr-test.html targets HEADLESS --dump-dom assertion (marker "ALR chromium
+      renders." that the device probe greps out of the DOM).
+    * THIS page targets the ON-SCREEN demo: a full-viewport branded layout meant
+      to be SEEN on the SurfaceView, sized for the device panel (portrait
+      1200x1920-ish) with a few live, no-network signals (CSS animation + a tiny
+      inline-script clock + a touch-scroll list) so the recorded clip visibly
+      shows a *live, interactive* chromium window — not a static screenshot.
+
+  Stage it next to cr-test.html (e.g. /root/demo.html in chromium-net-stage.tar,
+  or any app-writable path) and open it with:
+
+    chromium --ozone-platform=wayland --no-sandbox --disable-gpu \
+      --no-first-run --no-default-browser-check \
+      --user-data-dir=/tmp/cr4-profile --start-maximized \
+      --window-size=1200,1920 file:///root/demo.html
+
+  (file:// needs no network. A data: URL works too but file:// keeps the URL bar
+  clean for the demo clip.)
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>ALR · Chromium on Android</title>
+<style>
+  :root {
+    --bg0: #0b1021; --bg1: #131a36; --card: #182149;
+    --fg: #e9edff; --muted: #9fb0e0; --accent: #8ad6ff;
+    --hot: #ff5f6d; --warm: #ffc371; --ok: #7fe07f;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; min-height: 100%; }
+  body {
+    background: radial-gradient(1200px 800px at 20% -10%, #1c2a63 0%, var(--bg0) 60%);
+    color: var(--fg);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-text-size-adjust: 100%;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 28px 22px 56px; }
+
+  /* Header — the money shot for the demo clip. */
+  header { display: flex; align-items: center; gap: 16px; margin: 8px 0 22px; }
+  .mark { flex: 0 0 auto; }
+  h1 {
+    font-size: clamp(26px, 6vw, 44px); line-height: 1.08; margin: 0;
+    letter-spacing: -0.5px;
+  }
+  h1 .dot { color: var(--accent); }
+  h1 small {
+    display: block; font-size: clamp(12px, 3.2vw, 16px); font-weight: 500;
+    color: var(--muted); margin-top: 6px; letter-spacing: 0;
+  }
+
+  /* A CSS-gradient + box-shadow card row: pure paint, no image decode. */
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+           gap: 14px; margin: 20px 0; }
+  .card { background: var(--card); border: 1px solid #2a356f; border-radius: 14px;
+          padding: 16px 16px 18px; box-shadow: 0 6px 18px rgba(0,0,0,0.45); }
+  .card .k { font-size: 12px; color: var(--muted); text-transform: uppercase;
+             letter-spacing: 0.08em; }
+  .card .v { font-size: 20px; font-weight: 700; margin-top: 6px; }
+  .swatch { height: 56px; border-radius: 10px; margin-top: 12px;
+            background: linear-gradient(90deg, var(--hot) 0%, var(--warm) 100%); }
+
+  /* A pure-CSS animated bar: proves the compositor presents *live* frames
+     (frame callbacks round-trip), not a single static buffer. No JS needed. */
+  .live { margin: 22px 0; }
+  .live .lbl { font-size: 13px; color: var(--muted); margin-bottom: 8px; }
+  .track { height: 10px; border-radius: 6px; background: #0c1330;
+           overflow: hidden; border: 1px solid #243066; }
+  .pulse { height: 100%; width: 40%;
+           background: linear-gradient(90deg, var(--accent), var(--ok));
+           animation: slide 2.4s ease-in-out infinite alternate; }
+  @keyframes slide { from { margin-left: 0; } to { margin-left: 60%; } }
+
+  /* Inline SVG below exercises the SVG/2D paint path with no external resource. */
+  .badge { display: flex; align-items: center; gap: 12px; margin: 22px 0 10px;
+           color: var(--ok); font-size: 14px; }
+
+  /* A scrollable list so a touch drag is visibly interactive in the demo. */
+  .scroller { margin-top: 20px; border: 1px solid #243066; border-radius: 12px;
+              max-height: 230px; overflow-y: auto; -webkit-overflow-scrolling: touch;
+              background: #0e1533; }
+  .scroller h2 { font-size: 13px; color: var(--muted); margin: 0;
+                 padding: 12px 16px; position: sticky; top: 0; background: #0e1533;
+                 border-bottom: 1px solid #1b2552; }
+  .row { padding: 12px 16px; border-bottom: 1px solid #161e44; font-size: 15px; }
+  .row:last-child { border-bottom: 0; }
+  .row b { color: var(--accent); }
+  footer { margin-top: 26px; font-size: 12px; color: var(--muted); }
+  #clock { font-variant-numeric: tabular-nums; color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <!-- inline SVG mark: SVG paint path, no external fetch. -->
+    <svg class="mark" width="64" height="64" viewBox="0 0 120 120"
+         xmlns="http://www.w3.org/2000/svg" role="img" aria-label="ALR mark">
+      <rect x="6" y="6" width="108" height="108" rx="22"
+            fill="#1d2440" stroke="#8ad6ff" stroke-width="4"/>
+      <circle cx="60" cy="60" r="32" fill="none" stroke="#ff5f6d" stroke-width="7"/>
+      <polygon points="60,32 80,86 40,86" fill="#ffc371"/>
+    </svg>
+    <h1 id="title">ALR <span class="dot">·</span> Chromium on Android
+      <small>An unmodified ARM64 Linux Chromium, rendered into a Wayland window
+             on Android — no VM, no X11, software present onto the SurfaceView.</small>
+    </h1>
+  </header>
+
+  <div class="cards">
+    <div class="card"><div class="k">Backend</div><div class="v">ozone&#8209;wayland</div>
+      <div class="swatch"></div></div>
+    <div class="card"><div class="k">Buffers</div><div class="v">wl_shm (CPU)</div></div>
+    <div class="card"><div class="k">Network</div><div class="v">offline</div></div>
+    <div class="card"><div class="k">Clock</div><div class="v" id="clock">--:--:--</div></div>
+  </div>
+
+  <div class="live">
+    <div class="lbl">live present (CSS animation — frame callbacks round-tripping)</div>
+    <div class="track"><div class="pulse"></div></div>
+  </div>
+
+  <div class="badge">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none"
+         xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <path d="M5 12l4 4 10-10" stroke="#7fe07f" stroke-width="3"
+            stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+    <span>ALR-CR4-OK · on-screen Wayland window · zero network</span>
+  </div>
+
+  <div class="scroller">
+    <h2>scroll / drag me (touch → wl_seat → chromium)</h2>
+    <div class="row"><b>1</b> &nbsp;Chromium binds wl_compositor v4, xdg_wm_base v2, wl_shm</div>
+    <div class="row"><b>2</b> &nbsp;wl_seat v7 delivers pointer, keyboard, touch + repeat</div>
+    <div class="row"><b>3</b> &nbsp;wl_output v4 advertises the device panel geometry</div>
+    <div class="row"><b>4</b> &nbsp;Chromium maps an xdg_toplevel, commits ARGB8888 shm</div>
+    <div class="row"><b>5</b> &nbsp;Compositor repacks BGRA, hands a PresentSurface list</div>
+    <div class="row"><b>6</b> &nbsp;EGL hook uploads + draws a textured quad, eglSwapBuffers</div>
+    <div class="row"><b>7</b> &nbsp;Pixels land on the SurfaceView — same path as GIMP/foot</div>
+    <div class="row"><b>8</b> &nbsp;Tap and scroll round-trip through the inject entrypoints</div>
+  </div>
+
+  <footer>ALR (Android-on-Linux) · CR-4 demo · file:// only, no DNS/TLS required.</footer>
+</div>
+
+<script>
+  // Tiny no-network heartbeat: updates the clock once a second. Proves V8 runs
+  // and the window keeps repainting live. setInterval, no fetch, no timers tied
+  // to the network. Guarded so a no-JS / scripting-off run still shows the page.
+  (function () {
+    var el = document.getElementById('clock');
+    if (!el) return;
+    function tick() {
+      var d = new Date();
+      function p(n) { return (n < 10 ? '0' : '') + n; }
+      el.textContent = p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+    }
+    tick();
+    setInterval(tick, 1000);
+  })();
+</script>
+</body>
+</html>
