@@ -239,13 +239,68 @@ rel을 열어 fd로 치환하나"를 모호함 없이 안다. prefix 밖이면 �
 3. `bridge_mode`는 _희망_; ro/escape 정책이 항상 이긴다(DENY가 SUBSTITUTE_FD/
    REWRITE_PATH보다 우선).
 
+## 5.5 fd-주입 2차 강등 모델 (`tools/saf_proxy_fd_model.py`)
+
+`decide`(§5)는 _경로·모드만_으로 1차 분기(SUBSTITUTE_FD 대상인가)를 낸다. 그러나
+`SUBSTITUTE_FD` 가 **실제로 라이브 fd 치환으로 가능한지**는 런타임이 SAF
+`ParcelFileDescriptor`(PFD)를 열어보기 전엔 모른다(§3-D 한계). 그 **2차 결정
+(강등)** 을 별도 순수 함수 `decide_proxy` 로 격리한다 — `decide` 를 먼저 호출해
+경로/모드/정책 분기를 _재사용_ 하고(escape/ro/unknown-label 이 여기서도 모드보다
+먼저 강제 = 불변식 3), 1차가 `SUBSTITUTE_FD` 일 때만 PFD 능력 + 게스트 접근 의도 +
+디렉터리 여부로 강등한다.
+
+입력 축(런타임이 PFD/openat flags/후속 syscall 힌트로 관찰):
+
+- `FdBacking`: PFD 의 실제 backing. `REGULAR_FILE`(실파일 — seek+mmap), `SEEKABLE`
+  (seek O, mmap 보장 X), `PIPE`(네트워크/클라우드 provider — seek/mmap 둘 다 X),
+  `UNKNOWN`(미관찰 — 보수적으로 pipe 취급).
+- `GuestAccess`: `SEQUENTIAL`(순차 read/write — pipe 로도 충분), `RANDOM`
+  (lseek/pread/pwrite — seekable 필요), `MMAP`(파일 매핑 — 실파일 필요).
+- `is_dir`: 디렉터리 open 이면 fd 치환 자체가 불가(SAF 에 "디렉터리 fd" 없음).
+
+강등 결정(`ProxyAction`):
+
+| 조건(1차=SUBSTITUTE_FD 전제) | 액션 |
+|---|---|
+| `is_dir` | `GETDENTS_SYNTH`(listFiles → getdents64 합성, fd 치환 아님) |
+| seekable + (mmap 불요 or 실파일) | `SUBSTITUTE_LIVE_FD`(직통) |
+| pipe + 순차접근만 | `SUBSTITUTE_LIVE_FD`(순차는 pipe 로 충분) |
+| pipe/UNKNOWN + seek 요구 | `MEMFD_CLONE`(강등, `degraded_from_live=True`) |
+| seekable이나 mmap 요구 + mmap 불가 | `MEMFD_CLONE`(강등) |
+| (1차가 REWRITE_PATH = copy 마운트) | `COPY_FALLBACK` |
+| (1차가 DENY) | `DENY`(같은 errno) |
+| (1차가 FALLTHROUGH = SAF 밖) | `COPY_FALLBACK`(런타임 rootfs 중재) |
+
+페이로드:
+
+- `FdInjection`(LIVE/MEMFD): supervisor 의 §3-C fd-주입 _요건_. `source`
+  (`saf_pfd`/`memfd`), `read_only`(ro 마운트면 PFD 를 `"r"` 로), `writeback_on_close`
+  (memfd 강등 + rw + 변형 의도일 때만 True — close 에서 PFD 로 되쓰기),
+  `requires_seek`/`requires_mmap`(런타임 보장 점검용). 라이브 fd 는 즉시 반영이라
+  write-back 0.
+- `DirSynth`(GETDENTS): `tree_uri`/`label`/`mount_prefix`/`rel_path`/`read_only` —
+  런타임이 `DocumentFile.fromTreeUri` 에서 `rel_path` 를 따라가 `listFiles()` 로
+  자식 엔트리를 게스트 getdents64 버퍼로 합성. openat 은 통과시키되 **getdents 트랩**
+  을 가로채는 별도 경로(fd 치환 아님).
+
+**강등 불변식(테스트로 고정):**
+1. ro/escape/unknown-label DENY 는 어떤 강등 판정보다 _먼저_ — pipe든 dir든
+   ro 마운트 쓰기는 backing 무관 `DENY(EROFS)`, fd-주입/합성 비대상.
+2. memfd 강등은 `degraded_from_live=True` 로 표시 → 런타임이 `effective_mode` 를
+   기록해 같은 라벨 재시도 비용을 줄인다(§4).
+3. 라이브/memfd 주입 대상은 항상 mount prefix 안(`decide` 가 보장한 `ProxyTarget`
+   에서 파생) — prefix 밖이면 1차에서 이미 FALLTHROUGH(fd-주입 비대상).
+4. 디렉터리는 **항상** getdents 합성(backing/access 무관) — SAF 디렉터리 fd 부재.
+
 ## 6. copy→proxy 전환 단계 + device 게이트
 
 `file-bridge-saf.md` §6의 단계 로드맵을 proxy-우선으로 재배치:
 
 1. **단계 0(현재)** — host 순수 모델: 모드 분기·decision 매핑·proxy prefix→fd-주입
-   대상 판정·copy 폴백 라우팅을 `decide`로 고정 + 무회귀 테스트. **device 불요.**
-   (이 PR)
+   대상 판정·copy 폴백 라우팅을 `decide`(§5)로 고정 + **fd-주입 2차 강등**(라이브
+   fd vs memfd vs copy vs getdents 합성)을 `decide_proxy`(§5.5,
+   `tools/saf_proxy_fd_model.py` / `tests/test_saf_proxy_fd_model.py`)로 고정 +
+   무회귀 테스트. **device 불요.** (이 PR)
 2. **단계 1(copy 출시)** — `bridge_mode=COPY` 마운트만 배선. `alr_saf_resolve`가
    `REWRITE_PATH`만 반환 → 기존 x1 rewrite 재사용, **trap 핸들러 변경 0**. share-in
    / MediaStore-out 동시. **게이트: `DEVICE-REQ: ALR-SAF-copy — SM-X236N (am
@@ -286,6 +341,59 @@ rel을 열어 fd로 치환하나"를 모호함 없이 안다. prefix 밖이면 �
 3. **AndroidManifest.xml(다른 트랙 소유)** — share 수신 인텐트필터만(file-bridge
    -saf.md §8-1 그대로). `MANAGE_EXTERNAL_STORAGE`/`READ_MEDIA_*` 추가 안 함 —
    proxy도 전부 사용자-선택 tree URI + fd dup 으로 동작(광역 권한 0).
+
+## 7.5 WS-1 §5 인터페이스 계약 (본체 trap 핸들러에 요구하는 것)
+
+**본체 파일(runtime_report.cpp) 미접촉 — 아래는 _요구사항_ 만.** §5/§5.5 host
+모델이 결정(어느 트랩에서 어떤 fd 를 어디로)을 내고, 본체 supervisor 가 그 결정을
+실제 fd 주입으로 집행한다. 그 경계 시그니처:
+
+```cpp
+// file-bridge-saf.md §5-F 의 SafDecision 을 v2(memfd/getdents)로 확장.
+enum class SafDecision {
+    kFallthrough,    // SAF 무관: 기존 rootfs path rewrite (현행)
+    kRewritePath,    // copy 모드: copy-in 후 host_path 로 in-place rewrite
+    kSubstituteFd,   // 직통: ALR 가 연 fd(라이브 PFD 또는 memfd 복제)를 게스트로 치환
+    kSynthDirents,   // 디렉터리: listFiles() → getdents64 합성(별도 트랩 경로)
+    kDeny,           // 정책 위반: EACCES(13)/EROFS(30)
+};
+struct SafResolveResult {
+    SafDecision decision;
+    std::string host_path;     // kRewritePath: rootfs 안 절대경로
+    int         fd;            // kSubstituteFd: ALR 소유 fd(dup 해 게스트로 보냄)
+    bool        from_memfd;    // kSubstituteFd: 라이브 PFD(false) vs memfd 복제(true)
+    bool        writeback;     // kSubstituteFd&from_memfd&rw: close 에서 PFD 로 되쓰기
+    std::string tree_uri;      // kSynthDirents/kSubstituteFd 의 SAF URI 입력
+    std::string rel_path;      // mount prefix 아래 상대경로
+    bool        read_only;     // ro 마운트면 PFD 를 "r" 로
+    int         deny_errno;    // kDeny
+};
+SafResolveResult alr_saf_resolve(const char* guest_path, int flags);
+```
+
+요구하는 **fd-주입 접점**(ADR-003 §2-(B) 기존 trap 사이트 확장 — 새 ptrace op/
+권한/syscall 0):
+
+1. **부팅 시(fork 직후, `alr_enter_guest` 이전)** supervisor 가 socketpair
+   `(sv_parent, sv_guest)` 를 만들어 `sv_guest` 를 게스트에 상속시킨다(고정 fd,
+   게스트는 안 씀). 이게 §3-C 의 SCM_RIGHTS 채널.
+2. **openat 트랩(syscall-entry stop)** 에서 UI/SAF 레이어가 §5.5 `FdInjection`
+   요건대로 host fd 를 제공한다:
+   - `source=saf_pfd`: `ContentResolver.openFileDescriptor(uri, ro?"r":"rw")` →
+     `ParcelFileDescriptor.detachFd()` → host fd.
+   - `source=memfd`: supervisor 가 `memfd_create` + PFD 내용 복제 → host fd.
+   그 host fd 를 `sendmsg(sv_parent, SCM_RIGHTS=[host_fd])`.
+3. supervisor 가 게스트 레지스터를 저장하고 트램펄린으로 게스트가
+   `recvmsg(sv_guest,…)` 를 실행하게 해 **게스트 fd 테이블에 새 fd** 를 만든 뒤,
+   원래 openat 의 **syscall-exit `regs[0]`** 를 그 새 fd 번호로 치환(레지스터 복원).
+4. `writeback=true`(memfd+rw) 면 게스트 close 트랩에서 memfd 내용을
+   `openOutputStream(uri)` 로 PFD 에 되쓴다.
+5. `kSynthDirents` 는 fd 치환이 아니라 **getdents64 트랩**을 가로채 `listFiles()`
+   결과를 게스트 버퍼로 합성(openat 자체는 통과 또는 sentinel fd).
+
+호스트 모델이 보장하는 것: **decision·errno·주입 source·write-back 필요 여부·
+prefix 안전성**(§5.5 테스트). 본체가 채우는 것: 실제 fd 번호·SCM_RIGHTS·트램펄린
+single-step·getdents 바이트 합성(device-only, §6 게이트).
 
 ## 8. 비root / 안전성 점검
 
