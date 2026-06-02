@@ -64,9 +64,33 @@ ICU FD. Candidate fixes to try next:
    mediation) so `InitializeICU` takes the file path, not the (absent) zygote FD.
 3. A chromium flag / data-file layout so headless-shell embeds or self-opens ICU.
 
+## ICU blocker RESOLVED (v158) — /proc/self/exe → guest path
+icudtl.dat IS staged + valid (10.8MB, run-as confirmed), so the invalid FD was NOT
+file-not-found: chromium opens icudtl.dat relative to its executable's directory, which it
+derives from `readlink("/proc/self/exe")`. Under in-process ALR that returns the Android
+APK path, so chromium computed the wrong module dir → open failed → `g_icudtl_pf = -1` →
+the CHECK. Fix (general, benefits every glibc app that locates assets via the exe path):
+- runtime_report.cpp: loader injects `ALR_GUEST_EXE=<guest argv[0]>` into the guest env.
+- libalr_interpose.c: `readlink`/`readlinkat`("/proc/self/exe") returns `$ALR_GUEST_EXE`
+  (the guest-visible binary path) instead of the kernel's APK path. This implements the
+  long-standing `resolve_interposed_access` self-exe design that was only a host probe.
+Deployed via interpose-stage.tar (re-extract verified: `extracted=8`).
+
+**Device result (v158):** chromium `--dump-dom` no longer hits the ICU error — it runs
+PAST ICU init. No regression (same drain): GPU LIVE/VK RENDER/VK DRAW PASS, gtk3 gtk_init
+ok backend=wayland exit=0, foot exit=0.
+
+## NEW post-ICU wedge (next CR-1 step)
+Past ICU, chromium `--dump-dom` now runs the full 200s (watchdog SIGKILL, stdout=0) with
+the supervisor near-idle: `ev_total=1` (one SIGCHLD on a worker), leader `state=t syscall=-1`
+stopped, supervisor `state=S wchan=do_wait`, guard_fires=0. So chromium reaches post-ICU
+init and blocks on something OUTSIDE the supervisor's view (a futex / a service / a thread
+that never starts) rather than trapping. This is the next layer to diagnose (chromium init
+sequencing under --single-process --no-zygote), distinct from the now-fixed ICU/supervisor
+layers.
+
 ## Status
-- Supervisor (the CR blocker, task #53): **RESOLVED** — chromium runs in-process under the
-  supervisor; no deadlock, no livelock, no path-mediation wedge. The supervisor correctly
-  drives chromium to its own ICU CHECK.
-- chromium `--dump-dom` render (CR-1): **not yet** — now gated on chromium ICU data loading,
-  a chromium-environment issue, NOT a loader/supervisor issue.
+- Supervisor (the CR blocker, task #53): **RESOLVED** — no deadlock/livelock/path wedge.
+- chromium ICU data loading (task #57): **RESOLVED** — /proc/self/exe → guest path.
+- chromium `--dump-dom` render (CR-1): **not yet** — now gated on the post-ICU init wedge,
+  a chromium-internals issue. Two real blockers cleared this session (supervisor + ICU).

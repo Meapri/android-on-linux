@@ -24,7 +24,7 @@ def test_runner_probes_proot_with_multiple_entrypoints():
 
 def test_activity_reports_success_summary_without_default_direct_crash_probes():
     text = MAIN.read_text()
-    assert "build: 0.4.157-sd-v157" in text
+    assert "build: 0.4.158-sd-v158" in text
     assert "ROOTFS EXECUTION:" in text
     assert "probe dlopen talloc" in text
     assert "linker64 proot --version exit" in text

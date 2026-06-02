@@ -1591,6 +1591,13 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     // is expected to read wrong host paths. The full-trace baseline (ALR_PCGATE=="0")
     // keeps the supervisor doing every rewrite, exactly as before PCGATE.
     guest_env.push_back("ALR_ROOTFS=" + config.rootfs_dir);
+    // ALR_GUEST_EXE: the GUEST-visible program path (argv[0]). The interposer returns
+    // it for readlink("/proc/self/exe") — the real /proc/self/exe of this in-process
+    // guest is the Android APK, so apps that locate their assets via the executable
+    // path (chromium ICU/pak via PathService DIR_MODULE; many glibc apps) would look in
+    // the wrong directory. With this, DIR_MODULE resolves under the rootfs and normal
+    // path mediation maps the asset open. Only used when guest_rel is absolute.
+    guest_env.push_back("ALR_GUEST_EXE=" + guest_rel);
     // Two A/B gates, both read from the HOST (app) environment and decided here in
     // the parent. They are hoisted to function scope (not an inner block) so the
     // report lines below — including the path-mediation traps/rewrites line — can

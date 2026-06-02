@@ -195,6 +195,13 @@ static int a_under(const char *p, const char *d) {
     return p[i] == '/' || p[i] == '\0';
 }
 
+/* exact string equality (no <string.h> dependency in the trusted path). */
+static int a_eq(const char *p, const char *q) {
+    size_t i = 0;
+    while (p[i] && p[i] == q[i]) ++i;
+    return p[i] == q[i];
+}
+
 /* ----- ALR_ROOTFS, captured once at init ----- */
 
 /* Holds the trimmed rootfs prefix (trailing '/'s removed, lone "/" kept).
@@ -205,24 +212,46 @@ static char   g_rootfs[1024];
 static size_t g_rootfs_len = 0;
 static int    g_inited = 0;
 
+/* ALR_GUEST_EXE: the GUEST-visible path of the running program (e.g.
+ * "/usr/lib/chromium/chromium-headless-shell"). The loader sets it because the
+ * real /proc/self/exe of this in-process guest points at the Android APK/zygote,
+ * NOT the guest binary — so any app that locates its data dir via readlink
+ * /proc/self/exe (chromium's ICU/pak resolution via PathService, and many glibc
+ * apps) computes the wrong directory and fails to find its assets. We rewrite the
+ * readlink("/proc/self/exe") RESULT to this guest path so DIR_MODULE/DIR_ASSETS
+ * resolve under the rootfs (then normal path mediation maps the asset open). */
+static char   g_guest_exe[1024];
+static size_t g_guest_exe_len = 0;
+
 static void alr_init(void) {
     if (g_inited) return;
     g_inited = 1;
 
     /* getenv is safe to resolve normally; it is not interposed here. */
     const char *r = getenv("ALR_ROOTFS");
-    if (!r || r[0] != '/') {        /* must be an absolute host path */
+    if (r && r[0] == '/') {         /* must be an absolute host path */
+        size_t n = a_len(r);
+        /* trim trailing slashes, but keep a lone "/" (matches trim_trailing_slashes) */
+        while (n > 1 && r[n - 1] == '/') --n;
+        if (n >= sizeof(g_rootfs)) n = sizeof(g_rootfs) - 1;   /* clamp, never overflow */
+        for (size_t i = 0; i < n; ++i) g_rootfs[i] = r[i];
+        g_rootfs[n] = '\0';
+        /* A rootfs of exactly "/" is a no-op prefix; treat as disabled. */
+        g_rootfs_len = (n == 1 && g_rootfs[0] == '/') ? 0 : n;
+    } else {
         g_rootfs_len = 0;
-        return;
     }
-    size_t n = a_len(r);
-    /* trim trailing slashes, but keep a lone "/" (matches trim_trailing_slashes) */
-    while (n > 1 && r[n - 1] == '/') --n;
-    if (n >= sizeof(g_rootfs)) n = sizeof(g_rootfs) - 1;   /* clamp, never overflow */
-    for (size_t i = 0; i < n; ++i) g_rootfs[i] = r[i];
-    g_rootfs[n] = '\0';
-    /* A rootfs of exactly "/" is a no-op prefix; treat as disabled. */
-    g_rootfs_len = (n == 1 && g_rootfs[0] == '/') ? 0 : n;
+
+    const char *e = getenv("ALR_GUEST_EXE");
+    if (e && e[0] == '/') {         /* guest-absolute program path */
+        size_t n = a_len(e);
+        if (n >= sizeof(g_guest_exe)) n = sizeof(g_guest_exe) - 1;
+        for (size_t i = 0; i < n; ++i) g_guest_exe[i] = e[i];
+        g_guest_exe[n] = '\0';
+        g_guest_exe_len = n;
+    } else {
+        g_guest_exe_len = 0;
+    }
 }
 
 /*
@@ -1066,6 +1095,19 @@ int faccessat2(int dirfd, const char *path, int mode, int flags) {
 /* readlink/readlinkat both reduce to __NR_readlinkat (in the traced 9). */
 static ssize_t alr_readlink_emit(int dirfd, const char *path,
                                  char *buf, size_t bufsiz) {
+    alr_init();
+    /* /proc/self/exe substitution: the kernel would return the Android APK path
+     * (this is an in-process guest), which breaks every app that derives its data
+     * dir from the executable path. Return the loader-provided guest path instead.
+     * readlink semantics: copy up to bufsiz bytes, NO NUL terminator, return the
+     * number of bytes placed (the untruncated length clamped to bufsiz). */
+    if (g_guest_exe_len > 0 && path &&
+        (a_eq(path, "/proc/self/exe") || a_eq(path, "/proc/self/exe/"))) {
+        size_t n = g_guest_exe_len;
+        if (n > bufsiz) n = bufsiz;
+        for (size_t i = 0; i < n; ++i) buf[i] = g_guest_exe[i];
+        return (ssize_t)n;
+    }
     char b[ALR_PBUF];
     const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
     long r = alr_tramp_syscall(__NR_readlinkat, dirfd, (long)p,
