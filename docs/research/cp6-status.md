@@ -39,6 +39,34 @@ verdict = **measure-first**(supervisor 재-tweak 금지, read-only 측정창 분
 그 측정으로 render 경로의 N(절대 raw-svc 수)·trap 분포가 device 로 측정돼야 비로소 두 본질해법
 **M-R5(svc-rewrite) vs M-R1(USER_NOTIF)** 의 A/B 가 결정 가능하다.
 
+### 0-a. "`--version` 실행"에서 "browser 가 페이지를 렌더"까지 — CR-1..CR-5 사다리
+
+위의 `--version` device-PASS 는 *바이너리가 뜨고 풀 closure 를 링크하고 깨끗이 종료* 레벨일 뿐,
+**브라우저로서 페이지를 렌더하는 것**은 아니다. 그 사다리의 실행-경로 SSOT 가 새 문서
+**`docs/research/chromium-run-plan.md`**(CR-1..CR-5; GPU flag 사다리는 자매
+**`docs/research/chromium-gpu-path.md`**)다:
+
+- **CR-1 (near-term)** — `chromium-headless-shell --single-process --no-zygote --no-sandbox
+  --disable-gpu --dump-dom <data:/file: 페이지>` = single-proc headless 가 *실제로* 페이지를
+  파싱·레이아웃·렌더하고 DOM 을 dump(net/GPU/멀티proc 0). drain gate = logcat `child exit=0` +
+  `guest stdout=` 에 직렬화된 DOM. **net/GPU/멀티proc 벽을 모두 우회하므로 유일한 near-term 칸.**
+- **CR-2** — += 진짜 `https://` URL(net overlay: CA bundle/DNS). 여전히 `--single-process`.
+- **CR-3** — += GPU(`--use-gl=angle --use-angle=swiftshader` → … → 우리 GLES shim → Mali; 사다리/
+  staged-lib = `chromium-gpu-path.md`). 여전히 `--single-process`(in-proc GPU 스레드).
+- **CR-4** — `--ozone-platform=wayland` = GUI 창을 우리 in-app Wayland compositor 에(필수 wl =
+  `wl_compositor`/`wl_shm`/`xdg_wm_base`). 여전히 `--single-process`.
+- **CR-5 (장기, G1-gated)** — `--single-process` 떼기 = 멀티프로세스 zygote. **이건 §3 의 G1
+  (in-process 재-맵 exec re-entry)에 게이트** — G1 은 메커니즘+map/jump device-proven(ADR-003-v3,
+  `0x400640`)이나 재-맵 게스트 SIGILL + `/proc/self/exe` pass-through 가 남아 **RUNS 아님(in-flight)**.
+
+**왜 near-term 이 CR-1 뿐인가 — measure-first.** CR-1 의 `--dump-dom` 은 과거 "멀티스레드-ptrace
+데드락"으로 stall 했으나, **PR #2(`docs/design/adr-chromium-storm-deadlock.md`)가 그 데드락을
+오진(misdiagnosis)으로 재진단** — best-가설은 데드락이 아니라 **무거운 single-init 이 `alarm` 측정창을
+첫 워커 clone 전에 만료**(§5; chromium 은 이제 120s 를 받는다). 따라서 CR-1 의 1순위는 supervisor
+re-tweak 가 아니라 **측정창 분리**(`ALR_GUEST_ALARM_S`)로 render 가 끝까지 진행하는지 device 1회로
+가르는 것. 그리고 **`--single-process`(+`--no-zygote`)가 멀티프로세스 zygote 벽(=CR-5/G1)을 우회**
+하므로 CR-1..CR-4 는 G1 없이 진행 가능하고, G1 은 CR-5 에서만 게이트된다(그래서 CR-5 만 장기).
+
 exec re-entry(멀티프로세스)는 storm/데드락과 **독립된 별개 벽**(thread 벽이 아니라 exec 벽)이고, 이
 벽은 round-9→round-10 에서 **device-정복**됐다 — **in-process 재-맵(커널 execve 전무)이 map+jump 까지
 device-proven**(ADR-003-v3). round-6/7 의 B-1(execve x0 path-rewrite) + B-3(child envp) 는
@@ -264,4 +292,6 @@ device 1회로 가른다(measure-first; 2차 가설 device 전 배제 불가).
 *갱신 규칙:* device evidence 추가 시에만 RUNS/PASS 승급(evidence 파일명 명기). host-only 진전
 (프로토타입/계측 설계)만으로는 storm/exec 벽을 "풀림"으로 올리지 않는다. CP-6 는 사용자 보류이므로
 본질해법/x0-rewrite **구현** 착수는 보류 해제 + 해당 device 게이트 PASS 후. 잠긴 *범용* 로더 기능은
-`docs/research/loader-feature-gaps.md`, GUI 렌더 셋은 `docs/research/gui-universality-status.md`.
+`docs/research/loader-feature-gaps.md`, GUI 렌더 셋은 `docs/research/gui-universality-status.md`,
+**"`--version` → browser 렌더" 실행 사다리(CR-1..CR-5)는 `docs/research/chromium-run-plan.md`**
+(GPU flag 사다리 = `docs/research/chromium-gpu-path.md`).
