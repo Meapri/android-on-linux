@@ -126,6 +126,72 @@ _WL_OUTPUT = re.compile(
 )
 
 
+# --------------------------------------------------------------------------- #
+# ADR-002 §3 P1 (M-R2 syscall-mix). The supervisor (runtime_report.cpp, WS-1)
+# emits three storm-decomposition lines per chromium run. These regexes + the
+# `_parse_*_hist` / `_parse_stime` helpers below are ADD-only; `bench/syscall_mix`
+# imports them. They never alter the existing `parse_report` markers above.
+#
+#   alr sc trace_hist nr:count nr:count ...   RET_TRACE'd syscalls by nr (top-16)
+#   alr sc emul_hist  nr:count nr:count ...   SIGSYS-emulated syscalls by nr
+#   alr sc stime_us=.. utime_us=.. nonvol_ctxt=.. traps=.. emul=..
+#
+# The histogram body is a run of `nr:count` pairs; we capture the rest of the
+# SAME line ([^\n]*, never crossing into the next marker) and pull the pairs out
+# with `_HIST_PAIR` so a malformed token is skipped, not fatal. An empty body
+# (`alr sc trace_hist` with no pairs) is matched and parses to {}.
+_TRACE_HIST = re.compile(r"alr sc trace_hist[^\S\n]*([^\n]*)", re.MULTILINE)
+_EMUL_HIST = re.compile(r"alr sc emul_hist[^\S\n]*([^\n]*)", re.MULTILINE)
+_HIST_PAIR = re.compile(r"(\d+):(\d+)")
+_STIME = re.compile(
+    r"alr sc stime_us=(\d+)\s+utime_us=(\d+)\s+nonvol_ctxt=(\d+)"
+    r"\s+traps=(\d+)\s+emul=(\d+)"
+)
+
+
+def _parse_hist_pairs(body: str) -> dict[int, int]:
+    """Parse a `nr:count nr:count ...` histogram body into {nr: count}.
+
+    Later duplicates of the same nr accumulate (supervisor emits each nr once,
+    but summing is the safe idempotent choice). Malformed tokens are skipped.
+    """
+    out: dict[int, int] = {}
+    for m in _HIST_PAIR.finditer(body):
+        nr = int(m.group(1))
+        count = int(m.group(2))
+        out[nr] = out.get(nr, 0) + count
+    return out
+
+
+def _parse_trace_hist(text: str) -> dict[int, int] | None:
+    """`alr sc trace_hist ...` -> {nr: count}; None if the line is absent.
+
+    A present-but-empty histogram (`alr sc trace_hist` with no pairs) yields {}.
+    """
+    m = _TRACE_HIST.search(text)
+    return _parse_hist_pairs(m.group(1)) if m is not None else None
+
+
+def _parse_emul_hist(text: str) -> dict[int, int] | None:
+    """`alr sc emul_hist ...` -> {nr: count}; None if the line is absent."""
+    m = _EMUL_HIST.search(text)
+    return _parse_hist_pairs(m.group(1)) if m is not None else None
+
+
+def _parse_stime(text: str) -> dict[str, int] | None:
+    """`alr sc stime_us=.. ...` -> dict of the 5 integer fields; None if absent."""
+    m = _STIME.search(text)
+    if m is None:
+        return None
+    return {
+        "stime_us": int(m.group(1)),
+        "utime_us": int(m.group(2)),
+        "nonvol_ctxt": int(m.group(3)),
+        "traps": int(m.group(4)),
+        "emul": int(m.group(5)),
+    }
+
+
 def _int(pat: re.Pattern[str], text: str, group: int = 1) -> int | None:
     m = pat.search(text)
     return int(m.group(group)) if m else None
