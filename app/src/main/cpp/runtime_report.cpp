@@ -2053,6 +2053,16 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         return e != nullptr && e[0] == '1';
     }();
     int exec_inproc_redirected = 0;  // execs PC-redirected into the in-process trampoline
+    // G1 seqint: execs DELIBERATELY NOT inproc-redirected (fell through to B-1/B-3).
+    // The trampoline can only map a rootfs glibc target, so we must skip /proc/self/exe
+    // (resolves to the loader's own ANDROID bionic binary, interp /system/bin/linker64),
+    // any non-rootfs target, and the alr-reentry stub itself. Skipping them keeps the
+    // serialized supervision from wedging (a device drain showed an over-broad redirect
+    // stalled the onCreate probe sequence after ~9s on the chromium zygote's /proc/self/exe
+    // exec) so WS-1 can safely flip ALR_REEXEC_INPROC default-ON.
+    int exec_inproc_skipped = 0;
+    std::string first_inproc_skip_reason;  // proc-self-exe | non-rootfs | stub
+    std::string first_inproc_skip_target;  // the gp that was skipped
     int exec_reentry_spliced = 0;   // execs spliced to run via the re-entry stub
     std::string first_reentry_target;  // first target the stub was asked to re-map
     std::string first_exec_x0;       // first exec target the guest requested
@@ -2354,7 +2364,53 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                                 // touched by the splice/B-1/B-3 SETREGSETs that follow, so
                                 // this redirect survives them.
 #if defined(__aarch64__)
+                                // G1 seqint: SCOPE the inproc redirect. The trampoline can
+                                // only map a rootfs glibc target; redirecting everything
+                                // wedges the serialized supervision (device drain: onCreate
+                                // probe sequence stalled ~9s on the chromium zygote's
+                                // /proc/self/exe exec, whose PT_INTERP=/system/bin/linker64
+                                // is the ANDROID binary the trampoline cannot map into the
+                                // Debian rootfs). Decide whether to skip BEFORE writing regs;
+                                // on skip we fall through to the existing B-1/B-3 behavior
+                                // (no redirect), exactly as if inproc were off for this exec.
+                                const char* inproc_skip_reason = nullptr;
                                 if (inproc_reexec_on) {
+                                    // (a) /proc/self/exe or any /proc/ path resolves to the
+                                    // loader's own ANDROID bionic binary, not a rootfs glibc
+                                    // ELF — the trampoline cannot map it.
+                                    if (std::strcmp(gp, "/proc/self/exe") == 0 ||
+                                        std::strncmp(gp, "/proc/", 6) == 0) {
+                                        inproc_skip_reason = "proc-self-exe";
+                                    }
+                                    // (c) idempotency: never re-map the static re-entry stub.
+                                    if (inproc_skip_reason == nullptr) {
+                                        const char* gpb = std::strrchr(gp, '/');
+                                        if ((gpb != nullptr &&
+                                             std::strcmp(gpb, "/alr-reentry") == 0) ||
+                                            std::strcmp(gp, "alr-reentry") == 0) {
+                                            inproc_skip_reason = "stub";
+                                        }
+                                    }
+                                    // (b) only re-map a real rootfs binary: the resolved host
+                                    // target must be under config.rootfs_dir. The pure
+                                    // classifier says so iff it asked to rewrite (reason
+                                    // "rewrite" -> host_path under rootfs) or the guest path
+                                    // is ALREADY under rootfs (reason "already-host"). Any
+                                    // other case (relative/empty/sysdir/native) is non-rootfs.
+                                    if (inproc_skip_reason == nullptr &&
+                                        !med.should_rewrite &&
+                                        med.reason != "already-host") {
+                                        inproc_skip_reason = "non-rootfs";
+                                    }
+                                    if (inproc_skip_reason != nullptr) {
+                                        ++exec_inproc_skipped;
+                                        if (first_inproc_skip_reason.empty()) {
+                                            first_inproc_skip_reason = inproc_skip_reason;
+                                            first_inproc_skip_target = gp;
+                                        }
+                                    }
+                                }
+                                if (inproc_reexec_on && inproc_skip_reason == nullptr) {
                                     const std::string host =
                                         med.should_rewrite ? med.host_path
                                                            : std::string(gp);
@@ -3063,7 +3119,16 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     out << "\nalr exec reentry=" << (exec_reentry_on ? "on" : "off")
         << " spliced=" << exec_reentry_spliced
         << " inproc=" << (inproc_reexec_on ? "on" : "off")
-        << " inproc_redirected=" << exec_inproc_redirected;
+        << " inproc_redirected=" << exec_inproc_redirected
+        << " inproc_skipped=" << exec_inproc_skipped;
+    // G1 seqint: when execs were correctly NOT redirected (e.g. the chromium zygote's
+    // /proc/self/exe, or a non-rootfs/native target, or the alr-reentry stub), surface
+    // the first reason+target so the WS-1 drain can confirm the scoping before flipping
+    // ALR_REEXEC_INPROC default-ON.
+    if (!first_inproc_skip_reason.empty()) {
+        out << "\nalr exec inproc skip reason=" << first_inproc_skip_reason
+            << " target=" << first_inproc_skip_target;
+    }
     if (!first_reentry_target.empty()) {
         out << "\nalr exec reentry stub=" << config.rootfs_dir
             << "/usr/lib/androlinux/alr-reentry target=" << first_reentry_target;
