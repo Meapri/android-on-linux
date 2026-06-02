@@ -112,6 +112,7 @@ typedef struct {
     union { Elf64_Xword d_val; Elf64_Addr d_ptr; } d_un;
 } Elf64_Dyn;
 
+#define ET_EXEC 2
 #define ET_DYN  3
 #define PT_LOAD    1
 #define PT_DYNAMIC 2
@@ -174,6 +175,7 @@ typedef struct { Elf64_Addr r_offset; Elf64_Xword r_info; Elf64_Sxword r_addend;
 #define MAP_PRIVATE   0x02
 #define MAP_FIXED     0x10
 #define MAP_ANONYMOUS 0x20
+#define MAP_FIXED_NOREPLACE 0x100000  // since Linux 4.17; EEXIST if the range is taken
 #define MAP_FAILED ((void*)-1)
 
 // Distinct fatal exit codes so a device drain can localize the failure. The
@@ -296,6 +298,11 @@ typedef struct {
 // Page size: in-process we read AT_PAGESZ from /proc/self/auxv (see worker).
 // 4096 fallback; device may be 16K.
 static unsigned long g_pagesz = 4096;
+// Real AT_HWCAP mined from /proc/self/auxv (worker sets this before mapping). Passed
+// to R_AARCH64_IRELATIVE ifunc resolvers so they pick the correct CPU variant; a 0 or
+// wrong HWCAP can drive a resolver that indexes a feature table to a bad branch
+// (SIGILL). 0 until the worker mines it (then the resolvers see generic, still safe).
+static unsigned long g_hwcap = 0;
 ALR_FREESTANDING static inline uintptr_t page_down(uintptr_t v) {
     return v & ~(uintptr_t)(g_pagesz - 1);
 }
@@ -303,11 +310,31 @@ ALR_FREESTANDING static inline uintptr_t page_up(uintptr_t v) {
     return (v + g_pagesz - 1) & ~(uintptr_t)(g_pagesz - 1);
 }
 
-// Map every PT_LOAD of `img` (full ELF already in memory) into anonymous memory
-// with the W^X-safe RW->memcpy->RX MAP_FIXED path, then apply R_AARCH64_IRELATIVE.
-// SELF-CONTAINED duplicate of alr_reentry.c:map_elf_image (which itself mirrors
+// Map every PT_LOAD of `img` (full ELF already in memory) into anonymous memory,
+// then apply R_AARCH64_IRELATIVE. SELF-CONTAINED duplicate of
+// alr_reentry.c:map_elf_image (which itself mirrors
 // runtime_report.cpp:map_elf_image_into_execmem). Uses the runtime AT_PAGESZ so a
 // 16K-page device is handled.
+//
+// R11 SIGILL FIX — one-reservation model (was: per-PT_LOAD MAP_FIXED):
+//   The old loop mmap'd EACH PT_LOAD separately with MAP_FIXED. Whenever two
+//   segments shared a page (the page that holds the tail of segment N and the head
+//   of segment N+1 — common when a static glibc binary's RX text and RELRO/data
+//   borders are not a full page apart, and ALWAYS for any seg whose p_memsz BSS
+//   tail spills into the next seg's first page), the SECOND MAP_FIXED REPLACED that
+//   page with a fresh ZEROED anon page, wiping segment N's already-copied bytes. If
+//   the clobbered page held code or a const relocation/IFUNC pointer, execution hit
+//   zeros -> SIGILL (signal 4) in glibc startup. Device drain showed exactly this:
+//   map+jump reached entry=0x400640 (a fixed-address ET_EXEC), then the static
+//   /bin/sh SIGILL'd in its own startup.
+//   FIX: reserve the WHOLE [min_v,max_v) span as ONE anonymous RW mapping, memcpy
+//   each segment's p_filesz into it (no re-mmap -> no clobber; the [filesz,memsz)
+//   BSS tail + whole BSS pages stay zero from the fresh anon span), then walk the
+//   span PAGE BY PAGE and mprotect maximal runs to the UNION of p_flags of every
+//   PT_LOAD covering each page — so a shared boundary page keeps the perms both
+//   neighbours need (an executable boundary page never loses X). ET_EXEC reserves
+//   at its FIXED min_v with MAP_FIXED_NOREPLACE so a real collision is DETECTED,
+//   not silently clobbered.
 ALR_FREESTANDING static MappedImage map_elf_image(const char* img, size_t len,
                                                   const char* tag) {
     MappedImage R; m_set(&R, 0, sizeof(R));
@@ -326,31 +353,98 @@ ALR_FREESTANDING static MappedImage map_elf_image(const char* img, size_t len,
     if (min_v == ~(uintptr_t)0) { diag(tag); diag("NO_LOAD\n"); return R; }
 
     size_t span = page_up(max_v - min_v);
+    diag(tag); diag("span="); diag_hex("", (unsigned long)span);
+
+    // ONE reservation for the whole image. ET_DYN: kernel picks the base (we map at
+    // 0 then bias). ET_EXEC: reserve AT the fixed min_v with MAP_FIXED_NOREPLACE so
+    // a pre-existing mapping at the fixed range is reported (EEXIST) rather than
+    // silently clobbered. The reservation is RW so we can memcpy; per-segment
+    // mprotect below tightens to final perms (W^X-safe: RX/RO set after copy).
     uintptr_t base = 0;
+    void* reserve;
     if (eh->e_type == ET_DYN) {
-        void* reserve = (void*)sys6_(SYS_mmap, 0, span, PROT_NONE,
-                                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        reserve = (void*)sys6_(SYS_mmap, 0, span, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (reserve == MAP_FAILED) { diag(tag); diag("RESERVE_FAIL\n"); return R; }
         base = (uintptr_t)reserve - min_v;
+    } else {
+        // Fixed-address ET_EXEC: ask for exactly min_v, fail loudly on collision.
+        reserve = (void*)sys6_(SYS_mmap, min_v, span, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        if (reserve == MAP_FAILED) {
+            // The fixed range is occupied (the loader/guest already mapped 0x400000..).
+            // MAP_FIXED would silently clobber it -> corruption; refuse instead.
+            diag(tag); diag("EXEC_FIXED_OCCUPIED@"); diag_hex("", (unsigned long)min_v);
+            return R;
+        }
+        if ((uintptr_t)reserve != min_v) {
+            // Kernel ignored the hint (no NOREPLACE support); that's not the fixed
+            // address the ET_EXEC needs — bail rather than run at the wrong base.
+            diag(tag); diag("EXEC_FIXED_MOVED\n"); return R;
+        }
+        base = 0;  // ET_EXEC vaddrs are absolute
     }
+    diag(tag); diag("base="); diag_hex("", (unsigned long)base);
 
+    // Copy each segment's file bytes into the single reservation. The BSS tail
+    // ([p_filesz, p_memsz) within the seg, plus any whole BSS pages up to memsz)
+    // needs no memset: the reservation is one fresh anonymous region, all-zero, and
+    // we never re-mmap any page, so those bytes are already zero.
     for (int i = 0; i < eh->e_phnum; ++i) {
         if (ph[i].p_type != PT_LOAD) continue;
-        uintptr_t seg_start = base + page_down((uintptr_t)ph[i].p_vaddr);
-        uintptr_t v_off     = (uintptr_t)ph[i].p_vaddr - page_down((uintptr_t)ph[i].p_vaddr);
-        size_t    map_len   = page_up(v_off + ph[i].p_memsz);
-        void* m = (void*)sys6_(SYS_mmap, seg_start, map_len, PROT_READ | PROT_WRITE,
-                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-        if (m == MAP_FAILED) { diag(tag); diag("SEG_MAP_FAIL\n"); return R; }
+        diag(tag); diag("seg vaddr="); diag_hex("", (unsigned long)ph[i].p_vaddr);
+        diag(tag); diag("  filesz="); diag_hex("", (unsigned long)ph[i].p_filesz);
+        diag(tag); diag("  memsz="); diag_hex("", (unsigned long)ph[i].p_memsz);
+        diag(tag); diag("  flags="); diag_hex("", (unsigned long)ph[i].p_flags);
         m_cpy((void*)(base + ph[i].p_vaddr), img + ph[i].p_offset, ph[i].p_filesz);
+    }
+    diag(tag); diag("bss_zeroed=anon-span\n");
+
+    // Tighten protections per page across the whole reservation. A page can be
+    // claimed by more than one PT_LOAD (the boundary page between e.g. RX text and
+    // RW data when the linker did not separate them by a full page, or a seg whose
+    // BSS tail spills into the next seg's first page). A naive per-segment mprotect
+    // would let the LATER segment DROP perms the earlier one needs on that shared
+    // page (mprotect SETS, not ORs) -> e.g. an executable boundary page loses X ->
+    // SIGILL. So we compute, per page, the UNION of p_flags of every PT_LOAD that
+    // covers it, then mprotect maximal runs of equal prot. (Single pass over pages;
+    // span is small — a few hundred KiB for /bin/sh, a few MiB for ld.so.) A page
+    // claimed by gaps-only stays PROT_NONE (an inter-segment gap, like a real
+    // loader). The pathological case of a page that is BOTH PF_W and PF_X would yield
+    // RWX, which W^X rejects: mprotect then fails EACCES and we bail with
+    // SEG_PROT_FAIL — a clean, diagnosable refusal, never silent corruption. Real
+    // static glibc / ld.so never emit a W+X-shared page (code/data are page-separated
+    // by `-z separate-code`, the modern default), so this stays a guard, not a path.
+    int       prot_run   = -1;                    // prot of the current run (-1 = none yet)
+    uintptr_t prot_runva = 0;                     // image-vaddr of the run start
+    for (uintptr_t v = min_v; v < page_up(max_v); v += g_pagesz) {
         int prot = 0;
-        if (ph[i].p_flags & PF_R) prot |= PROT_READ;
-        if (ph[i].p_flags & PF_W) prot |= PROT_WRITE;
-        if (ph[i].p_flags & PF_X) prot |= PROT_EXEC;
-        if (sys3(SYS_mprotect, seg_start, map_len, prot) != 0) {
+        for (int i = 0; i < eh->e_phnum; ++i) {
+            if (ph[i].p_type != PT_LOAD) continue;
+            uintptr_t s = page_down((uintptr_t)ph[i].p_vaddr);
+            uintptr_t e = page_up((uintptr_t)(ph[i].p_vaddr + ph[i].p_memsz));
+            if (v < s || v >= e) continue;        // this page not in seg i
+            if (ph[i].p_flags & PF_R) prot |= PROT_READ;
+            if (ph[i].p_flags & PF_W) prot |= PROT_WRITE;
+            if (ph[i].p_flags & PF_X) prot |= PROT_EXEC;
+        }
+        if (prot != prot_run) {
+            if (prot_run >= 0) {  // flush the just-ended run
+                uintptr_t rs = base + prot_runva, re = base + v;
+                if (sys3(SYS_mprotect, rs, re - rs, prot_run) != 0) {
+                    diag(tag); diag("SEG_PROT_FAIL\n"); return R;
+                }
+                if (prot_run & PROT_EXEC) flush_icache(rs, re);
+            }
+            prot_run = prot; prot_runva = v;
+        }
+    }
+    if (prot_run >= 0) {  // flush the final run
+        uintptr_t rs = base + prot_runva, re = base + page_up(max_v);
+        if (sys3(SYS_mprotect, rs, re - rs, prot_run) != 0) {
             diag(tag); diag("SEG_PROT_FAIL\n"); return R;
         }
-        if (prot & PROT_EXEC) flush_icache(seg_start, seg_start + map_len);
+        if (prot_run & PROT_EXEC) flush_icache(rs, re);
     }
 
     // R_AARCH64_IRELATIVE via PT_DYNAMIC's DT_RELA (ld.so is section-stripped).
@@ -373,7 +467,13 @@ ALR_FREESTANDING static MappedImage map_elf_image(const char* img, size_t len,
                 if (ELF64_R_TYPE(r->r_info) != R_AARCH64_IRELATIVE) continue;
                 typedef unsigned long (*Resolver)(unsigned long, const void*);
                 Resolver res = (Resolver)(base + r->r_addend);
-                *(uint64_t*)(base + r->r_offset) = res(0, 0);  // HWCAP unthreaded (matches alr_reentry.c)
+                // Thread the REAL AT_HWCAP (was 0): glibc ifunc resolvers select a
+                // CPU variant from HWCAP; a 0/wrong value can SIGILL a resolver that
+                // indexes a feature table. The 2nd arg (HWCAP2/__ifunc_arg_t*) stays
+                // 0 — aarch64 glibc resolvers that need HWCAP2 take it via a pointer
+                // arg we don't synthesize; passing 0 makes them treat HWCAP2 as
+                // absent (generic), which is correct-but-conservative, never illegal.
+                *(uint64_t*)(base + r->r_offset) = res(g_hwcap, 0);
                 ++irel;
             }
         }
@@ -488,6 +588,9 @@ void alr_inproc_reexec_worker(const char* target, char** argv,
     unsigned long my_hwcap = 0, my_hwcap2 = 0, my_random = 0, my_sysinfo = 0;
     unsigned long my_clktck = 100;
     read_auxv(&my_hwcap, &my_hwcap2, &my_random, &my_sysinfo, &my_clktck);
+    g_hwcap = my_hwcap;  // map_elf_image's IRELATIVE resolvers read this (was hard 0)
+    diag_hex("ALR-INPROC: hwcap=", my_hwcap);
+    diag_hex("ALR-INPROC: pagesz=", g_pagesz);
     unsigned long my_uid  = (unsigned long)sys0(SYS_getuid);
     unsigned long my_euid = (unsigned long)sys0(SYS_geteuid);
     unsigned long my_gid  = (unsigned long)sys0(SYS_getgid);
@@ -608,8 +711,14 @@ void alr_inproc_reexec_worker(const char* target, char** argv,
         AT_SYSINFO_EHDR, my_sysinfo,
         AT_NULL, 0,
     };
-    const size_t n_aux = sizeof(aux) / sizeof(aux[0]);
+    const size_t n_aux = sizeof(aux) / sizeof(aux[0]);   // includes the AT_NULL pair
     const size_t n_words = 1 + (g_argc + 1) + (n_env + 1) + n_aux;
+    // Place the info block so its FIRST word (argc) is 16-byte aligned — the aarch64
+    // SysV requirement for the initial SP at process entry (glibc _start assumes it;
+    // a misaligned SP SIGBUS/SIGILLs the first SIMD spill in __libc_start_main).
+    // Rounding `start` DOWN with & ~0xf both reserves >= n_words*8 bytes and lands
+    // argc on a 16-byte boundary. n_words may be odd or even — the mask handles both
+    // (it only ever moves `start` further down, never into the strings above `top`).
     uintptr_t start = (top - n_words * 8) & ~(uintptr_t)0xf;
     uint64_t* w = (uint64_t*)start;
     size_t k = 0;
@@ -623,6 +732,14 @@ void alr_inproc_reexec_worker(const char* target, char** argv,
     // Dynamic: jump to ld.so (it drives the program). Static: jump straight to the
     // program's own entry (AT_BASE=0 since interp.base==0 for the static case).
     uintptr_t jump_entry = is_static ? prog.entry : interp.entry;
+    diag_hex("ALR-INPROC: argc=", (unsigned long)g_argc);
+    diag_hex("ALR-INPROC: envc=", (unsigned long)n_env);
+    diag_hex("ALR-INPROC: auxc=", (unsigned long)(n_aux / 2));  // # of AT_* pairs
+    diag_hex("ALR-INPROC: at_phdr=", (unsigned long)prog.phdr);
+    diag_hex("ALR-INPROC: at_entry=", (unsigned long)prog.entry);
+    diag_hex("ALR-INPROC: at_base=", (unsigned long)interp.base);
+    diag("ALR-INPROC: sp_align=");
+    diag((start & 0xf) ? "BAD\n" : "ok\n");   // must be 'ok' (16-byte aligned)
     diag("ALR-INPROC: mapped, jumping entry=");
     diag_hex("", (unsigned long)jump_entry);
     diag_hex("ALR-INPROC sp@", (unsigned long)start);
