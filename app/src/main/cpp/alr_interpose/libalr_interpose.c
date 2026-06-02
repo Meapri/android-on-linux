@@ -532,6 +532,95 @@ static void alr_install_pcgated_filter(void) {
      * abort the guest. */
 }
 
+/* Forward decl: the read-only svc-scan ROI probe (defined far below, in the
+ * M-R5-svcscan section). The constructor invokes it only under the ALR_SVCSCAN
+ * env gate; see alr_emit_svcscan_if_gated. */
+char *alr_svcscan_report(char *buf, size_t buflen);
+
+/* Emit `n` bytes of `s` to fd 2 (stderr) through the trampoline. write() is NOT
+ * one of the 9 traced path syscalls, so it is RET_ALLOW under the PC gate
+ * regardless of where it is called from; routing it through the trampoline just
+ * keeps the interposer's "every syscall via the single trusted PC" idiom and
+ * needs no wrapped libc symbol. errno is preserved by the caller. Short writes
+ * are not retried: this is a one-shot diagnostic, not a correctness path. */
+static void alr_emit_fd2(const char *s, size_t n) {
+    alr_tramp_syscall(__NR_write, 2, (long)s, (long)n, 0, 0, 0);
+}
+
+/*
+ * ALR_SVCSCAN diagnostic gate (OFF by default, zero cost unless set).
+ *
+ * When the loader propagates ALR_SVCSCAN with a non-"0" first char, the
+ * constructor runs the read-only svc-scan ROI probe once and writes its single
+ * "ALR-SVCSCAN ..." line to stderr (the fd the interposer's other diagnostics
+ * would use). Unset or "0" => nothing runs and nothing is written, so there is
+ * no overhead and no output in the normal path.
+ *
+ * The probe itself stays strictly read-only (it only opens/reads/closes
+ * /proc/self/maps and walks r-x words; it never patches or rewrites). errno is
+ * saved/restored across the whole emit so enabling the gate cannot perturb
+ * guest behavior. The buffer is a bounded stack buffer (no heap).
+ */
+static void alr_emit_svcscan_if_gated(void) {
+    const char *s = getenv("ALR_SVCSCAN");
+    if (s == NULL || s[0] == '0' || s[0] == '\0') return;   /* OFF by default */
+
+    int saved_errno = errno;
+    char report[256];
+    alr_svcscan_report(report, sizeof report);
+    size_t n = a_len(report);
+    if (n > 0) {
+        if (n < sizeof report) report[n++] = '\n';          /* one line, newline-terminated */
+        alr_emit_fd2(report, n);
+    }
+    errno = saved_errno;
+}
+
+/*
+ * CHILD-REENTRY CONTRACT (B-3): this .so is safe to be freshly LD_PRELOAD'd
+ * into exec'd children.
+ * --------------------------------------------------------------------------
+ * The supervisor (separate session) injects LD_PRELOAD=<abs rootfs interpose
+ * .so> + ALR_ROOTFS into exec'd children (sh, dpkg-deb, maintainer scripts), so
+ * THIS constructor runs from scratch in each child's fresh process image. The
+ * contract that keeps that safe:
+ *
+ *   (1) NO INHERITED IN-MEMORY STATE. exec() wipes the address space, so every
+ *       file-static here resets to its initializer: g_inited=0, g_rootfs_len=0,
+ *       g_rootfs_fd=-1, g_openat2_ok=0, g_faccessat2_ok=0, g_pcgate=1,
+ *       alr_tramp_lo=alr_tramp_hi=0, and all cached dlsym(RTLD_NEXT) slots NULL.
+ *       The constructor RECOMPUTES all of them from the new image: the
+ *       trampoline bounds from the linker __start_/__stop_ symbols (so they
+ *       track the child's fresh ASLR base — never an inherited address), and the
+ *       config from env (ALR_ROOTFS, ALR_PCGATE, ALR_SVCSCAN). Nothing assumes a
+ *       value survived from the parent.
+ *
+ *   (2) NO STATE READ FROM INHERITED FDS. The interposer reads its rootfs anchor
+ *       by OPENING g_rootfs fresh (alr_open_rootfs_fd) — it never expects an fd
+ *       number passed via env/argv, so a child missing any such fd cannot
+ *       misbehave. The credential getters (getuid/geteuid/...) are memoized from
+ *       a live syscall in THIS process, not inherited.
+ *
+ *   (3) MISSING CONFIG DEGRADES GRACEFULLY, NEVER ABORTS. If ALR_ROOTFS is unset
+ *       or not absolute, alr_init() leaves g_rootfs_len==0 and rw() becomes a
+ *       pure pass-through: the child runs with NO path mediation rather than
+ *       crashing (the supervisor's ptrace net, if present, still backstops). The
+ *       rootfs anchor open and the openat2/faccessat2 probes are all gated on
+ *       g_rootfs_len>0 and tolerate failure (fd stays -1, *_ok stays 0 => string
+ *       fallback). If the PC-gate filter cannot be installed it is simply not
+ *       installed; the guest is never aborted. No code path here calls abort(),
+ *       assert(), or dereferences a possibly-absent env/fd.
+ *
+ *   (4) IDEMPOTENT. alr_init() short-circuits on g_inited; the constructor runs
+ *       once per image. Re-entry means a NEW image (fresh statics), not a second
+ *       call in the same image, so there is no double-init hazard.
+ *
+ * Net: a dpkg child that loads this .so with ALR_ROOTFS present but every other
+ * ALR runtime artifact (shared rings, supervisor fds) absent initializes
+ * cleanly and either mediates paths (rootfs set) or no-ops (rootfs unset) — it
+ * never dies on load.
+ */
+
 /*
  * Constructor. ORDERING IS LOAD-BEARING (see CONTRACT "WHY THE ORDERING IS
  * SOUND"): it runs during ld.so init, AFTER all libraries are mapped via the
@@ -564,6 +653,13 @@ static void alr_ctor(void) {
      * have a valid anchor; in PCGATE=0 they are simply unused. */
     if (g_rootfs_len > 0) alr_open_rootfs_fd();
     alr_probe_faccessat2();
+
+    /* Diagnostic gate (OFF by default): if ALR_SVCSCAN is set non-"0", emit one
+     * read-only svc-scan ROI line to stderr. Runs in BOTH PCGATE modes and
+     * BEFORE the filter is installed, so its read-only syscalls (openat/read/
+     * close/write via the trampoline) are unconditionally allowed. No-op and
+     * zero-cost when the env var is unset. */
+    alr_emit_svcscan_if_gated();
 
     if (!g_pcgate) return;              /* PCGATE=0: install NO filter (loader does) */
 
