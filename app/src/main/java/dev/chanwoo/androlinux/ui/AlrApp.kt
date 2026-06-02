@@ -28,9 +28,12 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.lifecycle.viewmodel.CreationExtras
+import androidx.lifecycle.ViewModelProvider
 import androidx.navigation.NavGraphBuilder
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
@@ -42,6 +45,10 @@ import dev.chanwoo.androlinux.runtime.InstallProgress
 import dev.chanwoo.androlinux.runtime.InstalledApp
 import dev.chanwoo.androlinux.runtime.LaunchRequest
 import dev.chanwoo.androlinux.ui.theme.AlrTheme
+import dev.chanwoo.androlinux.ui.viewmodel.AppDetailViewModel
+import dev.chanwoo.androlinux.ui.viewmodel.CatalogViewModel
+import dev.chanwoo.androlinux.ui.viewmodel.LauncherViewModel
+import dev.chanwoo.androlinux.ui.viewmodel.SettingsViewModel
 import kotlinx.coroutines.flow.Flow
 
 // --------------------------------------------------------------------------- //
@@ -118,9 +125,14 @@ private fun NavGraphBuilder.launcherDestination(
     navController: NavHostController,
     onLaunchApp: (LaunchRequest) -> Unit,
 ) = composable(AlrRoutes.LAUNCHER) {
-    val installed by runtime.installedApps.collectAsState()
+    // MVVM: ViewModel 이 installedApps+sessions 를 가공해 LauncherUiState 로 노출 → 여기서
+    // collectAsState 로 받아 *기존 Route 시그니처* 그대로 넘긴다(화면은 ViewModel 을 모름).
+    val vm: LauncherViewModel = viewModel(factory = alrViewModelFactory { LauncherViewModel(runtime) })
+    val state by vm.uiState.collectAsState()
     LauncherRoute(
-        installedApps = installed,
+        installedApps = state.installedApps,
+        // 실행은 통합 측이 RunningSurface 결선과 함께 수행(onLaunchApp 위임) — ViewModel 의
+        // launch 는 mock/세션 표현용이라 두 경로가 같은 launch 로 수렴한다.
         onLaunch = { app -> onLaunchApp(app.toLaunchRequest()) },
         onOpenCatalog = { navController.navigate(AlrRoutes.CATALOG) },
         onOpenSettings = { navController.navigate(AlrRoutes.SETTINGS) },
@@ -132,11 +144,13 @@ private fun NavGraphBuilder.catalogDestination(
     runtime: AlrRuntime,
     navController: NavHostController,
 ) = composable(AlrRoutes.CATALOG) {
-    val catalog by runtime.catalog().collectAsState(initial = emptyList())
-    val installed by runtime.installedApps.collectAsState()
+    val vm: CatalogViewModel = viewModel(factory = alrViewModelFactory { CatalogViewModel(runtime) })
+    val state by vm.uiState.collectAsState()
+    // 확정 4-인자 시그니처 그대로. isOffline/isLoading 등 UiState 의 부가 신호는 통합 시
+    // CatalogScreen 의 인라인 설치(onInstall=vm::requestInstall)와 함께 활용할 수 있다.
     CatalogRoute(
-        catalog = catalog,
-        installedAppIds = remember(installed) { installed.map { it.appId }.toSet() },
+        catalog = state.catalog,
+        installedAppIds = state.installedAppIds,
         onOpenAppDetail = { appId -> navController.navigate(AlrRoutes.appDetail(appId)) },
         onBack = { navController.popBackStack() },
     )
@@ -148,16 +162,17 @@ private fun NavGraphBuilder.appDetailDestination(
     onLaunchApp: (LaunchRequest) -> Unit,
 ) = composable("${AlrRoutes.APP_DETAIL}/{${AlrRoutes.APP_DETAIL_ARG}}") { backStackEntry ->
     val appId = backStackEntry.arguments?.getString(AlrRoutes.APP_DETAIL_ARG).orEmpty()
-    val catalog by runtime.catalog().collectAsState(initial = emptyList())
-    val installed by runtime.installedApps.collectAsState()
-    val catalogApp = remember(catalog, appId) { catalog.firstOrNull { it.appId == appId } }
-    val installedApp = remember(installed, appId) { installed.firstOrNull { it.appId == appId } }
+    val vm: AppDetailViewModel =
+        viewModel(key = "appDetail:$appId", factory = alrViewModelFactory { AppDetailViewModel(appId, runtime) })
+    val state by vm.uiState.collectAsState()
+    // 지연 Flow 람다는 ViewModel 이 제공(installFlow/uninstallFlow) — 화면이 클릭 시 한 번
+    // 호출해 produceState 로 구독한다. 시그니처는 불변.
     AppDetailRoute(
-        appId = appId,
-        catalogApp = catalogApp,
-        installedApp = installedApp,
-        installProgress = { runtime.install(appId) },
-        uninstallProgress = { runtime.uninstall(appId) },
+        appId = state.appId,
+        catalogApp = state.catalogApp,
+        installedApp = state.installedApp,
+        installProgress = { vm.installFlow() },
+        uninstallProgress = { vm.uninstallFlow() },
         onOpen = { app -> onLaunchApp(app.toLaunchRequest()) },
         onBack = { navController.popBackStack() },
     )
@@ -167,11 +182,30 @@ private fun NavGraphBuilder.settingsDestination(
     runtime: AlrRuntime,
     navController: NavHostController,
 ) = composable(AlrRoutes.SETTINGS) {
-    val installed by runtime.installedApps.collectAsState()
+    val vm: SettingsViewModel = viewModel(factory = alrViewModelFactory { SettingsViewModel(runtime) })
+    val state by vm.uiState.collectAsState()
+    // SettingsRoute(installedApps, onBack) 확정 시그니처 그대로. SAF 등록부/진단은 ViewModel 이
+    // 소유하며, 통합 세션이 SettingsScreenRoute(onPickFolder→vm.onFolderPicked, diagnostics=
+    // state.diagnostics)로 결선할 때 mounts/diagnostics 를 끌어 쓴다.
     SettingsRoute(
-        installedApps = installed,
+        installedApps = state.installedApps,
         onBack = { navController.popBackStack() },
     )
+}
+
+// --------------------------------------------------------------------------- //
+// ViewModel 팩토리 — 생성자 인자(runtime/appId)를 가진 ViewModel 을 viewModel() 로 만들기 위한
+//   최소 Factory. lifecycle-viewmodel-compose 의 viewModel(factory=...) 에 넘긴다.
+// --------------------------------------------------------------------------- //
+
+/** 람다 하나로 ViewModel 을 만드는 Factory(타입 무관). 각 destination 이 자기 VM 생성을 캡처. */
+private inline fun <reified T : ViewModel> alrViewModelFactory(
+    crossinline create: () -> T,
+): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
+    override fun <U : ViewModel> create(modelClass: Class<U>, extras: CreationExtras): U {
+        @Suppress("UNCHECKED_CAST")
+        return create() as U
+    }
 }
 
 // --------------------------------------------------------------------------- //

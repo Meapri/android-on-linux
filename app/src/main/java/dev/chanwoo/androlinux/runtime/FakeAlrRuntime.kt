@@ -29,10 +29,41 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.flow
-import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+
+// --------------------------------------------------------------------------- //
+// 선택 능력(capability) 인터페이스 — 기본 AlrRuntime(§5-F) 계약 *밖* 의 데모/UX 신호.
+//   ViewModel 이 `runtime as? CatalogExtras` / `as? InstallQueueInfo` 로 안전 다운캐스트해
+//   끌어 쓰고, 없으면 graceful 폴백. 이렇게 AlrRuntime 인터페이스는 불변(WS-1 수락)으로 두고
+//   FakeAlrRuntime 만 오프라인/큐 같은 풍부한 상태를 제공한다.
+// --------------------------------------------------------------------------- //
+
+/** 오프라인 모드 토글 — catalog() fetch 실패를 시뮬레이션(카탈로그 ViewModel 의 [재시도] 대상). */
+interface CatalogExtras {
+    /** 현재 오프라인 여부(StateFlow — 화면이 배너를 즉시 반영). */
+    val offline: StateFlow<Boolean>
+
+    /** 오프라인 토글. true 면 catalog() 가 빈 목록 대신 예외를 흘려 ViewModel 이 offline 로 폴백. */
+    fun setOffline(value: Boolean)
+}
+
+/** 설치 큐 가시성 — 동시 1 + 대기열(ViewModel 자체 큐와 별개로 런타임 측 큐 상태를 노출). */
+interface InstallQueueInfo {
+    /** 현재 설치 중인 appId(없으면 null). */
+    val activeInstall: StateFlow<String?>
+
+    /** 설치 대기열(FIFO, 앞이 다음 차례). */
+    val installQueue: StateFlow<List<String>>
+}
+
+/** 테스트/데모용 CRASHED 주입 — 실행 중 세션을 비정상 종료로 전이(런처/상세의 "앱 종료됨" 훅). */
+interface CrashSimulator {
+    /** appId 의 현재 세션을 CRASHED 로 전이(있을 때만). INV-1~3 유지(RENDERING 자리 비움). */
+    fun simulateCrash(appId: String)
+}
 
 /**
  * AlrRuntime 의 인-메모리 mock.
@@ -40,11 +71,13 @@ import kotlinx.coroutines.sync.withLock
  * @param scope 상태 전이 코루틴이 도는 스코프(기본: SupervisorJob 독립 스코프).
  *   Compose Preview/테스트는 자기 TestScope 를 주입할 수 있다.
  * @param stepMillis 가짜 상태/진행 전이 간격(테스트는 0 으로 즉시 진행).
+ * @param failingInstalls 설치가 *처음* 실패하도록 시드할 appId 집합(재시도 시뮬). 재시도하면 성공.
  */
 class FakeAlrRuntime(
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob()),
     private val stepMillis: Long = 350,
-) : AlrRuntime {
+    failingInstalls: Set<String> = emptySet(),
+) : AlrRuntime, CatalogExtras, InstallQueueInfo, CrashSimulator {
 
     private val _installedApps = MutableStateFlow(seedInstalledApps())
     override val installedApps: StateFlow<List<InstalledApp>> = _installedApps.asStateFlow()
@@ -59,7 +92,31 @@ class FakeAlrRuntime(
     /** 모든 세션 상태 전이를 직렬화 — INV-2(원자적 양도)의 임계구역. */
     private val sessionLock = Mutex()
 
-    override fun catalog(): Flow<List<CatalogApp>> = flowOf(_catalog)
+    // --- CatalogExtras: 오프라인 ---------------------------------------------- //
+    private val _offline = MutableStateFlow(false)
+    override val offline: StateFlow<Boolean> = _offline.asStateFlow()
+    override fun setOffline(value: Boolean) { _offline.value = value }
+
+    // --- InstallQueueInfo: 동시 1 + 대기열 ----------------------------------- //
+    private val _activeInstall = MutableStateFlow<String?>(null)
+    override val activeInstall: StateFlow<String?> = _activeInstall.asStateFlow()
+    private val _installQueue = MutableStateFlow<List<String>>(emptyList())
+    override val installQueue: StateFlow<List<String>> = _installQueue.asStateFlow()
+
+    /** 설치 큐 직렬화 — install() 진입/완료 시 active/queue 를 원자적으로 갱신. */
+    private val installLock = Mutex()
+
+    /** 재시도 시뮬: 여기 있는 appId 는 첫 install 에서 실패하고, 두 번째(재시도)에 성공한다. */
+    private val pendingFailures = failingInstalls.toMutableSet()
+
+    /**
+     * catalog() — 오프라인이면 예외를 흘려(ViewModel 이 catch → offline 폴백) 데모. 온라인이면
+     * 시드 카탈로그. offline StateFlow 를 map 으로 흘려 토글이 즉시 재방출되게 한다.
+     */
+    override fun catalog(): Flow<List<CatalogApp>> = _offline.map { isOffline ->
+        if (isOffline) throw java.io.IOException("카탈로그 인덱스를 가져오지 못했습니다 (오프라인)")
+        _catalog
+    }
 
     // ----------------------------------------------------------------------- //
     // launch — INV-1~3 강제
@@ -80,6 +137,17 @@ class FakeAlrRuntime(
         return session
     }
 
+    /**
+     * 설치 트랜잭션 — *동시 1 + 대기열* 정책(InstallQueueInfo). install Flow 를 collect 하기
+     * 시작할 때 큐에 들어가고, 앞선 설치가 끝나 active 슬롯이 비면 진행한다. 즉:
+     *   - 슬롯이 비어 있으면 즉시 active 가 되어 단계별 진행률을 흘린다.
+     *   - 차 있으면 _installQueue 에 들어가 대기(ViewModel 은 Queued(position) 로 표시), 앞이
+     *     비면 자동 승격(여기 acquireSlot 의 polling 으로).
+     * 재시도 시뮬: pendingFailures 에 있으면 첫 시도는 Failed 로 끝나고(슬롯 반납) 그 appId 를
+     *   집합에서 지운다 → 같은 Flow 를 다시 collect(재시도)하면 성공한다.
+     *
+     * INV 와 무관(설치는 세션 불변식 임계구역과 별개) — 단 active/queue StateFlow 로 UI 가시.
+     */
     override fun install(appId: String): Flow<InstallProgress> = flow {
         val catalogApp = _catalog.firstOrNull { it.appId == appId }
         if (catalogApp == null) {
@@ -91,20 +159,72 @@ class FakeAlrRuntime(
             emit(InstallProgress.Done(appId))
             return@flow
         }
-        // 단계별 진행률(단조 증가): RESOLVING→DOWNLOADING→EXTRACTING→REGISTERING.
-        val stages = listOf(
-            InstallStage.RESOLVING to 15,
-            InstallStage.DOWNLOADING to 60,
-            InstallStage.EXTRACTING to 90,
-            InstallStage.REGISTERING to 99,
-        )
-        for ((stage, pct) in stages) {
-            emit(InstallProgress.Running(appId, pct, stage))
-            delay(stepMillis)
+        // 동시 1 슬롯 확보(대기열 경유). 확보 전까지는 emit 없이 대기.
+        acquireInstallSlot(appId)
+        try {
+            // 재시도 시뮬: 첫 시도 실패(슬롯 반납), 집합에서 제거 → 재시도 성공.
+            if (pendingFailures.remove(appId)) {
+                emit(InstallProgress.Running(appId, 15, InstallStage.RESOLVING))
+                delay(stepMillis)
+                emit(InstallProgress.Failed(appId, "오버레이 적용 실패 (재시도하세요)"))
+                return@flow
+            }
+            // 단계별 진행률(단조 증가): RESOLVING→DOWNLOADING→EXTRACTING→REGISTERING.
+            val stages = listOf(
+                InstallStage.RESOLVING to 15,
+                InstallStage.DOWNLOADING to 60,
+                InstallStage.EXTRACTING to 90,
+                InstallStage.REGISTERING to 99,
+            )
+            for ((stage, pct) in stages) {
+                emit(InstallProgress.Running(appId, pct, stage))
+                delay(stepMillis)
+            }
+            // 설치 완료 → installedApps 에 등록(카탈로그 메타에서 InstalledApp 합성).
+            _installedApps.value = _installedApps.value + catalogApp.toInstalledApp()
+            emit(InstallProgress.Done(appId))
+        } finally {
+            // 성공/실패/취소 어느 경로든 슬롯 반납 + 다음 대기 항목 승격.
+            releaseInstallSlot(appId)
         }
-        // 설치 완료 → installedApps 에 등록(카탈로그 메타에서 InstalledApp 합성).
-        _installedApps.value = _installedApps.value + catalogApp.toInstalledApp()
-        emit(InstallProgress.Done(appId))
+    }
+
+    // --- 설치 큐 헬퍼(동시 1 + 대기열) --------------------------------------- //
+
+    /**
+     * active 슬롯을 잡을 때까지 대기. 비어 있으면 즉시 active 로 등록, 차 있으면 대기열에 넣고
+     * 폴링으로 자기 차례(대기열 맨 앞 + active 비었음)를 기다린다. 폴링 간격은 stepMillis 의 일부.
+     */
+    private suspend fun acquireInstallSlot(appId: String) {
+        installLock.withLock {
+            if (_activeInstall.value == null && _installQueue.value.isEmpty()) {
+                _activeInstall.value = appId
+                return
+            }
+            if (appId !in _installQueue.value) {
+                _installQueue.value = _installQueue.value + appId
+            }
+        }
+        // 내 차례가 올 때까지 대기(대기열 맨 앞 + 슬롯 빔).
+        while (true) {
+            installLock.withLock {
+                if (_activeInstall.value == null && _installQueue.value.firstOrNull() == appId) {
+                    _installQueue.value = _installQueue.value.drop(1)
+                    _activeInstall.value = appId
+                    return
+                }
+            }
+            delay(if (stepMillis > 0) stepMillis / 4 + 1 else 1)
+        }
+    }
+
+    /** active 슬롯 반납 — 내가 active 였으면 비운다(다음 대기 항목이 acquire 폴링에서 승격). */
+    private suspend fun releaseInstallSlot(appId: String) {
+        installLock.withLock {
+            if (_activeInstall.value == appId) {
+                _activeInstall.value = null
+            }
+        }
     }
 
     override fun uninstall(appId: String): Flow<InstallProgress> = flow {
@@ -166,6 +286,41 @@ class FakeAlrRuntime(
             sessionLock.withLock {
                 session.setState(SessionState.STOPPED)
                 removeSession(session)
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------------- //
+    // CrashSimulator — CRASHED 주입(데모/테스트). INV-1~3 유지.
+    // ----------------------------------------------------------------------- //
+
+    /**
+     * appId 의 현재 세션을 CRASHED 로 전이. RENDERING 이던 세션이 크래시하면 RENDERING 은 0 이
+     * 되어(여전히 ≤ 1, INV-1 유지) 포그라운드가 빈다 — 통합/런타임은 여기서 다음 후보를 올릴 수
+     * 있으나 v1 mock 은 자동 승격하지 않는다(사용자가 최근앱에서 다시 띄움). CRASHED 세션은
+     * *목록에 남겨* 런처/상세가 "앱 종료됨 · 재시작" 을 보이게 한다(STOPPED 처럼 제거하지 않음).
+     */
+    override fun simulateCrash(appId: String) {
+        scope.launch {
+            sessionLock.withLock {
+                _sessions.value
+                    .filter {
+                        it.appId == appId &&
+                            it.state.value != SessionState.STOPPED &&
+                            it.state.value != SessionState.CRASHED
+                    }
+                    .forEach { it.setState(SessionState.CRASHED) }
+            }
+        }
+    }
+
+    /** CRASHED 세션 정리(사용자가 "앱 종료됨" 을 닫음) — 목록에서 제거해 훅을 끈다. */
+    fun dismissCrashed(appId: String) {
+        scope.launch {
+            sessionLock.withLock {
+                _sessions.value
+                    .filter { it.appId == appId && it.state.value == SessionState.CRASHED }
+                    .forEach { removeSession(it) }
             }
         }
     }
