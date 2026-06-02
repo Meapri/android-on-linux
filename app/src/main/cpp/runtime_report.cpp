@@ -1973,6 +1973,22 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     // (added or prepended). Both are 0 for any guest that never execs.
     int envp_injected = 0;
     int ld_preload_set = 0;
+    // ADR-003-v2 (R8-A Option S): execve re-map via the static re-entry stub. The
+    // device finding (v139 drain#17) is that B-1 path-rewrite + B-3 envp fire but
+    // exec_events stays 0 — the kernel can't execve a glibc-aarch64 ELF (its
+    // PT_INTERP = guest ld.so is unresolvable), so the new image never enters. The
+    // fix: splice the exec to run <rootfs>/usr/lib/androlinux/alr-reentry (a STATIC
+    // aarch64 ELF the kernel CAN load) with argv=[stub, target_host, orig argv1..];
+    // the stub then maps the glibc target in-process (inheriting seccomp+SEIZE+envp)
+    // and jumps to ld.so. Gated by ALR_EXEC_REENTRY (default ON) so it is A/B-able;
+    // it only ever touches the execve path, which is ALREADY broken on device, so it
+    // cannot regress the proven single-guest/GUI/GPU paths (none of which execve).
+    const bool exec_reentry_on = []{
+        const char* e = ::getenv("ALR_EXEC_REENTRY");
+        return !(e != nullptr && e[0] == '0');
+    }();
+    int exec_reentry_spliced = 0;   // execs spliced to run via the re-entry stub
+    std::string first_reentry_target;  // first target the stub was asked to re-map
     std::string first_exec_x0;       // first exec target the guest requested
     std::string first_exec_reason;   // its mediation reason (rewrite/sysdir/…)
     std::string first_exec_envp_reason;  // first exec's envp-injection reason (B-3)
@@ -2256,7 +2272,150 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                                     first_exec_x0 = gp;
                                     first_exec_reason = med.reason;
                                 }
-                                if (med.should_rewrite) {
+                                // === ADR-003-v2 (Option S): re-entry-stub splice ===
+                                // Prefer running the static re-entry stub (which the
+                                // kernel CAN execve, then re-maps the glibc target
+                                // in-process) over the plain B-1 x0 rewrite (which the
+                                // kernel can't complete for a glibc ELF -> exec_events=0).
+                                // We splice argv=[stub, target_host, orig argv1..] and
+                                // point x0/argv at it. Idempotent: never re-splice the
+                                // stub itself. Touches only x0/argv (and argv strings in
+                                // the sp-2048 scratch); x2/x3 envp is left for the B-3
+                                // block below; the B-3 envp window lives BELOW sp-2048.
+                                const std::string stub_host =
+                                    config.rootfs_dir +
+                                    "/usr/lib/androlinux/alr-reentry";
+                                const char* gp_base = std::strrchr(gp, '/');
+                                const bool already_stub =
+                                    (std::string(gp) == stub_host) ||
+                                    (gp_base != nullptr &&
+                                     std::strcmp(gp_base, "/alr-reentry") == 0);
+                                bool spliced = false;
+                                if (exec_reentry_on && !already_stub) {
+                                    const std::string target_host =
+                                        med.should_rewrite ? med.host_path
+                                                           : std::string(gp);
+                                    const uintptr_t argv_addr =
+                                        is_at ? static_cast<uintptr_t>(regs[2])
+                                              : static_cast<uintptr_t>(regs[1]);
+                                    // Read the guest's original argv pointer array
+                                    // (bounded, NULL-terminated). New argv =
+                                    // [stub, target, orig argv[1..]]; the guest's own
+                                    // argv[0] is dropped (the re-mapped guest sees
+                                    // argv[0]=target — argv[0] multicall is a follow-up).
+                                    constexpr std::size_t kArgvMax = 512;
+                                    std::vector<uintptr_t> orig_argv;
+                                    bool argv_ok = (argv_addr != 0);
+                                    if (argv_ok) {
+                                        orig_argv.reserve(8);
+                                        for (std::size_t i = 0; i < kArgvMax; ++i) {
+                                            uintptr_t p = 0;
+                                            ssize_t r = ::pread(
+                                                mfd, &p, sizeof(p),
+                                                static_cast<off_t>(
+                                                    argv_addr +
+                                                    i * sizeof(uintptr_t)));
+                                            if (r != static_cast<ssize_t>(sizeof(p))) {
+                                                argv_ok = false;
+                                                break;
+                                            }
+                                            orig_argv.push_back(p);
+                                            if (p == 0) break;  // NULL terminator
+                                        }
+                                    }
+                                    if (argv_ok && !orig_argv.empty()) {
+                                        const uintptr_t sp =
+                                            static_cast<uintptr_t>(regs[31]);
+                                        // Strings grow UP from sp-2048 toward sp, staying
+                                        // below it; the new argv array follows. Same scratch
+                                        // B-1 used (mutually exclusive with it).
+                                        uintptr_t cur =
+                                            (sp - 2048) &
+                                            ~static_cast<uintptr_t>(0xf);
+                                        const uintptr_t win_end = sp - 64;
+                                        uintptr_t stub_str = 0, target_str = 0;
+                                        bool blob_ok = true;
+                                        auto put = [&](const std::string& s,
+                                                       uintptr_t& out) {
+                                            const std::size_t n = s.size() + 1;
+                                            if (cur + n > win_end) {
+                                                blob_ok = false;
+                                                return;
+                                            }
+                                            if (::pwrite(mfd, s.c_str(), n,
+                                                         static_cast<off_t>(cur)) !=
+                                                static_cast<ssize_t>(n)) {
+                                                blob_ok = false;
+                                                return;
+                                            }
+                                            out = cur;
+                                            cur = (cur + n + 7) &
+                                                  ~static_cast<uintptr_t>(7);
+                                        };
+                                        put(stub_host, stub_str);
+                                        if (blob_ok) put(target_host, target_str);
+                                        std::vector<uintptr_t> new_argv;
+                                        new_argv.push_back(stub_str);
+                                        new_argv.push_back(target_str);
+                                        for (std::size_t i = 1; i < orig_argv.size();
+                                             ++i) {
+                                            new_argv.push_back(orig_argv[i]);
+                                        }
+                                        if (new_argv.empty() || new_argv.back() != 0) {
+                                            new_argv.push_back(0);
+                                        }
+                                        const uintptr_t arr_base =
+                                            (cur + 7) & ~static_cast<uintptr_t>(7);
+                                        const std::size_t arr_bytes =
+                                            new_argv.size() * sizeof(uintptr_t);
+                                        if (blob_ok &&
+                                            arr_base + arr_bytes <= win_end) {
+                                            bool arr_ok = true;
+                                            for (std::size_t i = 0;
+                                                 i < new_argv.size(); ++i) {
+                                                const uintptr_t v = new_argv[i];
+                                                if (::pwrite(
+                                                        mfd, &v, sizeof(v),
+                                                        static_cast<off_t>(
+                                                            arr_base +
+                                                            i * sizeof(v))) !=
+                                                    static_cast<ssize_t>(
+                                                        sizeof(v))) {
+                                                    arr_ok = false;
+                                                    break;
+                                                }
+                                            }
+                                            if (arr_ok) {
+                                                // x0=stub (execve) or x1=stub
+                                                // (execveat; abs path -> dirfd x0
+                                                // ignored); argv reg -> new array.
+                                                if (is_at) {
+                                                    regs[1] = stub_str;
+                                                    regs[2] = arr_base;
+                                                } else {
+                                                    regs[0] = stub_str;
+                                                    regs[1] = arr_base;
+                                                }
+                                                if (::ptrace(
+                                                        PTRACE_SETREGSET, w,
+                                                        reinterpret_cast<void*>(
+                                                            NT_PRSTATUS),
+                                                        &io) == 0) {
+                                                    spliced = true;
+                                                    ++exec_reentry_spliced;
+                                                    ++exec_rewrites;
+                                                    if (first_reentry_target.empty()) {
+                                                        first_reentry_target =
+                                                            target_host;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                // B-1 fallback (reentry off, or splice could not be
+                                // built): plain x0 program-path rewrite into the rootfs.
+                                if (!spliced && med.should_rewrite) {
                                     const uintptr_t sp =
                                         static_cast<uintptr_t>(regs[31]);
                                     const uintptr_t scratch =
@@ -2759,6 +2918,16 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     // exec also gets envp) and ld_preload_set>0 on the dpkg→sh→dpkg-deb chain.
     out << "\nalr exec envp_injected=" << envp_injected
         << " ld_preload_set=" << ld_preload_set;
+    // ADR-003-v2 (Option S) re-entry-stub splice telemetry. reentry=on/off is the
+    // ALR_EXEC_REENTRY gate; spliced>0 means at least one exec was rewritten to run
+    // via the static stub. The KEY gate for this milestone is exec_events>0 WITH
+    // spliced>0 (the static-stub execve completed where the glibc execve could not).
+    out << "\nalr exec reentry=" << (exec_reentry_on ? "on" : "off")
+        << " spliced=" << exec_reentry_spliced;
+    if (!first_reentry_target.empty()) {
+        out << "\nalr exec reentry stub=" << config.rootfs_dir
+            << "/usr/lib/androlinux/alr-reentry target=" << first_reentry_target;
+    }
     if (!first_exec_x0.empty()) {
         out << "\nalr exec x0=" << first_exec_x0
             << " reason=" << first_exec_reason
