@@ -1966,8 +1966,16 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     int exec_traps = 0;       // execve/execveat EVENT_SECCOMP traps seen
     int exec_rewrites = 0;    // x0 program-path rewrites into the rootfs (B-1)
     int exec_events = 0;      // PTRACE_EVENT_EXEC stops (new image entered) (B-2)
+    // ADR-003 §3 (B-3) child envp re-injection counters. envp_injected counts execs
+    // whose envp we rebuilt (x2/x3 pointed at an augmented array) so the new image
+    // re-enters ALR's interpose mediation (LD_PRELOAD=<abs rootfs .so>+ALR_ROOTFS).
+    // ld_preload_set counts the subset where the rebuilt envp carries our LD_PRELOAD
+    // (added or prepended). Both are 0 for any guest that never execs.
+    int envp_injected = 0;
+    int ld_preload_set = 0;
     std::string first_exec_x0;       // first exec target the guest requested
     std::string first_exec_reason;   // its mediation reason (rewrite/sysdir/…)
+    std::string first_exec_envp_reason;  // first exec's envp-injection reason (B-3)
     // M-R2 (ADR-002): storm decomposition — per-syscall-nr histograms at the two
     // EXISTING trap sites (no new ptrace op, no hot-loop pollution). trace_hist =
     // RET_TRACE/EVENT_SECCOMP (path-family + execve), emul_hist = SIGSYS-emulated
@@ -2284,6 +2292,191 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                                         }
                                     }
                                 }
+                                // === ADR-003 §3 (B-3): child envp re-injection ===
+                                // The exec'd child inherits the guest's envp ARRAY
+                                // verbatim (execve(path,argv,envp): x2; execveat(dirfd,
+                                // path,argv,envp,flags): x3). If that envp lacks
+                                // LD_PRELOAD=<abs rootfs interpose .so> and ALR_ROOTFS,
+                                // the new image's in-process path interposer never loads
+                                // and dpkg→sh→dpkg-deb hit the bare Android fs (unpack
+                                // fails). So we read the child's envp char** out of
+                                // tracee memory, ask the PURE classifier what must be
+                                // added/replaced, and — if anything — rebuild an
+                                // augmented envp (string blob + new pointer array) in a
+                                // scratch window BELOW the program-path scratch, then
+                                // point x2/x3 at it. This runs on EVERY exec trap (not
+                                // just the first), so it persists across the whole
+                                // dpkg→maintainer-script→sh→dpkg-deb chain; a child whose
+                                // parent we already injected inherits a satisfied envp
+                                // and the classifier returns a no-op (idempotent). Only
+                                // the envp register is touched — path/argv are unchanged.
+                                {
+                                    const uintptr_t envp_addr =
+                                        is_at ? static_cast<uintptr_t>(regs[3])
+                                              : static_cast<uintptr_t>(regs[2]);
+                                    // Read the guest envp pointer array: a NULL-terminated
+                                    // char*[] at envp_addr. Bounded to kEnvMax entries so a
+                                    // corrupt/huge array cannot run us away; a real dpkg/sh
+                                    // envp is ~40-80 entries.
+                                    constexpr std::size_t kEnvMax = 512;
+                                    std::vector<std::string> env_entries;
+                                    bool envp_read_ok = (envp_addr != 0);
+                                    if (envp_read_ok) {
+                                        env_entries.reserve(64);
+                                        for (std::size_t i = 0; i < kEnvMax; ++i) {
+                                            uintptr_t p = 0;
+                                            ssize_t r = ::pread(
+                                                mfd, &p, sizeof(p),
+                                                static_cast<off_t>(envp_addr +
+                                                                   i * sizeof(uintptr_t)));
+                                            if (r != static_cast<ssize_t>(sizeof(p))) {
+                                                envp_read_ok = false;
+                                                break;
+                                            }
+                                            if (p == 0) {
+                                                break;  // NULL terminator: array end
+                                            }
+                                            char es[1024] = {0};
+                                            ssize_t er = ::pread(mfd, es, sizeof(es) - 1,
+                                                                 static_cast<off_t>(p));
+                                            if (er <= 0) {
+                                                envp_read_ok = false;
+                                                break;
+                                            }
+                                            es[er] = '\0';
+                                            env_entries.emplace_back(es);
+                                        }
+                                    }
+                                    if (envp_read_ok) {
+                                        const auto inj =
+                                            alr::runtime::decide_exec_envp_injection(
+                                                config.rootfs_dir, env_entries);
+                                        if (first_exec_envp_reason.empty()) {
+                                            first_exec_envp_reason = inj.reason;
+                                        }
+                                        if (inj.should_inject) {
+                                            // Build the rebuilt envp in a scratch window
+                                            // BELOW the program-path scratch (sp-2048):
+                                            // strings grow up from str_base, then the new
+                                            // pointer array follows. The whole window is
+                                            // [sp-kEnvScratch, sp-2048); ample for a dpkg
+                                            // envp. The program path (if rewritten) lives
+                                            // at sp-2048 and is NOT overwritten.
+                                            const uintptr_t sp =
+                                                static_cast<uintptr_t>(regs[31]);
+                                            constexpr uintptr_t kEnvScratch = 128 * 1024;
+                                            constexpr uintptr_t kPathScratchTop = 2048;
+                                            const uintptr_t str_base =
+                                                (sp - kEnvScratch) &
+                                                ~static_cast<uintptr_t>(0xf);
+                                            const uintptr_t window_end = sp - kPathScratchTop;
+
+                                            // The rebuilt entries: every guest entry
+                                            // (skipping a replaced LD_PRELOAD) followed by
+                                            // the classifier's add_entries. We write each
+                                            // string into the blob, recording its tracee
+                                            // address for the new pointer array.
+                                            std::vector<uintptr_t> new_ptrs;
+                                            new_ptrs.reserve(env_entries.size() +
+                                                             inj.add_entries.size() + 1);
+                                            uintptr_t cur = str_base;
+                                            bool blob_ok = true;
+                                            auto write_str = [&](const std::string& s)
+                                                -> bool {
+                                                const std::size_t n = s.size() + 1;
+                                                if (cur + n > window_end) {
+                                                    return false;  // window exhausted
+                                                }
+                                                ssize_t w2 = ::pwrite(
+                                                    mfd, s.c_str(), n,
+                                                    static_cast<off_t>(cur));
+                                                if (w2 != static_cast<ssize_t>(n)) {
+                                                    return false;
+                                                }
+                                                new_ptrs.push_back(cur);
+                                                cur += n;
+                                                // 8-byte align the next string so the
+                                                // trailing pointer array is naturally
+                                                // aligned regardless of string lengths.
+                                                cur = (cur + 7) &
+                                                      ~static_cast<uintptr_t>(7);
+                                                return true;
+                                            };
+                                            // Copy guest entries, dropping the old
+                                            // LD_PRELOAD only when we are replacing it
+                                            // (prepend case). Otherwise keep all verbatim.
+                                            for (const auto& e : env_entries) {
+                                                if (inj.replace_ld_preload &&
+                                                    e.rfind("LD_PRELOAD=", 0) == 0) {
+                                                    continue;  // dropped; re-added below
+                                                }
+                                                if (!write_str(e)) {
+                                                    blob_ok = false;
+                                                    break;
+                                                }
+                                            }
+                                            if (blob_ok) {
+                                                for (const auto& e : inj.add_entries) {
+                                                    if (!write_str(e)) {
+                                                        blob_ok = false;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            // Place the new char*[] array (pointers +
+                                            // NULL) after the string blob, 8-byte aligned.
+                                            const uintptr_t arr_base =
+                                                (cur + 7) & ~static_cast<uintptr_t>(7);
+                                            const std::size_t arr_bytes =
+                                                (new_ptrs.size() + 1) * sizeof(uintptr_t);
+                                            if (blob_ok &&
+                                                arr_base + arr_bytes <= window_end) {
+                                                bool arr_ok = true;
+                                                for (std::size_t i = 0;
+                                                     i < new_ptrs.size(); ++i) {
+                                                    const uintptr_t v = new_ptrs[i];
+                                                    if (::pwrite(mfd, &v, sizeof(v),
+                                                                 static_cast<off_t>(
+                                                                     arr_base +
+                                                                     i * sizeof(v))) !=
+                                                        static_cast<ssize_t>(sizeof(v))) {
+                                                        arr_ok = false;
+                                                        break;
+                                                    }
+                                                }
+                                                const uintptr_t nul = 0;
+                                                if (arr_ok &&
+                                                    ::pwrite(
+                                                        mfd, &nul, sizeof(nul),
+                                                        static_cast<off_t>(
+                                                            arr_base +
+                                                            new_ptrs.size() *
+                                                                sizeof(nul))) ==
+                                                        static_cast<ssize_t>(
+                                                            sizeof(nul))) {
+                                                    // Point the envp register at the new
+                                                    // array; argv/path are untouched.
+                                                    if (is_at) {
+                                                        regs[3] = arr_base;
+                                                    } else {
+                                                        regs[2] = arr_base;
+                                                    }
+                                                    if (::ptrace(
+                                                            PTRACE_SETREGSET, w,
+                                                            reinterpret_cast<void*>(
+                                                                NT_PRSTATUS),
+                                                            &io) == 0) {
+                                                        ++envp_injected;
+                                                        if (!inj.ld_preload_value
+                                                                 .empty()) {
+                                                            ++ld_preload_set;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -2558,9 +2751,18 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         << " rewrites=" << exec_rewrites
         << " exec_events=" << exec_events
         << " clone_events=" << guest_threads;
+    // ADR-003 §3 (B-3) child envp re-injection telemetry. envp_injected>0 proves
+    // the supervisor rebuilt at least one exec'd child's envp so the new image
+    // re-enters ALR interpose mediation; ld_preload_set is the subset carrying our
+    // LD_PRELOAD. Both 0 for a no-exec guest (strict superset add). A device drain
+    // of `apt install` should show envp_injected==exec_rewrites (each rewritten
+    // exec also gets envp) and ld_preload_set>0 on the dpkg→sh→dpkg-deb chain.
+    out << "\nalr exec envp_injected=" << envp_injected
+        << " ld_preload_set=" << ld_preload_set;
     if (!first_exec_x0.empty()) {
         out << "\nalr exec x0=" << first_exec_x0
-            << " reason=" << first_exec_reason;
+            << " reason=" << first_exec_reason
+            << " envp_reason=" << first_exec_envp_reason;
     }
     out << "\nalr native loader seccomp-emulated syscalls=" << emulated_syscalls;
     if (emulated_syscalls > 0) {
