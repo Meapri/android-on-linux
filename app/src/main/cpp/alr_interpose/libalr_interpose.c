@@ -1183,6 +1183,38 @@ int bind(int fd, const struct sockaddr *addr, socklen_t len) {
     return r;
 }
 
+/* setsockopt(): CAP_NET_ADMIN routing-policy hints denied to untrusted_app.
+ * chromium's Linux net stack tags every outbound socket on the connect path with
+ * SO_MARK (traffic accounting / network isolation) and may set SO_BINDTODEVICE /
+ * SO_PRIORITY; all three need CAP_NET_ADMIN, which an Android app lacks → EPERM →
+ * chromium PCHECKs the socket-setup result and IMMEDIATE_CRASH()es (device: an
+ * IP-literal https fetch brk/CHECK-crashed in ~6s, SIGTRAP/TRAP_BRKPT). These are
+ * routing-POLICY hints, not the data path — the packet still flows over the default
+ * route, just untagged. So if the real call is denied with EPERM/EACCES for one of
+ * those options, report success. NOT a SELinux bypass: every syscall is still
+ * kernel-enforced; we only stop a kernel-denied POLICY hint from being misread as a
+ * fatal invariant violation. Every other setsockopt is unchanged. */
+#ifndef SO_MARK
+#define SO_MARK 36
+#endif
+#ifndef SO_BINDTODEVICE
+#define SO_BINDTODEVICE 25
+#endif
+#ifndef SO_PRIORITY
+#define SO_PRIORITY 12
+#endif
+int setsockopt(int fd, int level, int optname, const void *optval, socklen_t optlen) {
+    static int (*real)(int, int, int, const void *, socklen_t);
+    ALR_REAL(real, int (*)(int, int, int, const void *, socklen_t), "setsockopt");
+    int r = real(fd, level, optname, optval, optlen);
+    if (r != 0 && (errno == EPERM || errno == EACCES) && level == SOL_SOCKET &&
+        (optname == SO_MARK || optname == SO_BINDTODEVICE || optname == SO_PRIORITY)) {
+        errno = 0;
+        return 0;
+    }
+    return r;
+}
+
 /* =================================================================== */
 /* directory enumeration                                               */
 /* =================================================================== */

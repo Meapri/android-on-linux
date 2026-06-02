@@ -140,14 +140,21 @@ class MainActivity : Activity() {
                             "\n--user-data-dir=/tmp/cr2-profile\n--no-first-run" +
                             "\n--no-default-browser-check\n--disable-crash-reporter" +
                             "\n--enable-logging=stderr\n--v=1\n--dump-dom" +
-                            "\nhttps://example.com/",
+                            // IP-literal (no DNS) isolates connect+TLS from the DNS layer.
+                            "\nhttps://1.1.1.1/",
                     )
-                    val cr2Fetched = crCr2.contains("Example Domain") ||
-                        crCr2.contains("<title>Example")
+                    val cr2Fetched = crCr2.contains("one.one.one.one") ||
+                        crCr2.contains("Cloudflare") || crCr2.contains("1.1.1.1<")
+                    // Dump the FULL probe report (incl. chromium's complete stderr) to a file
+                    // so the connect/TLS brk CHECK — which lands in the MIDDLE of the output
+                    // that logcat truncates (head/tail only) — is recoverable via run-as.
+                    try {
+                        java.io.File(filesDir, "cr2-report.txt").writeText(crCr2)
+                    } catch (_: Throwable) {}
                     android.util.Log.i(
                         "alr_loader",
                         "chromium-CR2 (network https fetch+render): " +
-                            "${if (cr2Fetched) "PASS fetched-real-page" else "FAIL/incomplete"}\n$crCr2",
+                            "${if (cr2Fetched) "PASS fetched-real-page" else "FAIL/incomplete"} (full report -> filesDir/cr2-report.txt)",
                     )
                 }
             } catch (e: Throwable) {
@@ -807,7 +814,7 @@ class MainActivity : Activity() {
             alrSeccompPathTrapProbe.lineStartingWith("alr sc PATH_MEDIATION_VIABLE=")
                 .substringAfter("PATH_MEDIATION_VIABLE=", "") == "yes"
 
-        val executionSummary = "build: 0.4.160-sd-v160" +
+        val executionSummary = "build: 0.4.161-sd-v161" +
             "\nexecution summary" +
             "\nROOTFS EXECUTION: ${if (rootfsExecutionPassed) "PASS" else "FAIL"}" +
             "\nSHELL SCRIPT EXECUTION: ${if (shellScriptExecutionPassed) "PASS" else "FAIL"}" +
