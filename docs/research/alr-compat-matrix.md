@@ -103,6 +103,37 @@ host 백본(decode/ring/AHB-FBO/zero-copy present)은 Mali-G615 MC2에 픽셀 �
 | guest-GUI XKB 키맵 | 수정됨 (SIGSEGV fix, v127) | v127-xkb-config-root-gui-keymap-segv-fixed | `XKB_CONFIG_ROOT`를 rootfs-absolute 경로로 설정 → sig=11 카운트 0 |
 | `zwp_linux_dmabuf` zero-copy present (AHB→external-OES) | **DEVICE-VERIFIED** (`ALR AHB ZEROCOPY IMPORT: PASS`; gtk3demo rendered=true frames 12→13, ws-3 WaylandPresenter, 단일 게이트 후 회귀 0) | 2026-06-01-drain5-cp4-dmabuf-present-single-gate, v114-ahb-zerocopy-present-live | CP-4 / ws-3 M2. AHB→EGLImage→external-OES import는 device 검증됨. 남은 정직한 nuance: guest-side dmabuf 프로토콜 광고(zwp_linux_dmabuf 게스트 advertise)는 WS-3 M2 잔여 디테일 |
 
+## apt 설치 후보 앱 (closure host-예측)
+> **이 섹션은 host closure 예측이지 device 설치 성공이 아니다.** `tools/breadth_catalog.py`(기존 `tools/deb_closure.py` 재사용)가
+> noble ports 인덱스(`main`+`universe`, arm64) 위에서 각 후보 앱의 런타임 의존성 closure 를 BFS 로 해소하고,
+> **0-unsat**(모든 Depends 엣지가 인덱스 내 실패키지로 떨어짐) 여부 + 다운로드/스테이지 크기를 산출한다.
+> 0-unsat 은 `apt install` 의 **필요조건**일 뿐 충분조건이 아니다 — 종단 `unpacked=true`/launch 는 여전히
+> **G1 exec-re-entry** 잠금해제에 매여 있다(위 "in-app apt/dpkg 실제 설치" 행 + `docs/research/loader-feature-gaps.md` G1).
+> 그래서 "결과"는 전부 **CLOSURE-OK (host-예측)** / device 는 **PENDING(G1)** 으로 정직하게 표기한다.
+>
+> live 측정 baseline: noble ports 인덱스(2026-06-02 fetch) × `rootfs/tiny-rootfs.tar`(188 base SONAME) base-subtraction.
+> `download` = closure .deb `Size` 합. `stage(base-sub)` = base-owned SONAME 패키지를 제외한 `Installed-Size` 합 × prune(man/doc/locale) 휴리스틱
+> — base 가 이미 ship 하는 libc/ncurses/… 를 빼므로 CLI 는 수십 MiB→1MiB 급으로 줄어든다(정직한 추정). 재현: `python3 -m tools.breadth_catalog --live`.
+
+| 앱 | 종류 | 카테고리 | closure(pkg) | unsat | 결과(host) | download | stage(base-sub) | device | 비고 |
+|----|------|----------|-------------:|------:|:----------:|---------:|----------------:|:------:|------|
+| `nano` | CLI | editor | 6 | 0 | **CLOSURE-OK** | 3.3MiB | 1.1MiB | PENDING(G1) | closure 바닥(거의 libc-only) |
+| `htop` | CLI | system | 8 | 0 | **CLOSURE-OK** | 3.2MiB | 1.0MiB | PENDING(G1) | ncurses; virtual dep(libnl) Provides 해소 |
+| `ncdu` | CLI | system | 6 | 0 | **CLOSURE-OK** | 3.0MiB | 0.6MiB | PENDING(G1) | ncurses disk usage |
+| `jq` | CLI | utility | 6 | 0 | **CLOSURE-OK** | 3.1MiB | 0.9MiB | PENDING(G1) | oniguruma dep |
+| `tree` | CLI | utility | 4 | 0 | **CLOSURE-OK** | 2.8MiB | 0.3MiB | PENDING(G1) | 최소 closure |
+| `mpv` | CLI | media | 249 | 0 | **CLOSURE-OK** | 126.0MiB | 242.0MiB | PENDING(G1) | A/V 코덱 대형 closure(상한 예시) |
+| `galculator` | GUI | utility | 157 | 0 | **CLOSURE-OK** | 47.1MiB | 109.3MiB | PENDING(G1) | GTK3 계산기 |
+| `xcalc`(x11-apps) | GUI | utility | 54 | 0 | **CLOSURE-OK** | 10.9MiB | 15.2MiB | PENDING(G1) | Xaw; noble 에선 `x11-apps` 번들로 제공(standalone `xcalc` 패키지 없음 — breadth 발견) |
+| `xterm` | GUI | terminal | 38 | 0 | **CLOSURE-OK** | 7.7MiB | 8.8MiB | PENDING(G1) | X11 터미널(Xwayland 호스팅) |
+| `feh` | GUI | viewer | 138 | 0 | **CLOSURE-OK** | 58.6MiB | 91.2MiB | PENDING(G1) | imlib2 이미지 뷰어; X11 |
+| `gnome-mahjongg` | GUI | game | 170 | 0 | **CLOSURE-OK** | 54.8MiB | 122.4MiB | PENDING(G1) | GTK3 타일 게임 |
+| `inkscape` | GUI | graphics | 242 | 0 | **CLOSURE-OK** | 94.5MiB | 236.9MiB | PENDING(G1) | GTK3 벡터 에디터(GUI 상한 예시) |
+
+**roll-up:** 후보 **12/12 가 0-unsat** host closure 해소(노블 main+universe, arm64) — CLI 5종 + GUI 7종(GTK3/Xaw/X11/SDL 계열 다양성). 전체 download ~415MiB, base-subtracted stage 합 ~830MiB.
+즉 **"여러 경량 GUI/CLI 앱이 closure 상으로는 설치 가능"** 이 host 에서 예측된다. 단 모든 행의 device 열이 **PENDING(G1)**: 실 설치(`apt install` → unpack → exec)는 exec-re-entry(B-3 round-7) 통과 후에야 device-증명 가능하다.
+검증: `python3 -m tools.breadth_catalog --selftest`(offline ALL PASS) + `pytest tests/test_breadth_catalog.py`(13 passed, live 1 = `ALR_BREADTH_NET=1` 게이트).
+
 ## 미지원 / 부분 (현재 한계)
 | 항목 | 상태 | 비고 |
 |------|------|------|
