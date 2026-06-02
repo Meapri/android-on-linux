@@ -124,12 +124,99 @@ struct VkPhysProps {
 // The clear a CMD_BEGIN_CLEAR recorded into a virtual command buffer, plus the geometry
 // of the offscreen target it renders into. Held until the matching QUEUE_SUBMIT replays
 // it. Decoupled from <vulkan.h> so the wire test can drive it with no SDK.
+//
+// VK-M3 breadth: the SAME record carries a DRAW request (is_draw=true). For a draw, the
+// f32 clear[] is the BACKGROUND the render pass clears to, and the submit additionally
+// binds a graphics pipeline + vertex buffer and issues one vkCmdDraw of a triangle whose
+// color comes from the host fragment shader (kAlrVkTriColor*). is_draw=false = bare clear.
 struct VkClearRecord {
     bool recorded = false;
+    bool is_draw = false;  // VK-M3: clear-then-draw-triangle vs. bare clear
     uint32_t width = 0;
     uint32_t height = 0;
-    float clear[4] = {0, 0, 0, 0};  // RGBA, 0..1
+    float clear[4] = {0, 0, 0, 0};  // RGBA, 0..1 (the DRAW's background when is_draw)
 };
+
+// The fixed triangle color the VK-M3 draw fragment shader emits (kAlrVkTri*Spv below).
+// MUST equal the vec4 constant baked into the fragment SPIR-V — the wire test + the host
+// readback assert the center pixel ~matches this (and that it DIFFERS from the clear
+// background, proving a draw, not a clear). 0.95/0.10/0.80 -> ~242/26/204 in 8-bit UNORM.
+inline constexpr float kAlrVkTriColorR = 0.95f;
+inline constexpr float kAlrVkTriColorG = 0.10f;
+inline constexpr float kAlrVkTriColorB = 0.80f;
+inline constexpr float kAlrVkTriColorA = 1.00f;
+
+// ---------------------------------------------------------------------------
+// Handcrafted tiny SPIR-V for the VK-M3 draw-breadth triangle pipeline.
+//
+// HOW THESE WERE PRODUCED (reproducible with the NDK's bundled glslc — no extra deps):
+//   $NDK/shader-tools/<host>/glslc --target-env=vulkan1.1 -O alr_tri.vert -o v.spv
+//   $NDK/shader-tools/<host>/glslc --target-env=vulkan1.1 -O alr_tri.frag -o f.spv
+//   # then emit each .spv as little-endian uint32 words (python: struct.unpack('<I',...)).
+//
+// GLSL SOURCES (kept here so the bytes are auditable / regenerable):
+//   alr_tri.vert (#version 450):
+//       layout(location = 0) in vec2 inPos;
+//       void main() { gl_Position = vec4(inPos, 0.0, 1.0); }
+//   alr_tri.frag (#version 450):
+//       layout(location = 0) out vec4 outColor;
+//       void main() { outColor = vec4(0.95, 0.10, 0.80, 1.0); }
+//
+// The frag color is a BAKED constant (no push constant / no descriptor set) so the
+// VkPipelineLayout is empty — maximally portable on Mali — and the readback color is
+// fixed = kAlrVkTriColor*. Vertex positions come from a bound vertex buffer (vec2 NDC),
+// so the draw exercises vkCmdBindVertexBuffers + vkCmdDraw(3). SPIR-V version word is
+// 0x00010300 (SPIR-V 1.3 / Vulkan 1.1), matching --target-env. Word[0] is the magic
+// 0x07230203; a runtime guard below re-checks it before vkCreateShaderModule.
+inline constexpr uint32_t kAlrVkTriVertSpv[] = {
+    0x07230203u, 0x00010300u, 0x000d000au, 0x0000001bu, 0x00000000u, 0x00020011u,
+    0x00000001u, 0x0006000bu, 0x00000001u, 0x4c534c47u, 0x6474732eu, 0x3035342eu,
+    0x00000000u, 0x0003000eu, 0x00000000u, 0x00000001u, 0x0007000fu, 0x00000000u,
+    0x00000004u, 0x6e69616du, 0x00000000u, 0x0000000du, 0x00000012u, 0x00050048u,
+    0x0000000bu, 0x00000000u, 0x0000000bu, 0x00000000u, 0x00050048u, 0x0000000bu,
+    0x00000001u, 0x0000000bu, 0x00000001u, 0x00050048u, 0x0000000bu, 0x00000002u,
+    0x0000000bu, 0x00000003u, 0x00050048u, 0x0000000bu, 0x00000003u, 0x0000000bu,
+    0x00000004u, 0x00030047u, 0x0000000bu, 0x00000002u, 0x00040047u, 0x00000012u,
+    0x0000001eu, 0x00000000u, 0x00020013u, 0x00000002u, 0x00030021u, 0x00000003u,
+    0x00000002u, 0x00030016u, 0x00000006u, 0x00000020u, 0x00040017u, 0x00000007u,
+    0x00000006u, 0x00000004u, 0x00040015u, 0x00000008u, 0x00000020u, 0x00000000u,
+    0x0004002bu, 0x00000008u, 0x00000009u, 0x00000001u, 0x0004001cu, 0x0000000au,
+    0x00000006u, 0x00000009u, 0x0006001eu, 0x0000000bu, 0x00000007u, 0x00000006u,
+    0x0000000au, 0x0000000au, 0x00040020u, 0x0000000cu, 0x00000003u, 0x0000000bu,
+    0x0004003bu, 0x0000000cu, 0x0000000du, 0x00000003u, 0x00040015u, 0x0000000eu,
+    0x00000020u, 0x00000001u, 0x0004002bu, 0x0000000eu, 0x0000000fu, 0x00000000u,
+    0x00040017u, 0x00000010u, 0x00000006u, 0x00000002u, 0x00040020u, 0x00000011u,
+    0x00000001u, 0x00000010u, 0x0004003bu, 0x00000011u, 0x00000012u, 0x00000001u,
+    0x0004002bu, 0x00000006u, 0x00000014u, 0x00000000u, 0x0004002bu, 0x00000006u,
+    0x00000015u, 0x3f800000u, 0x00040020u, 0x00000019u, 0x00000003u, 0x00000007u,
+    0x00050036u, 0x00000002u, 0x00000004u, 0x00000000u, 0x00000003u, 0x000200f8u,
+    0x00000005u, 0x0004003du, 0x00000010u, 0x00000013u, 0x00000012u, 0x00050051u,
+    0x00000006u, 0x00000016u, 0x00000013u, 0x00000000u, 0x00050051u, 0x00000006u,
+    0x00000017u, 0x00000013u, 0x00000001u, 0x00070050u, 0x00000007u, 0x00000018u,
+    0x00000016u, 0x00000017u, 0x00000014u, 0x00000015u, 0x00050041u, 0x00000019u,
+    0x0000001au, 0x0000000du, 0x0000000fu, 0x0003003eu, 0x0000001au, 0x00000018u,
+    0x000100fdu, 0x00010038u};
+inline constexpr uint32_t kAlrVkTriFragSpv[] = {
+    0x07230203u, 0x00010300u, 0x000d000au, 0x0000000fu, 0x00000000u, 0x00020011u,
+    0x00000001u, 0x0006000bu, 0x00000001u, 0x4c534c47u, 0x6474732eu, 0x3035342eu,
+    0x00000000u, 0x0003000eu, 0x00000000u, 0x00000001u, 0x0006000fu, 0x00000004u,
+    0x00000004u, 0x6e69616du, 0x00000000u, 0x00000009u, 0x00030010u, 0x00000004u,
+    0x00000007u, 0x00040047u, 0x00000009u, 0x0000001eu, 0x00000000u, 0x00020013u,
+    0x00000002u, 0x00030021u, 0x00000003u, 0x00000002u, 0x00030016u, 0x00000006u,
+    0x00000020u, 0x00040017u, 0x00000007u, 0x00000006u, 0x00000004u, 0x00040020u,
+    0x00000008u, 0x00000003u, 0x00000007u, 0x0004003bu, 0x00000008u, 0x00000009u,
+    0x00000003u, 0x0004002bu, 0x00000006u, 0x0000000au, 0x3f733333u, 0x0004002bu,
+    0x00000006u, 0x0000000bu, 0x3dcccccdu, 0x0004002bu, 0x00000006u, 0x0000000cu,
+    0x3f4ccccdu, 0x0004002bu, 0x00000006u, 0x0000000du, 0x3f800000u, 0x0007002cu,
+    0x00000007u, 0x0000000eu, 0x0000000au, 0x0000000bu, 0x0000000cu, 0x0000000du,
+    0x00050036u, 0x00000002u, 0x00000004u, 0x00000000u, 0x00000003u, 0x000200f8u,
+    0x00000005u, 0x0003003eu, 0x00000009u, 0x0000000eu, 0x000100fdu, 0x00010038u};
+
+// The triangle's NDC vertices (vec2 each), big enough to cover the framebuffer center
+// so the center-pixel readback is always inside the triangle (a fan around origin).
+struct AlrVkVert2 { float x, y; };
+inline constexpr AlrVkVert2 kAlrVkTriVerts[3] = {
+    {0.0f, -0.8f}, {-0.8f, 0.8f}, {0.8f, 0.8f}};
 
 // Host decode state: virtual instance/physical-device/device/queue/pool/cmd ids -> the
 // host resources behind them. (The real Vulkan handles live in the real_* maps only on
@@ -609,6 +696,384 @@ inline int vk_real_clear_submit(VkDecodeState& st, uint32_t vdev, uint32_t vqueu
     return result;
 }
 
+// ---- VK-M3 draw-breadth, real Mali path: clear-then-DRAW one triangle. ----
+//
+// Extends vk_real_clear_submit beyond a bare clear: it builds a real GRAPHICS PIPELINE
+// (vkCreateShaderModule × vert+frag handcrafted SPIR-V, vkCreatePipelineLayout (empty),
+// vkCreateGraphicsPipelines with a vec2 vertex input), uploads the 3 NDC triangle verts
+// into a HOST_VISIBLE VkBuffer (vkCreateBuffer + vkAllocateMemory + vkMapMemory), then
+// records vkCmdBeginRenderPass(clear bg) / vkCmdBindPipeline / vkCmdBindVertexBuffers /
+// vkCmdDraw(3) / vkCmdEndRenderPass into the guest's command buffer, submits + waits, and
+// reads the AHB center pixel back. That pixel is the TRIANGLE color (kAlrVkTriColor*),
+// distinct from the clear background — the proof a DRAW (not just a clear) reached Mali.
+// Self-contained: allocates+frees its own AHB/image/view/renderpass/framebuffer/pipeline/
+// vertex-buffer per call. Returns an AlrVkRenderResult; fills px[4] (RGBA 0..255).
+inline int vk_real_draw_submit(VkDecodeState& st, uint32_t vdev, uint32_t vqueue,
+                               uint32_t vcmd, const VkClearRecord& rec, uint8_t px[4]) {
+    px[0] = px[1] = px[2] = px[3] = 0;
+    if (!rec.recorded) return ALR_VK_RENDER_NO_CLEAR_RECORDED;
+    auto dit = st.real_dev.find(vdev);
+    auto qit = st.real_queue.find(vqueue);
+    auto cit = st.real_cmd.find(vcmd);
+    if (dit == st.real_dev.end() || qit == st.real_queue.end() || cit == st.real_cmd.end())
+        return ALR_VK_RENDER_NO_DEVICE;
+    VkDevice dev = dit->second.dev;
+    VkPhysicalDevice phys = dit->second.phys;
+    VkQueue queue = qit->second;
+    VkCommandBuffer cmd = cit->second.second;
+    const uint32_t w = rec.width ? rec.width : 64;
+    const uint32_t h = rec.height ? rec.height : 64;
+
+    // ---- AHB color target (GPU framebuffer + CPU readable) ----
+    auto p_ahb_props = reinterpret_cast<PFN_vkGetAndroidHardwareBufferPropertiesANDROID>(
+        vkGetDeviceProcAddr(dev, "vkGetAndroidHardwareBufferPropertiesANDROID"));
+    if (!p_ahb_props) return ALR_VK_RENDER_TARGET_ALLOC;
+    AHardwareBuffer_Desc d{};
+    d.width = w;
+    d.height = h;
+    d.layers = 1;
+    d.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+    d.usage = AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER | AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN;
+    AHardwareBuffer* ahb = nullptr;
+    if (AHardwareBuffer_allocate(&d, &ahb) != 0 || ahb == nullptr)
+        return ALR_VK_RENDER_TARGET_ALLOC;
+
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkRenderPass rp = VK_NULL_HANDLE;
+    VkFramebuffer fb = VK_NULL_HANDLE;
+    // VK-M3 pipeline objects
+    VkShaderModule vert_mod = VK_NULL_HANDLE, frag_mod = VK_NULL_HANDLE;
+    VkPipelineLayout pipe_layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkBuffer vbuf = VK_NULL_HANDLE;
+    VkDeviceMemory vmem = VK_NULL_HANDLE;
+    auto cleanup = [&]() {
+        if (vbuf) vkDestroyBuffer(dev, vbuf, nullptr);
+        if (vmem) vkFreeMemory(dev, vmem, nullptr);
+        if (pipeline) vkDestroyPipeline(dev, pipeline, nullptr);
+        if (pipe_layout) vkDestroyPipelineLayout(dev, pipe_layout, nullptr);
+        if (frag_mod) vkDestroyShaderModule(dev, frag_mod, nullptr);
+        if (vert_mod) vkDestroyShaderModule(dev, vert_mod, nullptr);
+        if (fb) vkDestroyFramebuffer(dev, fb, nullptr);
+        if (rp) vkDestroyRenderPass(dev, rp, nullptr);
+        if (view) vkDestroyImageView(dev, view, nullptr);
+        if (image) vkDestroyImage(dev, image, nullptr);
+        if (mem) vkFreeMemory(dev, mem, nullptr);
+        AHardwareBuffer_release(ahb);
+    };
+
+    VkAndroidHardwareBufferFormatPropertiesANDROID fmt_props{};
+    fmt_props.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID;
+    VkAndroidHardwareBufferPropertiesANDROID ahb_props{};
+    ahb_props.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID;
+    ahb_props.pNext = &fmt_props;
+    if (p_ahb_props(dev, ahb, &ahb_props) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_TARGET_ALLOC; }
+    VkFormat color_fmt = (fmt_props.format != VK_FORMAT_UNDEFINED) ? fmt_props.format
+                                                                   : VK_FORMAT_R8G8B8A8_UNORM;
+
+    VkExternalMemoryImageCreateInfo ext_img{};
+    ext_img.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+    ext_img.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
+    VkImageCreateInfo img_ci{};
+    img_ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    img_ci.pNext = &ext_img;
+    img_ci.imageType = VK_IMAGE_TYPE_2D;
+    img_ci.format = color_fmt;
+    img_ci.extent = {w, h, 1};
+    img_ci.mipLevels = 1;
+    img_ci.arrayLayers = 1;
+    img_ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    img_ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    img_ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    img_ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    img_ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(dev, &img_ci, nullptr, &image) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_TARGET_ALLOC; }
+
+    uint32_t mem_type = 0;
+    bool found_type = false;
+    for (uint32_t i = 0; i < 32; ++i)
+        if (ahb_props.memoryTypeBits & (1u << i)) { mem_type = i; found_type = true; break; }
+    if (!found_type) { cleanup(); return ALR_VK_RENDER_TARGET_ALLOC; }
+    VkImportAndroidHardwareBufferInfoANDROID import_info{};
+    import_info.sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID;
+    import_info.buffer = ahb;
+    VkMemoryDedicatedAllocateInfo dedicated{};
+    dedicated.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+    dedicated.image = image;
+    dedicated.pNext = &import_info;
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.pNext = &dedicated;
+    mai.allocationSize = ahb_props.allocationSize;
+    mai.memoryTypeIndex = mem_type;
+    if (vkAllocateMemory(dev, &mai, nullptr, &mem) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_TARGET_ALLOC; }
+    if (vkBindImageMemory(dev, image, mem, 0) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_TARGET_ALLOC; }
+
+    VkImageViewCreateInfo vci{};
+    vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vci.image = image;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = color_fmt;
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (vkCreateImageView(dev, &vci, nullptr, &view) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_TARGET_ALLOC; }
+
+    VkAttachmentDescription att{};
+    att.format = color_fmt;
+    att.samples = VK_SAMPLE_COUNT_1_BIT;
+    att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    att.finalLayout = VK_IMAGE_LAYOUT_GENERAL;  // see vk_real_clear_submit: GENERAL so the
+                                                // queue-family-release + CPU read are defined
+    VkAttachmentReference att_ref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sub{};
+    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount = 1;
+    sub.pColorAttachments = &att_ref;
+    VkSubpassDependency dep{};
+    dep.srcSubpass = 0;
+    dep.dstSubpass = VK_SUBPASS_EXTERNAL;
+    dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep.dstStageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+    dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dep.dstAccessMask = 0;
+    VkRenderPassCreateInfo rpci{};
+    rpci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    rpci.attachmentCount = 1;
+    rpci.pAttachments = &att;
+    rpci.subpassCount = 1;
+    rpci.pSubpasses = &sub;
+    rpci.dependencyCount = 1;
+    rpci.pDependencies = &dep;
+    if (vkCreateRenderPass(dev, &rpci, nullptr, &rp) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_RECORD; }
+
+    VkFramebufferCreateInfo fbci{};
+    fbci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    fbci.renderPass = rp;
+    fbci.attachmentCount = 1;
+    fbci.pAttachments = &view;
+    fbci.width = w;
+    fbci.height = h;
+    fbci.layers = 1;
+    if (vkCreateFramebuffer(dev, &fbci, nullptr, &fb) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_RECORD; }
+
+    // ---- VK-M3: shader modules (handcrafted SPIR-V), empty pipeline layout, pipeline ----
+    if (kAlrVkTriVertSpv[0] != 0x07230203u || kAlrVkTriFragSpv[0] != 0x07230203u) {
+        cleanup();
+        return ALR_VK_RENDER_PIPELINE;  // embedded SPIR-V corrupt (magic mismatch)
+    }
+    VkShaderModuleCreateInfo vsm{};
+    vsm.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    vsm.codeSize = sizeof(kAlrVkTriVertSpv);
+    vsm.pCode = kAlrVkTriVertSpv;
+    if (vkCreateShaderModule(dev, &vsm, nullptr, &vert_mod) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_PIPELINE; }
+    VkShaderModuleCreateInfo fsm{};
+    fsm.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    fsm.codeSize = sizeof(kAlrVkTriFragSpv);
+    fsm.pCode = kAlrVkTriFragSpv;
+    if (vkCreateShaderModule(dev, &fsm, nullptr, &frag_mod) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_PIPELINE; }
+
+    VkPipelineLayoutCreateInfo plci{};
+    plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;  // empty: no sets / no push
+    if (vkCreatePipelineLayout(dev, &plci, nullptr, &pipe_layout) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_PIPELINE; }
+
+    // ---- vertex buffer (HOST_VISIBLE) holding the 3 NDC triangle verts ----
+    VkBufferCreateInfo bci{};
+    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size = sizeof(kAlrVkTriVerts);
+    bci.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(dev, &bci, nullptr, &vbuf) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_PIPELINE; }
+    VkMemoryRequirements vreq{};
+    vkGetBufferMemoryRequirements(dev, vbuf, &vreq);
+    VkPhysicalDeviceMemoryProperties mp{};
+    vkGetPhysicalDeviceMemoryProperties(phys, &mp);
+    uint32_t vtype = UINT32_MAX;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
+        const bool usable = (vreq.memoryTypeBits & (1u << i)) != 0;
+        const bool host_visible =
+            (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+            (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (usable && host_visible) { vtype = i; break; }
+    }
+    if (vtype == UINT32_MAX) { cleanup(); return ALR_VK_RENDER_PIPELINE; }
+    VkMemoryAllocateInfo vai{};
+    vai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    vai.allocationSize = vreq.size;
+    vai.memoryTypeIndex = vtype;
+    if (vkAllocateMemory(dev, &vai, nullptr, &vmem) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_PIPELINE; }
+    if (vkBindBufferMemory(dev, vbuf, vmem, 0) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_PIPELINE; }
+    void* vmap = nullptr;
+    if (vkMapMemory(dev, vmem, 0, sizeof(kAlrVkTriVerts), 0, &vmap) != VK_SUCCESS || !vmap) {
+        cleanup();
+        return ALR_VK_RENDER_PIPELINE;
+    }
+    std::memcpy(vmap, kAlrVkTriVerts, sizeof(kAlrVkTriVerts));
+    vkUnmapMemory(dev, vmem);  // HOST_COHERENT: no explicit flush needed
+
+    // ---- graphics pipeline: vec2 vertex input -> vert -> frag (fixed color) ----
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vert_mod;
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = frag_mod;
+    stages[1].pName = "main";
+
+    VkVertexInputBindingDescription vib{};
+    vib.binding = 0;
+    vib.stride = sizeof(AlrVkVert2);
+    vib.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+    VkVertexInputAttributeDescription via{};
+    via.location = 0;
+    via.binding = 0;
+    via.format = VK_FORMAT_R32G32_SFLOAT;  // vec2 inPos
+    via.offset = 0;
+    VkPipelineVertexInputStateCreateInfo vis{};
+    vis.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vis.vertexBindingDescriptionCount = 1;
+    vis.pVertexBindingDescriptions = &vib;
+    vis.vertexAttributeDescriptionCount = 1;
+    vis.pVertexAttributeDescriptions = &via;
+
+    VkPipelineInputAssemblyStateCreateInfo ias{};
+    ias.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ias.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkViewport vp{};
+    vp.width = static_cast<float>(w);
+    vp.height = static_cast<float>(h);
+    vp.maxDepth = 1.0f;
+    VkRect2D scissor{};
+    scissor.extent = {w, h};
+    VkPipelineViewportStateCreateInfo vps{};
+    vps.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vps.viewportCount = 1;
+    vps.pViewports = &vp;
+    vps.scissorCount = 1;
+    vps.pScissors = &scissor;
+
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;  // accept either winding so the center is always filled
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineColorBlendAttachmentState cba{};
+    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    cba.blendEnable = VK_FALSE;
+    VkPipelineColorBlendStateCreateInfo cb{};
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 1;
+    cb.pAttachments = &cba;
+
+    VkGraphicsPipelineCreateInfo gp{};
+    gp.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    gp.stageCount = 2;
+    gp.pStages = stages;
+    gp.pVertexInputState = &vis;
+    gp.pInputAssemblyState = &ias;
+    gp.pViewportState = &vps;
+    gp.pRasterizationState = &rs;
+    gp.pMultisampleState = &ms;
+    gp.pColorBlendState = &cb;
+    gp.layout = pipe_layout;
+    gp.renderPass = rp;
+    gp.subpass = 0;
+    if (vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gp, nullptr, &pipeline) != VK_SUCCESS) {
+        cleanup();
+        return ALR_VK_RENDER_PIPELINE;
+    }
+
+    // ---- record: clear bg, bind pipeline + vertex buffer, draw 3, end ----
+    vkResetCommandBuffer(cmd, 0);
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(cmd, &bi) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_RECORD; }
+    VkClearValue clear{};
+    clear.color = {{rec.clear[0], rec.clear[1], rec.clear[2], rec.clear[3]}};
+    VkRenderPassBeginInfo rbi{};
+    rbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rbi.renderPass = rp;
+    rbi.framebuffer = fb;
+    rbi.renderArea.extent = {w, h};
+    rbi.clearValueCount = 1;
+    rbi.pClearValues = &clear;
+    vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    VkDeviceSize voff = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &vbuf, &voff);
+    vkCmdDraw(cmd, 3, 1, 0, 0);  // the triangle
+    vkCmdEndRenderPass(cmd);
+    // Release the color image to the external (CPU) consumer (same as vk_real_clear_submit).
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.srcQueueFamilyIndex = dit->second.gfx_family;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+    barrier.image = image;
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_RECORD; }
+
+    // ---- submit + fence-wait ----
+    VkFence fence = VK_NULL_HANDLE;
+    VkFenceCreateInfo fci{};
+    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    if (vkCreateFence(dev, &fci, nullptr, &fence) != VK_SUCCESS) fence = VK_NULL_HANDLE;
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    if (vkQueueSubmit(queue, 1, &si, fence) != VK_SUCCESS) {
+        if (fence) vkDestroyFence(dev, fence, nullptr);
+        cleanup();
+        return ALR_VK_RENDER_SUBMIT;
+    }
+    if (fence) {
+        vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX);
+        vkDestroyFence(dev, fence, nullptr);
+    } else {
+        vkQueueWaitIdle(queue);
+    }
+
+    // ---- read the AHB center pixel back (should be the TRIANGLE color, not the bg) ----
+    AHardwareBuffer_Desc got{};
+    AHardwareBuffer_describe(ahb, &got);
+    void* cpu = nullptr;
+    if (AHardwareBuffer_lock(ahb, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN, -1, nullptr, &cpu) == 0 &&
+        cpu != nullptr) {
+        const uint32_t stride_px = got.stride ? got.stride : w;
+        const auto* base = static_cast<const unsigned char*>(cpu);
+        const size_t off = (static_cast<size_t>(h / 2) * stride_px + (w / 2)) * 4;
+        for (int i = 0; i < 4; ++i) px[i] = base[off + i];
+        AHardwareBuffer_unlock(ahb, nullptr);
+    } else {
+        cleanup();
+        return ALR_VK_RENDER_READBACK;
+    }
+
+    cleanup();
+    return ALR_VK_RENDER_OK;
+}
+
 inline void vk_real_destroy_device(VkDecodeState& st, uint32_t vdev) {
     auto it = st.real_dev.find(vdev);
     if (it == st.real_dev.end()) return;
@@ -665,6 +1130,11 @@ struct VkProvider {
     // Replay the clear+submit; fill px[4] (RGBA 0..255); return AlrVkRenderResult.
     int (*clear_submit)(void* ctx, uint32_t vdev, uint32_t vqueue, uint32_t vcmd,
                         const VkClearRecord& rec, uint8_t px[4]) = nullptr;
+    // VK-M3: replay the clear-then-DRAW-triangle + submit; fill px[4] (RGBA 0..255) with
+    // the post-draw center pixel; return AlrVkRenderResult. Null = fall back to a bare
+    // clear (so a provider that hasn't implemented draw still passes the clear path).
+    int (*draw_submit)(void* ctx, uint32_t vdev, uint32_t vqueue, uint32_t vcmd,
+                       const VkClearRecord& rec, uint8_t px[4]) = nullptr;
     void (*destroy_device)(void* ctx, uint32_t vdev) = nullptr;
     void* ctx = nullptr;
 };
@@ -828,9 +1298,31 @@ inline bool decode_vk_batch(const uint8_t* data, size_t len, VkDecodeState& st,
                 // The clear is RECORDED here (no GPU work yet); QUEUE_SUBMIT replays it.
                 VkClearRecord rec;
                 rec.recorded = true;
+                rec.is_draw = false;
                 rec.width = w;
                 rec.height = h;
                 rec.clear[0] = cr; rec.clear[1] = cg; rec.clear[2] = cb; rec.clear[3] = ca;
+                st.clears[vcmd] = rec;
+                st.decoded++;
+                break;
+            }
+
+            case ALR_VK_OP_CMD_BEGIN_DRAW: {
+                // VK-M3 breadth: same wire shape as CMD_BEGIN_CLEAR (the f32×4 is the
+                // BACKGROUND); is_draw=true makes QUEUE_SUBMIT run the triangle pipeline.
+                uint32_t vdev = 0, vcmd = 0, w = 0, h = 0;
+                float br = 0, bg = 0, bb = 0, ba = 0;
+                if (!r.u32(vdev) || !r.u32(vcmd) || !r.u32(w) || !r.u32(h) ||
+                    !r.f32(br) || !r.f32(bg) || !r.f32(bb) || !r.f32(ba)) {
+                    st.ok = false;
+                    break;
+                }
+                VkClearRecord rec;
+                rec.recorded = true;
+                rec.is_draw = true;
+                rec.width = w;
+                rec.height = h;
+                rec.clear[0] = br; rec.clear[1] = bg; rec.clear[2] = bb; rec.clear[3] = ba;
                 st.clears[vcmd] = rec;
                 st.decoded++;
                 break;
@@ -844,12 +1336,21 @@ inline bool decode_vk_batch(const uint8_t* data, size_t len, VkDecodeState& st,
                 uint8_t px[4] = {0, 0, 0, 0};
                 auto cit = st.clears.find(vcmd);
                 const VkClearRecord rec = (cit != st.clears.end()) ? cit->second : VkClearRecord{};
+                // VK-M3: a record marked is_draw runs the triangle pipeline (clear bg +
+                // draw); a bare clear runs the clear-only path. Both report through the
+                // same ALR_VK_REPLY_SUBMIT (render_result + center px).
+                const bool want_draw = rec.is_draw;
 #ifdef ALR_VK_DECODE_REAL
                 if (!provider)
-                    render_res = vk_real_clear_submit(st, vdev, vqueue, vcmd, rec, px);
+                    render_res = want_draw ? vk_real_draw_submit(st, vdev, vqueue, vcmd, rec, px)
+                                           : vk_real_clear_submit(st, vdev, vqueue, vcmd, rec, px);
 #endif
-                if (provider && provider->clear_submit)
-                    render_res = provider->clear_submit(provider->ctx, vdev, vqueue, vcmd, rec, px);
+                if (provider) {
+                    if (want_draw && provider->draw_submit)
+                        render_res = provider->draw_submit(provider->ctx, vdev, vqueue, vcmd, rec, px);
+                    else if (provider->clear_submit)  // draw provider absent -> clear fallback
+                        render_res = provider->clear_submit(provider->ctx, vdev, vqueue, vcmd, rec, px);
+                }
                 if (render_res != ALR_VK_RENDER_OK && render_res != ALR_VK_RENDER_NO_CLEAR_RECORDED)
                     submit_res = -1;  // a host stage failed; surface a non-success submit code
                 if (cit != st.clears.end()) st.clears.erase(cit);  // consume the recorded clear

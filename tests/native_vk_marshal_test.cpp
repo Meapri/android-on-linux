@@ -168,8 +168,82 @@ int main() {
         if (!pass) printf("---- render probe report ----\n%s\n", report.c_str());
     }
 
+    // ---- VK-M3 BODY: graphics pipeline + vertex buffer + vkCmdDraw (DRAW breadth) ----
+
+    // 10) Direct encode/decode of the FULL draw request stream: every op dispatches, the
+    //     synthetic provider "rasterizes" the fixed-color triangle, and the reply decodes
+    //     back to the device + submit records with the TRIANGLE color (not the clear bg).
+    {
+        const std::vector<uint8_t> req = build_vk_draw_request();
+        check(!req.empty(), "draw request encodes non-empty");
+
+        SyntheticMaliProvider syn;
+        VkProvider prov = syn.as_provider();
+        VkDecodeState st;
+        VkReplyEncoder reply;
+        const bool ok = decode_vk_batch(req.data(), req.size(), st, reply, &prov);
+        check(ok, "draw decode_vk_batch ok");
+        // create/enum/props/createDev/getQueue/createPool/allocCmd/DRAW/submit/destroyDev/destroyInst = 11
+        check(st.decoded == 11, "11 draw request ops decoded");
+
+        VkDecodedReply dr;
+        const bool rok = decode_vk_reply(reply.bytes().data(), reply.bytes().size(), dr);
+        check(rok, "draw reply decodes");
+        check(dr.devices.size() == 1 && dr.devices[0].result == 0, "draw device VK_SUCCESS");
+        check(dr.submits.size() == 1, "one draw submit reply");
+        if (dr.submits.size() == 1) {
+            const auto& s = dr.submits[0];
+            check(s.submit_result == 0, "draw submit VK_SUCCESS");
+            check(s.render_result == ALR_VK_RENDER_OK, "draw rendered OK");
+            const int want_r = (int)(kAlrVkTriColorR * 255.0f + 0.5f);
+            const int want_g = (int)(kAlrVkTriColorG * 255.0f + 0.5f);
+            const int want_b = (int)(kAlrVkTriColorB * 255.0f + 0.5f);
+            check(std::abs((int)s.px[0] - want_r) <= 1 &&
+                  std::abs((int)s.px[1] - want_g) <= 1 &&
+                  std::abs((int)s.px[2] - want_b) <= 1, "triangle color round-trips through readback");
+            // breadth proof: the draw readback differs from the clear background.
+            const int bg_g = (int)(kAlrVkDrawBgG * 255.0f + 0.5f);
+            check(std::abs((int)s.px[1] - bg_g) > 8, "draw center pixel is NOT the clear background");
+        }
+    }
+
+    // 11) The embedded handcrafted SPIR-V is well-formed (magic + non-empty + word-aligned).
+    {
+        check((sizeof(kAlrVkTriVertSpv) % 4) == 0, "vert SPIR-V is word-aligned");
+        check((sizeof(kAlrVkTriFragSpv) % 4) == 0, "frag SPIR-V is word-aligned");
+        check(kAlrVkTriVertSpv[0] == 0x07230203u, "vert SPIR-V magic");
+        check(kAlrVkTriFragSpv[0] == 0x07230203u, "frag SPIR-V magic");
+        check(sizeof(kAlrVkTriVertSpv) >= 32 && sizeof(kAlrVkTriFragSpv) >= 32,
+              "SPIR-V modules non-trivial");
+    }
+
+    // 12) A DRAW followed by submit must dispatch the draw seam, NOT clear_submit. Use a
+    //     provider with clear_submit returning the bg and draw_submit the triangle, then
+    //     assert the reply is the triangle (proves QUEUE_SUBMIT honored is_draw).
+    {
+        const std::vector<uint8_t> req = build_vk_draw_request();
+        SyntheticMaliProvider syn;
+        VkProvider prov = syn.as_provider();
+        VkDecodeState st;
+        VkReplyEncoder reply;
+        check(decode_vk_batch(req.data(), req.size(), st, reply, &prov), "draw-dispatch decodes");
+        VkDecodedReply dr;
+        check(decode_vk_reply(reply.bytes().data(), reply.bytes().size(), dr), "draw-dispatch reply decodes");
+        const int want_g = (int)(kAlrVkTriColorG * 255.0f + 0.5f);
+        check(dr.submits.size() == 1 && std::abs((int)dr.submits[0].px[1] - want_g) <= 1,
+              "is_draw routed to draw_submit (triangle color), not clear_submit (bg)");
+    }
+
+    // 13) Full DRAW transport round trip through the SPSC ring (the actual wire path).
+    {
+        const std::string report = run_vk_draw_wire_probe();
+        const bool pass = report.find("ALR VK DRAW MARSHAL: PASS") != std::string::npos;
+        check(pass, "draw ring round-trip probe PASS");
+        if (!pass) printf("---- draw probe report ----\n%s\n", report.c_str());
+    }
+
     if (failures == 0) {
-        printf("native_vk_marshal_test: ALL PASS (vk enumerate/props + device/queue/cmd/clear-submit marshalling)\n");
+        printf("native_vk_marshal_test: ALL PASS (vk enumerate/props + clear-submit + DRAW(pipeline/vbuf/vkCmdDraw) marshalling)\n");
         return 0;
     }
     printf("native_vk_marshal_test: %d FAILURE(S)\n", failures);

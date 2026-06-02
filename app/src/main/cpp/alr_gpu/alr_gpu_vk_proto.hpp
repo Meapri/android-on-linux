@@ -99,7 +99,28 @@ enum AlrVkOp {
     ALR_VK_OP_QUEUE_SUBMIT = 215,  // u32 vdev, u32 vqueue, u32 vcmd
 
     // destroy the logical device `vdev` (frees queue/pool/cmd/render-target maps).
-    ALR_VK_OP_DESTROY_DEVICE = 216  // u32 vdev
+    ALR_VK_OP_DESTROY_DEVICE = 216,  // u32 vdev
+
+    // ---- VK-M3 (render BREADTH): a real DRAW, not a bare clear. ----
+    // Record a render that (1) CLEARs the offscreen R8G8B8A8 target of `width`×`height`
+    // to the background `r,g,b,a`, then (2) DRAWs one filled triangle covering the
+    // target center with a graphics pipeline (vert+frag SPIR-V), a bound vertex buffer
+    // (NDC positions), and a single vkCmdDraw of 3 vertices. The triangle's color comes
+    // from the fragment shader itself (a fixed constant baked into the host-embedded
+    // SPIR-V), so the center-pixel readback after submit proves a DRAW landed (a value
+    // DISTINCT from the clear background). Like CMD_BEGIN_CLEAR this only RECORDS; the
+    // matching QUEUE_SUBMIT replays + reads back.
+    //
+    // WHY the shader/SPIR-V is NOT on the wire: the guest libvulkan ICD would normally
+    // ship the app's SPIR-V via VK_OP_CREATE_SHADER_MODULE blobs; for this first breadth
+    // step the probe uses ONE handcrafted triangle pipeline whose SPIR-V the host owns
+    // (alr_gpu_vk_decode.hpp embeds it). The wire still carries the draw INTENT (extent
+    // + background) and the host runs the full create-shader-module / pipeline-layout /
+    // render-pass / graphics-pipeline / vertex-buffer / bind / draw path on real Mali.
+    // A later step promotes the SPIR-V + vertex data to wire blobs (CREATE_SHADER_MODULE
+    // / CREATE_BUFFER ops) — the op number space below 230 is reserved for them.
+    ALR_VK_OP_CMD_BEGIN_DRAW = 217
+    //   u32 vdev, u32 vcmd, u32 width, u32 height, f32 bg_r, f32 bg_g, f32 bg_b, f32 bg_a
 };
 
 // ---- Reply record opcodes (host -> guest), carried in the reply blob. The reply is
@@ -155,7 +176,10 @@ enum AlrVkRenderResult {
     ALR_VK_RENDER_RECORD = 3,            // command-buffer record (begin/renderpass) failed
     ALR_VK_RENDER_SUBMIT = 4,            // vkQueueSubmit / wait failed
     ALR_VK_RENDER_READBACK = 5,          // could not read the target back on the CPU
-    ALR_VK_RENDER_NO_CLEAR_RECORDED = 6  // submit with no prior CMD_BEGIN_CLEAR
+    ALR_VK_RENDER_NO_CLEAR_RECORDED = 6, // submit with no prior CMD_BEGIN_CLEAR
+    // ---- VK-M3 draw-breadth stages (the bare-clear path never returns these) ----
+    ALR_VK_RENDER_PIPELINE = 7           // shader-module / pipeline-layout / vertex-buffer
+                                         // / graphics-pipeline create failed (DRAW path)
 };
 
 // VkPhysicalDeviceType mirror (so the guest/self-test can name the type without
@@ -267,6 +291,23 @@ static inline void alr_vk_enc_cmd_begin_clear(AlrVkEncoder *e, uint32_t vdev,
     alr_vk_enc_f32(e, g);
     alr_vk_enc_f32(e, b);
     alr_vk_enc_f32(e, a);
+}
+/* VK-M3 draw-breadth: record a clear-to-background + one-triangle DRAW into `vcmd`.
+ * Same field shape as cmd_begin_clear (the f32×4 is the BACKGROUND the pass clears to);
+ * the triangle color is baked into the host's fragment shader, so the wire stays small. */
+static inline void alr_vk_enc_cmd_begin_draw(AlrVkEncoder *e, uint32_t vdev,
+                                            uint32_t vcmd, uint32_t width,
+                                            uint32_t height, float bg_r, float bg_g,
+                                            float bg_b, float bg_a) {
+    alr_vk_enc_u8(e, (uint8_t)ALR_VK_OP_CMD_BEGIN_DRAW);
+    alr_vk_enc_u32(e, vdev);
+    alr_vk_enc_u32(e, vcmd);
+    alr_vk_enc_u32(e, width);
+    alr_vk_enc_u32(e, height);
+    alr_vk_enc_f32(e, bg_r);
+    alr_vk_enc_f32(e, bg_g);
+    alr_vk_enc_f32(e, bg_b);
+    alr_vk_enc_f32(e, bg_a);
 }
 static inline void alr_vk_enc_queue_submit(AlrVkEncoder *e, uint32_t vdev,
                                           uint32_t vqueue, uint32_t vcmd) {

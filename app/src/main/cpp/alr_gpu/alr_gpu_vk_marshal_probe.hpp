@@ -87,18 +87,30 @@ struct SyntheticMaliProvider {
                          uint32_t /*vcmd*/) {
         return 0;
     }
+    static uint8_t syn_to_u8(float f) {
+        if (f < 0.0f) f = 0.0f;
+        if (f > 1.0f) f = 1.0f;
+        return static_cast<uint8_t>(f * 255.0f + 0.5f);
+    }
     static int clear_submit(void* /*ctx*/, uint32_t /*vdev*/, uint32_t /*vqueue*/,
                             uint32_t /*vcmd*/, const VkClearRecord& rec, uint8_t px[4]) {
         if (!rec.recorded) return ALR_VK_RENDER_NO_CLEAR_RECORDED;
-        auto to_u8 = [](float f) -> uint8_t {
-            if (f < 0.0f) f = 0.0f;
-            if (f > 1.0f) f = 1.0f;
-            return static_cast<uint8_t>(f * 255.0f + 0.5f);
-        };
-        px[0] = to_u8(rec.clear[0]);
-        px[1] = to_u8(rec.clear[1]);
-        px[2] = to_u8(rec.clear[2]);
-        px[3] = to_u8(rec.clear[3]);
+        px[0] = syn_to_u8(rec.clear[0]);
+        px[1] = syn_to_u8(rec.clear[1]);
+        px[2] = syn_to_u8(rec.clear[2]);
+        px[3] = syn_to_u8(rec.clear[3]);
+        return ALR_VK_RENDER_OK;
+    }
+    // VK-M3 draw seam: the synthetic device "rasterizes" the fixed-color triangle that
+    // covers the center, so the center-pixel readback is the TRIANGLE color (not the bg).
+    // This lets the wire round trip assert the draw path end to end without a GPU.
+    static int draw_submit(void* /*ctx*/, uint32_t /*vdev*/, uint32_t /*vqueue*/,
+                           uint32_t /*vcmd*/, const VkClearRecord& rec, uint8_t px[4]) {
+        if (!rec.recorded) return ALR_VK_RENDER_NO_CLEAR_RECORDED;
+        px[0] = syn_to_u8(kAlrVkTriColorR);
+        px[1] = syn_to_u8(kAlrVkTriColorG);
+        px[2] = syn_to_u8(kAlrVkTriColorB);
+        px[3] = syn_to_u8(kAlrVkTriColorA);
         return ALR_VK_RENDER_OK;
     }
     static void destroy_device(void* ctx, uint32_t /*vdev*/) {
@@ -115,6 +127,7 @@ struct SyntheticMaliProvider {
         p.create_pool = &create_pool;
         p.alloc_cmd = &alloc_cmd;
         p.clear_submit = &clear_submit;
+        p.draw_submit = &draw_submit;  // VK-M3 draw seam
         p.destroy_device = &destroy_device;
         p.ctx = this;
         return p;
@@ -434,6 +447,192 @@ inline std::string run_vk_render_wire_probe() {
 inline std::string run_vk_render_mali_probe() {
     bool pass = false;
     return vk_render_roundtrip(/*provider=*/nullptr, "mali-libvulkan", pass);
+}
+#endif
+
+// ===========================================================================
+// VK-M3 (render BREADTH) — the DRAW path: graphics pipeline + vertex buffer + a real
+// vkCmdDraw of one triangle, beyond the bare clear. Builds the request stream a guest
+// libvulkan ICD would emit to bring up a device and DRAW a triangle, pushes it through
+// the SPSC ring, decodes it host-side (synthetic OR real Mali), and decodes the reply to
+// verify the center pixel came back as the TRIANGLE color — distinct from the clear
+// background, proving a draw (not just a clear) executed.
+//
+// FOR WS-1 (JNI wiring): expose run_vk_draw_mali_probe() behind a new JNI entry
+// `nativeAlrGpuVkDrawProbe` exactly like nativeAlrGpuVkRenderProbe wires
+// run_vk_render_mali_probe(). MainActivity should grep the gating first line
+// "ALR VK DRAW MARSHAL: PASS". No JNI is added here (this header stays JNI-free).
+// ===========================================================================
+
+// The background the draw probe clears to BEFORE the triangle — deliberately FAR from the
+// triangle color (kAlrVkTriColor*) so the readback unambiguously shows the draw landed.
+inline constexpr float kAlrVkDrawBgR = 0.04f;
+inline constexpr float kAlrVkDrawBgG = 0.04f;
+inline constexpr float kAlrVkDrawBgB = 0.06f;  // near-black blue-grey
+inline constexpr float kAlrVkDrawBgA = 1.00f;
+
+// Build the full VK-M3 draw request: create instance, enumerate, props, create device,
+// get queue, pool + command buffer, record a DRAW (clear bg + triangle), submit, tear
+// down. Same client-side virtual-handle shape as build_vk_render_request; the only
+// difference is CMD_BEGIN_DRAW instead of CMD_BEGIN_CLEAR.
+inline std::vector<uint8_t> build_vk_draw_request(uint32_t vinst = 1,
+                                                  uint32_t vphys_base = 100,
+                                                  uint32_t vdev = 10, uint32_t vqueue = 20,
+                                                  uint32_t vpool = 30, uint32_t vcmd = 40,
+                                                  uint32_t w = 64, uint32_t h = 64,
+                                                  uint32_t api = kAlrVkApi13) {
+    std::vector<uint8_t> buf(512, 0);
+    AlrVkEncoder e;
+    alr_vk_enc_init(&e, buf.data(), buf.size());
+    alr_vk_enc_create_instance(&e, vinst, api);
+    alr_vk_enc_enumerate_phys(&e, vinst, vphys_base);
+    alr_vk_enc_get_phys_props(&e, vinst, vphys_base);
+    alr_vk_enc_create_device(&e, vinst, vphys_base, vdev);
+    alr_vk_enc_get_device_queue(&e, vdev, /*queue_index=*/0, vqueue);
+    alr_vk_enc_create_command_pool(&e, vdev, vpool);
+    alr_vk_enc_allocate_command_buffers(&e, vdev, vpool, vcmd);
+    alr_vk_enc_cmd_begin_draw(&e, vdev, vcmd, w, h, kAlrVkDrawBgR, kAlrVkDrawBgG,
+                              kAlrVkDrawBgB, kAlrVkDrawBgA);
+    alr_vk_enc_queue_submit(&e, vdev, vqueue, vcmd);
+    alr_vk_enc_destroy_device(&e, vdev);
+    alr_vk_enc_destroy_instance(&e, vinst);
+    alr_vk_enc_u8(&e, static_cast<uint8_t>(ALR_VK_OP_END));
+    buf.resize(e.len);
+    return buf;
+}
+
+// Core draw round trip shared by both modes. `provider` non-null = wire mode; null =
+// device mode (real Mali libvulkan, needs ALR_VK_DECODE_REAL). PASS requires the device
+// created, the submit succeeded, the draw rendered (render_result == OK), the readback
+// center pixel ~matches the TRIANGLE color, AND that pixel is NOT the clear background
+// (so a fallback clear can't masquerade as a draw).
+inline std::string vk_draw_roundtrip(const VkProvider* provider, const char* mode,
+                                     bool& pass) {
+    std::ostringstream out;
+    pass = false;
+    constexpr uint32_t kVdev = 10, kVcmd = 40;
+
+    constexpr uint32_t kRing = 1u << 16;  // 64 KiB
+    std::vector<uint8_t> req_region(ring_region_size(kRing), 0);
+    std::vector<uint8_t> rep_region(ring_region_size(kRing), 0);
+    if (!ring_init(req_region.data(), kRing) || !ring_init(rep_region.data(), kRing)) {
+        out << "ALR VK DRAW MARSHAL: FAIL\nalr vk draw error=ring-init";
+        return out.str();
+    }
+    RingProducer req_prod(req_region.data());
+    RingConsumer req_cons(req_region.data());
+    RingProducer rep_prod(rep_region.data());
+    RingConsumer rep_cons(rep_region.data());
+
+    const std::vector<uint8_t> request = build_vk_draw_request();
+    const bool pushed =
+        req_prod.append(request.data(), static_cast<uint32_t>(request.size()));
+    req_prod.flush_and_wait(1);
+
+    std::vector<uint8_t> req_snap(req_cons.available());
+    const uint32_t req_got =
+        req_cons.snapshot(req_snap.data(), static_cast<uint32_t>(req_snap.size()));
+    VkDecodeState st;
+    VkReplyEncoder reply;
+    const bool decode_ok = decode_vk_batch(req_snap.data(), req_got, st, reply, provider);
+    req_cons.advance(req_got);
+    req_cons.post_reply();
+
+    const std::vector<uint8_t>& reply_bytes = reply.bytes();
+    const bool rep_pushed =
+        rep_prod.append(reply_bytes.data(), static_cast<uint32_t>(reply_bytes.size()));
+    rep_prod.flush_and_wait(1);
+    std::vector<uint8_t> rep_snap(rep_cons.available());
+    const uint32_t rep_got =
+        rep_cons.snapshot(rep_snap.data(), static_cast<uint32_t>(rep_snap.size()));
+    rep_cons.advance(rep_got);
+    VkDecodedReply decoded;
+    const bool reply_ok = decode_vk_reply(rep_snap.data(), rep_got, decoded);
+
+    const bool transport_ok = pushed && rep_pushed && req_got == request.size() &&
+                              rep_got == reply_bytes.size() &&
+                              req_cons.available() == 0 && rep_cons.available() == 0;
+    const bool dev_ok = decoded.devices.size() == 1 && decoded.devices[0].vdev == kVdev &&
+                        decoded.devices[0].result == 0;
+    const bool submit_present = decoded.submits.size() == 1;
+    const auto* sub = submit_present ? &decoded.submits[0] : nullptr;
+    const bool submit_ok = sub && sub->vdev == kVdev && sub->vcmd == kVcmd &&
+                           sub->submit_result == 0 && sub->render_result == ALR_VK_RENDER_OK;
+    auto to_u8 = [](float f) -> int {
+        if (f < 0.0f) f = 0.0f;
+        if (f > 1.0f) f = 1.0f;
+        return static_cast<int>(f * 255.0f + 0.5f);
+    };
+    const int want_r = to_u8(kAlrVkTriColorR), want_g = to_u8(kAlrVkTriColorG),
+              want_b = to_u8(kAlrVkTriColorB);
+    const int bg_r = to_u8(kAlrVkDrawBgR), bg_g = to_u8(kAlrVkDrawBgG),
+              bg_b = to_u8(kAlrVkDrawBgB);
+    bool draw_ok = false, not_bg = false;
+    if (sub) {
+        const int dr = std::abs(static_cast<int>(sub->px[0]) - want_r);
+        const int dg = std::abs(static_cast<int>(sub->px[1]) - want_g);
+        const int db = std::abs(static_cast<int>(sub->px[2]) - want_b);
+        draw_ok = dr <= 12 && dg <= 12 && db <= 12;  // UNORM rounding + tile resolve
+        // The readback must NOT be the clear background — that is the breadth proof.
+        const int er = std::abs(static_cast<int>(sub->px[0]) - bg_r);
+        const int eg = std::abs(static_cast<int>(sub->px[1]) - bg_g);
+        const int eb = std::abs(static_cast<int>(sub->px[2]) - bg_b);
+        not_bg = (er + eg + eb) > 24;
+    }
+
+    pass = decode_ok && reply_ok && transport_ok && dev_ok && submit_ok && draw_ok && not_bg;
+
+    out << "ALR VK DRAW MARSHAL: " << (pass ? "PASS" : "FAIL");
+    out << "\nalr vk draw mode=" << mode;
+    out << "\nalr vk draw request bytes=" << request.size() << " reply bytes="
+        << reply_bytes.size();
+    out << "\nalr vk draw transport=" << (transport_ok ? "ok" : "bad")
+        << " (req drained=" << req_got << " rep drained=" << rep_got << ")";
+    out << "\nalr vk draw ops decoded=" << st.decoded;
+    out << "\nalr vk draw device created=" << (dev_ok ? "yes" : "no");
+    if (dev_ok)
+        out << "\nalr vk draw gfx queue family=" << decoded.devices[0].gfx_family;
+    if (sub) {
+        out << "\nalr vk draw submit result=" << (sub->submit_result == 0 ? "VK_SUCCESS" : "fail");
+        out << "\nalr vk draw render result=" << sub->render_result
+            << " (0=OK 1=no-dev 2=target 3=record 4=submit 5=readback 6=no-clear 7=pipeline)";
+        out << "\nalr vk draw center px=" << static_cast<int>(sub->px[0]) << ","
+            << static_cast<int>(sub->px[1]) << "," << static_cast<int>(sub->px[2]) << ","
+            << static_cast<int>(sub->px[3]) << " (expect ~" << want_r << "," << want_g << ","
+            << want_b << " triangle)";
+        out << "\nalr vk draw bg was=" << bg_r << "," << bg_g << "," << bg_b
+            << " (center must DIFFER from bg)";
+        out << "\nalr vk draw triangle match=" << (draw_ok ? "yes" : "no")
+            << " not-background=" << (not_bg ? "yes" : "no");
+    } else {
+        out << "\nalr vk draw submit=absent";
+    }
+    out << "\nalr vk draw spirv vert words=" << (sizeof(kAlrVkTriVertSpv) / 4)
+        << " frag words=" << (sizeof(kAlrVkTriFragSpv) / 4) << " (handcrafted, host-embedded)";
+    out << "\nalr vk draw path=guest-encode(device/queue/pool/cmd/DRAW/submit) -> ring"
+           " -> host-decode(vendor libvulkan: shader-modules+pipeline+vertex-buffer+"
+           "vkCmdDraw into AHB) -> readback -> reply -> ring -> guest-decode";
+    return out.str();
+}
+
+// Host wire mode: the synthetic provider "rasterizes" the fixed-color triangle (returns
+// the triangle color as the readback pixel), so the full device/queue/cmd/DRAW/submit
+// round trip is verifiable on any host with NO Vulkan SDK / no GPU.
+inline std::string run_vk_draw_wire_probe() {
+    SyntheticMaliProvider syn;
+    VkProvider prov = syn.as_provider();
+    bool pass = false;
+    return vk_draw_roundtrip(&prov, "wire-synthetic", pass);
+}
+
+#ifdef ALR_VK_DECODE_REAL
+// Device mode: real vendor Mali libvulkan builds a graphics pipeline (handcrafted SPIR-V),
+// uploads a vertex buffer, and issues a real vkCmdDraw of a triangle into an AHB-backed
+// COLOR_ATTACHMENT, then reads it back. DEVICE-REQ verification entry point — WS-1 wires
+// this behind a JNI nativeAlrGpuVkDrawProbe and greps "ALR VK DRAW MARSHAL: PASS".
+inline std::string run_vk_draw_mali_probe() {
+    bool pass = false;
+    return vk_draw_roundtrip(/*provider=*/nullptr, "mali-libvulkan", pass);
 }
 #endif
 
