@@ -2191,12 +2191,20 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     // healthy guest the supervisor finishes first (sup_done=true) and the watchdog
     // no-ops, so it cannot regress GIMP/glmark2/--version etc.
     std::atomic<bool> sup_done{false};
+    // === diagnostic: ring buffer of the LAST supervisor events + §2.1 guard activity,
+    // dumped by the watchdog so a stall shows the EXACT decision sequence that led to the
+    // freeze (not just the frozen end-state). Each slot packs tid(16)|event(8)|stopsig(8).
+    std::array<uint32_t, 48> ev_ring{};
+    std::atomic<uint32_t> ev_head{0};
+    std::atomic<uint32_t> guard_fires{0};  // times the all-parked INTERRUPT guard ran
+    std::atomic<uint32_t> guard_ints{0};   // total PTRACE_INTERRUPTs it issued
     const unsigned watchdog_sec =
         host_path.find("chrom") != std::string::npos ? 200u
         : (host_path.find("gimp") != std::string::npos ? 1830u : 40u);
     const pid_t leader_pid = pid;
     const pid_t sup_tid = ::gettid();  // the single tracer thread, for self-diagnosis
-    std::thread watchdog([leader_pid, sup_tid, watchdog_sec, &sup_done]() {
+    std::thread watchdog([leader_pid, sup_tid, watchdog_sec, &sup_done,
+                          &ev_ring, &ev_head, &guard_fires, &guard_ints]() {
         for (unsigned i = 0; i < watchdog_sec; ++i) {
             if (sup_done.load(std::memory_order_acquire)) return;
             std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -2252,14 +2260,54 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         char sup_tid_s[16];
         std::snprintf(sup_tid_s, sizeof(sup_tid_s), "%d", static_cast<int>(sup_tid));
         dump_one("/proc/self/task", sup_tid_s, "SUPERVISOR");
+        // The recent-event ring + guard activity: the EXACT decision sequence before the
+        // freeze. event: 0=seccomp-path/exec done elsewhere; for EVENT_STOP we record the
+        // raw `event` (128) and stopsig. Decode tid|event|stopsig per slot.
+        __android_log_print(ANDROID_LOG_WARN, "alr_loader",
+                            "alr sup-stall guard_fires=%u guard_ints=%u ev_total=%u",
+                            guard_fires.load(), guard_ints.load(), ev_head.load());
+        const uint32_t head = ev_head.load(std::memory_order_acquire);
+        const uint32_t n = head < 48 ? head : 48;
+        char line[512];
+        int off = 0;
+        for (uint32_t k = 0; k < n; ++k) {
+            const uint32_t slot = (head - n + k) % 48;
+            const uint32_t v = ev_ring[slot];
+            off += std::snprintf(line + off, sizeof(line) - off, "%u:e%u/s%u ",
+                                 (v >> 16) & 0xffff, (v >> 8) & 0xff, v & 0xff);
+            if (off > static_cast<int>(sizeof(line)) - 24) break;
+        }
+        __android_log_print(ANDROID_LOG_WARN, "alr_loader",
+                            "alr sup-stall ev_ring [tid:eEVENT/sSTOPSIG] %s", line);
         ::kill(-leader_pid, SIGKILL);
         ::kill(leader_pid, SIGKILL);
     });
+    bool sigtrap_fwd_logged = false;  // one-shot: log the first genuine forwarded SIGTRAP
     // Multi-tracee supervisor: waitpid(-1, __WALL) catches the guest plus every
     // thread it clones and every process it forks/execs. Each blocked syscall
     // (SIGSYS) is emulated per-tracee; only blocked syscalls trap, so overhead
     // stays far below PRoot's trap-every-syscall model.
     while (true) {
+        // === ADR-003-v3 §2.1 PRIMARY FIX: never block forever on an all-parked group ===
+        // A group-stop is parked with PTRACE_LISTEN (below) and only re-reports when the
+        // group-stop ENDs — which, for a headless in-process guest, requires a SIGCONT
+        // that no one ever sends. If EVERY live tracee is LISTEN-parked, no waitpid event
+        // can ever arrive → the supervisor blocks in wait4 forever (device-confirmed:
+        // SUPERVISOR state=S wchan=do_wait while the guest sits state=t LISTEN-parked).
+        // PTRACE_INTERRUPT forces a parked tracee to re-report as a PTRACE_EVENT_STOP even
+        // while the group-stop persists (and works for ANY stop type, unlike SIGCONT which
+        // only clears job-control stops — which is why the earlier SIGCONT cure failed for
+        // dpkg-query). The re-report is then CONT-resumed by the group-stop-END handling
+        // below. This fires ONLY when provably wedged (all live tids parked), so it adds
+        // no overhead to a healthy guest and cannot re-stop a running one. (A partial park
+        // with a futex-blocked sibling is the bounded residual the stall watchdog covers.)
+        if (!known_tids.empty() && listening_tids.size() == known_tids.size()) {
+            guard_fires.fetch_add(1, std::memory_order_relaxed);
+            for (const pid_t lt : listening_tids) {
+                ::ptrace(PTRACE_INTERRUPT, lt, nullptr, nullptr);  // ESRCH benign
+                guard_ints.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         int status = 0;
         const pid_t w = ::waitpid(-1, &status, __WALL);
         if (w < 0) {
@@ -2270,6 +2318,8 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         }
         if (WIFEXITED(status)) {
             mem_fd_evict(w);  // tid reaped: close its cached /proc/<tid>/mem fd
+            known_tids.erase(w);      // drop from the live set (§2.1 all-parked guard)
+            listening_tids.erase(w);  // a parked tid that died is no longer parked
             if (w == pid) {
                 code = WEXITSTATUS(status);
             }
@@ -2277,6 +2327,8 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         }
         if (WIFSIGNALED(status)) {
             mem_fd_evict(w);  // tid killed: close its cached /proc/<tid>/mem fd
+            known_tids.erase(w);
+            listening_tids.erase(w);
             if (w == pid) {
                 sig = WTERMSIG(status);
             }
@@ -2287,6 +2339,12 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         }
         const int stopsig = WSTOPSIG(status);
         const int event = status >> 16;
+        {
+            const uint32_t i = ev_head.fetch_add(1, std::memory_order_relaxed);
+            ev_ring[i % 48] = (static_cast<uint32_t>(w & 0xffff) << 16) |
+                              (static_cast<uint32_t>(event & 0xff) << 8) |
+                              static_cast<uint32_t>(stopsig & 0xff);
+        }
         if (event == PTRACE_EVENT_SECCOMP) {
             // Path-mediation: the guest issued an openat-family syscall (RET_TRACE
             // by our stacked filter). The tracee is frozen at syscall-entry, before
@@ -3028,22 +3086,17 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                 // GROUP-STOP BEGIN (first time): park the thread with LISTEN (do NOT run
                 // it) — the single/multi-thread-safe handling. Record it so its END
                 // re-report (above) resumes instead of re-parking. ESRCH is benign.
+                // GROUP-STOP BEGIN: park with LISTEN (do NOT run it — that was the
+                // classic re-stops-the-group bug). It re-reports either when the
+                // group-stop naturally ends OR when the all-parked guard at the top of
+                // the loop PTRACE_INTERRUPTs it (the §2.1 release path for a headless
+                // guest with no SIGCONT source). Recording it in listening_tids drives
+                // both that guard and the END-resume branch above. ESRCH is benign.
                 listening_tids.insert(w);
                 if (::ptrace(PTRACE_LISTEN, w, nullptr, nullptr) != 0 && errno == ESRCH) {
                     listening_tids.erase(w);
                     continue;
                 }
-                // chromium-deadlock cure: a LISTEN-parked group-stop only ENDs (and thus
-                // resumes, via the branch above) when a SIGCONT arrives. A HEADLESS guest
-                // (chromium --dump-dom) has no job-control / no SIGCONT source, so an
-                // early single-thread group-stop would park the leader FOREVER
-                // (device-observed: tid=leader state=t wchan=ptrace_stop). We have no
-                // job-control intent for an in-process guest, so end the group-stop
-                // ourselves: SIGCONT the whole thread group. Each parked tid then
-                // re-reports its group-stop END (EINVAL) and the branch above CONT-resumes
-                // it. Idempotent — a SIGCONT to an already-running group is a no-op; the
-                // stall watchdog bounds any pathological re-stop loop. ESRCH is benign.
-                ::kill(pid, SIGCONT);
                 continue;
             }
             // A known tid that is NOT a group-stop (new-thread/INTERRUPT stop, or a
@@ -3076,23 +3129,56 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
             ::ptrace(PTRACE_CONT, w, nullptr, nullptr);
             continue;
         }
-        if (stopsig == SIGSTOP || stopsig == SIGTRAP) {
-            // Under SEIZE this branch is reached only for a genuine SIGNAL-DELIVERY-stop
-            // carrying SIGSTOP or SIGTRAP — NOT the attach sync (there is none: SEIZE
-            // does not stop the child and the go-pipe handshake replaced the TRACEME
-            // initial SIGSTOP), NOT a group-stop and NOT a new-thread/INTERRUPT stop
-            // (both are PTRACE_EVENT_STOP, handled above). A defensive, idempotent
-            // SETOPTIONS re-apply on a non-leader tid is kept purely as a backstop
-            // (SEIZE already inherits options to clones); the single/few-thread guest
-            // never enters this w!=pid path, so its behavior is byte-identical.
+        if (stopsig == SIGTRAP) {
+            // A genuine SIGTRAP signal-delivery-stop (event==0 here; every ptrace-mechanism
+            // SIGTRAP is a PTRACE_EVENT_*, handled above). chromium/V8 execute a `brk`
+            // (IMMEDIATE_CRASH / CHECK / __builtin_trap), which raises SIGTRAP with
+            // si_code==TRAP_BRKPT. Suppressing it (resume sig=0) leaves the PC ON the brk
+            // instruction → the guest re-executes it → an infinite SIGTRAP storm
+            // (device-confirmed: chromium leader looped e0/s5 4434×, never reaped). A
+            // genuine trap MUST be delivered: FORWARD it so the guest's own SIGTRAP handler
+            // runs (V8/crash reporter) or the default action fires deterministically —
+            // progress instead of a livelock. si_code<=0 (SI_USER/SI_QUEUE) or a non-brk
+            // code keeps the historical suppress (those are not re-executable instructions).
+            siginfo_t tsi{};
+            const bool have_si =
+                (::ptrace(PTRACE_GETSIGINFO, w, nullptr, &tsi) == 0);
+            // A genuine instruction trap (brk/single-step/hw-bkpt) must be FORWARDED — its
+            // PC is on a faulting instruction that re-fires if we suppress+resume. A
+            // user/queue-sent SIGTRAP (si_code<=0) is not re-executable, so keep suppress.
+            // si_code>0 is kernel-generated (TRAP_*, SI_KERNEL); forward those.
+            const int fwd = (have_si && tsi.si_code > 0) ? SIGTRAP : 0;
+            if (!sigtrap_fwd_logged) {
+                sigtrap_fwd_logged = true;
+                uint64_t r2[34] = {0};
+                struct iovec io2{r2, sizeof(r2)};
+                uintptr_t pc = 0;
+                if (::ptrace(PTRACE_GETREGSET, w,
+                             reinterpret_cast<void*>(NT_PRSTATUS), &io2) == 0) {
+                    pc = static_cast<uintptr_t>(r2[32]);  // aarch64 PC
+                }
+                __android_log_print(ANDROID_LOG_WARN, "alr_loader",
+                    "alr SIGTRAP tid=%d si_code=%d pc=%p fwd=%d (was livelock)",
+                    static_cast<int>(w), have_si ? tsi.si_code : -999,
+                    reinterpret_cast<void*>(pc), fwd);
+            }
+            if (::ptrace(PTRACE_CONT, w, nullptr,
+                         reinterpret_cast<void*>(static_cast<long>(fwd))) != 0 &&
+                errno == ESRCH) {
+                continue;
+            }
+            continue;
+        }
+        if (stopsig == SIGSTOP) {
+            // Genuine SIGSTOP signal-delivery-stop (not a group-stop / new-thread stop —
+            // those are PTRACE_EVENT_STOP, handled above). NEVER forward SIGSTOP: delivering
+            // it would re-stop the whole thread group → the classic deadlock. Suppress
+            // (resume sig=0). The idempotent SETOPTIONS re-apply on a non-leader tid is a
+            // backstop (SEIZE already inherits options to clones).
             if (w != pid) {
                 ::ptrace(PTRACE_SETOPTIONS, w, nullptr,
                          reinterpret_cast<void*>(kSeizeOpts));
             }
-            // Never forward SIGSTOP/SIGTRAP to the tracee: delivering SIGSTOP would
-            // re-stop the thread group → deadlock, and SIGTRAP is the ptrace event
-            // vehicle. Resume with signal 0 — unchanged from the TRACEME version for
-            // the single-thread path.
             if (::ptrace(PTRACE_CONT, w, nullptr, nullptr) != 0 && errno == ESRCH) {
                 continue;  // tid raced away between stop and resume; just loop
             }
