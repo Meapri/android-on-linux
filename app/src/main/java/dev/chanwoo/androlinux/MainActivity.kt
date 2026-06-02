@@ -1937,9 +1937,22 @@ class MainActivity : Activity() {
                 // tar size so re-pushing a rebuilt stage auto-re-extracts. fakeroot-stage.tar
                 // ships usr/lib/androlinux/libalr_fakeroot.so (0755); apt-dpkg-stage.tar ships
                 // usr/bin/{dpkg,apt,tar,…} + var/lib/dpkg admindir + var/cache/apt/archives/hello_*.deb.
-                for (name in listOf("fakeroot", "apt-dpkg")) {
+                // ORDER MATTERS (v2 admindir fix): apt-dpkg-stage ships the admindir SCAFFOLD
+                // (the empty var/lib/dpkg/{updates,triggers,alternatives}/ DIRECTORY entries +
+                // zero-byte status), while dpkg-db-stage ships the POPULATED status (72KB) +
+                // info/*.list but carries NO directory entries. v163 died at
+                // `var/lib/dpkg/updates/tmp.i: No such file or directory` because the scaffold's
+                // updates/ dir was missing (dpkg-db alone never creates it). So extract apt-dpkg
+                // FIRST (creates updates/ etc.), then dpkg-db LAST so its real status overwrites
+                // the scaffold's empty one while the scaffold's updates/ dir survives. All three
+                // (fakeroot, apt-dpkg, dpkg-db) MUST land before the dpkg run below.
+                // Use aptdrain-scoped markers (NOT the shared .{name}-staged-<size> the onCreate
+                // toolkit loop uses for dpkg-db) so this sequential, ordered extract is never
+                // pre-empted/skipped by that concurrent thread — guaranteeing apt-dpkg's scaffold
+                // lands before dpkg-db's populated status every armed cold start.
+                for (name in listOf("fakeroot", "apt-dpkg", "dpkg-db")) {
                     val tar = java.io.File("/data/local/tmp/$name-stage.tar")
-                    val marker = java.io.File(rootfsDir, ".$name-staged-${tar.length()}")
+                    val marker = java.io.File(rootfsDir, ".aptdrain-$name-staged-${tar.length()}")
                     if (tar.isFile && !marker.isFile) {
                         android.util.Log.i("alr_loader", "aptdrain: $name-stage extracting overlay (${tar.length()} bytes)")
                         val ovr = RootfsInstaller(this@MainActivity).extractOverlayTar(tar, rootfsDir)
@@ -1976,6 +1989,11 @@ class MainActivity : Activity() {
                 // .so and push FAKEROOTUID/GID=0. We restore it immediately after the probe so
                 // every OTHER probe path stays on the plain interpose-only chain (no regression).
                 android.system.Os.setenv("ALR_FAKEROOT", "1", true)
+                // (v2) Enable static re-map for dpkg's fork+exec children (zstd/sh/tar). dpkg
+                // shells out to the extract helper + maintainer scripts; without INPROC those
+                // statically-linked children don't get the in-process re-map and the unpack
+                // stage stalls. Scoped to the drain (unset in finally) so no other path changes.
+                android.system.Os.setenv("ALR_REEXEC_INPROC", "1", true)
                 try {
                     // (L3 effected) dpkg -i hello.deb. argv is verbatim the builder's
                     // --device-cmd: --force-not-root (bypass the superuser gate; fakeroot makes
@@ -2022,6 +2040,7 @@ class MainActivity : Activity() {
                 } finally {
                     // Restore: every other probe stays on interpose-only (strict no-regression).
                     android.system.Os.unsetenv("ALR_FAKEROOT")
+                    android.system.Os.unsetenv("ALR_REEXEC_INPROC")
                 }
             } catch (e: Throwable) {
                 android.util.Log.e("alr_loader", "aptdrain EXC: ${android.util.Log.getStackTraceString(e)}")
