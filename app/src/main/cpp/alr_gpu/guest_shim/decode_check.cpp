@@ -57,6 +57,13 @@ struct VadPlain { GLuint index; GLuint divisor; };
 struct VadNamed { std::string name; GLuint divisor; };
 static std::vector<VadPlain> vad_plain;
 static std::vector<VadNamed> vad_named;
+// constant generic vertex attributes (glVertexAttrib{1..4}fv) — plain index + by name
+struct VattribFPlain { GLuint index; std::vector<float> v; };
+struct VattribFNamed { std::string name; std::vector<float> v; };
+static std::vector<VattribFPlain> vattrib_f_plain;
+static std::vector<VattribFNamed> vattrib_f_named;
+// recorder defined below, after attrib_loc_name is declared.
+static void rec_vattrib_fv(GLuint index, const float *v, size_t n);
 // GLES3 core: UBO binding, sampler objects, MRT / read-buffer / invalidate
 struct BufBaseRec { GLenum target; GLuint index; GLuint buffer; };
 struct BufRangeRec { GLenum target; GLuint index; GLuint buffer; GLintptr offset; GLsizeiptr size; };
@@ -125,6 +132,14 @@ static void put_iv(GLint loc, const int32_t *v, size_t n) {
 static void put_matN(GLint loc, const float *v, size_t n) {
     auto it = uniform_loc_name.find(loc);
     if (it != uniform_loc_name.end()) matN_by_name[it->second] = std::vector<float>(v, v + n);
+}
+// glVertexAttrib{1..4}fv all funnel through one recorder (the decoder resolves a NAMED op
+// to a real attrib location via glGetAttribLocation, so the recorder keys on the index it
+// is handed — a real location for the named path, a literal index for the plain path).
+static void rec_vattrib_fv(GLuint index, const float *v, size_t n) {
+    auto it = attrib_loc_name.find(static_cast<GLint>(index));
+    if (it != attrib_loc_name.end()) vattrib_f_named.push_back({it->second, std::vector<float>(v, v + n)});
+    else vattrib_f_plain.push_back({index, std::vector<float>(v, v + n)});
 }
 }  // namespace rec
 
@@ -263,6 +278,13 @@ void glVertexAttribDivisor(GLuint index, GLuint divisor) {
     if (it != rec::attrib_loc_name.end()) rec::vad_named.push_back({it->second, divisor});
     else rec::vad_plain.push_back({index, divisor});
 }
+// constant generic vertex attributes — the decoder dispatches OP_VERTEX_ATTRIB_F[_NAMED]
+// to the matching fv arity; the recorder keys on the index it is handed (a real attrib
+// location for the named path, a literal index for the plain path).
+void glVertexAttrib1fv(GLuint index, const GLfloat *v) { rec::rec_vattrib_fv(index, v, 1); }
+void glVertexAttrib2fv(GLuint index, const GLfloat *v) { rec::rec_vattrib_fv(index, v, 2); }
+void glVertexAttrib3fv(GLuint index, const GLfloat *v) { rec::rec_vattrib_fv(index, v, 3); }
+void glVertexAttrib4fv(GLuint index, const GLfloat *v) { rec::rec_vattrib_fv(index, v, 4); }
 // per-fragment / raster state setters
 void glBlendFunc(GLenum s, GLenum d) { rec::blend_funcs.push_back({s, d}); }
 void glBlendFuncSeparate(GLenum sr, GLenum dr, GLenum sa, GLenum da) {
@@ -371,7 +393,7 @@ int main(int argc, char **argv) {
 
     // --- the stream decoded into exactly the cube + mesh GL calls. ---
     check(ok && st.ok, "decode_batch returned true (well-formed, no bad/unknown opcode)");
-    check(st.decoded == 102, "decoded op count == 102 (+3 RGB UNPACK-repack: gen/bind/teximg)");
+    check(st.decoded == 104, "decoded op count == 104 (+2 constant vertex attribs: plain + by-name)");
     check(st.shaders.size() == 2, "2 shaders mapped");
     check(st.programs.size() == 1, "1 program mapped");
     check(st.buffers.size() == 3, "3 buffers mapped (vbo + ebo + ubo)");
@@ -521,6 +543,18 @@ int main(int argc, char **argv) {
           "glVertexAttribDivisor plain index 0 -> divisor 1");
     check(rec::vad_named.size() == 1 && rec::vad_named[0].name == "position" && rec::vad_named[0].divisor == 2,
           "glVertexAttribDivisor BY NAME (position) -> divisor 2");
+
+    // constant generic vertex attributes (the value a DISABLED attrib array reads)
+    bool caf_ok = rec::vattrib_f_plain.size() == 1 && rec::vattrib_f_plain[0].index == 2 &&
+                  rec::vattrib_f_plain[0].v.size() == 3 &&
+                  rec::vattrib_f_plain[0].v[0] == 0.1f && rec::vattrib_f_plain[0].v[1] == 0.2f &&
+                  rec::vattrib_f_plain[0].v[2] == 0.3f;
+    check(caf_ok, "glVertexAttrib3f plain index 2 -> {0.1,0.2,0.3} (OP_VERTEX_ATTRIB_F ncomp=3)");
+    bool cafn_ok = rec::vattrib_f_named.size() == 1 && rec::vattrib_f_named[0].name == "normal" &&
+                   rec::vattrib_f_named[0].v.size() == 4 &&
+                   rec::vattrib_f_named[0].v[0] == 1.0f && rec::vattrib_f_named[0].v[1] == 0.0f &&
+                   rec::vattrib_f_named[0].v[2] == 0.0f && rec::vattrib_f_named[0].v[3] == 1.0f;
+    check(cafn_ok, "glVertexAttrib4fv BY NAME (normal) -> {1,0,0,1} (OP_VERTEX_ATTRIB_F_NAMED ncomp=4)");
 
     // ---- GLES3 core: UBO binding, sampler objects, MRT / read-buffer / invalidate ----
     static constexpr unsigned kGL_UNIFORM_BUFFER  = 0x8A11;

@@ -215,6 +215,15 @@ attrib offsets {0, 12} are correct, and there is exactly one `glDrawArrays(…, 
 * **`glVertexAttribPointer` is VBO-offset only.** The `pointer` arg is encoded as a
   `u32` byte offset into the bound `ARRAY_BUFFER` (the decoder reinterpret_casts it
   back). Client vertex arrays are out of scope; the cube binds a VBO.
+* **Constant generic vertex attributes** (`glVertexAttrib{1..4}f[v]`, the value a
+  *disabled* attrib array reads) are real wire ops (`OP_VERTEX_ATTRIB_F` /
+  `…_F_NAMED`) carrying `ncomp` + the supplied floats; the host fills any unspecified
+  trailing component from the GL default `(0,0,0,1)`. Same packed-handle by-name idiom
+  as `glVertexAttribPointer`: a `glGetAttribLocation` handle emits the NAMED op (host
+  resolves the real location), a literal `glBindAttribLocation` index emits the plain
+  op. These were accept-and-drop no-ops until G5 — dropping them left the harder
+  glmark2 scenes (shading/bump/shadow/refract/conditionals/function/loop) reading the
+  GL default instead of the app's constant, a silent wrong-pixels bug.
 * **Optimistic queries.** `glGetError → GL_NO_ERROR` (unless the shim set a sticky
   error, e.g. an oversized upload → `GL_OUT_OF_MEMORY`); `glGetShaderiv(COMPILE_
   STATUS)` / `glGetProgramiv(LINK_STATUS) → GL_TRUE`. Real failures surface as

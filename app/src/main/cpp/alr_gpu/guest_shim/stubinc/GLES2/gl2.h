@@ -66,6 +66,11 @@ void   glEnableVertexAttribArray(GLuint);
 void   glVertexAttribPointer(GLuint, GLint, GLenum, GLboolean, GLsizei, const void *);
 void   glDrawArrays(GLenum, GLint, GLsizei);
 void   glDrawElements(GLenum, GLsizei, GLenum, const void *);
+/* constant generic vertex attributes (OP_VERTEX_ATTRIB_F[_NAMED] -> these fv arities) */
+void   glVertexAttrib1fv(GLuint, const GLfloat *);
+void   glVertexAttrib2fv(GLuint, const GLfloat *);
+void   glVertexAttrib3fv(GLuint, const GLfloat *);
+void   glVertexAttrib4fv(GLuint, const GLfloat *);
 GLint  glGetAttribLocation(GLuint, const GLchar *);
 void   glCullFace(GLenum);
 void   glFrontFace(GLenum);

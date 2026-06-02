@@ -125,6 +125,15 @@ enum Op : uint8_t {
     OP_VERTEX_ATTRIB_POINTER_NAMED = 81,// u32 vprog, blob(name), i32 size, u32 type, u8 norm, i32 stride, u32 offset
     // --- indexed draw (meshes) ---
     OP_DRAW_ELEMENTS = 82,      // u32 mode, i32 count, u32 type, u32 offset (into bound ELEMENT_ARRAY_BUFFER)
+    // --- CONSTANT generic vertex attributes (glVertexAttrib{1..4}f[v]). The value an
+    //     attribute reads when its array is DISABLED. The build/texture scenes are all
+    //     VBO-array-backed (never set a constant attrib), but the harder glmark2 scenes
+    //     (shading/bump/shadow/refract/conditionals/function/loop) and toolkit GL paths
+    //     do; dropping them = the attrib reads the GL default (0,0,0,1) instead of the
+    //     app's value (silent wrong-pixels). ncomp picks glVertexAttrib{1,2,3,4}fv; the
+    //     NAMED variant carries the attribute NAME (host resolves the real location). ---
+    OP_VERTEX_ATTRIB_F = 84,       // u32 index, u8 ncomp(1..4), f32[ncomp]
+    OP_VERTEX_ATTRIB_F_NAMED = 85, // u32 vprog, blob(name), u8 ncomp(1..4), f32[ncomp]
     // --- framebuffer / renderbuffer objects (render-to-texture scenes). Virtual FBO/RBO
     //     ids like buffers/textures; vfb 0 = the executor's default (AHB) target. ---
     OP_GEN_FRAMEBUFFER = 90,         // u32 vfb_id
@@ -578,6 +587,41 @@ inline bool decode_batch(const uint8_t* data, size_t len, HostState& st) {
                 // + OP_BUFFER_DATA on that target); offset is a byte offset into it.
                 glDrawElements(mode, count, type,
                                reinterpret_cast<const void*>(static_cast<uintptr_t>(offset)));
+                ++st.decoded; break;
+            }
+            case OP_VERTEX_ATTRIB_F: {
+                uint32_t index; uint8_t ncomp; float v[4];
+                if (!r.u32(index) || !r.u8(ncomp)) { st.ok = false; break; }
+                if (ncomp < 1 || ncomp > 4) { st.ok = false; break; }
+                if (!r.floats(v, ncomp)) { st.ok = false; break; }
+                // The fv form sets the supplied components; the host fills the unspecified
+                // trailing components from the GL default (0,0,0,1) exactly as the scalar
+                // glVertexAttrib{1,2,3}f forms do.
+                switch (ncomp) {
+                    case 1: glVertexAttrib1fv(index, v); break;
+                    case 2: glVertexAttrib2fv(index, v); break;
+                    case 3: glVertexAttrib3fv(index, v); break;
+                    case 4: glVertexAttrib4fv(index, v); break;
+                }
+                ++st.decoded; break;
+            }
+            case OP_VERTEX_ATTRIB_F_NAMED: {
+                uint32_t vp, nlen; const uint8_t* name; uint8_t ncomp; float v[4];
+                if (!r.u32(vp)) { st.ok = false; break; }
+                if (!r.blob(name, nlen)) { st.ok = false; break; }
+                if (!r.u8(ncomp)) { st.ok = false; break; }
+                if (ncomp < 1 || ncomp > 4) { st.ok = false; break; }
+                if (!r.floats(v, ncomp)) { st.ok = false; break; }
+                std::string nm(reinterpret_cast<const char*>(name), nlen);
+                GLint loc = glGetAttribLocation(st.real_prog(vp), nm.c_str());
+                if (loc >= 0) {
+                    switch (ncomp) {
+                        case 1: glVertexAttrib1fv(static_cast<GLuint>(loc), v); break;
+                        case 2: glVertexAttrib2fv(static_cast<GLuint>(loc), v); break;
+                        case 3: glVertexAttrib3fv(static_cast<GLuint>(loc), v); break;
+                        case 4: glVertexAttrib4fv(static_cast<GLuint>(loc), v); break;
+                    }
+                }
                 ++st.decoded; break;
             }
             case OP_GEN_FRAMEBUFFER: {

@@ -97,6 +97,19 @@ enum AlrOp {
     ALR_OP_VERTEX_ATTRIB_POINTER_NAMED = 81, /* u32 vprog, blob(name), i32 size, u32 type, u8 norm, i32 stride, u32 offset */
     /* indexed draw (meshes) */
     ALR_OP_DRAW_ELEMENTS = 82,       /* u32 mode, i32 count, u32 type, u32 offset (into bound ELEMENT_ARRAY_BUFFER) */
+    /* CONSTANT generic vertex attributes (glVertexAttrib{1..4}f[v]). The VALUE supplied
+     * for an attribute whose array is DISABLED — the build/texture scenes never use them
+     * (all attribs are VBO-array-backed) so they were accept-and-drop no-ops, but glmark2's
+     * shading/bump/shadow/refract/conditionals/function/loop scenes (and many toolkit GL
+     * paths) set a constant attrib for a non-array input. Dropping it = the attrib reads
+     * the GL default (0,0,0,1) instead of the app's value -> wrong shading, a SILENT
+     * wrong-pixels bug. Same packed-handle by-NAME idiom as VERTEX_ATTRIB_POINTER_NAMED:
+     * a glGetAttribLocation handle (high 16 bits set) carries the NAME (host resolves the
+     * real location), a literal glBindAttribLocation index uses the plain op. ncomp 1..4
+     * picks glVertexAttrib{1,2,3,4}fv on the host; the host fills the unspecified trailing
+     * components from the GL default (0,0,0,1) exactly as real glVertexAttrib{1,2,3}f do. */
+    ALR_OP_VERTEX_ATTRIB_F = 84,       /* u32 index, u8 ncomp(1..4), f32[ncomp] */
+    ALR_OP_VERTEX_ATTRIB_F_NAMED = 85, /* u32 vprog, blob(name), u8 ncomp(1..4), f32[ncomp] */
     /* framebuffer / renderbuffer objects (render-to-texture). Virtual ids; vfb 0 = default. */
     ALR_OP_GEN_FRAMEBUFFER = 90,         /* u32 vfb_id */
     ALR_OP_BIND_FRAMEBUFFER = 91,        /* u32 target, u32 vfb_id (0 -> default) */
