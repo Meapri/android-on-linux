@@ -29,10 +29,12 @@
 //     guest, not a fresh kernel image. We read AT_PAGESZ/AT_HWCAP/AT_HWCAP2/
 //     AT_RANDOM/AT_SYSINFO_EHDR from /proc/self/auxv, and uid/gid from raw
 //     getuid/geteuid/getgid/getegid syscalls.
-//   * We MUST clear TPIDR_EL0 (=0) before the jump: unlike the standalone static
-//     ELF, we run under a LIVE bionic TCB; leaving it set would let glibc's ld.so
-//     trip over a foreign thread pointer. (alr_enter_guest in the loader does the
-//     same msr tpidr_el0, xzr.)
+//   * We MUST move TPIDR_EL0 OFF the live bionic TCB before the jump: leaving it set
+//     would let glibc's ld.so trip over a foreign thread pointer. But it must NOT be
+//     NULL either — glibc's pre-TLS-init startup reads the stack canary via
+//     THREAD_SELF (=TPIDR_EL0), which faults at ~0 if TP=0. So we point TP at a fresh
+//     zeroed 16 KiB region (alr_enter_guest in the loader does the same; see
+//     enter_guest below). The earlier `msr tpidr_el0, xzr` was the SEGV bug.
 //   * The rootfs prefix comes from x22 directly (the supervisor already resolved
 //     it), not from getenv(ALR_ROOTFS).
 //
@@ -125,7 +127,13 @@ typedef struct {
 #define DT_RELA    7
 #define DT_RELASZ  8
 #define DT_RELAENT 9
-#define R_AARCH64_IRELATIVE 1027
+// ARM ABI (aaelf64): 1027=R_AARCH64_RELATIVE (base-relative: *slot += base),
+// 1032=R_AARCH64_IRELATIVE (ifunc resolver). The old `IRELATIVE 1027` was the
+// RELATIVE value — it made the reloc loop treat every RELATIVE entry as an ifunc
+// (calling a data address -> SIGILL) and skip the real IRELATIVEs. Match the
+// device-proven loader (runtime_report.cpp:36).
+#define R_AARCH64_RELATIVE  1027
+#define R_AARCH64_IRELATIVE 1032
 #define ELF64_R_TYPE(i) ((i) & 0xffffffff)
 
 typedef struct { Elf64_Addr r_offset; Elf64_Xword r_info; Elf64_Sxword r_addend; } Elf64_Rela;
@@ -161,6 +169,7 @@ typedef struct { Elf64_Addr r_offset; Elf64_Xword r_info; Elf64_Sxword r_addend;
 #define SYS_close       57
 #define SYS_read        63
 #define SYS_write       64
+#define SYS_brk         214
 #define SYS_mmap        222
 #define SYS_mprotect    226
 #define SYS_exit        93
@@ -447,7 +456,13 @@ ALR_FREESTANDING static MappedImage map_elf_image(const char* img, size_t len,
         if (prot_run & PROT_EXEC) flush_icache(rs, re);
     }
 
-    // R_AARCH64_IRELATIVE via PT_DYNAMIC's DT_RELA (ld.so is section-stripped).
+    // Relocations via PT_DYNAMIC's DT_RELA (ld.so is section-stripped). We apply
+    // BOTH R_AARCH64_RELATIVE (base-relative fixups in a static-PIE / ET_DYN image:
+    // *(base+offset) += base) AND R_AARCH64_IRELATIVE (ifunc resolver). The old code
+    // only handled "IRELATIVE 1027" — which was actually the RELATIVE value, so it
+    // (a) ran every RELATIVE entry through the ifunc path (calling a data address ->
+    // SIGILL) and (b) skipped the true IRELATIVEs (1032). Mirrors the device-proven
+    // loader (runtime_report.cpp ~L1376-1433), extended with RELATIVE for static-PIE.
     const Elf64_Phdr* dynph = 0;
     for (int i = 0; i < eh->e_phnum; ++i) {
         if (ph[i].p_type == PT_DYNAMIC) { dynph = &ph[i]; break; }
@@ -464,17 +479,25 @@ ALR_FREESTANDING static MappedImage map_elf_image(const char* img, size_t len,
         if (rela && relaent) {
             for (size_t off = 0; off < relasz; off += relaent) {
                 const Elf64_Rela* r = (const Elf64_Rela*)(rela + off);
-                if (ELF64_R_TYPE(r->r_info) != R_AARCH64_IRELATIVE) continue;
-                typedef unsigned long (*Resolver)(unsigned long, const void*);
-                Resolver res = (Resolver)(base + r->r_addend);
-                // Thread the REAL AT_HWCAP (was 0): glibc ifunc resolvers select a
-                // CPU variant from HWCAP; a 0/wrong value can SIGILL a resolver that
-                // indexes a feature table. The 2nd arg (HWCAP2/__ifunc_arg_t*) stays
-                // 0 — aarch64 glibc resolvers that need HWCAP2 take it via a pointer
-                // arg we don't synthesize; passing 0 makes them treat HWCAP2 as
-                // absent (generic), which is correct-but-conservative, never illegal.
-                *(uint64_t*)(base + r->r_offset) = res(g_hwcap, 0);
-                ++irel;
+                unsigned long rtype = ELF64_R_TYPE(r->r_info);
+                if (rtype == R_AARCH64_RELATIVE) {
+                    // Base-relative: the linker emitted addend = link-time vaddr;
+                    // the runtime value is addend + load bias. For ET_EXEC base==0
+                    // (no-op); for ET_DYN/static-PIE this is the bulk of startup
+                    // relocs that glibc's _dl_relocate_static_pie would otherwise do.
+                    *(uintptr_t*)(base + r->r_offset) = base + (uintptr_t)r->r_addend;
+                } else if (rtype == R_AARCH64_IRELATIVE) {
+                    typedef unsigned long (*Resolver)(unsigned long, const void*);
+                    Resolver res = (Resolver)(base + r->r_addend);
+                    // Thread the REAL AT_HWCAP (was 0): glibc ifunc resolvers select a
+                    // CPU variant from HWCAP; a 0/wrong value can SIGILL a resolver that
+                    // indexes a feature table. The 2nd arg (HWCAP2/__ifunc_arg_t*) stays
+                    // 0 — aarch64 glibc resolvers that need HWCAP2 take it via a pointer
+                    // arg we don't synthesize; passing 0 makes them treat HWCAP2 as
+                    // absent (generic), which is correct-but-conservative, never illegal.
+                    *(uint64_t*)(base + r->r_offset) = res(g_hwcap, 0);
+                    ++irel;
+                }
             }
         }
     }
@@ -506,16 +529,21 @@ ALR_FREESTANDING static MappedImage map_elf_image(const char* img, size_t len,
 }
 
 // Transfer control to the guest entry with the freshly built SysV stack. Mirrors
-// alr_reentry.c:enter_guest, PLUS the loader's `msr tpidr_el0, xzr`: in-process we
-// run under a LIVE bionic TCB, so we must zero the thread pointer before ld.so
-// installs its own. Naked-ish: never returns.
-ALR_FREESTANDING __attribute__((noreturn)) static void enter_guest(void* sp, void* entry) {
+// the device-proven loader's alr_enter_guest(sp, entry, tcb) (runtime_report.cpp
+// L1160-1169). In-process we run under a LIVE bionic TCB, so we must move the thread
+// pointer OFF it before glibc startup runs. The old code used `msr tpidr_el0, xzr`
+// (TP=NULL) — but glibc's pre-TLS-init csu (_dl_aux_init/__tunables_init) is built
+// with -fstack-protector and reads the canary via THREAD_SELF (=TPIDR_EL0); with
+// TP=NULL that load faults near address 0 (SIGSEGV). The loader instead points TP at
+// a fresh ZEROED 16 KiB region (caller mmaps it, passes its center) so those reads
+// land in mapped-zero until ld.so installs its own TLS. Naked-ish: never returns.
+ALR_FREESTANDING __attribute__((noreturn)) static void enter_guest(void* sp, void* entry, void* tcb) {
     __asm__ volatile(
-        "msr tpidr_el0, xzr\n"   // clean TCB: glibc ld.so installs its own TLS
+        "msr tpidr_el0, %2\n"    // clean zeroed TCB (NOT xzr): canary/THREAD_SELF reads land in mapped-zero
         "mov sp, %0\n"
         "mov x0, #0\n"
         "br  %1\n"
-        :: "r"(sp), "r"(entry) : "memory");
+        :: "r"(sp), "r"(entry), "r"(tcb) : "memory");
     __builtin_unreachable();
 }
 
@@ -743,7 +771,29 @@ void alr_inproc_reexec_worker(const char* target, char** argv,
     diag("ALR-INPROC: mapped, jumping entry=");
     diag_hex("", (unsigned long)jump_entry);
     diag_hex("ALR-INPROC sp@", (unsigned long)start);
-    enter_guest((void*)start, (void*)jump_entry);
+
+    // ---- brk init (S2 / glibc BZ2066147) --------------------------------------
+    // We did NOT execve, so the kernel never re-armed mm->brk for a fresh image: the
+    // program break is wherever bionic left it. glibc's __libc_setup_tls calls
+    // _dl_early_allocate -> __sbrk(0) to read the current break before its mmap
+    // fallback; on a re-mapped (non-execve) guest a never-touched/zero break can fault
+    // that path. A single brk(0) just READS the current break (brk with addr below the
+    // minimum is a no-op that returns the current break) so the value is materialized
+    // for glibc's first __sbrk. Best-effort: failure is non-fatal (glibc 2.36+ falls
+    // back to mmap), so we only diag it.
+    long cur_brk = sys1(SYS_brk, 0);
+    diag_hex("ALR-INPROC: brk0=", (unsigned long)cur_brk);
+
+    // ---- clean zeroed TCB (FIX: was msr tpidr_el0, xzr -> NULL deref) ----------
+    // glibc's pre-TLS-init startup reads the stack canary via TPIDR_EL0; point it at a
+    // fresh 16 KiB zero region (loader pattern, runtime_report.cpp L1888) so those
+    // reads land in mapped-zero, not at NULL. center+8192 leaves slack on both sides.
+    void* tcb_region = (void*)sys6_(SYS_mmap, 0, 16384, PROT_READ | PROT_WRITE,
+                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void* tcb = (tcb_region == MAP_FAILED) ? (void*)0 : (void*)((char*)tcb_region + 8192);
+    diag_hex("ALR-INPROC: tcb@", (unsigned long)tcb);
+
+    enter_guest((void*)start, (void*)jump_entry, tcb);
     sys_exit(99);  // unreachable
 }
 
