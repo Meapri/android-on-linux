@@ -1980,12 +1980,22 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     // fix: splice the exec to run <rootfs>/usr/lib/androlinux/alr-reentry (a STATIC
     // aarch64 ELF the kernel CAN load) with argv=[stub, target_host, orig argv1..];
     // the stub then maps the glibc target in-process (inheriting seccomp+SEIZE+envp)
-    // and jumps to ld.so. Gated by ALR_EXEC_REENTRY (default ON) so it is A/B-able;
-    // it only ever touches the execve path, which is ALREADY broken on device, so it
-    // cannot regress the proven single-guest/GUI/GPU paths (none of which execve).
+    // and jumps to ld.so.
+    // DEVICE FINDING (v140 drain#18, R9): the splice FIRES correctly (spliced=1, stub
+    // + target paths right), but the kernel-execve of the stub NEVER completes
+    // (exec_events=0, stub never runs) EVEN WITH the stub present at the path — because
+    // the stub lives in app storage (app_data_file) and untrusted_app's W^X SELinux
+    // policy (targetSdk 35) forbids execve() of any app-storage file. This is the SAME
+    // wall that requires ALR's in-process ELF mapping. So Option S via a rootfs-path
+    // stub is DEAD; default is now OFF (opt-in via ALR_EXEC_REENTRY=1). The mechanism
+    // is retained for the two live continuations: (a) re-point the stub to
+    // nativeLibraryDir (the bundled-executable hatch — needs extractNativeLibs=true)
+    // and re-test the SELinux verdict, or (b) ADR-003-v3 in-process re-map (NO execve:
+    // a resident file-backed-PROT_EXEC trampoline maps the new ELF in-process — the
+    // mmap is allowed where execve is not). See docs/evidence/2026-06-02-round9-*.
     const bool exec_reentry_on = []{
         const char* e = ::getenv("ALR_EXEC_REENTRY");
-        return !(e != nullptr && e[0] == '0');
+        return e != nullptr && e[0] == '1';
     }();
     int exec_reentry_spliced = 0;   // execs spliced to run via the re-entry stub
     std::string first_reentry_target;  // first target the stub was asked to re-map
