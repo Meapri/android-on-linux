@@ -37,6 +37,9 @@
 #endif
 
 #include <chrono>
+#include <atomic>
+#include <thread>
+#include <dirent.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -2176,6 +2179,82 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     // input => same output, so the rewrite is provably unchanged.
     std::unordered_map<std::string, std::string> xlate_cache;
     constexpr std::size_t kXlateCacheCap = 256;
+    // === ADR-003-v3 §2.2/§4: parent-side stall WATCHDOG (chromium-deadlock bound +
+    // diagnostic). The per-guest alarm() is armed in the CHILD (alr_enter_guest path),
+    // but a thread that is ptrace-stopped / PTRACE_LISTEN-parked cannot service SIGALRM
+    // — so a wedged multithread guest (chromium --dump-dom) makes this waitpid loop
+    // block FOREVER (no event, no child death), silently hanging the loader. This
+    // join-able watchdog thread sleeps a deadline (a margin past the child alarm); if
+    // the supervisor has not finished, it DUMPS every tracee's /proc state (which
+    // thread is stuck WHERE — state/wchan/syscall) to logcat, then SIGKILLs the guest
+    // process group so waitpid returns and the probe reports instead of hanging. For a
+    // healthy guest the supervisor finishes first (sup_done=true) and the watchdog
+    // no-ops, so it cannot regress GIMP/glmark2/--version etc.
+    std::atomic<bool> sup_done{false};
+    const unsigned watchdog_sec =
+        host_path.find("chrom") != std::string::npos ? 200u
+        : (host_path.find("gimp") != std::string::npos ? 1830u : 40u);
+    const pid_t leader_pid = pid;
+    const pid_t sup_tid = ::gettid();  // the single tracer thread, for self-diagnosis
+    std::thread watchdog([leader_pid, sup_tid, watchdog_sec, &sup_done]() {
+        for (unsigned i = 0; i < watchdog_sec; ++i) {
+            if (sup_done.load(std::memory_order_acquire)) return;
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        if (sup_done.load(std::memory_order_acquire)) return;
+        // Stall confirmed: dump every tracee thread's kernel state, then kill.
+        __android_log_print(ANDROID_LOG_WARN, "alr_loader",
+                            "alr sup-stall WATCHDOG fired after %us leader=%d sup_tid=%d — dumping + SIGKILL",
+                            watchdog_sec, static_cast<int>(leader_pid), static_cast<int>(sup_tid));
+        // Dump one /proc/<dir>/<tid>/{stat-state,wchan,syscall} line. `tag` flags whether
+        // this is a tracee (guest) or the supervisor's OWN tracer thread — the latter
+        // reveals WHY a tracee isn't resumed: supervisor wchan/syscall = a blocking pread
+        // on /proc/<dead-tid>/mem (candidate c) vs parked in waitpid (mis-resume, d/e).
+        auto dump_one = [](const char* dir, const char* tid, const char* tag) {
+            char p[96];
+            char stat_s[16] = "?", wchan_s[64] = "?", sysc_s[80] = "?";
+            std::snprintf(p, sizeof(p), "%s/%s/stat", dir, tid);
+            if (int fd = ::open(p, O_RDONLY | O_CLOEXEC); fd >= 0) {
+                char buf[256] = {0};
+                if (::read(fd, buf, sizeof(buf) - 1) > 0) {
+                    const char* rp = std::strrchr(buf, ')');  // state = char after "pid (comm) "
+                    if (rp && rp[1] && rp[2]) { stat_s[0] = rp[2]; stat_s[1] = '\0'; }
+                }
+                ::close(fd);
+            }
+            std::snprintf(p, sizeof(p), "%s/%s/wchan", dir, tid);
+            if (int fd = ::open(p, O_RDONLY | O_CLOEXEC); fd >= 0) {
+                ssize_t n = ::read(fd, wchan_s, sizeof(wchan_s) - 1);
+                if (n > 0) wchan_s[n] = '\0';
+                ::close(fd);
+            }
+            std::snprintf(p, sizeof(p), "%s/%s/syscall", dir, tid);
+            if (int fd = ::open(p, O_RDONLY | O_CLOEXEC); fd >= 0) {
+                ssize_t n = ::read(fd, sysc_s, sizeof(sysc_s) - 1);
+                if (n > 0) { sysc_s[n] = '\0'; if (char* nl = std::strchr(sysc_s, '\n')) *nl = '\0'; }
+                ::close(fd);
+            }
+            __android_log_print(ANDROID_LOG_WARN, "alr_loader",
+                                "alr sup-stall %s tid=%s state=%s wchan=%s syscall=%s",
+                                tag, tid, stat_s, wchan_s, sysc_s);
+        };
+        char taskdir[64];
+        std::snprintf(taskdir, sizeof(taskdir), "/proc/%d/task", static_cast<int>(leader_pid));
+        if (DIR* d = ::opendir(taskdir)) {
+            while (struct dirent* e = ::readdir(d)) {
+                if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+                dump_one(taskdir, e->d_name, "guest");
+            }
+            ::closedir(d);
+        }
+        // The supervisor's OWN tracer thread (same process = /proc/self) — pinpoints the
+        // wedge: if it is in pread/process_vm_readv it is blocked on a dead tid's mem.
+        char sup_tid_s[16];
+        std::snprintf(sup_tid_s, sizeof(sup_tid_s), "%d", static_cast<int>(sup_tid));
+        dump_one("/proc/self/task", sup_tid_s, "SUPERVISOR");
+        ::kill(-leader_pid, SIGKILL);
+        ::kill(leader_pid, SIGKILL);
+    });
     // Multi-tracee supervisor: waitpid(-1, __WALL) catches the guest plus every
     // thread it clones and every process it forks/execs. Each blocked syscall
     // (SIGSYS) is emulated per-tracee; only blocked syscalls trap, so overhead
@@ -2954,6 +3033,17 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                     listening_tids.erase(w);
                     continue;
                 }
+                // chromium-deadlock cure: a LISTEN-parked group-stop only ENDs (and thus
+                // resumes, via the branch above) when a SIGCONT arrives. A HEADLESS guest
+                // (chromium --dump-dom) has no job-control / no SIGCONT source, so an
+                // early single-thread group-stop would park the leader FOREVER
+                // (device-observed: tid=leader state=t wchan=ptrace_stop). We have no
+                // job-control intent for an in-process guest, so end the group-stop
+                // ourselves: SIGCONT the whole thread group. Each parked tid then
+                // re-reports its group-stop END (EINVAL) and the branch above CONT-resumes
+                // it. Idempotent — a SIGCONT to an already-running group is a no-op; the
+                // stall watchdog bounds any pathological re-stop loop. ESRCH is benign.
+                ::kill(pid, SIGCONT);
                 continue;
             }
             // A known tid that is NOT a group-stop (new-thread/INTERRUPT stop, or a
@@ -3089,6 +3179,11 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
             continue;
         }
     }
+    // Supervisor finished (ECHILD: all tracees reaped) — tell the stall watchdog to
+    // stand down BEFORE it could fire (it no-ops if sup_done, so a healthy guest is
+    // never killed/dumped), then join it (≤1s: it polls sup_done each second).
+    sup_done.store(true, std::memory_order_release);
+    watchdog.join();
     // Supervisor loop exited (ECHILD: all tracees reaped). Per-exit eviction already
     // closed each tid's fd; close any survivors (e.g. a tid lost to the SIGKILL
     // runaway path before its WIFSIGNALED was observed) so no /proc/<tid>/mem fd leaks.
