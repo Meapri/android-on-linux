@@ -10,8 +10,8 @@
 //   * wl_shm (provided by wl_display_init_shm; ARGB8888/XRGB8888)
 //   * xdg_wm_base (v2) -> xdg_surface -> xdg_toplevel, with the configure
 //     handshake (first map sends xdg_toplevel.configure + xdg_surface.configure)
-//   * wl_seat (v5) and wl_output (v2) globals (capabilities/mode advertised;
-//     actual input event injection is a P3.2 TODO documented below)
+//   * wl_seat (v7) and wl_output (v4) globals (capabilities/mode advertised;
+//     wl_output v4 emits name/description for chromium's display enumeration)
 //   * an epoll reactor folding wl_event_loop_get_fd() + a wakeup eventfd
 //
 // What is deliberately a hook/TODO:
@@ -72,7 +72,11 @@ namespace {
 constexpr int kCompositorVersion = 4;
 constexpr int kShmVersion = 1;  // wl_display_init_shm manages wl_shm itself
 constexpr int kSeatVersion = 7;  // generated ceiling is 10; GDK negotiates MIN(v,5)
-constexpr int kOutputVersion = 2;
+// wl_output v4 (generated ceiling) so the bind handler can emit name/description.
+// chromium ozone/wayland's WaylandOutput keys display enumeration off wl_output and
+// is happier with a named output; GTK/Qt/SDL/foot all negotiate MIN(advertised,client)
+// so v4 is a no-op regression risk for them (they ignore name/description if older).
+constexpr int kOutputVersion = 4;
 constexpr int kXdgWmBaseVersion = 2;
 
 // ---------------------------------------------------------------------------
@@ -1823,6 +1827,16 @@ void Compositor::bind_output(struct wl_client* client, void* data,
     if (version >= WL_OUTPUT_SCALE_SINCE_VERSION) {
         wl_output_send_scale(r, scale);
     }
+    // wl_output v4 name/description (sent before done, per protocol event ordering).
+    // chromium ozone/wayland's WaylandOutput records these; a stable machine-readable
+    // name also lets a client correlate the output across reconnects. Older clients
+    // (which negotiated <v4) never receive these, so this is additive only.
+    if (version >= WL_OUTPUT_NAME_SINCE_VERSION) {
+        wl_output_send_name(r, "ALR-0");
+    }
+    if (version >= WL_OUTPUT_DESCRIPTION_SINCE_VERSION) {
+        wl_output_send_description(r, "ALR Android SurfaceView output");
+    }
     if (version >= WL_OUTPUT_DONE_SINCE_VERSION) {
         wl_output_send_done(r);
     }
@@ -1866,6 +1880,44 @@ void Compositor::bind_data_device_manager(struct wl_client* client, void* /*data
     ALR_WL_LOGI("client bound: wl_data_device_manager v%u", version);
 }
 
+// ---------------------------------------------------------------------------
+// CR-4 (chromium --ozone-platform=wayland) global-requirement audit.
+//
+// chromium's WaylandConnection::Initialize() (ui/ozone/platform/wayland/host) has
+// exactly ONE hard global requirement that aborts startup if missing: the xdg
+// shell (stable xdg_wm_base). It also needs wl_compositor and a wl_shm/buffer
+// factory to put pixels on screen, and binds wl_seat + wl_output for input/sizing.
+// All of these are advertised below already, so chromium binds and starts; it does
+// NOT print "wl_X not available" for the set we ship. (Confirmed against this
+// project's Scout-3 recon in docs/research/chromium-native-plan.md: "Mandatory wl
+// interfaces ... wl_compositor, wl_shm, xdg_wm_base (stable). Strongly-needed:
+// wl_seat + wl_output.")
+//
+// Globals chromium *also* binds when advertised but treats as OPTIONAL (a missing
+// one only warns / changes behaviour, never aborts) — and why we do NOT add them
+// here:
+//   * zxdg_decoration_manager_v1 — server-side decorations. Absent => chromium uses
+//     its own client-side decorations (CSD), which is what we want anyway (we are a
+//     borderless single-output SurfaceView compositor). No generated glue exists for
+//     this protocol in third_party/wayland_generated/, and adding it would mean
+//     touching the generator/CMake (not in this file's scope). NOT NEEDED for CR-4.
+//   * wp_presentation (presentation-time) — optional frame-timing feedback. Absent =>
+//     chromium falls back to its own swap pacing (we already pace at the panel rate
+//     via the frame timer + wl_callback). No generated glue; NOT NEEDED for CR-4.
+//   * xdg_output_manager_v1 — logical output geometry. Absent => chromium derives
+//     geometry from wl_output mode/scale (which we now send at v4, incl. name). No
+//     generated glue; NOT NEEDED for CR-4.
+//   * zwp_linux_dmabuf_v1 — DELIBERATELY un-advertised (per the plan + the task
+//     constraint): we are wl_shm-only, so chromium must fall back to shm buffers and
+//     let our AHB presenter composite. Faking dmabuf without /dev/dri would break it.
+//
+// Already-present extras that chromium binds: wl_data_device_manager (clipboard/DnD —
+// originally added for GDK; chromium binds it too) and wl_subcompositor (overlay/
+// background subsurfaces). So the registry below is already a superset of chromium's
+// required globals; CR-4's remaining work is purely the present path (shm -> SurfaceView),
+// not registry completeness. The DEVICE-PENDING gate is: chromium binds + maps a
+// toplevel the compositor presents.
+// ---------------------------------------------------------------------------
 bool Compositor::register_globals() {
     g_compositor_ = wl_global_create(display_, &wl_compositor_interface,
                                      kCompositorVersion, this, bind_compositor);
