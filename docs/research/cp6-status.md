@@ -7,14 +7,20 @@
 >
 > - `docs/design/adr-001-syscall-overhead-user-notif.md` — syscall 중재 오버헤드 + USER_NOTIF 평가(원형).
 > - `docs/design/adr-002-chromium-cp6-roadmap.md` — raw-svc storm 돌파(측정-우선; svc-rewrite vs USER_NOTIF A/B).
-> - `docs/design/adr-003-multiprocess-exec-reentry.md` — 멀티프로세스 exec re-entry(loader 재진입 기각, 상속 채택).
+> - `docs/design/adr-chromium-storm-deadlock.md` — chromium `--dump-dom` "데드락" 재진단: **오진(misdiagnosis)**,
+>   measure-first(측정창 분리 실험으로 진단부터 닫음; supervisor 재-tweak 금지).
+> - `docs/design/adr-003-multiprocess-exec-reentry.md` — 멀티프로세스 exec re-entry(v1 상속 가설→round-7 반증;
+>   §8 v2 Option S→round-9 W^X DEAD; v3 in-process 재-맵→round-10 device-proven).
 >
 > 소유: WS-5(L5). HOST-ONLY — 새 device 측정 없음, 기존 `docs/evidence/` 인용만. 벤치 문서 아님
 > (성능 숫자는 `docs/PERFORMANCE.md`/`docs/research/cp3-cpu-overhead-ratio.md`). 잠긴 *범용* 로더
 > 기능 SSOT 는 `docs/research/loader-feature-gaps.md`(storm 벽은 거기서 *갭으로 격상하지 않음* —
 > CP-6 보류분이므로 여기로 분리).
 >
-> baseline: 통합 트리 v139 (round-7 drain `docs/evidence/2026-06-02-round7-vkrender-pass-drain.md`;
+> baseline: 통합 트리 v143 (round-10 step2 `docs/evidence/2026-06-02-round10-step2-inproc-remap-mapjump.md`;
+> round-10 step1 `docs/evidence/2026-06-02-round10-step1-inproc-reexec-mechanism-proven.md`;
+> round-9 `docs/evidence/2026-06-02-round9-optionS-dead-wx-execve.md`;
+> round-7 drain `docs/evidence/2026-06-02-round7-vkrender-pass-drain.md`;
 > round-6 `docs/evidence/2026-06-02-round6-qt6-execreentry-vkrender.md`). 디바이스 `R5KL20B6S3X`
 > (SM-X236N, mt6878, Mali-G615 MC2, Android 16, 1200×1920@90Hz, untrusted_app).
 
@@ -24,16 +30,26 @@
 
 **chromium-headless-shell(Chromium 147)이 ALR 네이티브 로더로 device 에서 `--version` 실행(child
 exit=0)됐고, 그 init 경로의 중재 오버헤드 verdict 는 `mediation-negligible`(traps=0, emul=1) 이다.**
-즉 *init* 은 라운드트립 storm 이 아니다 — 무거운 `--dump-dom` *render* storm 만 남았고, 그건
-멀티스레드-ptrace 데드락에 막혀 아직 device-미측정이다. 데드락이 풀려 render storm 의 N(절대 raw-svc
-수)·trap 분포가 device 로 측정돼야 비로소 두 본질해법 **M-R5(svc-rewrite) vs M-R1(USER_NOTIF)** 의
-A/B 가 결정 가능하다. exec re-entry(멀티프로세스)는 storm 과 **독립된 별개 벽**으로, ADR-003 이
-`--single-process --no-zygote` 기준선 + read-only 프로브로 분리했다 — round-6 v138 에서 그 **B-1
-(execve x0 path-rewrite)이 device-fires**(§3)했고 round-7 v139 에서 B-3(child envp 재주입) 결정도
-device 에서 평가됐으나(`envp_reason=already`), **round-7 의 결정적 관측은 모든 execve 에서
-`exec_events=0`** — 커널이 glibc-aarch64 ELF(`PT_INTERP`=게스트 ld.so)의 execve 를 완료하지 못한다.
-따라서 chromium 의 zygote/gpu fresh-execve 자식(=멀티프로세스의 핵심)은 **B-1+B-3 만으로 불충분**하고
-**loader 의 on-exec in-process 새-ELF 재-맵(ADR-003-v2, 병행 세션 소유)에 게이트**된다(§3).
+즉 *init* 은 라운드트립 storm 이 아니다 — 무거운 `--dump-dom` *render* 경로만 남았고, 그건 지금까지
+"멀티스레드-ptrace 데드락"으로 불렸으나 **PR #2(`docs/design/adr-chromium-storm-deadlock.md`)가 그
+데드락 진단을 *오진(misdiagnosis)*으로 재진단**했다(아래 §5). 5축 자가-적대 재진단이 세 데드락 후보
+(clone-못함/clone-trap-block/futex-deadlock)를 전부 코드근거로 기각하고, best-가설 = **deadlock 이
+아니라 무거운 single-init 이 `alarm(25s)` 측정창을 첫 워커 clone 전에 만료시킨 것**으로 좁혔다 →
+verdict = **measure-first**(supervisor 재-tweak 금지, read-only 측정창 분리 실험으로 진단부터 닫는다).
+그 측정으로 render 경로의 N(절대 raw-svc 수)·trap 분포가 device 로 측정돼야 비로소 두 본질해법
+**M-R5(svc-rewrite) vs M-R1(USER_NOTIF)** 의 A/B 가 결정 가능하다.
+
+exec re-entry(멀티프로세스)는 storm/데드락과 **독립된 별개 벽**(thread 벽이 아니라 exec 벽)이고, 이
+벽은 round-9→round-10 에서 **device-정복**됐다 — **in-process 재-맵(커널 execve 전무)이 map+jump 까지
+device-proven**(ADR-003-v3). round-6/7 의 B-1(execve x0 path-rewrite) + B-3(child envp) 는
+device-fires 하나 **모든 execve 에서 `exec_events=0`**(커널이 glibc-aarch64 ELF 의 `PT_INTERP`=게스트
+ld.so 를 resolve 못 함 ⇒ 커널-execve 미완)으로 **불충분**임이 드러났고, round-9 v140 이
+ADR-003-v2 **Option S(커널-execve stub)를 W^X 로 DEAD** 입증(`app_data_file:execute` neverallow)한 뒤,
+round-10 이 **ADR-003-v3(in-process 재-맵, NO execve)로 메커니즘(v141) + map+jump(v143)을 device-proven**
+했다(§3). 따라서 chromium 의 zygote/gpu fresh-execve 자식(=멀티프로세스의 핵심)은 이제
+**in-process-remap 트랙 위**에 있다 — 단 재-맵된 static 게스트가 startup 에서 **SIGILL** 하고
+chromium 은 추가로 `/proc/self/exe`(Android linker64) re-exec 라는 별도 pass-through 가 필요해, 아직
+device-RUNS 승급은 안 된다.
 
 ---
 
@@ -137,10 +153,34 @@ ld.so `/lib/ld-linux-aarch64.so.1` 를 Android 커널이 resolve 불가 → exec
 top-level 이 `GUEST EXEC FAIL`(`traps=0`)로 execve trap 전에 실패 — apt 가 minimally-staged
 (`apt-config-stage.tar` 10KiB; 전체 closure 부재)라 full apt 스테이징 오버레이가 병행 진행된다.
 
+**★ round-9→round-10 device: in-process 재-맵 벽 정복(커널 execve 0).** round-7 이 지목한 "on-exec
+새-ELF 재-맵" 벽이 **device-proven 으로 정복**됐다 — 단 ADR-003-v2 의 *방식*은 죽고 ADR-003-v3 가 정답.
+- **round-9 v140 — Option S DEAD(W^X).** `docs/evidence/2026-06-02-round9-optionS-dead-wx-execve.md`:
+  ADR-003-v2 의 Option S(커널이 적재 가능한 정적 re-entry stub 을 execve)를 시험했으나 splice 정상
+  발화(`spliced=1`)에도 **모든 execve 에서 `exec_events=0`**, stub 미실행(2초마다 재푸시해 stub 존재
+  확인 후에도 동일). 근인 = **W^X**: rootfs 파일이 `app_data_file` 라벨이고 targetSdk 35 untrusted_app
+  정책의 `neverallow untrusted_app … app_data_file:file execute` 가 app-storage 파일의 *모든* execve 를
+  막는다. **커널-execve 로 re-entry 하는 길은 비-root untrusted_app 에서 구조적으로 죽었다.**
+- **round-10 step1 v141 — 메커니즘 device-proven.**
+  `docs/evidence/2026-06-02-round10-step1-inproc-reexec-mechanism-proven.md`:
+  `ALR-REEXEC: inproc trampoline reached (no execve)` / `inproc_redirected=1` / child exit=123. execve
+  seccomp-trap 에서 `NT_ARM_SYSTEM_CALL=-1`(커널이 execve skip) + PC 를 fork-상속 loader `.text` 의
+  resident 트램폴린으로 redirect → **커널 execve 0** 으로 resident 코드 진입.
+- **round-10 step2 v143 — 진짜 map+jump device-proven.**
+  `docs/evidence/2026-06-02-round10-step2-inproc-remap-mapjump.md`:
+  `ALR-INPROC: mapped, jumping entry=0x400640` — 트램폴린이 target ELF 를 `mmap(PROT_EXEC)`(W^X-허용)
+  로 in-process map → 새 SysV stack → **entry 점프(커널 execve 0)**, static+dynamic 경로 wired.
+
+즉 chromium 멀티프로세스의 핵심인 (B) fresh-execve 자식은 이제 **in-process-remap 트랙**(ADR-003-v3)
+위에 있다. 남은 것 = (i) 재-맵된 static glibc 게스트가 자기 startup 에서 **SIGILL**(실행-정확성 버그),
+(ii) chromium 의 `**/proc/self/exe**`(interp `/system/bin/linker64`) re-exec 는 *Android* 앱 바이너리라
+Debian rootfs 로 매개 불가 → **별도 pass-through** 필요(rootfs-바이너리 재-맵과 구분),
+(iii) apt 는 비-root `dpkg: requires superuser`(fakeroot/root-emulation)로 exec-re-entry 와 **독립**.
+
 | 자식 클래스 | 띄우는 법 | ALR 중재 | 상태 |
 |---|---|---|---|
 | renderer(다수) | zygote가 **fork**(no exec) | 이미 매개(주소공간 복제 + 상속 seccomp/SEIZE) | 자동(ADR-003 §2-A) |
-| zygote/gpu | browser가 **fresh execve** | (B) exec 벽 — B-1 x0-rewrite + B-3 envp **만으론 불충분**; `exec_events=0` ⇒ loader 재-맵 필요 | **B-1+B-3 device-fires(r6/r7)**; 진짜 벽 = on-exec 재-맵(**ADR-003-v2**) |
+| zygote/gpu | browser가 **fresh execve** | (B) exec 벽 — B-1 x0-rewrite + B-3 envp **만으론 불충분**(`exec_events=0`); on-exec 재-맵 필요 | **재-맵 메커니즘+map/jump device-proven(r10, ADR-003-v3)**; 단 재-맵 게스트 SIGILL + `/proc/self/exe` pass-through 잔여 ⇒ 미승급 |
 
 **급소(재구도, round-7).** round-6 의 가설은 "남은 급소 = B-3 child envp 재주입"이었으나 round-7 가
 이를 **반증**했다: 관측된 execs 는 LD_PRELOAD 를 *상속*하므로 envp 주입이 불필요(`envp_reason=already`)
@@ -161,22 +201,65 @@ rewrite 제외, rootfs-내 idempotency guard). darwin 호스트는 실커널 sec
 
 ---
 
+## 5. chromium `--dump-dom` "멀티스레드 데드락" 재진단 — 오진(misdiagnosis), measure-first
+
+§3 의 exec 벽(thread 벽이 아니라 exec 벽)과 **직교**하는, render 경로의 "멀티스레드-ptrace 데드락"
+진단이 PR #2 에서 **재진단**됐다(`docs/design/adr-chromium-storm-deadlock.md`; 격리 브랜치
+research/chromium-storm, base v141, main·ws-N 미변경). 본문이 칭하는 'ADR-004' 번호는 product-ux
+브랜치 충돌로 통합 세션이 파일명(`adr-chromium-storm-deadlock`)으로 재번호.
+
+**한 줄 결론: "멀티스레드-ptrace 데드락"은 best-가설로 *오진(misdiagnosis)*이다.** 5축 자가-적대
+재진단(R1 재진단/R2 우회측정/R3 svc-rewrite/R4 USER_NOTIF/R5 적대재정의)이 코드 5대 사실로 세 데드락
+후보를 **전부 기각**했다:
+- **(a) seccomp-floor-glacial**(단일 init 이 라운드트립 storm 으로 느림) — PCGATE BPF 는 9 path nr
+  만 RET_TRACE, clone/clone3/futex/mmap 등 비-path 전부 RET_ALLOW → 0 라운드트립. M-R2 device traps=0
+  (init)이 확증.
+- **(b) clone-trap-block**(supervisor 가 clone 못 처리) — clone/clone3 은 비-path RET_ALLOW,
+  EVENT_CLONE 처리는 즉시 CONT. "supervisor 가 clone 못 처리"가 아니라 "게스트가 아직 clone 안 함".
+- **(c) futex-deadlock** — futex 도 비-path RET_ALLOW(emul 안 됨); single-init 이 futex 로 워커를
+  기다리는 단계에 도달조차 안 했을 수 있음.
+
+best-가설 = **deadlock 이 아니라 무거운 single-thread bring-up 이 측정창을 만료**: dynamic 게스트의
+`alarm(25s)`(`runtime_report.cpp` L1938)가 chromium 의 ld.so 동적링크 + V8 부트스트랩 + single-init
+render 가 *첫 워커를 clone 하기도 전에* 만료해 `Threads=1` 스냅샷만 잡힌 것(utime 1→5 기어감 =
+단일 메인스레드가 R state 로 *진짜 진행 중*이라는 직접 증거). **미스터리 해소**: L2754 의 SEIZE/
+EVENT_STOP fix 는 정상이나 *워커가 clone 된 후에만* 발화 — `Threads=1` 이면 그 분기에 진입조차 안 하니
+"fix 작동함"과 "증상 남음"은 무교차(non-intersection).
+
+**verdict = measure-first(5축 만장일치).** supervisor 를 또 tweak 하는 길(v122–v124)은 막다른 골목으로
+**금지**. 대신 **read-only 측정창 분리 실험**: dynamic alarm 을 `ALR_GUEST_ALARM_S` 로 파라미터화
+(예 180s) + supervisor 에 `EVENT_CLONE` 시계열(tid·n·t_ms) + 멈춘 tid 의 마지막 nr 로깅 → "게스트가
+첫 clone 에 도달하는가/몇 초에/멈추면 어느 nr 에서"가 device 한 방에 답해져 (a)/(b)/(c)/window-too-short
+4분류 결정. **단 2차 가설(v124 SEIZE 전환이 *새* group-stop 데드락을 유발했을 가능성)은 device 전에
+배제 불가** → 정직하게 measure-first. host 코어 = `bench/storm_microbench_model.py` +
+`tests/test_storm_microbench_model.py`(N-thread raw-svc storm cost 모델). 이 재진단은 §0·§2 의 storm
+A/B(M-R5 vs M-R1) *앞에* 끼는 1순위 진단이다 — render storm 의 N 이 측정되려면 먼저 "render 가 첫
+워커 clone 에 도달"해야 하므로.
+
+---
+
 ## 4. ADR 상호참조 한눈에
 
 | ADR | 무엇 | 이 문서와의 관계 |
 |-----|------|-----------------|
 | **ADR-001** | syscall 중재 오버헤드 측정 + USER_NOTIF 후보(원형) | §2 의 "24ns 바닥은 seccomp 켜는 한 안 사라짐"·USER_NOTIF 후보의 출발점 |
 | **ADR-002** | raw-svc storm 돌파(측정-우선; M-R2/M-R5/M-R1/M-R3) | §1 M-R2 verdict·§2 분기(svc-rewrite vs USER_NOTIF A/B)의 근거 |
-| **ADR-003** | 멀티프로세스 exec re-entry(상속 채택, loader 재진입 기각) | §3 의 자식 클래스 분리·envp 전파 급소·M-R4 프로브 — **단 round-7 가 "상속만으로 충분" 전제를 반증**(`exec_events=0`) ⇒ loader 재-맵으로 후속(아래) |
-| **ADR-003-v2** | exec-completion in-process 재-맵(loader-as-bootstrap; 병행 세션 소유) | §3 의 진짜 벽 = on-exec 새 ELF 재-맵; 이 SSOT 는 경로만 참조하고 편집하지 않음 |
+| **adr-chromium-storm-deadlock** | chromium `--dump-dom` "멀티스레드 데드락" 재진단 = **오진(misdiagnosis)**; measure-first(측정창 분리 실험) | §0·§5 — ADR-002 §1 분기 *앞에* 새 1순위 진단을 끼움; 데드락 3후보(clone-못함/clone-trap/futex) 전부 기각, best-가설 = window-too-short on heavy single-init; supervisor 재-tweak 금지 |
+| **ADR-003** | 멀티프로세스 exec re-entry(v1: 상속 채택, loader 재진입 기각) | §3 의 자식 클래스 분리·envp 전파 급소·M-R4 프로브 — **단 round-7 가 "상속만으로 충분" 전제를 반증**(`exec_events=0`) ⇒ 재-맵으로 후속(아래) |
+| **ADR-003-v2** | Option S — 커널이 적재 가능한 정적 re-entry stub 을 execve(loader-as-bootstrap) | §3 의 round-7 진짜 벽 후보였으나 **round-9 v140 이 W^X 로 DEAD 입증**(`app_data_file:execute` neverallow; `exec_events=0`, stub 미실행) |
+| **ADR-003-v3** | in-process 재-맵 — 커널 execve 0, execve 취소 + PC-redirect → resident 트램폴린 map+jump | §3 의 정복 경로: **round-10 step1(메커니즘 v141) + step2(map+jump v143) device-proven**; 잔여 = 재-맵 게스트 SIGILL + `/proc/self/exe` + 비-root dpkg |
 
 **정직 섹션(미확정 — device 측정 전).** ① render storm 절대 N(=5M~50M?) 미측정 — 모든 정량모델의
 핵심 입력. ② stime 지배 요인(라운드트립 vs chromium 자체 24ns×N) — M-R2 storm 분해가 답하나 데드락
 선결. ③ NEW_LISTENER 가 untrusted_app SELinux 통과하는지(M-R1 device-only). ④ svc-rewrite 가
-186MB+수백 .so 안정 치환(M-R5 device-only). ⑤ **execve-completion 재진입**(round-7 v139 가 결정:
-B-1 x0-rewrite + B-3 envp 결정 모두 device-fires 하나 모든 execve 에서 `exec_events=0` ⇒ 커널이
-glibc-aarch64 ELF 의 execve 를 완료 못 함; 진짜 벽은 loader 의 on-exec in-process 재-맵 = ADR-003-v2,
-병행 세션 진행) + full apt 스테이징 오버레이(apt minimally-staged).
+186MB+수백 .so 안정 치환(M-R5 device-only). ⑤ **execve-completion 재진입**(round-7 v139: B-1
+x0-rewrite + B-3 envp 모두 device-fires 하나 `exec_events=0` ⇒ 커널-execve 미완. round-9 v140: ADR-003
+-v2 Option S 커널-execve stub 은 **W^X DEAD**. round-10 v141/v143: **ADR-003-v3 in-process 재-맵이
+메커니즘 + map/jump device-proven**(커널 execve 0). **잔여(device-pending)**: 재-맵된 static glibc
+게스트가 startup 에서 **SIGILL**(실행-정확성), chromium 의 `/proc/self/exe` re-exec pass-through, 비-root
+`dpkg: requires superuser`(fakeroot), full apt 스테이징 오버레이). ⑥ **render storm "데드락"이 정말
+window-too-short 인가 vs SEIZE-induced-new-deadlock 인가**(§5) — `ALR_GUEST_ALARM_S` 측정창 분리 실험이
+device 1회로 가른다(measure-first; 2차 가설 device 전 배제 불가).
 
 *갱신 규칙:* device evidence 추가 시에만 RUNS/PASS 승급(evidence 파일명 명기). host-only 진전
 (프로토타입/계측 설계)만으로는 storm/exec 벽을 "풀림"으로 올리지 않는다. CP-6 는 사용자 보류이므로

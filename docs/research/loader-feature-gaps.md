@@ -9,11 +9,29 @@
 > 소유: WS-5 (L5). HOST-ONLY — 새 device 측정 없음, 기존 `docs/evidence/` 인용만. 벤치 문서 아님
 > (성능 숫자는 `docs/PERFORMANCE.md`/`cp2-gpu-ratio-glmark2.md`/`cp3-cpu-overhead-ratio.md`).
 >
-> baseline: 통합 트리 v139 (round-7 drain device-verified `docs/evidence/2026-06-02-round7-vkrender-pass-drain.md`;
+> baseline: 통합 트리 v143 (round-10 step2 device-proven `docs/evidence/2026-06-02-round10-step2-inproc-remap-mapjump.md`;
+> round-10 step1 `docs/evidence/2026-06-02-round10-step1-inproc-reexec-mechanism-proven.md`;
+> round-9 `docs/evidence/2026-06-02-round9-optionS-dead-wx-execve.md`;
+> round-7 drain `docs/evidence/2026-06-02-round7-vkrender-pass-drain.md`;
 > round-6 `docs/evidence/2026-06-02-round6-qt6-execreentry-vkrender.md`;
 > round-5 drain#14 `docs/evidence/2026-06-02-round5-vulkan-device-marshal.md`
 > + CP-6 M-R2 `docs/evidence/2026-06-02-cp6-mr2-chromium-syscall-mix.md`).
 > 디바이스 `R5KL20B6S3X` (SM-X236N, mt6878, Mali-G615 MC2, Android 16, 1200×1920@90Hz, untrusted_app).
+>
+> **round-9→round-10 device 갱신(이 갱신, G1):** G1(최고 레버리지 exec-re-entry)의 **벽이 개념적으로
+> 정복**됐다 — **in-process 재-맵(커널 execve 전무)이 map+jump 까지 device-proven.** round-9 v140 이
+> ADR-003-v2 의 **Option S(커널이 적재 가능한 정적 re-entry stub 을 execve)를 DEAD** 로 입증했다:
+> targetSdk 35 untrusted_app 의 W^X SELinux 정책(`neverallow untrusted_app … app_data_file:file
+> execute`)이 app-storage 안의 *어떤* 파일도 `execve` 못 하게 막는다(stub 존재 확인+재푸시에도
+> `exec_events=0`, stub 미실행). round-10 이 정답으로 피벗(ADR-003-v3): step1 v141 이 **메커니즘을
+> device-proven** — execve seccomp-trap 에서 syscall 취소(`NT_ARM_SYSTEM_CALL=-1`) + tracee PC 를
+> **resident(fork-공유 `.text`) 트램폴린**으로 redirect(`ALR-REEXEC: inproc trampoline reached`,
+> child exit=123, 커널 execve 0). step2 v143 이 **진짜 map+jump 를 device-proven** — 트램폴린이 target
+> ELF 를 `mmap(PROT_EXEC)`(W^X-허용) 로 in-process map 하고 entry 로 점프(`ALR-INPROC: mapped, jumping
+> entry=0x400640`, static+dynamic 경로 wired, 커널 execve 0). 따라서 G1 은 "재-맵 벽(미구현)"에서
+> **"재-맵 메커니즘 + map/jump device-proven; 남은 것 = 재-맵된 게스트 실행 정확성(static glibc startup
+> SIGILL) + `/proc/self/exe` pass-through + 비-root `dpkg` superuser"**로 전진한다. 단 셀 승급은
+> 아직: 재-맵된 게스트가 깨끗이 실행되기 전엔 apt/dpkg/GIMP-plugin 체인이 device-동작하지 않는다.
 >
 > **round-6 device-verified 요약(이 갱신):** G1(최고 레버리지 exec-re-entry)은 **ADR-003 B-1(execve
 > x0 path-rewrite)이 device-fires**(`alr exec x0=/bin/sh reason=rewrite` traps=1 rewrites=1; no-exec
@@ -34,7 +52,7 @@
 
 | # | 기능 갭 | 잠금해제하는 것 | 난이도 | 의존 | 상태 |
 |---|---------|----------------|--------|------|------|
-| **G1** | **exec-re-entry** (rootfs 바이너리 `execve` → ALR 로더가 새 ELF 를 **in-process 재-맵**) | `apt`/`dpkg` 실제 설치, GIMP plugin(fork+exec), 임의 멀티프로세스 Linux 앱, 셸 파이프라인 | **높음** | clone3/fork 시맨틱(메모리: device-evidence-mali-android16); 설계=ADR-003 → **ADR-003-v2 (loader 재-맵)** | **PARTIAL→재-맵 벽** (round-7 v139: B-1 path-rewrite + B-3 envp 결정 **device-fires**하나 모든 execve 에서 `exec_events=0` → 커널이 glibc-aarch64 ELF 의 execve 를 완료 못 함 ⇒ 진짜 벽은 **loader 의 on-exec 새-ELF in-process 재-맵(re-entry stub)**; apt 는 추가로 full staging 필요) |
+| **G1** | **exec-re-entry** (rootfs 바이너리 `execve` → ALR 로더가 새 ELF 를 **in-process 재-맵**) | `apt`/`dpkg` 실제 설치, GIMP plugin(fork+exec), 임의 멀티프로세스 Linux 앱, 셸 파이프라인 | **높음** | clone3/fork 시맨틱(메모리: device-evidence-mali-android16); 설계=ADR-003(v1) → ADR-003-v2(Option S, R9 가 DEAD 입증) → **ADR-003-v3 (in-process 재-맵, NO execve)** | **MECHANISM CONQUERED→실행 정확성 벽** (round-10 v141/v143: **in-process 재-맵 메커니즘 device-proven** — execve trap 에서 syscall 취소(`NT_ARM_SYSTEM_CALL=-1`) + PC-redirect → resident 트램폴린이 target ELF 를 `mmap(PROT_EXEC)` 로 map+jump(`entry=0x400640`), **커널 execve 0**. round-9 v140: Option S(커널-execve stub)는 W^X(targetSdk 35 untrusted_app `app_data_file:execute` neverallow)로 **DEAD**. 남은 것 = 재-맵된 static glibc 게스트가 자기 startup 중 **SIGILL** + `/proc/self/exe`(chromium zygote) pass-through + 비-root `dpkg` superuser) |
 | **G2** | **Qt6 wl_shm 경로** (EGL hwintegration 회피 → 소프트웨어 client-buffer) | Qt6 GUI 앱 전반(analogclock→KDE/Qt 앱군) | 중간 | EGL 플러그인 비활성/wl_shm 강제(WS-4 env+overlay); G1 무관 | **DONE** (round-6 v138: `EGL→wl_shm` → analogclock **device-렌더** rendered=true frames 2215→2216) |
 | **G3** | **Vulkan render pipeline** (ring 명령 body + ICD + AHB color-attach) | Vulkan-native 게임, Wine/DXVK/VKD3D, ANGLE-GLES | 높음 | enumerate/props backbone(**device-verified✓**) → VK-M2 명령 body | **PARTIAL→render device✓** (backbone device✓ round-5; **round-7 v139 VK-M2 render device-검증: device created + clear `vkQueueSubmit`=VK_SUCCESS**; 남은 것=ICD + textured/multi-draw 파이프라인) |
 | **G4** | **netsurf 네트워크/입력 interaction** | 실 웹 페이지 로드(자산 fetch)·클릭/스크롤 입력 | 중간 | WS-3 입력 라우팅 + 게스트 네트워크 정책 | **PARTIAL** (정적 `about:welcome` RENDERS✓) |
@@ -55,8 +73,63 @@
 
 **무엇이 막혔나.** rootfs 안의 바이너리가 `execve`(또는 `posix_spawn`/`fork`+`exec`)로 또 다른
 rootfs 바이너리를 띄울 때, 그 자식이 다시 ALR 네이티브 로더를 통과해 in-process glibc 게스트로
-실행되는 경로(=exec-re-entry)가 아직 없다. 현재 로더는 **앱이 직접 launch 하는 단일 게스트**만
-in-process 로 띄운다.
+실행되는 경로(=exec-re-entry)가 아직 없었다. 현재 로더는 **앱이 직접 launch 하는 단일 게스트**만
+in-process 로 띄웠다. **round-10 에서 그 in-process 재-맵 메커니즘이 device-proven 됐다(아래
+"round-9→round-10").**
+
+**★ round-9→round-10 device 정복(메커니즘 + map/jump device-proven, 커널 execve 0).**
+ADR-003 lineage 가 세 갈래로 진화·검증됐다 — v1(상속만으로 충분: round-7 가 `exec_events=0` 로
+반증) → v2(Option S: 커널이 적재 가능한 정적 re-entry stub 을 execve: **round-9 가 W^X 로 DEAD
+입증**) → **v3(in-process 재-맵, NO execve: round-10 이 map+jump 까지 device-proven)**.
+
+**round-9 v140 — Option S 는 DEAD(W^X).** `docs/evidence/2026-06-02-round9-optionS-dead-wx-execve.md`:
+supervisor splice 는 정상 발화(`alr exec reentry stub=… target=…` `spliced=1`)했으나 **모든 execve 에서
+`exec_events=0`** 이고 stub 은 **단 한 줄도 출력하지 않았다**(stub 을 2초마다 재푸시해 splice 경로에
+존재함을 확인한 뒤에도 동일). 근인 = **W^X SELinux 거부**: rootfs 파일은 `app_data_file` 로 라벨되고,
+targetSdk ≥ 29 (이 앱 35) untrusted_app 정책의 `neverallow untrusted_app … app_data_file:file
+execute` 가 app-storage 안의 *어떤* 파일도 `execve` 못 하게 막는다. 즉 **커널-execve 로 re-entry
+stub 을 띄우는 길은 비-root untrusted_app 에서 구조적으로 죽었다**(`nativeLibraryDir` execve 해치도
+`extractNativeLibs` unset 이라 부재). 이것이 정확히 ALR 이 in-process 매핑(file-backed `mmap(PROT_EXEC)`
+는 허용)으로 존재하는 이유다.
+
+**round-10 step1 v141 — 메커니즘 device-proven.**
+`docs/evidence/2026-06-02-round10-step1-inproc-reexec-mechanism-proven.md`:
+```
+ALR-REEXEC: inproc trampoline reached (no execve)
+alr exec reentry=off spliced=0 inproc=on inproc_redirected=1
+alr native loader child exit=123 signal=0
+```
+execve seccomp-trap 에서 supervisor 가 (1) `NT_ARM_SYSTEM_CALL=-1` 로 **커널이 execve 를 skip**
+하게 하고(W^X-금지 exec 미실행) (2) `regs[32]`(pc)를 fork 로 상속된(절대 unmap 안 되는) loader `.text`
+안의 **resident raw-syscall 루틴**으로 redirect → tracee 가 **커널 execve 0** 으로 그 코드에 점프.
+keystone: **비-root untrusted_app 에서 커널 execve 없는 exec-re-entry 가 viable** — R9 가 죽인
+`app_data_file:execute` 벽을 우회한다(파일 exec 을 커널에 요청하지 않고, 이미 매핑된 코드로 PC 만 돌린다).
+
+**round-10 step2 v143 — 진짜 map+jump device-proven.**
+`docs/evidence/2026-06-02-round10-step2-inproc-remap-mapjump.md`:
+```
+ALR-INPROC: worker target=/data/.../rootfs/debian-arm64/bin/sh
+ALR-INPROC: static target (no PT_INTERP) — direct map+jump
+ALR-INPROC: mapped, jumping entry=0x400640
+alr exec ... inproc=on inproc_redirected=2
+```
+트램폴린(`alr_inproc_reexec.c`, `alr_reentry.c` freestanding 매퍼 재사용)이 target ELF 를 열고
+PT_LOAD 를 `mmap(PROT_EXEC)`(W^X-허용) 로 in-process map → 새 SysV stack(argv/envp/auxv) 구성 →
+**entry 로 점프(커널 execve 0)**. static(no PT_INTERP → AT_BASE=0, program entry 직점프) + dynamic
+경로 둘 다 wired. 즉 **cancel execve → PC-redirect → resident 트램폴린 → target in-process map → jump**
+전 체인이 device 에서 end-to-end 동작. → 개념적·기계적 벽은 **정복**(ADR-003-v3).
+
+**남은 것(정복된 토대 위 focused iteration — 개념적 미지가 아님).**
+- 재-맵된 static `/bin/sh` 가 jump 후 **자기 startup 중 SIGILL**(foot 인터랙티브 셸:
+  `terminal.c:1770: slave exited with signal 4 (Illegal instruction)`) — map+jump 가 entry 에 도달하나
+  static glibc 가 자기 부트스트랩에서 fault(후보: static IRELATIVE/IFUNC, BSS-tail 0-fill, TLS/TPIDR,
+  auxv 필드). **이 실행-정확성 버그가 셀 승급을 막는 잔여 게이트.**
+- 게스트가 `**/proc/self/exe**`(interp `/system/bin/linker64`)를 exec — chromium zygote 가 *Android*
+  앱 바이너리를 re-exec → Debian rootfs 로 매개 불가(`interp open/read fail`). **별도 pass-through 경로**
+  필요(rootfs-바이너리 재-맵과 구분).
+- `apt install` 은 여전히 `unpacked=false` 이나 핵심 driver 가 **exec-re-entry 와 독립**으로 드러남:
+  `dpkg: error: requires superuser privilege`(비-root dpkg 가 unpack 거부) → **fakeroot/root-emulation**
+  경로 별도 필요.
 
 **device 증거(B-1+B-3 결정은 device-fires 하나 `exec_events=0` ⇒ execve 자체가 미완 — THE WALL).**
 round-7 v139(`docs/evidence/2026-06-02-round7-vkrender-pass-drain.md`):
@@ -114,10 +187,13 @@ exec-re-entry 는 로더가 exec 시 새 ELF 를 _직접_ 재-맵해야 한다. 
 host 프로토타입(WS-5): `tests/exec_map_model.py`(clone:exec 분류) + `tests/test_execve_pathrw.py`
 (x0 vs x1 분기 결정모델). device 프로브 게이트 = M-R4-fork/execmap/envprop(ADR-003 §5, read-only).
 
-**의존.** fork/clone3 시맨틱 안정화(메모리: device-evidence-mali-android16); 설계=ADR-003 →
-**ADR-003-v2(loader 재-맵)**. G2/G3/G4/G5 와 독립(이들은 G1 없이도 부분 진행 가능). 단 GIMP 풀
-필터(babl/gegl) 와 apt 설치는 **G1(재-맵)에 강하게 의존**. apt 설치는 추가로 full apt+dpkg+solver
-스테이징 오버레이에도 의존(현 `apt-config-stage.tar` 10KiB minimally-staged).
+**의존.** fork/clone3 시맨틱 안정화(메모리: device-evidence-mali-android16); 설계 lineage =
+ADR-003(v1, 상속-가설 round-7 반증) → ADR-003-v2(Option S 커널-execve stub, **round-9 W^X DEAD**)
+→ **ADR-003-v3(in-process 재-맵, NO execve; round-10 map+jump device-proven)**. G2/G3/G4/G5 와
+독립(이들은 G1 없이도 부분 진행 가능). 단 GIMP 풀 필터(babl/gegl) 와 apt 설치는 **G1(재-맵)에 강하게
+의존**. apt 설치는 추가로 (a) 재-맵된 게스트 실행 정확성(SIGILL), (b) 비-root dpkg 의
+fakeroot/root-emulation(`dpkg: requires superuser`), (c) full apt+dpkg+solver 스테이징 오버레이(현
+`apt-config-stage.tar` 10KiB minimally-staged)에 의존 — (b)/(c)는 exec-re-entry 와 **독립**.
 
 ---
 
@@ -248,6 +324,15 @@ duration↑ 또는 분할 launch.
   ELF(`PT_INTERP`=게스트 ld.so)를 execve 완료 못 함을 입증 ⇒ G1 의 벽은 "path-rewrite + envp"가
   아니라 **loader 의 on-exec in-process 재-맵(re-entry stub)**; 설계=**ADR-003-v2**(병행 세션 소유).
   G1 셀은 여전히 미승급(apt-install `unpacked=false` device-실패 + 재-맵 미구현).
+- **round-9→round-10 전이(G1 벽 정복)**: round-7 이 지목한 "loader 재-맵" 벽이 **device-정복**됐다.
+  round-9 v140 이 ADR-003-v2 **Option S(커널-execve stub)를 W^X 로 DEAD** 입증(`exec_events=0`, stub
+  미실행; `app_data_file:execute` neverallow). round-10 이 ADR-003-v3 로 피벗해 step1 v141(메커니즘:
+  execve 취소 + PC-redirect → resident 트램폴린, child exit=123) → step2 v143(진짜 map+jump:
+  `mmap(PROT_EXEC)` + entry 점프 `entry=0x400640`, 커널 execve 0)을 device-proven. G1 은 "재-맵 벽
+  (미구현)"→"**재-맵 메커니즘 + map/jump device-proven; 남은 것 = 재-맵 게스트 실행 정확성(SIGILL) +
+  `/proc/self/exe` pass-through + 비-root dpkg superuser**"로 전진. **그러나 셀 미승급**: 재-맵된
+  static glibc 게스트가 자기 startup 에서 SIGILL 하므로(map+jump 는 entry 도달, 실행은 미완) apt/dpkg/
+  GIMP-plugin 체인은 아직 device-동작하지 않는다 — 메커니즘 device-proof ≠ 셀(RUNS) 승급.
 - **새 측정 금지**(WS-5 HOST-ONLY) — 기존 `docs/evidence/` 인용만. device evidence 없이
   BLOCKED→DONE 승급 금지.
 - **레버리지 순서 유지** — exec-re-entry(G1)가 최고 레버리지라는 판단은 "한 기능이 푸는 막힌 셀
