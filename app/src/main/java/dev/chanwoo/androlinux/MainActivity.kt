@@ -275,6 +275,15 @@ class MainActivity : Activity() {
         // ALR native loader and emits version/exit/summary to logcat tag alr_loader, so the
         // integration device drain can capture functional evidence (not just "staged").
         launchPackageManagerProbes(rootfsStatus.rootfsDir, rootfsManifest.name)
+        // v2 apt-pipeline (research/apt-launch SSOT §5 R-V2-LAUNCH): MARKER-GATED
+        // `dpkg -i hello.deb` under the fakeroot+interpose chain. Distinct from the
+        // launchPackageManagerProbes apt-install probe above (that one runs the base
+        // alr-smoke .deb WITHOUT fakeroot — it dies on `requires superuser`/EPERM for a
+        // non-root uid). This block extracts the fakeroot + apt-dpkg stage overlays, flips
+        // the ALR_FAKEROOT host-env hook the loader reads, and runs the real `hello` .deb.
+        // Gated on /data/local/tmp/.alr-aptdrain so normal cold starts never run it (same
+        // convention as .alr-cr1/.alr-cr2). See docs/design/v2-apt-pipeline-ssot.md §5/§7.
+        launchAptDrainProbe(rootfsStatus.rootfsDir, rootfsManifest.name)
         // WS-4 §10(b) toolkit launch FUNCTIONAL probes: run a lightweight smoke of the
         // SDL2 / Qt6 / netsurf binaries (from the sdl2/qt6/netsurf overlays staged above)
         // through the ALR native loader and Log.i(tag=alr_loader, "toolkit-<name>: ...") the
@@ -1866,6 +1875,136 @@ class MainActivity : Activity() {
                 }
             } catch (e: Throwable) {
                 android.util.Log.e("alr_loader", "pkgfunc EXC: ${android.util.Log.getStackTraceString(e)}")
+            }
+        }.start()
+    }
+
+    // v2 apt-pipeline drain (research/apt-launch SSOT §5 R-V2-LAUNCH / §7 DEVICE-REQ
+    // ALR-V2-apt-unpack). MARKER-GATED `dpkg -i hello.deb` under the fakeroot+interpose
+    // chain so a NON-ROOT (uid 10xxx) guest can clear dpkg's `requires superuser` gate +
+    // chown/chmod EPERM and actually UNPACK a real Debian/Ubuntu .deb in-process.
+    //
+    // Mirrors the chromium-stage probe (onCreate L59+) pattern exactly: size-keyed extract
+    // markers (.{name}-staged-<size>) via the WS-4 M1 guarded extractOverlayTar (can never
+    // downgrade a base lib), a bounded wait for the staged binaries, and a flag-file gate so
+    // normal cold starts are a strict no-op (only an explicit integration/device drain that
+    // `adb shell touch /data/local/tmp/.alr-aptdrain` arms it — same convention as .alr-cr1).
+    //
+    // T1/T2 SPLIT (IMPORTANT — see SSOT §5 + runtime_report.cpp L1617-1636): the native JNI
+    // entry `nativeAlrNativeLoaderProbe(package,libDir,filesDir,cacheDir,rootfsName,program)`
+    // is a FIXED 6-arg signature — it takes NO extra-env parameter. The loader decides the
+    // guest LD_PRELOAD itself and currently HARDCODES the single
+    // `<rootfs>/usr/lib/androlinux/libalr_interpose.so` (runtime_report.cpp L1633). It reads
+    // its A/B gates only from the HOST (app) process env via ::getenv (ALR_DISABLE_INTERPOSE,
+    // ALR_PCGATE). So MainActivity's ONLY clean, signature-stable hook is to set an
+    // `ALR_FAKEROOT=1` host-env var before the probe; the loader (T2, runtime_report.cpp —
+    // WS-1 territory) must then chain fakeroot FIRST:
+    //   LD_PRELOAD=<rootfs>/usr/lib/androlinux/libalr_fakeroot.so
+    //             :<rootfs>/usr/lib/androlinux/libalr_interpose.so
+    //   + FAKEROOTUID=0 FAKEROOTGID=0  (ALR_ROOTFS is already injected by the loader).
+    // Until that loader diff lands (SSOT §5 proposed diff A), the chain is NOT yet wired:
+    // this block extracts the overlays + arms the marker + sets ALR_FAKEROOT + runs the dpkg
+    // argv, and the unpack will only flip to true once T2 honors ALR_FAKEROOT. The dpkg argv
+    // here is verbatim `tools/build_fakeroot_overlay.py --device-cmd`
+    // (`dpkg --force-not-root --force-bad-path -i <deb>`).
+    private fun launchAptDrainProbe(rootfsDir: File, rootfsName: String) {
+        if (!java.io.File("/data/local/tmp/.alr-aptdrain").isFile) return
+        Thread {
+            try {
+                android.util.Log.i("alr_loader", "aptdrain: marker present — v2 apt-pipeline drain armed")
+                // (L1 — SSOT §5) Extract the fakeroot + apt-dpkg stage overlays through the
+                // SAME guarded extractOverlayTar the chromium/foot/toolkit blocks use, keyed on
+                // tar size so re-pushing a rebuilt stage auto-re-extracts. fakeroot-stage.tar
+                // ships usr/lib/androlinux/libalr_fakeroot.so (0755); apt-dpkg-stage.tar ships
+                // usr/bin/{dpkg,apt,tar,…} + var/lib/dpkg admindir + var/cache/apt/archives/hello_*.deb.
+                for (name in listOf("fakeroot", "apt-dpkg")) {
+                    val tar = java.io.File("/data/local/tmp/$name-stage.tar")
+                    val marker = java.io.File(rootfsDir, ".$name-staged-${tar.length()}")
+                    if (tar.isFile && !marker.isFile) {
+                        android.util.Log.i("alr_loader", "aptdrain: $name-stage extracting overlay (${tar.length()} bytes)")
+                        val ovr = RootfsInstaller(this@MainActivity).extractOverlayTar(tar, rootfsDir)
+                        marker.writeText("staged\n")
+                        android.util.Log.i("alr_loader", "aptdrain: $name-stage overlay done (extracted=${ovr.extracted} skipped=${ovr.skipped.size})")
+                        if (ovr.skipped.isNotEmpty()) android.util.Log.w("alr_loader", "aptdrain: $name-stage guard skipped downgrades:\n${ovr.skipped.joinToString("\n")}")
+                    } else if (!tar.isFile) {
+                        android.util.Log.i("alr_loader", "aptdrain: $name-stage.tar absent (push it to /data/local/tmp to arm the drain)")
+                    }
+                }
+                // The fakeroot .so + dpkg + the hello .deb must all be present before we probe;
+                // the overlays land via the loop above (or a prior cold start's markers).
+                val fakerootSo = java.io.File(rootfsDir, "usr/lib/androlinux/libalr_fakeroot.so")
+                val dpkgBin = java.io.File(rootfsDir, "usr/bin/dpkg")
+                // hello .deb lands in the apt cache (apt-dpkg overlay's --fetch-test-deb asset).
+                val helloDeb = java.io.File(rootfsDir, "var/cache/apt/archives/hello_2.10-3build1_arm64.deb")
+                var waited = 0
+                while (waited < 20000 && !(fakerootSo.isFile && dpkgBin.isFile && helloDeb.isFile)) {
+                    Thread.sleep(500)
+                    waited += 500
+                }
+                android.util.Log.i(
+                    "alr_loader",
+                    "aptdrain: fakeroot.so=${fakerootSo.isFile} dpkg=${dpkgBin.isFile} " +
+                        "hello.deb=${helloDeb.isFile} (waited ${waited}ms)",
+                )
+                if (!(fakerootSo.isFile && dpkgBin.isFile && helloDeb.isFile)) {
+                    android.util.Log.w("alr_loader", "aptdrain: prerequisites missing — skipping dpkg -i (push fakeroot-stage.tar + apt-dpkg-stage.tar)")
+                    return@Thread
+                }
+                // (L2 — SSOT §5) Flip the host-env hook the loader reads. Setting ALR_FAKEROOT=1
+                // on THIS app process env is the signature-stable trigger for the loader (T2,
+                // runtime_report.cpp) to chain libalr_fakeroot.so FIRST ahead of the interpose
+                // .so and push FAKEROOTUID/GID=0. We restore it immediately after the probe so
+                // every OTHER probe path stays on the plain interpose-only chain (no regression).
+                android.system.Os.setenv("ALR_FAKEROOT", "1", true)
+                try {
+                    // (L3 effected) dpkg -i hello.deb. argv is verbatim the builder's
+                    // --device-cmd: --force-not-root (bypass the superuser gate; fakeroot makes
+                    // getuid()==0 but this is belt-and-suspenders) + --force-bad-path. The deb is
+                    // referenced by its rootfs-relative path (the loader/interpose map it under
+                    // the rootfs). NOTE: with T2 not yet landed, the fakeroot chain is not active
+                    // so a non-root device run will still hit the superuser/EPERM wall — the
+                    // ALR_FAKEROOT env + dpkg argv are correct and ready for the loader diff.
+                    val out = nativeAlrNativeLoaderProbe(
+                        packageName,
+                        applicationInfo.nativeLibraryDir,
+                        filesDir.absolutePath,
+                        cacheDir.absolutePath,
+                        rootfsName,
+                        "/usr/bin/dpkg\n--force-not-root\n--force-bad-path\n-i\n" +
+                            "/var/cache/apt/archives/hello_2.10-3build1_arm64.deb",
+                    )
+                    val exec = out.lineStartingWith("ALR NATIVE LOADER GUEST EXEC:")
+                    // §7 DEVICE-REQ markers: unpack-stage success (the extract child re-map must
+                    // pass for the .zst data.tar to actually unpack — G1 gated per SSOT §6).
+                    val unpacked = out.contains("Unpacking hello") ||
+                        out.contains("Preparing to unpack") ||
+                        out.contains("Selecting previously unselected package hello")
+                    // Configure stage = maintainer-script /bin/sh fork+exec (G1 too).
+                    val configured = out.contains("Setting up hello")
+                    android.util.Log.i(
+                        "alr_loader",
+                        "aptdrain: unpacked=$unpacked configured=$configured exec=[$exec] " +
+                            "ALR_FAKEROOT=1 (fakeroot-chain wiring = T2/runtime_report.cpp; " +
+                            "extract+maintainer-script need G1 exec-re-entry per SSOT §6)",
+                    )
+                    android.util.Log.i("alr_loader", "aptdrain-out:\n$out")
+                    // §7 stretch: post-install status query (proves the admin DB recorded hello).
+                    val statusOut = nativeAlrNativeLoaderProbe(
+                        packageName,
+                        applicationInfo.nativeLibraryDir,
+                        filesDir.absolutePath,
+                        cacheDir.absolutePath,
+                        rootfsName,
+                        "/usr/bin/dpkg\n--status\nhello",
+                    )
+                    val installed = statusOut.contains("Status: install ok installed")
+                    android.util.Log.i("alr_loader", "aptdrain: installed=$installed (dpkg --status hello)")
+                } finally {
+                    // Restore: every other probe stays on interpose-only (strict no-regression).
+                    android.system.Os.unsetenv("ALR_FAKEROOT")
+                }
+            } catch (e: Throwable) {
+                android.util.Log.e("alr_loader", "aptdrain EXC: ${android.util.Log.getStackTraceString(e)}")
             }
         }.start()
     }
