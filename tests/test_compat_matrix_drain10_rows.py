@@ -61,32 +61,41 @@ def test_matrix_records_babl_gegl_staged_but_filter_pending():
 
 
 def test_toolkit_overlays_staged_launchable_pending():
-    """qt6 / sdl2 / netsurf: overlay STAGED but launchable binary PENDING.
+    """qt6 / sdl2: overlay STAGED but GUI demo not yet launched on device.
 
-    Each toolkit must appear on a row that simultaneously says STAGED (the libs are
-    there) and PENDING (no launchable binary yet) — the refined honest status.
+    Each must appear on a row that says STAGED (the libs are there) yet stops short
+    of a device render. Round-4 reworded the launch caveat from "launchable binary
+    PENDING" to "GUI 데모 launch 진행중(round-4)", so accept either phrasing as long
+    as the row does NOT overclaim a render. (netsurf was promoted to RENDERS in
+    drain#12, so it is intentionally dropped from this still-staged set — see
+    test_compat_matrix_netsurf_renders.py.)
     """
     text = _text()
     lines = text.splitlines()
-    for toolkit in ("Qt6", "SDL2", "netsurf"):
+    for toolkit in ("Qt6", "SDL2"):
         rows = [
             ln for ln in lines
-            if toolkit in ln and "STAGED" in ln and "PENDING" in ln
+            if toolkit in ln
+            and "STAGED" in ln
+            and ("PENDING" in ln or "진행중" in ln)
+            and "RENDERS" not in ln
+            and "USABLE" not in ln
         ]
         assert rows, (
-            f"matrix must carry a '{toolkit}: overlay STAGED, launchable binary "
-            "PENDING' row (drain#10 refinement of 'staged-but-launch-pending')"
+            f"matrix must carry a '{toolkit}: overlay STAGED, GUI launch pending' "
+            "row that does not overclaim a device render"
         )
 
 
 def test_toolkit_rows_do_not_overclaim_render_or_usable():
-    """None of the still-pending toolkits may be marked RENDERS/USABLE/RUNS.
+    """The still-pending toolkits (qt6/sdl2) may not be marked RENDERS/USABLE.
 
     They have no device launch yet; claiming a render state would be dishonest.
+    (netsurf is excluded — it was device-proven RENDERS in drain#12.)
     """
     text = _text()
     lines = text.splitlines()
-    for toolkit in ("Qt6", "SDL2", "netsurf"):
+    for toolkit in ("Qt6", "SDL2"):
         for ln in lines:
             if toolkit not in ln or "|" not in ln:
                 continue

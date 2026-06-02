@@ -4,7 +4,7 @@
 > 도는지의 앱×결과 표. **device evidence가 있는 행만 USABLE/RUNS/RENDERS로 표기**한다.
 > host-only/예정은 WIRED/PENDING. 이 표는 WS-5가 유지하며, 새 device evidence가 추가될 때마다 갱신.
 
-작성 baseline: HEAD `0df74dc` (v124) → 통합 트리 v127 (CP-1 landed) → v128/v129 (CP-2 GPU-native FINAL + CP-5 8MiB ring) → v130 (5-WS fan-out drain#9: GL_RENDERER passthrough + getpwuid fix + apt/dpkg/Xwayland 기능 device-PROVEN) → v132 (6-WS breadth fan-out drain#10: babl-gegl 67 op .so staged + qt6/xwayland auto-stage + WS-1 traps↓ gtk3-widget-factory 135→99). 디바이스 `R5KL20B6S3X` (SM-X236N, mt6878 SoC, Mali-G615 MC2, Android 16, 1200×1920@90Hz, untrusted_app).
+작성 baseline: HEAD `0df74dc` (v124) → 통합 트리 v127 (CP-1 landed) → v128/v129 (CP-2 GPU-native FINAL + CP-5 8MiB ring) → v130 (5-WS fan-out drain#9: GL_RENDERER passthrough + getpwuid fix + apt/dpkg/Xwayland 기능 device-PROVEN) → v132 (6-WS breadth fan-out drain#10: babl-gegl 67 op .so staged + qt6/xwayland auto-stage + WS-1 traps↓ gtk3-widget-factory 135→99) → v133 (round-3 drain#11: GLES3 core 커버리지 회귀0 + netsurf-gtk 가 ALR 로더로 GTK init 까지 실행) → v134 (drain#12: **netsurf-gtk 웹브라우저가 컴포지터에 RENDERS — rendered=true, 5 threads**). 디바이스 `R5KL20B6S3X` (SM-X236N, mt6878 SoC, Mali-G615 MC2, Android 16, 1200×1920@90Hz, untrusted_app).
 
 ## 상태 범례
 - **USABLE** — device에서 사람이 실제로 조작 가능(입력 포함).
@@ -42,7 +42,7 @@ on-device 실행**. 단, 실제 `apt install`(네트워크/소스 fetch+unpack)�
 | `dpkg-query -l libc6` | **RUNS** (`ok=true`, marker `[libc6]`) | 2026-06-02-5ws-fanout-renderer-getpwuid-pkgfunc | dpkg-db overlay(ws-3/ws-4 staged) 조회 OK |
 | `apt-get --version` | **RUNS** (`ok=true`, marker `[apt ]`) | 2026-06-02-5ws-fanout-renderer-getpwuid-pkgfunc | apt-config overlay 적재, 실행+버전 보고 |
 | `Xwayland -version` | **RUNS** (`ok=true`, marker `[Xwayland]`) | 2026-06-02-5ws-fanout-renderer-getpwuid-pkgfunc | x11 overlay; X11-only 앱 호스팅 기반 (전체 X11 앱 표시는 PENDING) |
-| 실제 `apt install <pkg>` (네트워크 fetch+unpack) | PENDING | — | dpkg unpack/maintainer-script 경로 device 미검증 (clone3 PRoot 한계 메모리: device-evidence-mali-android16) |
+| 실제 `apt install <pkg>` (네트워크 fetch+unpack) | **PENDING (round-4 진행 중)** | — | dpkg unpack/**maintainer-script exec-re-entry** 경로 device 미검증 — dpkg 가 unpack 후 maintainer-script(preinst/postinst)를 `execve` 로 재진입해야 하는데, 그 in-process exec-re-entry 가 round-4 의존 항목 (clone3 PRoot 한계 메모리: device-evidence-mali-android16) |
 
 mediation 불변식: `pcgate=1 interpose=1 traps=0 rewrites=0` (CLI 집합과 동일).
 
@@ -59,10 +59,10 @@ mediation 불변식: `pcgate=1 interpose=1 traps=0 rewrites=0` (CLI 집합과 �
 | in-process 이미지 디코드 (gdk-pixbuf PNG/JPEG/BMP/GIF) | — | RUNS (PASS, 전 포맷) | — | v95-image-decode, 2026-06-01-gtk3-svg-sigabrt-resolved-gui-runs | shared-mime-info DB + **.so x-bit fix 후 bmp/gif/png/jpeg 전부 decode OK** |
 | 입력 주입 (`/bin/alr-input-test`/`alr-interactive-test`) | wl_seat | USABLE (received=24: pointer 10/key 8/touch 6) | (의도된 dispatch 대기) | v86-input-injection, v87-interactive-toolkit-pacing | redraw 루프(redraws=5 hits=2) |
 | foot | (terminal) | **RENDERS** (rendered=true) | — | 2026-06-01-gtk3-svg-sigabrt-resolved-gui-runs | GUI 안정화(keymap+locale+SVG) 후 렌더; libfcft4/libutf8proc shim closure OK |
-| Qt6 (qtwayland) | Qt | **overlay STAGED, launchable binary PENDING** (qt6-stage overlay extracted=48 skipped=0; runtime lib 적재되나 toolkit-qt6 smoke = "missing" — qtdiag6/qmake6 등 실행 바이너리 부재) | — | 2026-06-02-breadth-fanout-drain | WS-4 wire-toolkit auto-stage 목록에 진입(0 guard skip). lib O / launchable demo·CLI 바이너리 X → device launch 아직. (직전 "staged-but-launch-pending" 의 정교화) |
-| SDL2 | SDL | **overlay STAGED (~31MB), launchable binary PENDING** (런타임 lib staged; toolkit-sdl2 smoke = "missing" — sdl2-config 등 부재) | — | 2026-06-02-breadth-fanout-drain | WS-4 M2 / WS-2 M4 — lib O, launchable demo 바이너리 X → device launch 아직 |
-| netsurf-gtk | (경량 브라우저) | **overlay STAGED (~195MB), launchable binary PENDING** (런타임 lib staged; toolkit-netsurf smoke = "missing" — /usr/bin/netsurf[-gtk3|-gtk] 부재) | — | 2026-06-02-breadth-fanout-drain | WS-4 M2 — lib O, launchable browser 바이너리 X → device launch 아직 |
-| babl/gegl GIMP op 모듈 (67 .so) | (GIMP 백엔드) | **overlay STAGED** (babl-gegl-stage extracted=67 skipped=0, .so 0755 → dlopen-able; root cause = non-exec 0644 였음, 부재 아님). GIMP 필터 device 실사용은 **PENDING** | — | 2026-06-02-breadth-fanout-drain | WS-4. 67개 op 모듈 x-bit 0755 로 stage → dlopen 가능. 실제 GIMP babl/gegl 필터 exercise(device)는 미검증 |
+| Qt6 (qtwayland) | Qt | **overlay STAGED, GUI 데모 launch 진행중(round-4)** (qt6-stage overlay 적재; round-3 에서 `qtpaths6` 가 probe 경로 `/usr/lib/qt6/bin/qtpaths6` 에 없어 미실행 = overlay layout/symlink mismatch) | — | 2026-06-02-breadth-fanout-drain, 2026-06-02-round3-gles3-toolkit-drain | WS-4. lib O / launchable demo 바이너리 X → qtpaths6 경로 정합 + 컴포지터 launch(netsurf/foot 처럼 display-backed)는 **round-4 진행 중**(device 렌더 미확인) |
+| SDL2 | SDL | **overlay STAGED (~31MB), GUI 데모 launch 진행중(round-4)** (런타임 lib staged; round-3 에서 `/usr/libexec/installed-tests/SDL2/testver` 가 ALR 로더로 **실행됨**(SDL marker matched, exit non-zero) — 로더/의존성은 OK, 화면 창은 미확인) | — | 2026-06-02-breadth-fanout-drain, 2026-06-02-round3-gles3-toolkit-drain | WS-4 M2 / WS-2 M4. testver CLI 는 RUN, SDL2 데모 창 컴포지터 launch 는 **round-4 진행 중**(device 렌더 미확인) |
+| netsurf-gtk | (경량 GTK3 웹브라우저) | **RENDERS** (`netsurf-result: rendered=true` frames 2214→2217; 컴포지터 wl-frame counter 전진 = 창이 SurfaceView 에 합성; **5 guest threads** 멀티스레드 in-process; 25s 풀 생존 sig=14=SIGALRM=alarm timeout, crash 아님; drain#12) | 25031 | 2026-06-02-netsurf-browser-renders | WS-4 M2 / WS-3 GUI-launch. 실 GTK3 웹브라우저 바이너리(`/usr/bin/netsurf-gtk`, static-PIE 5.8MB)가 ALR 로더로 PARSE/MAP/INTERP/entry → GDK→wl_shm→SurfaceView (foot/GIMP 와 동일 경로) `about:welcome` 렌더. 범용 GUI 증명셋에 **브라우저** 추가. 잔여(증분, 회귀 아님): 전체 페이지 자산/네트워크/입력 interaction = round-4 진행 |
+| babl/gegl GIMP op 모듈 (67 .so) | (GIMP 백엔드) | **overlay STAGED** (babl-gegl-stage extracted=67 skipped=0, .so 0755 → dlopen-able; root cause = non-exec 0644 였음, 부재 아님). GIMP 필터 device 실사용은 **PENDING (round-4 진행 중)** | — | 2026-06-02-breadth-fanout-drain | WS-4. 67개 op 모듈 x-bit 0755 로 stage → dlopen 가능. 실제 GIMP babl/gegl 필터 exercise(device)는 미검증 — **round-4 진행 중** |
 
 ## 브라우저 (Goal-2)
 | 앱 | 결과 | Evidence | 비고 |
@@ -104,7 +104,7 @@ host 백본(decode/ring/AHB-FBO/zero-copy present)은 Mali-G615 MC2에 픽셀 �
 | 항목 | 상태 | 비고 |
 |------|------|------|
 | X11-only 앱 (실제 X11 클라이언트 표시) | PENDING | `Xwayland -version` 은 RUNS(drain#9, 위 패키지매니저 섹션) — Xwayland 바이너리는 게스트로 실행됨. 실제 X11 클라이언트를 Xwayland 에 붙여 화면에 띄우는 end-to-end 는 device 미검증 (WS-4 M4 잔여) |
-| in-app `apt`/`dpkg` 실제 설치 | 부분 | `dpkg-query`/`apt-get`/`Xwayland` **버전 보고 실행**은 device-PROVEN(drain#9, 위 섹션). 실제 `apt install`(네트워크 fetch + dpkg unpack/maintainer-script)은 PENDING — dpkg clone3 PRoot 한계 (메모리: device-evidence-mali-android16) |
+| in-app `apt`/`dpkg` 실제 설치 | 부분 (round-4 진행 중) | `dpkg-query`/`apt-get`/`Xwayland` **버전 보고 실행**은 device-PROVEN(drain#9, 위 섹션). 실제 `apt install`(네트워크 fetch + dpkg unpack/maintainer-script)은 PENDING — **maintainer-script exec-re-entry**(dpkg 가 unpack 후 preinst/postinst 를 `execve` 로 재진입) 의존, round-4 진행 중 (dpkg clone3 PRoot 한계 메모리: device-evidence-mali-android16) |
 | OpenCL / 벤더 GPU compute | 미추진 | non-root/public-API 계약 위반; GIMP GEGL은 CPU (v114 honest-scope) |
 
 ---
