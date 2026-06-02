@@ -9,7 +9,8 @@
 > 소유: WS-5 (L5). HOST-ONLY — 새 device 측정 없음, 기존 `docs/evidence/` 인용만. 벤치 문서 아님
 > (성능 숫자는 `docs/PERFORMANCE.md`/`cp2-gpu-ratio-glmark2.md`/`cp3-cpu-overhead-ratio.md`).
 >
-> baseline: 통합 트리 v138 (round-6 drain device-verified `docs/evidence/2026-06-02-round6-qt6-execreentry-vkrender.md`;
+> baseline: 통합 트리 v139 (round-7 drain device-verified `docs/evidence/2026-06-02-round7-vkrender-pass-drain.md`;
+> round-6 `docs/evidence/2026-06-02-round6-qt6-execreentry-vkrender.md`;
 > round-5 drain#14 `docs/evidence/2026-06-02-round5-vulkan-device-marshal.md`
 > + CP-6 M-R2 `docs/evidence/2026-06-02-cp6-mr2-chromium-syscall-mix.md`).
 > 디바이스 `R5KL20B6S3X` (SM-X236N, mt6878, Mali-G615 MC2, Android 16, 1200×1920@90Hz, untrusted_app).
@@ -33,7 +34,7 @@
 
 | # | 기능 갭 | 잠금해제하는 것 | 난이도 | 의존 | 상태 |
 |---|---------|----------------|--------|------|------|
-| **G1** | **exec-re-entry** (rootfs 바이너리 `execve` → ALR 로더 재진입) | `apt`/`dpkg` 실제 설치, GIMP plugin(fork+exec), 임의 멀티프로세스 Linux 앱, 셸 파이프라인 | **높음** | clone3/fork 시맨틱(메모리: device-evidence-mali-android16); 설계=ADR-003 | **PARTIAL** (round-6: B-1 execve x0 path-rewrite **device-fires**; B-3 child envp 재주입 IN-FLIGHT round-7, apt-install 여전히 `unpacked=false`) |
+| **G1** | **exec-re-entry** (rootfs 바이너리 `execve` → ALR 로더가 새 ELF 를 **in-process 재-맵**) | `apt`/`dpkg` 실제 설치, GIMP plugin(fork+exec), 임의 멀티프로세스 Linux 앱, 셸 파이프라인 | **높음** | clone3/fork 시맨틱(메모리: device-evidence-mali-android16); 설계=ADR-003 → **ADR-003-v2 (loader 재-맵)** | **PARTIAL→재-맵 벽** (round-7 v139: B-1 path-rewrite + B-3 envp 결정 **device-fires**하나 모든 execve 에서 `exec_events=0` → 커널이 glibc-aarch64 ELF 의 execve 를 완료 못 함 ⇒ 진짜 벽은 **loader 의 on-exec 새-ELF in-process 재-맵(re-entry stub)**; apt 는 추가로 full staging 필요) |
 | **G2** | **Qt6 wl_shm 경로** (EGL hwintegration 회피 → 소프트웨어 client-buffer) | Qt6 GUI 앱 전반(analogclock→KDE/Qt 앱군) | 중간 | EGL 플러그인 비활성/wl_shm 강제(WS-4 env+overlay); G1 무관 | **DONE** (round-6 v138: `EGL→wl_shm` → analogclock **device-렌더** rendered=true frames 2215→2216) |
 | **G3** | **Vulkan render pipeline** (ring 명령 body + ICD + AHB color-attach) | Vulkan-native 게임, Wine/DXVK/VKD3D, ANGLE-GLES | 높음 | enumerate/props backbone(**device-verified✓**) → VK-M2 명령 body | **PARTIAL→render device✓** (backbone device✓ round-5; **round-7 v139 VK-M2 render device-검증: device created + clear `vkQueueSubmit`=VK_SUCCESS**; 남은 것=ICD + textured/multi-draw 파이프라인) |
 | **G4** | **netsurf 네트워크/입력 interaction** | 실 웹 페이지 로드(자산 fetch)·클릭/스크롤 입력 | 중간 | WS-3 입력 라우팅 + 게스트 네트워크 정책 | **PARTIAL** (정적 `about:welcome` RENDERS✓) |
@@ -57,17 +58,27 @@ rootfs 바이너리를 띄울 때, 그 자식이 다시 ALR 네이티브 로더�
 실행되는 경로(=exec-re-entry)가 아직 없다. 현재 로더는 **앱이 직접 launch 하는 단일 게스트**만
 in-process 로 띄운다.
 
-**device 증거(B-1 device-fires, full chain 은 여전히 벽).** round-6 v138:
+**device 증거(B-1+B-3 결정은 device-fires 하나 `exec_events=0` ⇒ execve 자체가 미완 — THE WALL).**
+round-7 v139(`docs/evidence/2026-06-02-round7-vkrender-pass-drain.md`):
 ```
-alr exec x0=/bin/sh reason=rewrite     traps=1 rewrites=1 clone_events=7
-apt-install: unpacked=false
+alr exec x0=/bin/dash reason=rewrite envp_reason=already
+alr exec envp_injected=0 ld_preload_set=0      (모든 exec)
+alr exec traps=1 rewrites=1 exec_events=0 clone_events=7   (/bin/sh, round-6 repro)
+apt-install: unpacked=false configured=false exec=[ALR NATIVE LOADER GUEST EXEC: FAIL]
 ```
-ADR-003 **B-1**(execve x0 path-rewrite)이 device 에서 발화한다 — 게스트 `execve(/bin/sh)` 가
-EVENT_SECCOMP 에서 trap 되고 **program path(x0)가 rootfs 로 재작성**(argv/envp 불변)된 뒤 게스트가
-fork(7 clones). no-exec 게스트는 `traps=0 rewrites=0`(무회귀). 그러나 `dpkg -i` 의 full
-fork+exec maintainer-script chain 은 여전히 `unpacked=false` — 자식이 ALR interposer 를 상속하지
-못해 rootfs path-mediation 없이 실행되기 때문. (evidence:
-`docs/evidence/2026-06-02-round6-qt6-execreentry-vkrender.md`; round-4 첫 관측
+ADR-003 **B-1**(execve x0 path-rewrite)은 계속 device-fires(`x0=/bin/dash reason=rewrite`,
+argv/envp 불변). **B-3**(child envp 재주입) 결정함수도 모든 execve/execveat trap 에서 평가되며 —
+`/bin/dash` 에 대해 `envp_reason=already`(게스트가 exec 한 child 가 로더-설정 `LD_PRELOAD`/
+`ALR_ROOTFS` 를 *상속*하므로 재주입 불필요 → `envp_injected=0` 이 **올바른 no-op**, 실패가 아님).
+**그러나 결정적 관측: 관측된 모든 exec 에서 `exec_events=0`** — `PTRACE_EVENT_EXEC`(새 program
+image 가 실제로 로더 아래에서 실행에 진입)가 **단 한 번도 발화하지 않는다**, 심지어 pre-exec
+seccomp trap 이 경로를 재작성한 뒤에도. 근인: 커널이 glibc-aarch64 ELF 를 execve 할 수 없다 — 그
+`PT_INTERP` = 게스트 ld.so `/lib/ld-linux-aarch64.so.1` 를 Android 커널이 resolve 못 함 → execve
+실패, 새 이미지 없음. 즉 **B-1 + B-3 는 necessary 이나 NOT sufficient** — 진짜 벽은
+**loader 의 on-exec in-process 새-ELF 재-맵(re-entry stub / loader-as-bootstrap)**이다.
+`apt` top-level 은 더 앞에서 실패(`GUEST EXEC FAIL`, `traps=0`) — apt 가 minimally-staged 라
+(`apt-config-stage.tar` 10KiB; 전체 apt+dpkg+solver closure 부재) execve trap 까지 도달조차 못 한다.
+(round-6 첫 관측 `docs/evidence/2026-06-02-round6-qt6-execreentry-vkrender.md`; round-4
 `docs/evidence/2026-06-02-round4-milestones-drain.md`.) clone3 계열 PRoot 한계는 별도 메모리
 (device-evidence-mali-android16)에 기록.
 
@@ -83,24 +94,30 @@ fork+exec maintainer-script chain 은 여전히 `unpacked=false` — 자식이 A
 상속, ld.so 재진입)해야 하고, `execve` 가로채기가 in-process map 교체로 동작해야 한다. 단순 추가가
 아니라 별개의 큰 로더 마일스톤.
 
-**round-6 진행(IN-PROGRESS → PARTIAL: B-1 device-fires, B-3 in-flight).** 설계 **ADR-003**
+**round-6→round-7 재구도(PARTIAL → 진짜 벽 = loader 재-맵).** 설계 **ADR-003**
 (`docs/design/adr-003-multiprocess-exec-reentry.md`)는 자식을 두 클래스로 나눈다: **(A) zygote-fork
 자식(renderer 다수)은 execve 를 안 거치므로 이미 매개된 주소공간 + 상속 seccomp + SEIZE-trace 로
-_자동_ 매개**, **(B) fresh-execve 자식(zygote/gpu)만 진짜 벽**이고 이건 "loader 재진입"이 아니라 —
-seccomp 필터가 execve 로 보존되고(커널 확정) supervisor 가 `PTRACE_O_TRACEEXEC` 로 자동 재포착 —
-기존 trap 사이트 확장(신규 ptrace op 0, 신규 권한 0)으로 풀린다. **round-6 v138 에서 (B-1) execve
-x0 path-rewrite 가 device-fires**(`alr exec x0=/bin/sh reason=rewrite` traps=1 rewrites=1) — 현
-코드가 *at-style x1 만 읽고 exec 는 건너뛰던 것(`runtime_report.cpp`)을 넘어 execve **x0** 를 읽어
-rootfs 로 재작성. **남은 급소 = (B-3) execve 된 child 로의 interposer 재주입**: 자식 envp 에
-abs-rootfs `LD_PRELOAD` + `ALR_ROOTFS` 를 주입해야 자식이 rootfs path-mediation 을 상속한다 — 이게
-없어 `apt-install: unpacked=false`. **B-3 는 round-7 진행 중**(device-pending). host 프로토타입(WS-5):
-`tests/exec_map_model.py`(clone:exec 분류) + `tests/test_execve_pathrw.py`(x0 vs x1 분기 결정모델).
-device 프로브 게이트 = M-R4-fork/execmap/envprop(ADR-003 §5, read-only).
+_자동_ 매개**, **(B) fresh-execve 자식(zygote/gpu)만 진짜 벽**. round-6 v138 에서 ADR-003 의 전제
+("(B) 는 'loader 재진입'이 아니라 seccomp-across-execve + `PTRACE_O_TRACEEXEC` 자동 재포착으로 풀린다")
+하에 **(B-1) execve x0 path-rewrite 가 device-fires**(`alr exec x0=/bin/sh reason=rewrite` traps=1
+rewrites=1)했고, round-7 v139 에서 **(B-3) child envp 재주입 결정함수도 device 에서 평가**됨
+(`envp_reason=already` — 상속-envp execs 에선 재주입 불필요라 `envp_injected=0` 이 올바른 no-op).
+**그러나 round-7 의 결정적 device 관측이 ADR-003 의 전제를 _반증_했다: 모든 execve 에서
+`exec_events=0`** — `PTRACE_EVENT_EXEC` 가 끝내 발화하지 않는다. 커널이 glibc-aarch64 ELF 의 execve 를
+완료하지 못하기 때문(그 `PT_INTERP`=게스트 ld.so `/lib/ld-linux-aarch64.so.1` 를 Android 커널이
+resolve 불가). 따라서 **B-1 + B-3 는 necessary-but-NOT-sufficient** 이고, G1 은 "path-rewrite +
+envp 주입"에서 **"on-exec 새 ELF 의 in-process 재-맵(re-entry stub / loader-as-bootstrap)"으로
+재구도**된다 — 즉 ADR-003 의 "loader 재진입 기각, 상속 채택" 전제가 하드웨어로 disproven 이며, 실제
+exec-re-entry 는 로더가 exec 시 새 ELF 를 _직접_ 재-맵해야 한다. 이 재-맵 설계는 **ADR-003-v2**
+(docs/design/, 병행 세션 소유 — 이 SSOT 는 경로만 참조, 편집하지 않음)가 담당하며 full apt 스테이징
+오버레이도 같은 라운드에서 진행된다(`apt-install: unpacked=false` 의 두 번째 원인 = apt minimally-staged).
+host 프로토타입(WS-5): `tests/exec_map_model.py`(clone:exec 분류) + `tests/test_execve_pathrw.py`
+(x0 vs x1 분기 결정모델). device 프로브 게이트 = M-R4-fork/execmap/envprop(ADR-003 §5, read-only).
 
-**의존.** fork/clone3 시맨틱 안정화(메모리: device-evidence-mali-android16); 설계=ADR-003.
-G2/G3/G4/G5 와 독립(이들은 G1 없이도 부분 진행 가능). 단 GIMP 풀 필터(babl/gegl) 와 apt 설치는
-**G1 에 강하게 의존**. (B-1) x0-rewrite 실구현 착수는 M-R4-execmap 이 "exec 자식이 rootfs-내 절대경로
-사용(`/proc/self/exe` 아님)"을 device 로 보인 후로 게이트.
+**의존.** fork/clone3 시맨틱 안정화(메모리: device-evidence-mali-android16); 설계=ADR-003 →
+**ADR-003-v2(loader 재-맵)**. G2/G3/G4/G5 와 독립(이들은 G1 없이도 부분 진행 가능). 단 GIMP 풀
+필터(babl/gegl) 와 apt 설치는 **G1(재-맵)에 강하게 의존**. apt 설치는 추가로 full apt+dpkg+solver
+스테이징 오버레이에도 의존(현 `apt-config-stage.tar` 10KiB minimally-staged).
 
 ---
 
@@ -223,6 +240,14 @@ duration↑ 또는 분할 launch.
   created=yes 이나 clear-submit FAIL 로 PARTIAL 유지(round-7 clear-submit fix). **IN-PROGRESS/PARTIAL
   은 RENDERS/USABLE/DONE 이 아니다** — device 해소 전엔 셀 승급 금지(G1 apt-install·G3 clear-submit
   은 아직 device-실패라 셀 승급 불가).
+- **round-7 v139 전이**: **G3 는 clear `vkQueueSubmit`=VK_SUCCESS 로 render device-검증✓**(R7-A
+  가 AHB device-ext `VK_ANDROID_external_memory_android_hardware_buffer` 활성 + tiler readback
+  barrier 로 round-6 의 submit=FAIL 해결; backbone 과 합쳐 enumerate+render 둘 다 device-PASS — 단
+  ICD/textured/multi-draw 가 남아 PARTIAL 유지). **G1 은 진짜 벽이 재구도**됨 — B-1 path-rewrite +
+  B-3 envp 결정 모두 device-fires 하나 **모든 execve 에서 `exec_events=0`** 가 커널이 glibc-aarch64
+  ELF(`PT_INTERP`=게스트 ld.so)를 execve 완료 못 함을 입증 ⇒ G1 의 벽은 "path-rewrite + envp"가
+  아니라 **loader 의 on-exec in-process 재-맵(re-entry stub)**; 설계=**ADR-003-v2**(병행 세션 소유).
+  G1 셀은 여전히 미승급(apt-install `unpacked=false` device-실패 + 재-맵 미구현).
 - **새 측정 금지**(WS-5 HOST-ONLY) — 기존 `docs/evidence/` 인용만. device evidence 없이
   BLOCKED→DONE 승급 금지.
 - **레버리지 순서 유지** — exec-re-entry(G1)가 최고 레버리지라는 판단은 "한 기능이 푸는 막힌 셀
