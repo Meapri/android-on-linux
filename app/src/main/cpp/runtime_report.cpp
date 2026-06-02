@@ -92,6 +92,10 @@
 // streams a spinning textured cube to the SurfaceView (in-process, no fork/rootfs).
 #include "alr_gpu/alr_gpu_screen.hpp"
 #include "alr_gpu/alr_gpu_ring_hook.hpp"  // WS-1↔WS-2 CP-0 §5-A: GPU ring hook (GLES guest → Mali)
+// §VK-M2 device path: real vendor Mali libvulkan behind the guest-Vulkan marshalling.
+// ALR_VK_DECODE_REAL pulls <vulkan/vulkan.h> (NDK) + selects run_vk_marshal_mali_probe().
+#define ALR_VK_DECODE_REAL 1
+#include "alr_gpu/alr_gpu_vk_marshal_probe.hpp"
 // alr_jit_probe.hpp: V8-style iterative W^X (RW<->RX) executable-memory cycle probe —
 // decides whether Chromium (V8/SwiftShader JIT) can run WITHOUT --jitless on this
 // untrusted_app domain. Pure anonymous mmap/mprotect; no memfd-exec (that's EACCES).
@@ -1498,6 +1502,9 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     // the qt6 demo overlay) instead of Qt's compiled-in default (xcb → no X server →
     // abort). Harmless for non-Qt guests. Pairs with the r4 qt6 analogclock launch.
     guest_env.push_back("QT_QPA_PLATFORM=wayland");
+    // ALR compositor is wl_shm-only (no wl-egl / dmabuf for clients); skip Qt's
+    // client-side decoration plugin (a SIGSEGV suspect) so it uses the SHM path.
+    guest_env.push_back("QT_WAYLAND_DISABLE_WINDOWDECORATION=1");
     // GTK/GIMP startup: render with cairo (no client GL yet), an in-memory
     // GSettings backend (no dconf/D-Bus), a UTF-8 locale, and rootfs-relative XDG
     // dirs. Service-file paths (fontconfig, gdk-pixbuf loaders, gschemas) are
@@ -1582,7 +1589,6 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     // Record both arms in the report so each run is self-identifying for A/B.
     out << "\nalr native loader pcgate=" << (pcgate_on ? "on" : "off")
         << " interpose=" << (interpose_off ? "off" : "on");
-    guest_env.push_back("GDK_PIXBUF_MODULE_FILE=/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders.cache");
 
     const int fd = ::open(host_path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
@@ -5293,6 +5299,18 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeHostVulkanProbe(
     JNIEnv* env,
     jobject /* thiz */) {
     const auto report = build_host_vulkan_probe_report();
+    return env->NewStringUTF(report.c_str());
+}
+
+// §VK-M2: guest Vulkan enumerate/props REQUEST stream -> SPSC ring -> host decode on
+// the REAL vendor Mali libvulkan -> reply stream -> guest decode. Proves the Vulkan
+// marshalling path end-to-end on hardware (the Vulkan analogue of the GLES ring probe).
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeAlrGpuVkMarshalProbe(
+    JNIEnv* env,
+    jobject /* thiz */) {
+    const auto report = alr::gpu::run_vk_marshal_mali_probe();
+    __android_log_print(ANDROID_LOG_INFO, "alr_loader", "vk-marshal:\n%s", report.c_str());
     return env->NewStringUTF(report.c_str());
 }
 
