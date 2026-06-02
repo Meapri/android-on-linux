@@ -256,6 +256,15 @@ R11(SIGILL fix) · R12(sequence-safe)까지 왔고 남은 게 **re-map된 static
 
 > 통합/device 세션(단일 device 소유)이 §9 drain으로 게이트. 이 세션은 APK install 안 함.
 > 마지막 커밋 메시지에 `DEVICE-REQ: ALR-V2-apt-unpack` 마커로 요청.
+>
+> **집행 런북(이 §7을 1회로 끝내는 정확한 절차서):** `docs/evidence/RUNBOOK-v2-apt-drain.md`.
+> 통합 세션은 그 런북 순서대로 — (1) 선행 머지(PR#8 static fix + T1 MainActivity wiring +
+> T2 runtime_report 패치) → (2) `assembleDebug`(통합 stamp) → (3) host stage 3산출물
+> (`tools/build_v2_stage.sh`) → (4) `adb push fakeroot-stage.tar`/`apt-dpkg-stage.tar`
+> + `touch /data/local/tmp/.alr-aptdrain` → (5) `am force-stop` → `logcat -c` →
+> `am start` → `logcat -s alr_loader` → (6) 게이트 grep + `stat root:root`. crash 시
+> 런북 §7이 PR#8 fix 항목을 `si_code`로 분리한다. device serial = `R5KL20B6S3X`(SM-X236N),
+> device rootfs = `/data/data/dev.chanwoo.androlinux/files/rootfs/<name>`.
 
 **전제(staging — 이 세션 host 완료, device push 필요):**
 - `fakeroot-stage.tar`, `apt-dpkg-stage.tar`를 `/data/local/tmp/`에 adb push → onCreate 추출
@@ -299,6 +308,8 @@ R11(SIGILL fix) · R12(sequence-safe)까지 왔고 남은 게 **re-map된 static
 
 ## 9. 교차참조
 
+- **device drain 집행 런북(§7 1회 집행):** `docs/evidence/RUNBOOK-v2-apt-drain.md` — 선행 머지
+  → 빌드 → host stage → push+마커 → 콜드스타트 → 게이트 grep + crash si_code 분기까지 복붙 절차.
 - 호환 매트릭스 apt-install 행: `docs/research/alr-compat-matrix.md`(이 SSOT가 진전 반영).
 - exec-re-entry(G1) 설계: `docs/design/adr-003-multiprocess-exec-reentry.md`(§8 ADR-003-v2),
   `docs/research/loader-feature-gaps.md`(G1).
