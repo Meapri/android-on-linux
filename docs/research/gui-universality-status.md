@@ -9,7 +9,7 @@
 > `docs/research/alr-compat-matrix.md`. 이 문서는 그중 **GUI(창이 뜨는) 앱**만 추려
 > 범용성(어떤 toolkit/앱군이 device 에서 뜨는지)을 한눈에 보인다.
 
-baseline: 통합 트리 v134 (drain#12). 디바이스 `R5KL20B6S3X`
+baseline: 통합 트리 v135 (round-4 drain#13). 디바이스 `R5KL20B6S3X`
 (SM-X236N, mt6878 SoC, Mali-G615 MC2, Android 16, 1200×1920@90Hz, untrusted_app).
 공통 경로: **glibc 게스트 → ALR native loader(비root, public Android API only) →
 GDK/toolkit → wl_shm(소프트웨어 픽셀) → Wayland-on-SurfaceView 컴포지터 → Android SurfaceView**.
@@ -34,11 +34,13 @@ GPU(glmark2)는 별도 shim→ring→host Mali executor 경로(아래 §3).
 | **gtk3-demo** (`/bin/alr-gtk3-test`) | GTK3 데모 창 | **RENDERS** | `2026-06-01-gtk3-svg-sigabrt-resolved-gui-runs`, `v89-gtk3-renders`, `v90-real-gtk3-window` | 렌더 루프 정상(frames 12→2213). gtk_init backend=wayland; ~2088 file open 이 rootfs 로 mediation |
 | **foot** | 터미널 에뮬레이터 | **RENDERS** | `2026-06-01-gtk3-svg-sigabrt-resolved-gui-runs`; 무회귀 재확인 `2026-06-02-netsurf-browser-renders` | `rendered=true`. keymap+locale+SVG 안정화 후 렌더; libfcft4/libutf8proc shim closure OK. GTK 아닌 native Wayland 클라이언트도 뜸을 증명 |
 | **netsurf-gtk** | 웹브라우저 / GTK3 | **RENDERS** | `2026-06-02-netsurf-browser-renders` (drain#12, v134) | `netsurf-result: rendered=true` frames 2214→2217; **5 guest threads** 멀티스레드 in-process; static-PIE 5.8MB; `about:welcome` 가 SurfaceView 에 합성; 25s 풀 생존(sig14=SIGALRM, crash 아님). 실 웹브라우저가 ALR 로 Android 에 렌더 |
+| **SDL2** (testdraw2) | 위젯/그래픽 데모 / SDL2 | **RENDERS** | `2026-06-02-round4-milestones-drain` (drain#13, v135) | `sdl2gui-result: rendered=true frames=2217→2218` `bin=/usr/libexec/installed-tests/SDL2/testdraw2`; `SDL_VIDEODRIVER=wayland`; overlay extracted=120. GTK 도 native-Wayland 도 아닌 **SDL2 클라이언트**가 ALR 로더로 컴포지터에 렌더 → 네 번째 독립 toolkit |
 
-**범용성 의미.** 이 다섯은 **세 가지 독립 toolkit/클라이언트 종류**를 가로지른다:
+**범용성 의미.** 이 여섯은 **네 가지 독립 toolkit/클라이언트 종류**를 가로지른다:
 (1) GTK3 풀 앱(GIMP·widget-factory·gtk3-demo·netsurf), (2) native Wayland 클라이언트(foot),
-(3) 멀티스레드 웹브라우저(netsurf, 5 threads). 즉 ALR 의 GUI 경로는 한 앱에 특화된 게 아니라
-**임의 glibc GTK3/Wayland GUI 바이너리**를 비root·public-API 로 Android SurfaceView 에 띄운다.
+(3) 멀티스레드 웹브라우저(netsurf, 5 threads), (4) **SDL2 그래픽 데모(testdraw2)**.
+즉 ALR 의 GUI 경로는 한 앱에 특화된 게 아니라
+**임의 glibc GTK3/Wayland/SDL2 GUI 바이너리**를 비root·public-API 로 Android SurfaceView 에 띄운다.
 모두 cairo 소프트웨어 렌더 → wl_shm → 컴포지터 합성(GPU 합성은 zero-copy AHB present, CP-4).
 
 ### 보조 GUI 프리미티브 (창 렌더의 하위 검증 — device-증명)
@@ -54,16 +56,19 @@ GPU(glmark2)는 별도 shim→ring→host Mali executor 경로(아래 §3).
 ## 2. 진행 중인 toolkit (overlay STAGED, device 렌더 미확인)
 
 다음 toolkit 은 overlay(런타임 lib)는 device 에 stage 되지만 **컴포지터에 창을 띄우는 것**은
-아직(round-4 진행). 정직하게 RENDERS 로 올리지 않는다 — device 렌더 evidence 없이 승급 금지.
+아직(round-5 진행). 정직하게 RENDERS 로 올리지 않는다 — device 렌더 evidence 없이 승급 금지.
+(SDL2 는 round-4 drain#13 에서 `testdraw2` 가 RENDERS 로 §1 에 승급됨.)
 
 | toolkit | 현재 도달점 | 남은 일 | evidence |
 |---------|-----------|--------|----------|
-| **Qt6** (qtwayland) | overlay STAGED. round-3 에서 `qtpaths6` 가 probe 경로 `/usr/lib/qt6/bin/qtpaths6` 에 없어 미실행(overlay layout/symlink mismatch) | qtpaths6 경로 정합 + 데모를 컴포지터에 display-backed launch(netsurf/foot 처럼) | `2026-06-02-round3-gles3-toolkit-drain`, `2026-06-02-breadth-fanout-drain` |
-| **SDL2** | overlay STAGED(~31MB). round-3 에서 `installed-tests/SDL2/testver` 가 ALR 로더로 **실행됨**(SDL marker matched) — 로더/의존성 OK, 화면 창 미확인 | SDL2 데모 창을 컴포지터에 launch(device 렌더) | `2026-06-02-round3-gles3-toolkit-drain`, `2026-06-02-breadth-fanout-drain` |
+| **Qt6** (qtwayland) | overlay STAGED(extracted=289). round-4 drain#13 에서 `analogclock` 바이너리는 staged + `QT_QPA_PLATFORM=wayland` 설정됐으나 **fork 된 게스트 child 가 Qt init 에서 SIGSEGV**(`signal 11 SEGV_MAPERR`, pid 21297) → `qt6gui-result: rendered=false`. **앱 회귀 아님**(app pid 21224 생존, 이후 모든 probe 정상). 105MB overlay + wayland QPA plugin 만으로는 Qt platform init 클로저 부족 | **Qt6 wayland closure 보강**(libQt6WaylandClient + integration plugins + 그 deps) → SIGSEGV 해소 후 display-backed launch (round-5) | `2026-06-02-round4-milestones-drain` |
 
 > netsurf 도 round-3(drain#11)에서는 "GTK init 까지 실행되나 headless 라 `cannot open display` exit"
 > 단계였고, drain#12 에서 컴포지터에 display-backed launch 하자 **RENDERS** 로 올라갔다(§1).
-> qt6/sdl2 도 같은 마지막 한 발(컴포지터 launch)이 남았다 — 로더/의존성은 이미 통과.
+> SDL2 도 round-4 drain#13 에서 같은 한 발(컴포지터 launch)을 디뎌 RENDERS 로 승급됐다(§1).
+> qt6 는 launch 한 발 전에 **Qt init SIGSEGV(closure 부족)** 벽이 하나 더 있다 — round-5 에서
+> wayland closure 를 보강해 게스트 child crash 를 먼저 없애야 한다. 잠긴 큰 로더 기능들의
+> SSOT 는 `docs/research/loader-feature-gaps.md`.
 
 ---
 
@@ -80,8 +85,10 @@ guest shim → SPSC ring → host Mali executor 로 가속된다. glmark2-es2 �
 ## 4. 한 줄 요약 + 갱신 규칙
 
 **device-증명 범용 GUI 셋(창이 실제로 뜸): GIMP 3.0.2(USABLE) · gtk3-widget-factory ·
-gtk3-demo · foot · netsurf-gtk(웹브라우저, 5 threads) — GTK3/native-Wayland/멀티스레드
-브라우저를 가로지름.** 진행 중: qt6 · sdl2(overlay STAGED, 컴포지터 launch round-4).
+gtk3-demo · foot · netsurf-gtk(웹브라우저, 5 threads) · SDL2(testdraw2) —
+GTK3/native-Wayland/멀티스레드 브라우저/SDL2 를 가로지름.** 진행 중: qt6(overlay STAGED,
+Qt-init SIGSEGV → wayland closure 보강 round-5). 잠긴 큰 로더 기능 SSOT =
+`docs/research/loader-feature-gaps.md`.
 
 *갱신 규칙:* device evidence 추가 시에만 RENDERS/USABLE 로 승급(evidence 파일명 명기).
 host-only 진전(overlay stage, 로더가 entry 도달)만으로는 §1 으로 올리지 않고 §2 에 둔다.

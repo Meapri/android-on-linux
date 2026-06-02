@@ -4,11 +4,15 @@
 "which Linux GUI apps actually appear on the device". It is a *render* doc, not a
 *bench* doc. These lenient checks pin:
   - the device-proven universal-GUI set (GIMP / gtk3-widget-factory / gtk3-demo /
-    foot / netsurf-gtk) is each present with a render/usable status,
+    foot / netsurf-gtk / SDL2) is each present with a render/usable status,
   - each cites a real on-disk evidence doc,
-  - the still-pending toolkits (qt6/sdl2) are listed honestly (STAGED / 진행중),
-    NOT promoted to RENDERS,
+  - the still-pending toolkit (qt6) is listed honestly (STAGED, Qt-init SIGSEGV →
+    wayland closure 보강중 round-5), NOT promoted to RENDERS,
   - the doc stays a render doc (does not masquerade as a perf/bench doc).
+
+round-4 drain#13 (docs/evidence/2026-06-02-round4-milestones-drain.md, v135)
+device-proved the SDL2 window demo testdraw2 RENDERS, so SDL2 graduates from the
+in-progress section into the proven set; qt6 stays pending (Qt-init SIGSEGV).
 """
 from pathlib import Path
 
@@ -17,10 +21,10 @@ DOC = ROOT / "docs" / "research" / "gui-universality-status.md"
 EVIDENCE_DIR = ROOT / "docs" / "evidence"
 
 # The device-proven universal GUI set this doc must enumerate.
-PROVEN_GUI = ("GIMP", "gtk3-widget-factory", "gtk3-demo", "foot", "netsurf")
+PROVEN_GUI = ("GIMP", "gtk3-widget-factory", "gtk3-demo", "foot", "netsurf", "SDL2")
 
-# Still-pending toolkits that must NOT be marked RENDERS/USABLE.
-PENDING_TOOLKITS = ("Qt6", "SDL2")
+# Still-pending toolkit that must NOT be marked RENDERS/USABLE.
+PENDING_TOOLKITS = ("Qt6",)
 
 
 def _text() -> str:
