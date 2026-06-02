@@ -1969,15 +1969,42 @@ class MainActivity : Activity() {
                 val dpkgBin = java.io.File(rootfsDir, "usr/bin/dpkg")
                 // hello .deb lands in the apt cache (apt-dpkg overlay's --fetch-test-deb asset).
                 val helloDeb = java.io.File(rootfsDir, "var/cache/apt/archives/hello_2.10-3build1_arm64.deb")
+                // v2 ROOT CAUSE FIX (device-confirmed, /tmp/aptdrain9.log): the
+                // libalr_interpose.so under usr/lib/androlinux/ is (re)written IN PLACE by
+                // the SEPARATE onCreate overlay-staging Thread (the "interpose-stage"
+                // extractOverlayTar). That thread ran CONCURRENTLY with this dpkg probe —
+                // its extract window (interpose-stage: extracting → overlay done) bracketed
+                // the dpkg launch. When the guest ld.so mmap'd libalr_interpose.so mid-
+                // rewrite (truncate+write), the LD_PRELOAD of the interposer FAILED to load
+                // (non-fatally: glibc skips a broken preload and proceeds), so the
+                // interposer's init_array/ctor never ran → NO path mediation → dpkg's
+                // relative opens hit literal Android paths → var/lib/dpkg/updates/tmp.i
+                // ENOENT → unpacked=false. fakeroot.so was staged earlier and settled, so
+                // ITS ctor ran (ALR-FRDIAG), which is why the two preloads diverged.
+                // FIX: also WAIT for the interpose-stage marker (written only AFTER the
+                // extract fully completes) so the .so is stable before any guest LD_PRELOADs
+                // it. The marker is name-versioned by tar size (.interpose-staged-<len>); we
+                // accept any .interpose-staged-* so a re-pushed tar of a different size still
+                // gates correctly. Absent tar (interpose shipped only in the base rootfs) →
+                // no marker is ever written, so don't block on it in that case.
+                val interposeStageTar = java.io.File("/data/local/tmp/interpose-stage.tar")
+                val interposeStaging = {
+                    interposeStageTar.isFile &&
+                        (rootfsDir.listFiles { f ->
+                            f.name.startsWith(".interpose-staged-")
+                        }?.isEmpty() ?: true)
+                }
                 var waited = 0
-                while (waited < 20000 && !(fakerootSo.isFile && dpkgBin.isFile && helloDeb.isFile)) {
+                while (waited < 20000 &&
+                    !(fakerootSo.isFile && dpkgBin.isFile && helloDeb.isFile && !interposeStaging())) {
                     Thread.sleep(500)
                     waited += 500
                 }
+                val interposeStaged = !interposeStaging()
                 android.util.Log.i(
                     "alr_loader",
                     "aptdrain: fakeroot.so=${fakerootSo.isFile} dpkg=${dpkgBin.isFile} " +
-                        "hello.deb=${helloDeb.isFile} (waited ${waited}ms)",
+                        "hello.deb=${helloDeb.isFile} interpose-staged=$interposeStaged (waited ${waited}ms)",
                 )
                 if (!(fakerootSo.isFile && dpkgBin.isFile && helloDeb.isFile)) {
                     android.util.Log.w("alr_loader", "aptdrain: prerequisites missing — skipping dpkg -i (push fakeroot-stage.tar + apt-dpkg-stage.tar)")

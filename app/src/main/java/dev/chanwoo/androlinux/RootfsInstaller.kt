@@ -202,17 +202,49 @@ class RootfsInstaller(private val context: Context) {
             }
             entry.isFile -> {
                 target.parentFile?.mkdirs()
-                target.outputStream().use { output -> tar.copyTo(output) }
-                target.setReadable(true, true)
-                // Set the exec bit when the tar entry is executable OR the file is a
-                // shared library. ALR's dlopen (file-backed PROT_EXEC under
-                // untrusted_app) REJECTS a non-executable .so — Debian ships .so as
-                // 0644 (no x), which extracts to 0600 and breaks dlopen of e.g. the
-                // gdk-pixbuf svg loader (device-evidence: gtk3 SIGABRT) and the base
-                // pixbuf loaders. Shared libs need x here even though stock Linux
-                // dlopen does not require it.
-                if (entry.mode and 0b001_001_001 != 0 || isSharedLibName(target.name)) {
-                    target.setExecutable(true, true)
+                // ATOMIC REPLACE (v2 race fix): write to a sibling temp file, set its
+                // perms, then rename() it onto the final path. A plain
+                // `target.outputStream()` opens the EXISTING file and TRUNCATES it to
+                // zero before streaming — so for the duration of the copy the file is
+                // partial/zero-length. Overlay staging runs on its own Thread CONCURRENTLY
+                // with guest probes that LD_PRELOAD freshly-staged .so files
+                // (libalr_interpose.so); a guest ld.so that mmap'd the .so mid-truncate
+                // got a broken image and the preload SILENTLY FAILED (glibc skips a bad
+                // LD_PRELOAD and proceeds), so the interposer's ctor/init_array never ran
+                // → no path mediation → dpkg tmp.i ENOENT → unpacked=false (device-
+                // confirmed, /tmp/aptdrain9.log: interpose-stage extract window bracketed
+                // the dpkg launch). rename(2) on the SAME directory (hence same fs) is
+                // atomic: a concurrent open sees either the whole old inode or the whole
+                // new one, never a partial write. The temp carries the same final perms so
+                // the swapped-in file is immediately correct (no post-rename perm window).
+                val tmp = File(target.parentFile, ".${target.name}.alrpart")
+                try {
+                    tmp.outputStream().use { output -> tar.copyTo(output) }
+                    tmp.setReadable(true, true)
+                    // Set the exec bit when the tar entry is executable OR the file is a
+                    // shared library. ALR's dlopen (file-backed PROT_EXEC under
+                    // untrusted_app) REJECTS a non-executable .so — Debian ships .so as
+                    // 0644 (no x), which extracts to 0600 and breaks dlopen of e.g. the
+                    // gdk-pixbuf svg loader (device-evidence: gtk3 SIGABRT) and the base
+                    // pixbuf loaders. Shared libs need x here even though stock Linux
+                    // dlopen does not require it. Perms are set on the TEMP before rename
+                    // so the visible file is never momentarily non-executable.
+                    if (entry.mode and 0b001_001_001 != 0 || isSharedLibName(target.name)) {
+                        tmp.setExecutable(true, true)
+                    }
+                    // Atomic swap. Os.rename is rename(2): atomic same-fs replace. Fall
+                    // back to File.renameTo if the platform call is unavailable, and to a
+                    // direct write only as a last resort (still better than nothing).
+                    try {
+                        android.system.Os.rename(tmp.absolutePath, target.absolutePath)
+                    } catch (e: android.system.ErrnoException) {
+                        if (!tmp.renameTo(target)) {
+                            target.outputStream().use { output -> tmp.inputStream().use { it.copyTo(output) } }
+                            tmp.delete()
+                        }
+                    }
+                } finally {
+                    if (tmp.exists()) tmp.delete()
                 }
             }
             else -> throw IllegalArgumentException("unsupported tar entry type: ${entry.name}")
