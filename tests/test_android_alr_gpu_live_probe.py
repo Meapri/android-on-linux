@@ -30,4 +30,4 @@ def test_main_activity_reports_gpu_live_gate():
     assert "alrGpuLiveProbe" in text
     assert "alrGpuLivePassed" in text
     assert "ALR GPU LIVE INTEGRATION:" in text
-    assert "build: 0.4.150-sd-v150" in text
+    assert "build: 0.4.160-sd-v160" in text

@@ -124,6 +124,7 @@
 #include <fcntl.h>
 #include <time.h>       /* struct timespec (utimensat) */
 #include <sys/types.h>
+#include <sys/socket.h> /* struct sockaddr, AF_NETLINK, socklen_t (bind workaround) */
 #include <sys/stat.h>   /* struct stat[64], struct statx, statx flags */
 
 /* PCGATE additions: raw UAPI seccomp/BPF + openat2, plus the SIGSYS-catching
@@ -195,6 +196,13 @@ static int a_under(const char *p, const char *d) {
     return p[i] == '/' || p[i] == '\0';
 }
 
+/* exact string equality (no <string.h> dependency in the trusted path). */
+static int a_eq(const char *p, const char *q) {
+    size_t i = 0;
+    while (p[i] && p[i] == q[i]) ++i;
+    return p[i] == q[i];
+}
+
 /* ----- ALR_ROOTFS, captured once at init ----- */
 
 /* Holds the trimmed rootfs prefix (trailing '/'s removed, lone "/" kept).
@@ -205,24 +213,46 @@ static char   g_rootfs[1024];
 static size_t g_rootfs_len = 0;
 static int    g_inited = 0;
 
+/* ALR_GUEST_EXE: the GUEST-visible path of the running program (e.g.
+ * "/usr/lib/chromium/chromium-headless-shell"). The loader sets it because the
+ * real /proc/self/exe of this in-process guest points at the Android APK/zygote,
+ * NOT the guest binary — so any app that locates its data dir via readlink
+ * /proc/self/exe (chromium's ICU/pak resolution via PathService, and many glibc
+ * apps) computes the wrong directory and fails to find its assets. We rewrite the
+ * readlink("/proc/self/exe") RESULT to this guest path so DIR_MODULE/DIR_ASSETS
+ * resolve under the rootfs (then normal path mediation maps the asset open). */
+static char   g_guest_exe[1024];
+static size_t g_guest_exe_len = 0;
+
 static void alr_init(void) {
     if (g_inited) return;
     g_inited = 1;
 
     /* getenv is safe to resolve normally; it is not interposed here. */
     const char *r = getenv("ALR_ROOTFS");
-    if (!r || r[0] != '/') {        /* must be an absolute host path */
+    if (r && r[0] == '/') {         /* must be an absolute host path */
+        size_t n = a_len(r);
+        /* trim trailing slashes, but keep a lone "/" (matches trim_trailing_slashes) */
+        while (n > 1 && r[n - 1] == '/') --n;
+        if (n >= sizeof(g_rootfs)) n = sizeof(g_rootfs) - 1;   /* clamp, never overflow */
+        for (size_t i = 0; i < n; ++i) g_rootfs[i] = r[i];
+        g_rootfs[n] = '\0';
+        /* A rootfs of exactly "/" is a no-op prefix; treat as disabled. */
+        g_rootfs_len = (n == 1 && g_rootfs[0] == '/') ? 0 : n;
+    } else {
         g_rootfs_len = 0;
-        return;
     }
-    size_t n = a_len(r);
-    /* trim trailing slashes, but keep a lone "/" (matches trim_trailing_slashes) */
-    while (n > 1 && r[n - 1] == '/') --n;
-    if (n >= sizeof(g_rootfs)) n = sizeof(g_rootfs) - 1;   /* clamp, never overflow */
-    for (size_t i = 0; i < n; ++i) g_rootfs[i] = r[i];
-    g_rootfs[n] = '\0';
-    /* A rootfs of exactly "/" is a no-op prefix; treat as disabled. */
-    g_rootfs_len = (n == 1 && g_rootfs[0] == '/') ? 0 : n;
+
+    const char *e = getenv("ALR_GUEST_EXE");
+    if (e && e[0] == '/') {         /* guest-absolute program path */
+        size_t n = a_len(e);
+        if (n >= sizeof(g_guest_exe)) n = sizeof(g_guest_exe) - 1;
+        for (size_t i = 0; i < n; ++i) g_guest_exe[i] = e[i];
+        g_guest_exe[n] = '\0';
+        g_guest_exe_len = n;
+    } else {
+        g_guest_exe_len = 0;
+    }
 }
 
 /*
@@ -1066,6 +1096,19 @@ int faccessat2(int dirfd, const char *path, int mode, int flags) {
 /* readlink/readlinkat both reduce to __NR_readlinkat (in the traced 9). */
 static ssize_t alr_readlink_emit(int dirfd, const char *path,
                                  char *buf, size_t bufsiz) {
+    alr_init();
+    /* /proc/self/exe substitution: the kernel would return the Android APK path
+     * (this is an in-process guest), which breaks every app that derives its data
+     * dir from the executable path. Return the loader-provided guest path instead.
+     * readlink semantics: copy up to bufsiz bytes, NO NUL terminator, return the
+     * number of bytes placed (the untruncated length clamped to bufsiz). */
+    if (g_guest_exe_len > 0 && path &&
+        (a_eq(path, "/proc/self/exe") || a_eq(path, "/proc/self/exe/"))) {
+        size_t n = g_guest_exe_len;
+        if (n > bufsiz) n = bufsiz;
+        for (size_t i = 0; i < n; ++i) buf[i] = g_guest_exe[i];
+        return (ssize_t)n;
+    }
     char b[ALR_PBUF];
     const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
     long r = alr_tramp_syscall(__NR_readlinkat, dirfd, (long)p,
@@ -1110,6 +1153,34 @@ ssize_t __readlinkat_chk(int dirfd, const char *path, char *buf, size_t bufsiz,
     char b[ALR_PBUF];
     const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
     return real(dirfd, p, buf, bufsiz, buflen);
+}
+
+/* =================================================================== */
+/* bind(): netlink connectivity-probe workaround (NOT a path syscall)  */
+/* =================================================================== */
+/* Android SELinux denies untrusted_app a bind() of an AF_NETLINK route socket
+ * to multicast groups (EACCES). chromium's net::AddressTrackerLinux uses exactly
+ * that to watch for interface/route changes; on the bind failure its
+ * NetworkChangeNotifier reports the network as unavailable and EVERY request
+ * stalls (device: https fetch hung 180s; address_tracker_linux.cc:243 "Could not
+ * bind NETLINK socket: Permission denied"). The kernel still permits nlmsg_read,
+ * so the INITIAL interface enumeration (an RTM_GETLINK dump on the auto-bound
+ * socket) works — only the multicast SUBSCRIPTION is denied. So: if a real
+ * netlink bind fails with EACCES/EPERM, return success. The app loses async
+ * network-change notifications (fine for a one-shot fetch) but proceeds ONLINE.
+ * This is NOT a SELinux bypass — the kernel still enforces every syscall; we only
+ * stop a kernel-denied connectivity PROBE from being misread as "offline". Real
+ * AF_INET data sockets, and netlink binds that actually succeed, are untouched. */
+int bind(int fd, const struct sockaddr *addr, socklen_t len) {
+    static int (*real)(int, const struct sockaddr *, socklen_t);
+    ALR_REAL(real, int (*)(int, const struct sockaddr *, socklen_t), "bind");
+    int r = real(fd, addr, len);
+    if (r != 0 && (errno == EACCES || errno == EPERM) &&
+        addr && addr->sa_family == AF_NETLINK) {
+        errno = 0;
+        return 0;
+    }
+    return r;
 }
 
 /* =================================================================== */
