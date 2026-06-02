@@ -27,6 +27,54 @@ This builder produces the rootfs-absolute §5-E overlay that unblocks BOTH:
      ``ca-certificates`` .deb ships under ``/usr/share/ca-certificates/mozilla``
      (see ANALYSIS below — the .deb does *not* ship the pre-built bundle; its
      postinst assembles it via ``update-ca-certificates``, which we reproduce).
+  5. ``/etc/hosts`` — pins the chosen **DoH** (DNS-over-HTTPS) server hostname to
+     its stable public anycast IP(s) so the DoH *bootstrap* can connect without a
+     prior UDP-53 lookup (see "CR-2 DNS — DoH over 443" below). The base rootfs
+     ships no ``/etc/hosts``; without it the DoH server hostname can't be resolved
+     and secure DoH never gets off the ground.
+
+CR-2 DNS — Android blocks apps' raw UDP-53; the fix is DoH over 443
+------------------------------------------------------------------
+The plain ``resolv.conf`` path (member #2) is necessary but **not sufficient on
+Android**: a non-root ``untrusted_app`` is not permitted to send raw UDP/53 to an
+arbitrary nameserver (8.8.8.8). Android funnels app DNS through the system
+resolver (``netd``); a glibc guest doing its own ``sendto(:53)`` just hangs until
+chromium's ~180s navigation alarm fires (device-observed — see
+``docs/evidence/2026-06-02-cr2-network-netlink-blocker.md``). So for chromium the
+DNS layer must ride a transport the app *is* allowed: **HTTPS on port 443**, i.e.
+**DNS-over-HTTPS (DoH)**. chromium has first-class DoH; we drive it via flags:
+
+    --dns-over-https-mode=secure
+    --dns-over-https-templates=https://dns.google/dns-query
+
+In ``secure`` mode chromium sends ALL name resolution over the DoH template (TCP
+443) and NEVER falls back to plaintext UDP-53 — which is exactly what we want,
+since UDP-53 is the blocked transport.
+
+The bootstrap problem (and its fix)
+-----------------------------------
+DoH has a chicken-and-egg: to *open* the HTTPS connection to ``dns.google`` it
+must first resolve ``dns.google`` — but plaintext DNS is blocked. We break the
+cycle by pinning the DoH server hostname to its well-known anycast IP two ways
+(belt-and-suspenders), so no plaintext lookup is ever needed:
+
+  * **chromium-level** — ``--host-resolver-rules="MAP dns.google 8.8.8.8,..."``.
+    chromium consults host-resolver-rules BEFORE any resolver runs (including
+    before DoH), so the DoH template host resolves locally and the rule does NOT
+    recurse into DoH. This is the canonical chromium DoH-bootstrap pattern.
+  * **glibc-level** — an ``/etc/hosts`` entry mapping the same hostname→IP, so any
+    libc ``getaddrinfo`` chromium issues for the DoH host is also satisfied
+    offline. (``nsswitch.conf`` already orders ``hosts: files dns`` → ``files``
+    i.e. /etc/hosts wins.)
+
+These anycast IPs (Google 8.8.8.8/8.8.4.4, Cloudflare 1.1.1.1/1.0.0.1, Quad9
+9.9.9.9/149.112.112.112) are stable, long-lived, and are the same bootstrap
+addresses chromium ships internally for these providers.
+
+This overlay supplies the /etc/hosts pin; the chromium DoH/host-resolver FLAGS go
+on the command line (the MainActivity CR-2 probe). The builder emits the exact
+flag block for the chosen provider via ``doh_chromium_flags()`` /
+``--doh-flags`` so WS-1 can paste it verbatim.
 
 ANALYSIS — ALR does NOT mediate sockets; network "just works" once staged
 -------------------------------------------------------------------------
@@ -141,6 +189,109 @@ NSSWITCH_BODY = (
 TEST_PAGE_SRC = Path(__file__).resolve().parent / "chromium" / "cr-test.html"
 TEST_PAGE_PATH = "root/cr-test.html"
 
+# --------------------------------------------------------------------------- #
+# CR-2 DNS — DoH (DNS-over-HTTPS) providers
+# --------------------------------------------------------------------------- #
+# Each provider gives chromium a `secure`-mode DoH template (HTTPS/443 — a
+# transport the untrusted_app CAN use, unlike raw UDP-53). The `bootstrap` IPs are
+# that provider's stable public anycast addresses; we pin host->IP both in
+# /etc/hosts (glibc) and via chromium --host-resolver-rules so the DoH server
+# hostname resolves with ZERO plaintext DNS (solving the DoH bootstrap cycle).
+#
+# These anycast addresses are long-lived and documented by each provider; they are
+# the same bootstrap IPs chromium ships internally for these well-known providers.
+
+
+@dataclass(frozen=True)
+class DohProvider:
+    key: str
+    host: str               # DoH server hostname (the template host)
+    template: str           # RFC 8484 DoH query URL
+    bootstrap: tuple[str, ...]  # stable anycast IPv4 to pin host -> IP
+
+
+DOH_PROVIDERS: dict[str, DohProvider] = {
+    "google": DohProvider(
+        key="google",
+        host="dns.google",
+        template="https://dns.google/dns-query",
+        bootstrap=("8.8.8.8", "8.8.4.4"),
+    ),
+    "cloudflare": DohProvider(
+        key="cloudflare",
+        host="cloudflare-dns.com",
+        template="https://cloudflare-dns.com/dns-query",
+        bootstrap=("1.1.1.1", "1.0.0.1"),
+    ),
+    "quad9": DohProvider(
+        key="quad9",
+        host="dns.quad9.net",
+        template="https://dns.quad9.net/dns-query",
+        bootstrap=("9.9.9.9", "149.112.112.112"),
+    ),
+}
+DEFAULT_DOH_PROVIDER = "google"
+
+# /etc/hosts — base rootfs ships none. We add loopback + the DoH bootstrap pins.
+HOSTS_PATH = "etc/hosts"
+
+
+def _resolve_doh_provider(name: str | DohProvider) -> DohProvider:
+    if isinstance(name, DohProvider):
+        return name
+    try:
+        return DOH_PROVIDERS[name]
+    except KeyError:
+        raise ValueError(
+            f"unknown DoH provider {name!r}; choose one of "
+            f"{', '.join(sorted(DOH_PROVIDERS))}"
+        ) from None
+
+
+def doh_host_resolver_rules(provider: str | DohProvider = DEFAULT_DOH_PROVIDER) -> str:
+    """Return the chromium ``--host-resolver-rules`` value pinning the DoH host.
+
+    e.g. ``MAP dns.google 8.8.8.8,MAP dns.google 8.8.4.4`` — consulted by chromium
+    BEFORE any resolver runs (incl. before DoH), so the DoH template host resolves
+    locally and does NOT recurse into DoH. This is the DoH bootstrap fix.
+    """
+    p = _resolve_doh_provider(provider)
+    return ",".join(f"MAP {p.host} {ip}" for ip in p.bootstrap)
+
+
+def doh_chromium_flags(provider: str | DohProvider = DEFAULT_DOH_PROVIDER) -> list[str]:
+    """The exact chromium flag list to make secure DoH work on Android.
+
+    WS-1 pastes these into the MainActivity CR-2 probe (one per ``\\n``-joined
+    arg). Order: secure DoH mode, the template, then the host-resolver-rules pin
+    that bootstraps the template host with no plaintext DNS.
+    """
+    p = _resolve_doh_provider(provider)
+    return [
+        "--dns-over-https-mode=secure",
+        f"--dns-over-https-templates={p.template}",
+        f"--host-resolver-rules={doh_host_resolver_rules(p)}",
+    ]
+
+
+def build_hosts_body(provider: str | DohProvider = DEFAULT_DOH_PROVIDER) -> str:
+    """The ``/etc/hosts`` body: loopback + DoH bootstrap pins (host -> anycast IP).
+
+    The glibc half of the DoH bootstrap: any libc getaddrinfo chromium issues for
+    the DoH host is satisfied from /etc/hosts (nsswitch ``hosts: files dns`` →
+    files first), so it never needs the blocked UDP-53.
+    """
+    p = _resolve_doh_provider(provider)
+    lines = [
+        "# ALR chromium-net overlay — loopback + DoH bootstrap pins.",
+        "127.0.0.1\tlocalhost",
+        "::1\tlocalhost ip6-localhost ip6-loopback",
+        f"# DoH bootstrap ({p.key}): pin {p.host} so secure DoH connects with no plaintext DNS.",
+    ]
+    for ip in p.bootstrap:
+        lines.append(f"{ip}\t{p.host}")
+    return "\n".join(lines) + "\n"
+
 
 @dataclass
 class ChromiumNetOverlayResult:
@@ -150,6 +301,8 @@ class ChromiumNetOverlayResult:
     ca_bundle_bytes: int = 0
     ca_deb_filename: str = ""
     file_count: int = 0
+    doh_provider: str = DEFAULT_DOH_PROVIDER
+    doh_flags: tuple[str, ...] = ()
 
     def as_dict(self) -> dict:
         return {
@@ -160,6 +313,8 @@ class ChromiumNetOverlayResult:
             "ca_bundle_kib": round(self.ca_bundle_bytes / 1024, 1),
             "ca_deb_filename": self.ca_deb_filename,
             "file_count": self.file_count,
+            "doh_provider": self.doh_provider,
+            "doh_flags": list(self.doh_flags),
         }
 
 
@@ -289,14 +444,16 @@ def build_chromium_net_overlay(
     ca_bundle: bytes | None = None,
     ca_cert_count: int | None = None,
     ca_deb_filename: str = "",
+    doh_provider: str | DohProvider = DEFAULT_DOH_PROVIDER,
 ) -> ChromiumNetOverlayResult:
     """Pack the §5-E ``chromium-net-stage.tar``.
 
     NETWORK PATH unless ``ca_bundle`` is supplied (offline/selftest): fetches the
     noble ca-certificates .deb, assembles the CA bundle, then writes resolv.conf +
-    nsswitch.conf + the CA bundle + the local CR-1 test page into one ./-rooted
-    overlay tar at their rootfs-absolute paths.
+    nsswitch.conf + /etc/hosts (DoH bootstrap pin) + the CA bundle + the local
+    CR-1 test page into one ./-rooted overlay tar at their rootfs-absolute paths.
     """
+    provider = _resolve_doh_provider(doh_provider)
     out_tar = Path(out_tar)
     out_tar.parent.mkdir(parents=True, exist_ok=True)
     cache = Path(cache_dir) if cache_dir is not None else Path("/tmp/deb-cache-ubuntu")
@@ -324,6 +481,8 @@ def build_chromium_net_overlay(
         members.append("./" + RESOLV_CONF_PATH)
         _add_file(tar, NSSWITCH_PATH, NSSWITCH_BODY.encode())
         members.append("./" + NSSWITCH_PATH)
+        _add_file(tar, HOSTS_PATH, build_hosts_body(provider).encode())
+        members.append("./" + HOSTS_PATH)
         _add_file(tar, CA_BUNDLE_PATH, ca_bundle)
         members.append("./" + CA_BUNDLE_PATH)
         _add_file(tar, TEST_PAGE_PATH, page_bytes)
@@ -339,6 +498,8 @@ def build_chromium_net_overlay(
         ca_bundle_bytes=len(ca_bundle),
         ca_deb_filename=ca_deb_filename,
         file_count=file_count,
+        doh_provider=provider.key,
+        doh_flags=tuple(doh_chromium_flags(provider)),
     )
 
 
@@ -360,6 +521,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cache", default="/tmp/deb-cache-ubuntu")
     parser.add_argument("--test-page", default=str(TEST_PAGE_SRC),
                         help="path to the CR-1 local HTML page to pack at /root/cr-test.html")
+    parser.add_argument("--doh-provider", default=DEFAULT_DOH_PROVIDER,
+                        choices=sorted(DOH_PROVIDERS),
+                        help="DoH (DNS-over-HTTPS) provider whose server host is pinned in "
+                        f"/etc/hosts + emitted as chromium flags (default {DEFAULT_DOH_PROVIDER})")
+    parser.add_argument("--doh-flags", action="store_true",
+                        help="print ONLY the chromium DoH/host-resolver flag block for "
+                        "--doh-provider (the args WS-1 pastes into the CR-2 probe) and exit")
     parser.add_argument("--list", "--dry-run", action="store_true", dest="dry_run",
                         help="resolve the ca-certificates .deb + print the planned overlay "
                         "members WITHOUT downloading/packing")
@@ -370,6 +538,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.selftest:
         return _selftest()
 
+    provider = _resolve_doh_provider(args.doh_provider)
+
+    if args.doh_flags:
+        flags = doh_chromium_flags(provider)
+        if args.json:
+            print(json.dumps({
+                "doh_provider": provider.key,
+                "doh_server_host": provider.host,
+                "doh_bootstrap_ips": list(provider.bootstrap),
+                "doh_flags": flags,
+            }, indent=2))
+        else:
+            print(f"chromium DoH flags ({provider.key} → {provider.host} "
+                  f"@ {', '.join(provider.bootstrap)}):")
+            for f in flags:
+                print(f"  {f}")
+        return 0
+
     components = tuple(args.components) if args.components else COMPONENTS
 
     if args.dry_run:
@@ -379,6 +565,7 @@ def main(argv: list[str] | None = None) -> int:
         planned = sorted([
             "./" + RESOLV_CONF_PATH,
             "./" + NSSWITCH_PATH,
+            "./" + HOSTS_PATH,
             "./" + CA_BUNDLE_PATH,
             "./" + TEST_PAGE_PATH,
         ])
@@ -387,6 +574,10 @@ def main(argv: list[str] | None = None) -> int:
             "planned_members": planned,
             "test_page_src": args.test_page,
             "test_page_exists": Path(args.test_page).is_file(),
+            "doh_provider": provider.key,
+            "doh_server_host": provider.host,
+            "doh_bootstrap_ips": list(provider.bootstrap),
+            "doh_flags": doh_chromium_flags(provider),
         }
         if args.json:
             print(json.dumps(info, indent=2))
@@ -395,6 +586,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  ca-certificates .deb: {filename}")
             print(f"  test page src: {args.test_page} "
                   f"(exists={info['test_page_exists']})")
+            print(f"  DoH provider: {provider.key} → {provider.host} "
+                  f"@ {', '.join(provider.bootstrap)} (pinned in /etc/hosts)")
+            print("  DoH chromium flags (for the CR-2 probe):")
+            for f in info["doh_flags"]:
+                print(f"    {f}")
             print("  planned members:")
             for m in planned:
                 print(f"    {m}")
@@ -406,6 +602,7 @@ def main(argv: list[str] | None = None) -> int:
     res = build_chromium_net_overlay(
         args.out, mirror=args.mirror, suite=args.suite, arch=ARCH,
         components=components, cache_dir=args.cache, test_page_src=args.test_page,
+        doh_provider=provider,
     )
     if args.json:
         print(json.dumps(res.as_dict(), indent=2))
@@ -415,6 +612,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  CA bundle: {res.ca_cert_count} certs, "
               f"{round(res.ca_bundle_bytes / 1024, 1)} KiB "
               f"(from {res.ca_deb_filename})")
+        print(f"  DoH provider: {res.doh_provider} ({provider.host} "
+              f"@ {', '.join(provider.bootstrap)})")
+        print("  DoH chromium flags (for the CR-2 probe):")
+        for f in res.doh_flags:
+            print(f"    {f}")
         print("  members:")
         for m in res.members:
             print(f"    {m}")
@@ -469,6 +671,7 @@ def _selftest() -> int:
                     bodies[n] = t.extractfile(m).read()
         check("overlay ships ./etc/resolv.conf", "./etc/resolv.conf" in names)
         check("overlay ships ./etc/nsswitch.conf", "./etc/nsswitch.conf" in names)
+        check("overlay ships ./etc/hosts", "./etc/hosts" in names)
         check("overlay ships ./etc/ssl/certs/ca-certificates.crt",
               "./etc/ssl/certs/ca-certificates.crt" in names)
         check("overlay ships ./root/cr-test.html", "./root/cr-test.html" in names)
@@ -480,17 +683,60 @@ def _selftest() -> int:
         check("nsswitch hosts: files dns",
               b"hosts:" in bodies.get("./etc/nsswitch.conf", b"")
               and b"dns" in bodies.get("./etc/nsswitch.conf", b""))
+        hosts_body = bodies.get("./etc/hosts", b"")
+        check("hosts has loopback 127.0.0.1 localhost",
+              b"127.0.0.1\tlocalhost" in hosts_body)
+        check("hosts pins default DoH host (dns.google) -> bootstrap IP",
+              b"8.8.8.8\tdns.google" in hosts_body)
         check("CA bundle is the assembled PEM",
               bodies.get("./etc/ssl/certs/ca-certificates.crt") == bundle)
         check("packed page == on-disk page",
               bodies.get("./root/cr-test.html") == TEST_PAGE_SRC.read_bytes())
         check("result reports 2 certs", res.ca_cert_count == 2)
-        check("result file_count == 4", res.file_count == 4)
+        check("result file_count == 5", res.file_count == 5)
+        check("result reports doh_provider=google", res.doh_provider == "google")
+        check("result doh_flags includes secure mode",
+              "--dns-over-https-mode=secure" in res.doh_flags)
 
         # §5-E structural conformance
         from tools.stage_tar_spec import validate_stage_tar
         rep = validate_stage_tar(str(out))
         check("overlay is stage_tar_spec conformant", rep.conformant)
+
+    # --- DoH flag / hosts-body helpers (per provider) ----------------------- #
+    g_flags = doh_chromium_flags("google")
+    check("google DoH template flag points at dns.google",
+          "--dns-over-https-templates=https://dns.google/dns-query" in g_flags)
+    check("google host-resolver-rules MAPs dns.google to 8.8.8.8",
+          "MAP dns.google 8.8.8.8" in doh_host_resolver_rules("google"))
+    cf_flags = doh_chromium_flags("cloudflare")
+    check("cloudflare DoH template flag points at cloudflare-dns.com",
+          "--dns-over-https-templates=https://cloudflare-dns.com/dns-query" in cf_flags)
+    check("cloudflare hosts body pins 1.1.1.1 -> cloudflare-dns.com",
+          "1.1.1.1\tcloudflare-dns.com" in build_hosts_body("cloudflare"))
+    check("quad9 hosts body pins 9.9.9.9 -> dns.quad9.net",
+          "9.9.9.9\tdns.quad9.net" in build_hosts_body("quad9"))
+    try:
+        _resolve_doh_provider("nope")
+        check("unknown DoH provider rejected", False)
+    except ValueError:
+        check("unknown DoH provider rejected", True)
+
+    # a cloudflare-provider overlay pins cloudflare in /etc/hosts (not google)
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "cf.tar"
+        rescf = build_chromium_net_overlay(
+            out, ca_bundle=bundle, ca_cert_count=2, ca_deb_filename="(synthetic)",
+            doh_provider="cloudflare",
+        )
+        with tarfile.open(out) as t:
+            cf_hosts = t.extractfile("./etc/hosts").read()
+        check("cloudflare overlay /etc/hosts pins cloudflare-dns.com",
+              b"1.1.1.1\tcloudflare-dns.com" in cf_hosts)
+        check("cloudflare overlay /etc/hosts does NOT pin dns.google",
+              b"dns.google" not in cf_hosts)
+        check("cloudflare overlay result doh_provider=cloudflare",
+              rescf.doh_provider == "cloudflare")
 
     # --- assemble_ca_bundle over a synthetic ca-certificates-like .deb ------ #
     import shutil
