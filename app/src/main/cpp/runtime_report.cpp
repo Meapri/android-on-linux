@@ -1952,8 +1952,13 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         // (this is the per-launch lifetime the old comment above promised). The 25s
         // default still cycles the intermediate verification apps quickly.
         const bool is_gimp = host_path.find("gimp") != std::string::npos;
+        // CR-1 measure-first (chromium-run-plan / PR #2): a 140s drain showed
+        // chromium --single-process --dump-dom did not render within 120s (the loader
+        // went silent ~2min under chromium's thread/syscall storm via the serialized
+        // ptrace supervision). Give chromium 600s to answer "does it render GIVEN time
+        // (window-bound) or never (a real supervision-throughput wall)?".
         const unsigned alarm_sec =
-            dynamic ? (is_gimp ? 1800u : (is_chromium ? 120u : 25u)) : 5u;
+            dynamic ? (is_gimp ? 1800u : (is_chromium ? 600u : 25u)) : 5u;
         ::alarm(alarm_sec);
         alr_enter_guest(reinterpret_cast<void*>(start), reinterpret_cast<void*>(jump_entry),
                         reinterpret_cast<void*>(tcb));
