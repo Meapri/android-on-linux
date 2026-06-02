@@ -2024,13 +2024,28 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         // (this is the per-launch lifetime the old comment above promised). The 25s
         // default still cycles the intermediate verification apps quickly.
         const bool is_gimp = host_path.find("gimp") != std::string::npos;
+        // dpkg/apt install class: the deep fork+exec install chain (dpkg ->
+        // dpkg-deb/dpkg-split/tar + maintainer-script sh) runs ENTIRELY in-process
+        // (ALR_REEXEC_INPROC), each re-mapped glibc child doing hundreds of path traps
+        // under the single-threaded ptrace supervisor — legitimately ~10-50x slower
+        // than native. The device drain that fixed the supervisor cross-talk
+        // (__WNOTHREAD) showed galculator's dpkg -i now UNPACKS (unpacked=true,
+        // exit -1/signal 14 = SIGALRM at ~26s) — i.e. it was making real progress and
+        // the 25s alarm killed it MID-CONFIGURE, not a wedge. Give the package tools a
+        // chromium-class window so unpack+configure completes ("Setting up …"). The
+        // progress-aware watchdog below still SIGKILLs a genuinely stuck install
+        // quickly (no-progress timeout), so this larger ceiling cannot mask a real hang.
+        const bool is_pkgtool =
+            host_path.find("/dpkg") != std::string::npos ||
+            host_path.find("/apt") != std::string::npos;
         // CR-1 measure-first (chromium-run-plan / PR #2): a 140s drain showed
         // chromium --single-process --dump-dom did not render within 120s (the loader
         // went silent ~2min under chromium's thread/syscall storm via the serialized
         // ptrace supervision). Give chromium 600s to answer "does it render GIVEN time
         // (window-bound) or never (a real supervision-throughput wall)?".
         const unsigned alarm_sec =
-            dynamic ? (is_gimp ? 1800u : (is_chromium ? 180u : 25u)) : 5u;
+            dynamic ? (is_gimp ? 1800u : ((is_chromium || is_pkgtool) ? 180u : 25u))
+                    : 5u;
         ::alarm(alarm_sec);
         alr_enter_guest(reinterpret_cast<void*>(start), reinterpret_cast<void*>(jump_entry),
                         reinterpret_cast<void*>(tcb));
@@ -2043,6 +2058,38 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     ::close(out_pipe[1]);
     ::close(diag_pipe[1]);
     ::close(go_pipe[0]);  // parent writes the SEIZE-ready byte to go_pipe[1]
+    // === CONCURRENT PIPE DRAIN — device-root-caused (galculator dpkg configure) ===
+    // The guest's stdout+stderr are dup'd onto out_pipe[1] and its diag onto
+    // diag_pipe[1]; the parent USED to read both ONLY AFTER the supervisor loop
+    // exited. But a chatty guest fills the 64 KiB kernel pipe buffer and then blocks
+    // in pipe_write FOREVER, because nothing drains the read end while the loop runs.
+    // Device signature (galculator dpkg -i, post-unpack configure): the re-mapped dpkg
+    // emitted hundreds of `dpkg: warning: … missing 'Maintainer' field` lines (one per
+    // package in /var/lib/dpkg/status) — well over 64 KiB — and wedged
+    //   guest tid=20896 state=S wchan=pipe_write syscall=64   (write, blocked)
+    // with the supervisor idle in wait4 and the no-progress watchdog firing at 41s.
+    // This is NOT a ptrace stall (state=S, not t): the guest is alive but flow-control-
+    // blocked on a full pipe. FIX: drain BOTH pipes on dedicated reader threads NOW, so
+    // the guest never blocks on output. The readers hit EOF (read()==0) when the guest
+    // and every in-process re-mapped child holding the dup'd write end have exited —
+    // i.e. right as the supervisor reaps the last tracee — then we join them after the
+    // loop. read_all_from_fd already loops to EOF; running it on a thread is behavior-
+    // identical for a guest that never fills the buffer (hello/--version), so no
+    // regression. Strings are filled by the threads and consumed after join().
+    std::string guest_stdout_buf;
+    std::string diag_buf;
+    std::string drain_err;
+    const int out_rd = out_pipe[0];
+    const int diag_rd = diag_pipe[0];
+    std::thread out_reader([out_rd, &guest_stdout_buf, &drain_err]() {
+        try { guest_stdout_buf = read_all_from_fd(out_rd); }
+        catch (const std::exception& e) { drain_err = e.what(); }
+    });
+    std::thread diag_reader([diag_rd, &diag_buf]() {
+        // diag failures are non-fatal (the report still stands on stdout + exit code);
+        // swallow so a diag-pipe error never masks a good run.
+        try { diag_buf = read_all_from_fd(diag_rd); } catch (const std::exception&) {}
+    });
     // SEIZE attach (replaces the child's PTRACE_TRACEME + initial SIGSTOP). The child
     // is blocked reading go_pipe[0]; we attach with PTRACE_SEIZE — which, unlike
     // TRACEME, installs all options ATOMICALLY at attach and does NOT stop the tracee
@@ -2267,22 +2314,54 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     std::atomic<uint32_t> ev_head{0};
     std::atomic<uint32_t> guard_fires{0};  // times the all-parked INTERRUPT guard ran
     std::atomic<uint32_t> guard_ints{0};   // total PTRACE_INTERRUPTs it issued
+    // Absolute lifetime CEILING (a hard upper bound). chromium and the dpkg/apt
+    // install class both legitimately run long under the serialized in-process
+    // supervisor, so they get the large ceiling; GIMP is interactive; everything else
+    // keeps the short 40s ceiling.
     const unsigned watchdog_sec =
-        host_path.find("chrom") != std::string::npos ? 200u
+        (host_path.find("chrom") != std::string::npos ||
+         host_path.find("/dpkg") != std::string::npos ||
+         host_path.find("/apt") != std::string::npos) ? 200u
         : (host_path.find("gimp") != std::string::npos ? 1830u : 40u);
+    // PROGRESS-AWARE no-progress timeout. The OLD watchdog was a FIXED deadline: it
+    // killed any guest still alive at watchdog_sec, even one making steady progress —
+    // which is why a legitimately-slow dpkg install (unpack+configure of galculator,
+    // hundreds of in-process re-map path traps) got SIGKILLed mid-configure. We now
+    // ALSO track event progress (ev_head, bumped on every waitpid stop): if the
+    // supervisor has not processed a SINGLE new event for kNoProgressSec seconds it is
+    // genuinely wedged (the device wedge signature was exactly this — leader state=t,
+    // supervisor idle in wait4, ev_ring frozen), so fire EARLY regardless of the
+    // ceiling. A guest that is still trapping/cloning keeps resetting the no-progress
+    // timer and runs up to the ceiling. This catches a real hang as fast as the old
+    // 40s (a wedged guest emits no events) while no longer killing a working install.
+    const unsigned kNoProgressSec = 40u;
     const pid_t leader_pid = pid;
     const pid_t sup_tid = ::gettid();  // the single tracer thread, for self-diagnosis
     std::thread watchdog([leader_pid, sup_tid, watchdog_sec, &sup_done,
                           &ev_ring, &ev_head, &guard_fires, &guard_ints]() {
-        for (unsigned i = 0; i < watchdog_sec; ++i) {
+        uint32_t last_ev = ev_head.load(std::memory_order_acquire);
+        unsigned stagnant = 0;   // consecutive seconds with NO event progress
+        unsigned elapsed = 0;    // total seconds the guest has run
+        const char* why = "ceiling";
+        for (;;) {
             if (sup_done.load(std::memory_order_acquire)) return;
             std::this_thread::sleep_for(std::chrono::seconds(1));
+            ++elapsed;
+            const uint32_t now_ev = ev_head.load(std::memory_order_acquire);
+            if (now_ev != last_ev) {       // progress -> reset the no-progress timer
+                last_ev = now_ev;
+                stagnant = 0;
+            } else {
+                ++stagnant;
+            }
+            if (stagnant >= kNoProgressSec) { why = "no-progress"; break; }
+            if (elapsed >= watchdog_sec) { why = "ceiling"; break; }
         }
         if (sup_done.load(std::memory_order_acquire)) return;
         // Stall confirmed: dump every tracee thread's kernel state, then kill.
         __android_log_print(ANDROID_LOG_WARN, "alr_loader",
-                            "alr sup-stall WATCHDOG fired after %us leader=%d sup_tid=%d — dumping + SIGKILL",
-                            watchdog_sec, static_cast<int>(leader_pid), static_cast<int>(sup_tid));
+                            "alr sup-stall WATCHDOG fired (%s) after %us leader=%d sup_tid=%d — dumping + SIGKILL",
+                            why, elapsed, static_cast<int>(leader_pid), static_cast<int>(sup_tid));
         // Dump one /proc/<dir>/<tid>/{stat-state,wchan,syscall} line. `tag` flags whether
         // this is a tracee (guest) or the supervisor's OWN tracer thread — the latter
         // reveals WHY a tracee isn't resumed: supervisor wchan/syscall = a blocking pread
@@ -2352,10 +2431,39 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         ::kill(leader_pid, SIGKILL);
     });
     bool sigtrap_fwd_logged = false;  // one-shot: log the first genuine forwarded SIGTRAP
-    // Multi-tracee supervisor: waitpid(-1, __WALL) catches the guest plus every
-    // thread it clones and every process it forks/execs. Each blocked syscall
+    // Multi-tracee supervisor: waitpid(-1, __WALL|__WNOTHREAD) catches the guest plus
+    // every thread it clones and every process it forks/execs. Each blocked syscall
     // (SIGSYS) is emulated per-tracee; only blocked syscalls trap, so overhead
     // stays far below PRoot's trap-every-syscall model.
+    //
+    // === CONCURRENT-SUPERVISOR CROSS-TALK FIX (__WNOTHREAD) — device-root-caused ===
+    // build_native_loader_probe() runs once per nativeAlrNativeLoaderProbe JNI call,
+    // and MainActivity fires MANY of these concurrently (the onCreate probe sequence
+    // + the aptdrain dpkg -i, each on its own Java thread). Every such call forks its
+    // own guest IN ITS OWN THREAD and runs THIS loop. All those supervisor threads
+    // live in ONE process, so a bare waitpid(-1) from supervisor A also matches
+    // supervisor B's guest: a tracee's child-state-change is visible to every thread
+    // of the tracer's thread group via the natural-children traversal, even though
+    // the PTRACE_CONT can only be issued by the actual tracer thread. The device
+    // signature was decisive (galculator dpkg, two live supervisors 19614/19615):
+    //   sup=19615 seccomp tid=19708 ... (146×, all CONT rc=0)   <- 19708 IS 19615's tracee
+    //   sup=19614 seccomp-CONT tid=19708 rc=-1 errno=3 (ESRCH)  <- 19614 STOLE the stop
+    // Supervisor 19614 dequeued 19708's seccomp-stop, ran path-mediation on it, then
+    // PTRACE_CONT'd it -> ESRCH (not 19614's tracee). The stop was CONSUMED, so the
+    // real tracer 19615's waitpid NEVER saw it: 19708 sat state=t (ptrace-stopped)
+    // forever, 19615 blocked in wait4, the 40s watchdog SIGKILLed it. galculator's
+    // deep dpkg fork tree (dpkg->dpkg-deb/dpkg-split/tar/sh, each re-mapped in-process
+    // -> a high path-trap rate -> a high collision probability) hit this every run;
+    // chromium multiprocess is the same class (many tids racing two supervisors).
+    // FIX: __WNOTHREAD restricts each waitpid to children of the CALLING THREAD only.
+    // ptrace reparents a tracee's ->parent to its tracer thread, so a tracer still
+    // reaps ALL of its own tracees (the forked guest + every PTRACE_O_TRACE{FORK,CLONE,
+    // VFORK}-attached descendant — their ->parent IS this thread) while it can no
+    // longer dequeue another supervisor thread's tracee. Single-supervisor guests
+    // (GIMP, glmark2, chromium --version run as the only forker on their thread) are
+    // byte-unaffected: their only children are their own tracees, which __WNOTHREAD
+    // still matches. This is the "supervisor 멀티스레드 ptrace 벽" — the shared
+    // serialized-supervision wall both galculator and chromium MP were stuck behind.
     while (true) {
         // === ADR-003-v3 §2.1 PRIMARY FIX: never block forever on an all-parked group ===
         // A group-stop is parked with PTRACE_LISTEN (below) and only re-reports when the
@@ -2378,7 +2486,7 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
             }
         }
         int status = 0;
-        const pid_t w = ::waitpid(-1, &status, __WALL);
+        const pid_t w = ::waitpid(-1, &status, __WALL | __WNOTHREAD);
         if (w < 0) {
             if (errno == EINTR) {
                 continue;
@@ -3372,16 +3480,20 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         }
     }
     mem_fds.clear();
-    std::string guest_stdout;
-    std::string diag;
-    try {
-        guest_stdout = read_all_from_fd(out_pipe[0]);
-        diag = read_all_from_fd(diag_pipe[0]);
-    } catch (const std::exception& exc) {
-        diag = exc.what();
-    }
+    // Join the concurrent pipe-drain readers (started before the loop). They finish at
+    // EOF, which arrives once the guest + every in-process re-mapped child holding the
+    // dup'd write end has exited — i.e. right as the loop reaped the last tracee. The
+    // strings are then complete; do NOT re-read the pipes (the readers already consumed
+    // them to EOF). A reader exception is surfaced via drain_err into diag.
+    out_reader.join();
+    diag_reader.join();
     ::close(out_pipe[0]);
     ::close(diag_pipe[0]);
+    std::string guest_stdout = std::move(guest_stdout_buf);
+    std::string diag = std::move(diag_buf);
+    if (diag.empty() && !drain_err.empty()) {
+        diag = drain_err;
+    }
     const bool noarch = diag.find("NOARCH") != std::string::npos;
     const bool mapped = diag.find("MAPPED") != std::string::npos;
     const bool jumped = diag.find("JUMPING") != std::string::npos;
