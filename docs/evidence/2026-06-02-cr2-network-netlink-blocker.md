@@ -40,7 +40,21 @@ Android-sandbox restriction, NOT a loader/supervisor issue (CR-1 — the engine 
    if DNS (raw UDP 53 to 8.8.8.8, which Android may also block for apps) is a SECOND blocker
    behind the NETLINK one.
 
+## NETLINK fix landed — advanced past connectivity, now a 2nd (DNS/connect) blocker
+Interposer `bind()` wrapper: a netlink bind that fails EACCES/EPERM returns success (the
+kernel-denied multicast SUBSCRIPTION is skipped; initial enumeration via nlmsg_read still
+works). Device re-drain (interpose .so 142848, re-extracted): the NETLINK bind error is
+GONE and chromium now ISSUES the request —
+`net/base/network_delegate.cc:38 NetworkDelegate::NotifyBeforeURLRequest: https://example.com/`
+— so NetworkChangeNotifier sees the network online (the fix worked). But the request still
+doesn't complete (200s, no DOM): a SECOND blocker in the request itself — DNS or TCP connect.
+Most likely DNS: Android typically blocks apps from raw UDP-53 to arbitrary nameservers
+(8.8.8.8), requiring the system resolver (netd); chromium's resolv.conf-based DNS would then
+hang. Next: isolate via `--host-resolver-rules="MAP example.com <ip>"` (bypass DNS) — if it
+then fetches, DNS is the only remaining blocker (workaround: chromium DoH over 443, which
+connect permits), and connect+TLS are proven.
+
 ## Status
 - CR-1 (engine + DOM render in-process): **ACHIEVED + reproduced 2/2** (v159).
-- CR-2 (network fetch): **blocked at chromium's NETLINK connectivity probe** (Android SELinux
-  EACCES) — scaffolding in place, first blocker identified, candidate fixes above.
+- CR-2 (network fetch): NETLINK connectivity blocker **CLEARED** (interposer bind fix);
+  chromium now issues the request; remaining = DNS/connect layer (isolation in flight).

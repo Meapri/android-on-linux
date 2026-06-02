@@ -124,6 +124,7 @@
 #include <fcntl.h>
 #include <time.h>       /* struct timespec (utimensat) */
 #include <sys/types.h>
+#include <sys/socket.h> /* struct sockaddr, AF_NETLINK, socklen_t (bind workaround) */
 #include <sys/stat.h>   /* struct stat[64], struct statx, statx flags */
 
 /* PCGATE additions: raw UAPI seccomp/BPF + openat2, plus the SIGSYS-catching
@@ -1152,6 +1153,34 @@ ssize_t __readlinkat_chk(int dirfd, const char *path, char *buf, size_t bufsiz,
     char b[ALR_PBUF];
     const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
     return real(dirfd, p, buf, bufsiz, buflen);
+}
+
+/* =================================================================== */
+/* bind(): netlink connectivity-probe workaround (NOT a path syscall)  */
+/* =================================================================== */
+/* Android SELinux denies untrusted_app a bind() of an AF_NETLINK route socket
+ * to multicast groups (EACCES). chromium's net::AddressTrackerLinux uses exactly
+ * that to watch for interface/route changes; on the bind failure its
+ * NetworkChangeNotifier reports the network as unavailable and EVERY request
+ * stalls (device: https fetch hung 180s; address_tracker_linux.cc:243 "Could not
+ * bind NETLINK socket: Permission denied"). The kernel still permits nlmsg_read,
+ * so the INITIAL interface enumeration (an RTM_GETLINK dump on the auto-bound
+ * socket) works — only the multicast SUBSCRIPTION is denied. So: if a real
+ * netlink bind fails with EACCES/EPERM, return success. The app loses async
+ * network-change notifications (fine for a one-shot fetch) but proceeds ONLINE.
+ * This is NOT a SELinux bypass — the kernel still enforces every syscall; we only
+ * stop a kernel-denied connectivity PROBE from being misread as "offline". Real
+ * AF_INET data sockets, and netlink binds that actually succeed, are untouched. */
+int bind(int fd, const struct sockaddr *addr, socklen_t len) {
+    static int (*real)(int, const struct sockaddr *, socklen_t);
+    ALR_REAL(real, int (*)(int, const struct sockaddr *, socklen_t), "bind");
+    int r = real(fd, addr, len);
+    if (r != 0 && (errno == EACCES || errno == EPERM) &&
+        addr && addr->sa_family == AF_NETLINK) {
+        errno = 0;
+        return 0;
+    }
+    return r;
 }
 
 /* =================================================================== */
