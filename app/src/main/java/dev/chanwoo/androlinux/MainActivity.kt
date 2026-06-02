@@ -1994,6 +1994,11 @@ class MainActivity : Activity() {
                 // statically-linked children don't get the in-process re-map and the unpack
                 // stage stalls. Scoped to the drain (unset in finally) so no other path changes.
                 android.system.Os.setenv("ALR_REEXEC_INPROC", "1", true)
+                // (v2 diag) Arm the interposer's chdir/relative-create trace so the
+                // device drain reveals exactly which syscall dpkg uses to create
+                // var/lib/dpkg/updates/tmp.i and whether cwd lands inside the rootfs.
+                // Scoped to the drain (unset in finally); pure diagnostic, no behavior change.
+                android.system.Os.setenv("ALR_INTERPOSE_DIAG", "1", true)
                 try {
                     // (L3 effected) dpkg -i hello.deb. argv is verbatim the builder's
                     // --device-cmd: --force-not-root (bypass the superuser gate; fakeroot makes
@@ -2041,6 +2046,7 @@ class MainActivity : Activity() {
                     // Restore: every other probe stays on interpose-only (strict no-regression).
                     android.system.Os.unsetenv("ALR_FAKEROOT")
                     android.system.Os.unsetenv("ALR_REEXEC_INPROC")
+                    android.system.Os.unsetenv("ALR_INTERPOSE_DIAG")
                 }
             } catch (e: Throwable) {
                 android.util.Log.e("alr_loader", "aptdrain EXC: ${android.util.Log.getStackTraceString(e)}")

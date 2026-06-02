@@ -1659,6 +1659,15 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         guest_env.push_back("FAKEROOTGID=0");
     }
     guest_env.push_back(pcgate_on ? "ALR_PCGATE=1" : "ALR_PCGATE=0");
+    // ALR_INTERPOSE_DIAG (default OFF): when the app-process sets it, propagate
+    // to the guest so the interposer emits its one-line chdir/relative-create
+    // trace to stderr. Read from the HOST env like ALR_PCGATE; pure diagnostic.
+    {
+        const char* idiag = ::getenv("ALR_INTERPOSE_DIAG");
+        if (idiag != nullptr && idiag[0] != '0' && idiag[0] != '\0') {
+            guest_env.push_back(std::string("ALR_INTERPOSE_DIAG=") + idiag);
+        }
+    }
     // Record both arms in the report so each run is self-identifying for A/B.
     out << "\nalr native loader pcgate=" << (pcgate_on ? "on" : "off")
         << " interpose=" << (interpose_off ? "off" : "on");
@@ -1866,7 +1875,12 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         // Disable glibc's rseq registration: bionic already owns this thread's
         // rseq area, and a second registration conflicts in-process.
         // Push all envp strings (built in the parent, COW-inherited here).
-        constexpr std::size_t kMaxEnv = 32;
+        // Headroom: base env (~23) + ALR_ROOTFS/ALR_GUEST_EXE + LD_PRELOAD +
+        // FAKEROOTUID/GID + ALR_PCGATE + ALR_INTERPOSE_DIAG + the GpuRing env block
+        // can exceed 32; an undersized cap would silently TRUNCATE the tail
+        // (dropping the GpuRing vars, or LD_PRELOAD itself if reordered), so keep
+        // generous headroom. envp_ptrs[] is sized to match.
+        constexpr std::size_t kMaxEnv = 48;
         const std::size_t n_env = guest_env.size() < kMaxEnv ? guest_env.size() : kMaxEnv;
         uintptr_t envp_ptrs[kMaxEnv] = {0};
         for (std::size_t i = n_env; i-- > 0;) {

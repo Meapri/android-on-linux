@@ -578,6 +578,50 @@ static void alr_emit_fd2(const char *s, size_t n) {
     alr_tramp_syscall(__NR_write, 2, (long)s, (long)n, 0, 0, 0);
 }
 
+/* ----- ALR_INTERPOSE_DIAG: cwd/relative-open diagnostic (OFF by default) -----
+ *
+ * Set ALR_INTERPOSE_DIAG=1 in the guest env to make this .so emit one stderr
+ * line per chdir() and per AT_FDCWD-relative open with O_CREAT, so a device
+ * drain can confirm exactly which syscall dpkg uses to create
+ * var/lib/dpkg/updates/tmp.i and whether cwd lands inside the rootfs. Zero cost
+ * and zero output when unset/"0". Strictly diagnostic — never changes behavior.
+ * errno is saved/restored by callers around the emit. */
+static int g_diag = 0;   /* read once in ctor from ALR_INTERPOSE_DIAG */
+
+/* Emit "ALR-IDIAG <tag> <a>[ <b>][ =<r>]\n" through the trampoline write.
+ * All args are bytewise-copied (no libc string calls in the trusted path). */
+static void alr_diag(const char *tag, const char *a, const char *b, long r) {
+    if (!g_diag) return;
+    int saved = errno;
+    char line[1280];
+    size_t o = 0;
+    const char *pre = "ALR-IDIAG ";
+    for (size_t i = 0; pre[i] && o < sizeof line - 1; ++i) line[o++] = pre[i];
+    for (size_t i = 0; tag && tag[i] && o < sizeof line - 1; ++i) line[o++] = tag[i];
+    if (a) {
+        if (o < sizeof line - 1) line[o++] = ' ';
+        for (size_t i = 0; a[i] && o < sizeof line - 1; ++i) line[o++] = a[i];
+    }
+    if (b) {
+        if (o < sizeof line - 1) line[o++] = ' ';
+        for (size_t i = 0; b[i] && o < sizeof line - 1; ++i) line[o++] = b[i];
+    }
+    /* " =<r>" as a signed decimal */
+    if (o < sizeof line - 3) { line[o++] = ' '; line[o++] = '='; }
+    {
+        char num[24]; int ni = 0; long v = r; int neg = 0;
+        if (v < 0) { neg = 1; }
+        unsigned long u = neg ? (unsigned long)(-(v + 1)) + 1UL : (unsigned long)v;
+        if (u == 0) num[ni++] = '0';
+        while (u && ni < (int)sizeof num) { num[ni++] = (char)('0' + (u % 10)); u /= 10; }
+        if (neg && o < sizeof line - 1) line[o++] = '-';
+        while (ni > 0 && o < sizeof line - 1) line[o++] = num[--ni];
+    }
+    if (o < sizeof line) line[o++] = '\n';
+    alr_emit_fd2(line, o);
+    errno = saved;
+}
+
 /*
  * ALR_SVCSCAN diagnostic gate (OFF by default, zero cost unless set).
  *
@@ -678,6 +722,15 @@ static void alr_ctor(void) {
     const char *g = getenv("ALR_PCGATE");
     g_pcgate = (g != NULL && g[0] == '0') ? 0 : 1;
 
+    /* ALR_INTERPOSE_DIAG gate (OFF unless first char is non-'0'). Read before
+     * any wrapper can fire so the chdir/relative-open trace is complete. */
+    const char *dg = getenv("ALR_INTERPOSE_DIAG");
+    g_diag = (dg != NULL && dg[0] != '0' && dg[0] != '\0') ? 1 : 0;
+    /* Liveness marker: proves THIS process actually loaded the interposer (vs a
+     * static/raw-syscall guest where the wrappers never fire => rewrites=0). */
+    alr_diag("ctor-live rootfs", (g_rootfs_len > 0) ? g_rootfs : "(none)", 0,
+             (long)g_rootfs_len);
+
     /* rootfs anchor + openat2 probe, then the faccessat2 probe. Both use the
      * trampoline and tolerate the rootfs being unset (self-disable). These run
      * regardless of g_pcgate so the trampoline emit paths (used in PCGATE=1)
@@ -770,6 +823,12 @@ static int alr_open_emit(int dirfd, const char *path, int flags, mode_t mode) {
     char b[ALR_PBUF];
     const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
     long r = alr_tramp_syscall(__NR_openat, dirfd, (long)p, flags, mode, 0, 0);
+    /* Diagnostic: spotlight AT_FDCWD-relative creations (dpkg journal tmp.i is
+     * exactly this: open("updates/tmp.i", O_CREAT) after chdir to admindir). */
+    if (g_diag && path && path[0] != '/' && dirfd == AT_FDCWD && (flags & O_CREAT)) {
+        alr_diag("relcreat", path, (dirfd == AT_FDCWD) ? "AT_FDCWD" : "fd",
+                 (r < 0 && r >= -4095) ? r : 0);
+    }
     return (int)alr_ret(r);
 }
 
@@ -1486,7 +1545,10 @@ int chdir(const char *path) {
     static int (*real)(const char *);
     ALR_REAL(real, int (*)(const char *), "chdir");
     char b[ALR_PBUF];
-    return real(rw(path, b, sizeof b));
+    const char *p = rw(path, b, sizeof b);
+    int r = real(p);
+    alr_diag("chdir", path, (p != path) ? p : "(norw)", (r == 0) ? 0 : -errno);
+    return r;
 }
 int chmod(const char *path, mode_t mode) {
     static int (*real)(const char *, mode_t);
