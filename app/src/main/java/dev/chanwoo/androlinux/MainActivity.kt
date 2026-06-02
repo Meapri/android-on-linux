@@ -157,6 +157,48 @@ class MainActivity : Activity() {
                             "${if (cr2Fetched) "PASS fetched-real-page" else "FAIL/incomplete"} (full report -> filesDir/cr2-report.txt)",
                     )
                 }
+                // CR-5 stepA (chromium-multiprocess-plan §8): the REAL multiprocess
+                // render — drop --single-process so chromium spawns the renderer as a
+                // FRESH child that re-execs "/proc/self/exe". GATE-1 (runtime_report.cpp
+                // STEP-2 self-exe SUBSTITUTE) re-points that exec to the rootfs chrome
+                // (host_path) and in-process re-maps it (no kernel execve; W^X-safe),
+                // inheriting the seccomp+SEIZE trace. --no-zygote keeps the tree shallow
+                // (zygote pre-fork is a separate exec storm); --renderer-process-limit=1
+                // bounds it to one renderer. Requires ALR_REEXEC_INPROC=1 (the in-process
+                // re-map gate) — set ONLY around this probe so every other path is
+                // unchanged (strict no-regression). Gated behind /data/local/tmp/.alr-crmp
+                // so normal cold starts never pay this (it holds the guest-launch lock).
+                if (java.io.File("/data/local/tmp/.alr-crmp").isFile) {
+                    android.system.Os.setenv("ALR_REEXEC_INPROC", "1", true)
+                    try {
+                        val crMp = nativeAlrNativeLoaderProbe(
+                            packageName,
+                            applicationInfo.nativeLibraryDir,
+                            filesDir.absolutePath,
+                            cacheDir.absolutePath,
+                            rootfsManifest.name,
+                            "/usr/lib/chromium/chromium-headless-shell\n--no-zygote" +
+                                "\n--renderer-process-limit=1\n--no-sandbox\n--disable-gpu" +
+                                "\n--disable-dev-shm-usage\n--user-data-dir=/tmp/crmp" +
+                                "\n--no-first-run\n--no-default-browser-check" +
+                                "\n--disable-crash-reporter\n--enable-logging=stderr\n--v=1" +
+                                "\n--dump-dom" +
+                                "\ndata:text/html,<h1>ALR-CRMP-OK</h1>",
+                        )
+                        val crMpRendered = crMp.contains("ALR-CRMP-OK")
+                        try {
+                            java.io.File(filesDir, "crmp-report.txt").writeText(crMp)
+                        } catch (_: Throwable) {}
+                        android.util.Log.i(
+                            "alr_loader",
+                            "chromium-CRMP (multiprocess --no-zygote renderer render): " +
+                                "${if (crMpRendered) "PASS rendered-DOM-has-marker" else "FAIL/incomplete"} " +
+                                "(full report -> filesDir/crmp-report.txt)\n$crMp",
+                        )
+                    } finally {
+                        android.system.Os.unsetenv("ALR_REEXEC_INPROC")
+                    }
+                }
             } catch (e: Throwable) {
                 android.util.Log.e("alr_loader", "chromium-boot EXC: ${android.util.Log.getStackTraceString(e)}")
             }

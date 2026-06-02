@@ -2723,16 +2723,60 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                                 // on skip we fall through to the existing B-1/B-3 behavior
                                 // (no redirect), exactly as if inproc were off for this exec.
                                 const char* inproc_skip_reason = nullptr;
+                                // GATE-1 (CR-5): chromium's zygote/gpu/utility children
+                                // re-exec their OWN binary via "/proc/self/exe" (or
+                                // "/proc/<pid>/exe"). The old code SKIPPED every "/proc/*"
+                                // -> the fresh-execve child ran the ANDROID linker64 image,
+                                // never re-mapped into the rootfs. We now SUBSTITUTE the
+                                // launch guest's rootfs host path (host_path, L1507 —
+                                // already in-scope here, all chromium children re-exec the
+                                // SAME chrome binary) for those self-exe forms and fall into
+                                // the existing re-map path below (regs[19]=host). Non-exe
+                                // "/proc/*" (maps/cpuinfo/self/root/...) are NOT exec targets
+                                // and keep the conservative SKIP. host model + decision
+                                // table: tools/proc_self_exe_model.py (is_self_exe_target /
+                                // decide_exec_trap), tests/test_proc_self_exe_gate.py.
+                                bool self_exe_subst = false;
                                 if (inproc_reexec_on) {
-                                    // (a) /proc/self/exe or any /proc/ path resolves to the
-                                    // loader's own ANDROID bionic binary, not a rootfs glibc
-                                    // ELF — the trampoline cannot map it.
-                                    if (std::strcmp(gp, "/proc/self/exe") == 0 ||
-                                        std::strncmp(gp, "/proc/", 6) == 0) {
+                                    // (a) self-exe exec target: "/proc/self/exe" or
+                                    // "/proc/<all-digits>/exe". Only these forms name "this
+                                    // process's own binary" — divert them to the rootfs
+                                    // chrome via host_path; any OTHER /proc/* keeps skipping.
+                                    bool is_self_exe = (std::strcmp(gp, "/proc/self/exe") == 0);
+                                    if (!is_self_exe && std::strncmp(gp, "/proc/", 6) == 0) {
+                                        const char* d = gp + 6;          // after "/proc/"
+                                        const char* p = d;
+                                        while (*p >= '0' && *p <= '9') ++p;  // span digits
+                                        // "/proc/<digits>/exe" with >=1 digit and exact tail.
+                                        if (p != d && std::strcmp(p, "/exe") == 0) {
+                                            is_self_exe = true;
+                                        }
+                                    }
+                                    if (is_self_exe) {
+                                        if (!host_path.empty()) {
+                                            // SUBSTITUTE: leave skip_reason null so we fall
+                                            // into the re-map path; the host-selection below
+                                            // reads self_exe_subst to use host_path (not gp).
+                                            self_exe_subst = true;
+                                        } else {
+                                            // Launch guest unknown -> conservative SKIP.
+                                            inproc_skip_reason = "proc-self-exe";
+                                        }
+                                    } else if (std::strncmp(gp, "/proc/", 6) == 0) {
+                                        // non-exe /proc/* (not an exec target) -> SKIP.
                                         inproc_skip_reason = "proc-self-exe";
                                     }
                                     // (c) idempotency: never re-map the static re-entry stub.
-                                    if (inproc_skip_reason == nullptr) {
+                                    // GATE-1: a self-exe SUBSTITUTE already resolved the
+                                    // target to the rootfs chrome (host_path), so it must
+                                    // bypass the stub/non-rootfs gates below — they classify
+                                    // `gp` (=/proc/self/exe), which is neither the stub nor a
+                                    // rootfs path, and would otherwise re-skip the very exec
+                                    // GATE-1 just diverted (device drain v163: skip reason was
+                                    // "non-rootfs" because med.reason=="sysdir" for /proc/*).
+                                    // Mirrors proc_self_exe_model.decide_exec_trap returning
+                                    // SUBSTITUTE *before* the stub/non-rootfs checks.
+                                    if (inproc_skip_reason == nullptr && !self_exe_subst) {
                                         const char* gpb = std::strrchr(gp, '/');
                                         if ((gpb != nullptr &&
                                              std::strcmp(gpb, "/alr-reentry") == 0) ||
@@ -2746,7 +2790,7 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                                     // "rewrite" -> host_path under rootfs) or the guest path
                                     // is ALREADY under rootfs (reason "already-host"). Any
                                     // other case (relative/empty/sysdir/native) is non-rootfs.
-                                    if (inproc_skip_reason == nullptr &&
+                                    if (inproc_skip_reason == nullptr && !self_exe_subst &&
                                         !med.should_rewrite &&
                                         med.reason != "already-host") {
                                         inproc_skip_reason = "non-rootfs";
@@ -2760,9 +2804,15 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                                     }
                                 }
                                 if (inproc_reexec_on && inproc_skip_reason == nullptr) {
+                                    // GATE-1: a self-exe target ("/proc/self/exe" etc.)
+                                    // re-maps the launch guest's rootfs chrome (host_path),
+                                    // NOT the literal /proc path (med.should_rewrite is false
+                                    // for it, so the old ternary would have kept gp).
                                     const std::string host =
-                                        med.should_rewrite ? med.host_path
-                                                           : std::string(gp);
+                                        self_exe_subst
+                                            ? host_path
+                                            : (med.should_rewrite ? med.host_path
+                                                                  : std::string(gp));
                                     const std::string& rootfs = config.rootfs_dir;
                                     const uintptr_t sp =
                                         static_cast<uintptr_t>(regs[31]);

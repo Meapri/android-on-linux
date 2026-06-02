@@ -174,8 +174,11 @@ typedef struct { Elf64_Addr r_offset; Elf64_Xword r_info; Elf64_Sxword r_addend;
 #define SYS_mprotect    226
 #define SYS_exit        93
 #define SYS_exit_group  94
+#define SYS_lseek       62
+#define SYS_munmap      215
 
 #define O_RDONLY 0
+#define SEEK_END 2
 #define AT_FDCWD (-100)
 #define PROT_NONE  0
 #define PROT_READ  1
@@ -292,6 +295,29 @@ ALR_FREESTANDING static long read_file(const char* path, char* buf, size_t cap) 
     }
     sys1(SYS_close, fd);
     return (long)total;
+}
+
+// Like read_file, but mmaps the file read-only instead of copying it into a
+// fixed buffer — REQUIRED for large targets. The chrome binary is ~186 MiB,
+// far past read_file's 8 MiB FILEBUF_CAP (which made read_file return -1 ->
+// "target open/read fail" on the device CR-MP drain v163). map_elf_image reads
+// the source ELF ONLY through its `img` pointer (img + p_offset) and never
+// writes it, so a PROT_READ|MAP_PRIVATE file mapping is a drop-in `img`. We map
+// the whole file at offset 0 (ELF phdrs + every PT_LOAD's file bytes live within
+// it). `*out_len` gets the file size; returns the mapping base or MAP_FAILED.
+// Caller may munmap(base, *out_len) after map_elf_image has copied the segments
+// out (the live image is the fresh anonymous reservation, not this mapping).
+ALR_FREESTANDING static void* map_file(const char* path, size_t* out_len) {
+    long fd = sys4(SYS_openat, AT_FDCWD, path, O_RDONLY, 0);
+    if (fd < 0) return MAP_FAILED;
+    long sz = sys3(SYS_lseek, fd, 0, SEEK_END);   // file size (bytes)
+    if (sz <= 0) { sys1(SYS_close, fd); return MAP_FAILED; }
+    void* p = (void*)sys6_(SYS_mmap, 0, (size_t)sz, PROT_READ,
+                           MAP_PRIVATE, fd, 0);
+    sys1(SYS_close, fd);   // the mapping keeps its own ref; fd no longer needed
+    if (p == MAP_FAILED) return MAP_FAILED;
+    *out_len = (size_t)sz;
+    return p;
 }
 
 // ---- mapped-image result (mirror of loader's MappedImage) -------------------
@@ -584,10 +610,11 @@ ALR_FREESTANDING static void read_auxv(unsigned long* hwcap, unsigned long* hwca
 }
 
 // File buffers: static .bss, no heap (we must not call libc malloc mid-guest).
-// 8 MiB each matches alr_reentry.c's headroom for ld.so + a typical target's
-// PT_LOAD file image.
+// 8 MiB matches alr_reentry.c's headroom for the guest ld.so (the INTERP). The
+// TARGET is no longer read into a fixed buffer — it is mmap'd (map_file) because
+// large targets (chrome ~186 MiB) exceed any sane static .bss; only ld.so still
+// uses this read_file buffer (it is small and bounded).
 #define FILEBUF_CAP (8u * 1024u * 1024u)
-static char g_target_buf[FILEBUF_CAP];
 static char g_interp_buf[FILEBUF_CAP];
 static char g_interp_path[1024];
 
@@ -624,12 +651,16 @@ void alr_inproc_reexec_worker(const char* target, char** argv,
     unsigned long my_gid  = (unsigned long)sys0(SYS_getgid);
     unsigned long my_egid = (unsigned long)sys0(SYS_getegid);
 
-    // ---- read + validate the target ELF (host_target_path is already rootfs) --
-    long tlen = read_file(target, g_target_buf, FILEBUF_CAP);
-    if (tlen < 0) { diag("ALR-INPROC: target open/read fail\n"); sys_exit(EX_OPEN_TARGET); }
-    if (tlen < (long)sizeof(Elf64_Ehdr) ||
-        g_target_buf[0] != 0x7f || g_target_buf[1] != 'E' ||
-        g_target_buf[2] != 'L'  || g_target_buf[3] != 'F') {
+    // ---- mmap + validate the target ELF (host_target_path is already rootfs) --
+    // mmap (not read_file): chrome is ~186 MiB, past FILEBUF_CAP (8 MiB). The file
+    // mapping is a read-only `img` for map_elf_image, which copies each PT_LOAD out
+    // into its own fresh anonymous reservation (so we can drop this mapping after).
+    size_t tlen = 0;
+    char* tbuf = (char*)map_file(target, &tlen);
+    if (tbuf == MAP_FAILED) { diag("ALR-INPROC: target open/read fail\n"); sys_exit(EX_OPEN_TARGET); }
+    if (tlen < sizeof(Elf64_Ehdr) ||
+        tbuf[0] != 0x7f || tbuf[1] != 'E' ||
+        tbuf[2] != 'L'  || tbuf[3] != 'F') {
         diag("ALR-INPROC: target not ELF\n"); sys_exit(EX_ELF_TARGET);
     }
 
@@ -637,11 +668,11 @@ void alr_inproc_reexec_worker(const char* target, char** argv,
     //      STATIC targets have none — we map them directly and jump to their own
     //      entry (no ld.so). Static-PIE (ET_DYN, no INTERP) self-relocates in its
     //      _start using AT_PHDR; static-ET_EXEC runs at its fixed vaddr. ----
-    const Elf64_Ehdr* teh = (const Elf64_Ehdr*)g_target_buf;
-    const Elf64_Phdr* tph = (const Elf64_Phdr*)(g_target_buf + teh->e_phoff);
+    const Elf64_Ehdr* teh = (const Elf64_Ehdr*)tbuf;
+    const Elf64_Phdr* tph = (const Elf64_Phdr*)(tbuf + teh->e_phoff);
     const char* interp_str = 0;
     for (int i = 0; i < teh->e_phnum; ++i) {
-        if (tph[i].p_type == PT_INTERP) { interp_str = g_target_buf + tph[i].p_offset; break; }
+        if (tph[i].p_type == PT_INTERP) { interp_str = tbuf + tph[i].p_offset; break; }
     }
     const int is_static = (interp_str == 0);
     if (is_static) {
@@ -651,7 +682,7 @@ void alr_inproc_reexec_worker(const char* target, char** argv,
     }
 
     // ---- map the target's PT_LOADs --------------------------------------------
-    MappedImage prog = map_elf_image(g_target_buf, (size_t)tlen, "ALR-INPROC PROG IREL=");
+    MappedImage prog = map_elf_image(tbuf, tlen, "ALR-INPROC PROG IREL=");
     if (!prog.ok) { diag("ALR-INPROC: prog map fail\n"); sys_exit(EX_MAP_TARGET); }
 
     // ---- (dynamic only) build <rootfs><interp> and map the guest ld.so --------
@@ -675,6 +706,10 @@ void alr_inproc_reexec_worker(const char* target, char** argv,
         interp = map_elf_image(g_interp_buf, (size_t)ilen, "ALR-INPROC INTERP IREL=");
         if (!interp.ok) { diag("ALR-INPROC: interp map fail\n"); sys_exit(EX_MAP_INTERP); }
     }
+    // The target file mapping has served its purpose (segments copied out by
+    // map_elf_image; interp_str consumed). Release it so the re-mapped guest does
+    // not carry a stray ~186 MiB read-only mapping of its own on-disk image.
+    sys3(SYS_munmap, (long)tbuf, (long)tlen, 0);
     diag("ALR-INPROC: mapped\n");
 
     // ---- build the guest's SysV initial stack ---------------------------------
