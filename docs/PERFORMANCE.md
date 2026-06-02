@@ -13,7 +13,7 @@
 | **CPU 연산** | 네이티브 arm64 속도 그대로 | **+0.00% 오버헤드** (native 4.06 = ALR 4.06 ns/op, **같은 바이너리**) | ❌ 에뮬 없음 — in-process 네이티브 실행 | [CP-3 microbench](evidence/2026-06-01-ws5-cpu-overhead-quantified.md) |
 | **CPU syscall** | 중재 비용은 seccomp 고정비뿐 | +11.98% (~24 ns/syscall, seccomp 디스패치) | ❌ 에뮬 없음 — 커널 BPF 통과 비용 | [CP-3 ratio](research/cp3-cpu-overhead-ratio.md) |
 | **GPU 렌더 (GLES)** | 실제 Mali GPU에서 가속 | glmark2-es2 **~1000–1200 FPS @ 1920×1200**, `software=false` | ❌ SW 래스터 아님 — `GL_RENDERER: Mali-G615 MC2` | [CP-2 FINAL](evidence/2026-06-02-cp2-FINAL-glmark2-score-1074.md), [drain#9](evidence/2026-06-02-5ws-fanout-renderer-getpwuid-pkgfunc.md) |
-| **GPU (Vulkan)** | guest Vulkan → 실 Mali libvulkan | enumerate 마샬링 device-검증: VK_SUCCESS, Mali-G615 MC2, **API 1.3** | ❌ 실 vendor libvulkan (ARM 0x13b5) | [Vulkan](evidence/2026-06-02-round5-vulkan-device-marshal.md) |
+| **GPU (Vulkan)** | guest Vulkan → 실 Mali libvulkan | enumerate **+ render** device-검증: device created + clear `vkQueueSubmit`=**VK_SUCCESS**, Mali-G615 MC2, **API 1.3** | ❌ 실 vendor libvulkan (ARM 0x13b5) | [enum](evidence/2026-06-02-round5-vulkan-device-marshal.md), [render](evidence/2026-06-02-round7-vkrender-pass-drain.md) |
 | **디스플레이** | device-exact | **1920×1200 @ 90Hz** | — | [CP-1](evidence/2026-06-01-gtk3-svg-sigabrt-resolved-gui-runs.md) |
 
 **핵심:** CPU는 게스트 arm64 명령을 CPU가 **직접 실행**(QEMU/번역 레이어 0) → 순수 연산은 native와 **수치적으로 동일(0%)**. GPU는 게스트 GLES 호출이 실 **Mali-G615 실리콘**에서 돌아간다(`software renderer = false`, 게스트가 보는 `GL_RENDERER`가 실제 `Mali-G615 MC2`). 둘 다 "네이티브 가속"이 정성·정량으로 증명됐다.

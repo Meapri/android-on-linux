@@ -20,9 +20,10 @@
 > apt-install 은 여전히 `unpacked=false`(device-pending). G2(Qt6)는 **DONE** — round-6 v138 에서
 > `EGL→wl_shm` 전환(EGL QPA/HwIntegration 플러그인 제외 + `QT_WAYLAND_DISABLE_HW_INTEGRATION=1`)으로
 > analogclock 이 **device-렌더(`qt6gui-result: rendered=true` frames 2215→2216)** → 7-toolkit 범용
-> GUI 셋 완성. G3(Vulkan)는 round-6 VK-M2 가 **실 Mali 에 device created=yes**(vkCreateDevice/queue/cmd
-> 마샬, gfx queue family=0)이나 clear `vkQueueSubmit`=FAIL(render-pass/AHB-import setup; clear-submit
-> fix round-7 진행). CP-6 보류 박스에 M-R5 svc-scan(read-only ROI 프로브) 명시.
+> GUI 셋 완성. G3(Vulkan render)는 **round-7 v139 에서 device-검증✓** — R7-A 가 마샬 device 를
+> AHB device-ext(`VK_ANDROID_external_memory_android_hardware_buffer`) 활성 + tiler readback barrier 로
+> 고쳐 clear `vkQueueSubmit`=**VK_SUCCESS**(round-6 의 submit=FAIL 해결). CP-6 보류 박스에 M-R5
+> svc-scan(read-only ROI 프로브) 명시.
 
 ---
 
@@ -34,7 +35,7 @@
 |---|---------|----------------|--------|------|------|
 | **G1** | **exec-re-entry** (rootfs 바이너리 `execve` → ALR 로더 재진입) | `apt`/`dpkg` 실제 설치, GIMP plugin(fork+exec), 임의 멀티프로세스 Linux 앱, 셸 파이프라인 | **높음** | clone3/fork 시맨틱(메모리: device-evidence-mali-android16); 설계=ADR-003 | **PARTIAL** (round-6: B-1 execve x0 path-rewrite **device-fires**; B-3 child envp 재주입 IN-FLIGHT round-7, apt-install 여전히 `unpacked=false`) |
 | **G2** | **Qt6 wl_shm 경로** (EGL hwintegration 회피 → 소프트웨어 client-buffer) | Qt6 GUI 앱 전반(analogclock→KDE/Qt 앱군) | 중간 | EGL 플러그인 비활성/wl_shm 강제(WS-4 env+overlay); G1 무관 | **DONE** (round-6 v138: `EGL→wl_shm` → analogclock **device-렌더** rendered=true frames 2215→2216) |
-| **G3** | **Vulkan render pipeline** (ring 명령 body + ICD + AHB color-attach) | Vulkan-native 게임, Wine/DXVK/VKD3D, ANGLE-GLES | 높음 | enumerate/props backbone(**device-verified✓**) → VK-M2 명령 body | **PARTIAL** (backbone device✓ round-5; round-6 VK-M2 device created=yes 이나 clear `vkQueueSubmit`=FAIL → clear-submit fix round-7) |
+| **G3** | **Vulkan render pipeline** (ring 명령 body + ICD + AHB color-attach) | Vulkan-native 게임, Wine/DXVK/VKD3D, ANGLE-GLES | 높음 | enumerate/props backbone(**device-verified✓**) → VK-M2 명령 body | **PARTIAL→render device✓** (backbone device✓ round-5; **round-7 v139 VK-M2 render device-검증: device created + clear `vkQueueSubmit`=VK_SUCCESS**; 남은 것=ICD + textured/multi-draw 파이프라인) |
 | **G4** | **netsurf 네트워크/입력 interaction** | 실 웹 페이지 로드(자산 fetch)·클릭/스크롤 입력 | 중간 | WS-3 입력 라우팅 + 게스트 네트워크 정책 | **PARTIAL** (정적 `about:welcome` RENDERS✓) |
 | **G5** | **GLES3 전체 scene 커버리지** (전체 glmark2 14-scene + GLES3+) | 풀 GPU 벤치 매트릭스, GLES3 앱/에뮬레이터, GTK4 GL 렌더러 | 중간 | shim op 커버리지(WS-2); G3 와 일부 공유 | **PARTIAL** (build+texture Score~1000+✓, 2-scene) |
 
@@ -137,30 +138,30 @@ hwintegration 플러그인을 overlay 에서 제외하고 **wl_shm 소프트웨�
 ## G3 — Vulkan render pipeline
 
 **무엇이 막혔나.** 게스트 Vulkan 호출을 실 Mali Vulkan 드라이버까지 끌고 가는 풀 파이프라인.
-**enumerate/props 마샬링 backbone 은 round-5 에서 실 Mali 에 device-verified(VK 1.3)**, **round-6 의
-VK-M2 가 device/queue/command 마샬을 실 Mali 에 device created=yes** 했다 — 남은 막힘은 **clear
-`vkQueueSubmit`(render-pass/image-layout/AHB-import setup) + ICD + AHB color-attach present**.
+**enumerate/props backbone(round-5 VK 1.3) + VK-M2 render(round-7 v139) 둘 다 실 Mali 에
+device-verified.** 남은 막힘은 **ICD(VK-M3) + textured/multi-draw 파이프라인 + 컴포지터 sample**.
 
 **증거(현 상태).** round-5 drain#14(`docs/evidence/2026-06-02-round5-vulkan-device-marshal.md`):
 `ALR VK ENUM MARSHAL: PASS`, `mode=mali-libvulkan`, `VK_SUCCESS`/`Mali-G615 MC2`/**api=1.3**/
-`vendorID=0x13b5(ARM)`. round-6 v138(`docs/evidence/2026-06-02-round6-qt6-execreentry-vkrender.md`):
+`vendorID=0x13b5(ARM)`. **round-7 v139(`docs/evidence/2026-06-02-round7-vkrender-pass-drain.md`):**
 ```
-ALR VK RENDER MARSHAL: FAIL
-mode=mali-libvulkan  ops decoded=11  transport=ok
-device created=yes  gfx queue family=0  submit result=fail
+ALR VK RENDER MARSHAL: PASS
+ops decoded=11  device created=yes  gfx queue family=0  submit result=VK_SUCCESS
 ```
-즉 VK-M2 body 가 게스트 `vkCreateDevice` + `vkGetDeviceQueue` + command-pool/buffer 를 **실 Mali
-libvulkan** 으로 마샬(device created=yes, queue family 해결) — device/queue/command marshalling 은
-device 에 입증됐다. 단 AHB-backed color attachment 로의 **clear `vkQueueSubmit` 은 FAIL**(render-pass/
-image-layout/AHB-import setup 디버깅 필요). enumerate 경로는 무영향(`ALR VK ENUM MARSHAL: PASS` 유지).
-clear-submit fix 는 **round-7 진행 중**. 전략 전체는 `docs/research/gpu-guest-accel-strategy.md`
-(VK-M1/M2/M3 트랙).
+즉 VK-M2 body 가 게스트 `vkCreateDevice` + `vkGetDeviceQueue` + command-pool/buffer + clear 를 **실 Mali
+libvulkan** 으로 마샬하고 clear `vkQueueSubmit` 이 **VK_SUCCESS** 로 완료된다. round-6 의 submit=FAIL 은
+**근인이 마샬 device 를 확장 없이 생성**한 것이었다 — clear 경로가 AHB color target 을
+`VK_ANDROID_external_memory_android_hardware_buffer` 로 import 하는데 그 entry point 는 device-ext 가
+`vkCreateDevice` 에서 활성일 때만 합법. R7-A 가 AHB device-ext(+ `VK_EXT_queue_family_foreign` 가능 시)
+활성 + tiler readback barrier(render-pass `finalLayout`→`GENERAL` + `VK_QUEUE_FAMILY_EXTERNAL` release)
+를 추가해 해결. enumerate + render 모두 device-PASS. 전략 전체는
+`docs/research/gpu-guest-accel-strategy.md`(VK-M1/M2/M3 트랙).
 
 **무엇을 잠금해제하나.** Vulkan-native 게임, **모든 Wine/DXVK/VKD3D**(전략 문서 옵션 A),
 그리고 ANGLE→Vulkan 으로 robust GLES 경로(옵션 B). GUI 의 cairo-SW 가 아니라 게스트 *자체* 3D.
 
-**난이도: 높음.** device/queue 마샬(device-created✓) 다음은 (a) clear `vkQueueSubmit` 성공(render-pass/
-image-layout/AHB-import 정합 — round-7), (b) 게스트 `libvulkan_alr.so` ICD + manifest(VK-M3),
+**난이도: 높음.** device/queue 마샬(device-created✓) + clear `vkQueueSubmit`(VK_SUCCESS, round-7✓)
+다음은 (a) 게스트 `libvulkan_alr.so` ICD + manifest(VK-M3), (b) textured/multi-draw 파이프라인,
 (c) `VK_ANDROID_external_memory_AHB` color-attach 렌더타깃 → 컴포지터 sample.
 Mali proprietary Vulkan 한계(no transform_feedback/geometry/tess)는 전략 문서에 기록.
 
