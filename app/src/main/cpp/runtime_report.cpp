@@ -1958,7 +1958,7 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         // ptrace supervision). Give chromium 600s to answer "does it render GIVEN time
         // (window-bound) or never (a real supervision-throughput wall)?".
         const unsigned alarm_sec =
-            dynamic ? (is_gimp ? 1800u : (is_chromium ? 600u : 25u)) : 5u;
+            dynamic ? (is_gimp ? 1800u : (is_chromium ? 180u : 25u)) : 5u;
         ::alarm(alarm_sec);
         alr_enter_guest(reinterpret_cast<void*>(start), reinterpret_cast<void*>(jump_entry),
                         reinterpret_cast<void*>(tcb));

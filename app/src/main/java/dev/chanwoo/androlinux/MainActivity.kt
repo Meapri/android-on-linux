@@ -86,31 +86,38 @@ class MainActivity : Activity() {
                     "/usr/lib/chromium/chromium-headless-shell\n--no-sandbox\n--version",
                 )
                 android.util.Log.i("alr_loader", "chromium-boot:\n$crReport")
-                // CR-1 (chromium-run-plan): the engine renders a page, SINGLE-PROCESS.
-                // The earlier --dump-dom hang was MULTIPROCESS (zygote fork+exec tree
-                // overwhelming the serialized ptrace supervision). --single-process
-                // --no-zygote collapses chromium to ONE process (still multi-threaded,
-                // which the 120s chromium alarm + SEIZE handling cover) so it sidesteps
-                // the exec-re-entry/G1 multiprocess wall entirely. --disable-gpu = SW
-                // raster (no Mali/ANGLE dep yet). A self-contained data: URL needs no
-                // network/files. PASS = the dumped DOM contains the rendered marker text
-                // => Chromium's full HTML parse->layout->paint engine RAN in-process.
-                val crCr1 = nativeAlrNativeLoaderProbe(
-                    packageName,
-                    applicationInfo.nativeLibraryDir,
-                    filesDir.absolutePath,
-                    cacheDir.absolutePath,
-                    rootfsManifest.name,
-                    "/usr/lib/chromium/chromium-headless-shell\n--no-sandbox\n--single-process" +
-                        "\n--no-zygote\n--disable-gpu\n--disable-dev-shm-usage\n--dump-dom" +
-                        "\ndata:text/html,<h1>ALR-CR1-OK</h1><div style=color:red>render</div>",
-                )
-                val cr1Rendered = crCr1.contains("ALR-CR1-OK")
-                android.util.Log.i(
-                    "alr_loader",
-                    "chromium-CR1 (single-process headless render): " +
-                        "${if (cr1Rendered) "PASS rendered-DOM-has-marker" else "FAIL/incomplete"}\n$crCr1",
-                )
+                // CR-1 (chromium-run-plan): the engine renders a page, SINGLE-PROCESS,
+                // --dump-dom of a self-contained data: URL (no net/GPU/multiprocess).
+                // DEVICE FINDING (v148/v149 drains, evidence 2026-06-02-cr1-chromium-
+                // supervisor-deadlock): even single-process + --user-data-dir + up to a
+                // 600s window, chromium --dump-dom NEVER completes — the loader goes
+                // silent and the supervisor's waitpid never reaps the guest (the
+                // multithread ptrace supervision DEADLOCKS on chromium's ~20-thread
+                // syscall storm). So it is NOT the alarm window (PR #2 hypothesis); it is
+                // the supervision wall. Because this probe HOLDS the loader's guest-launch
+                // lock until the alarm (blocking every later GPU/GUI probe), it is GATED
+                // behind a flag file so normal cold starts are unaffected — it runs only
+                // for a dedicated investigation (adb create /data/local/tmp/.alr-cr1).
+                if (java.io.File("/data/local/tmp/.alr-cr1").isFile) {
+                    val crCr1 = nativeAlrNativeLoaderProbe(
+                        packageName,
+                        applicationInfo.nativeLibraryDir,
+                        filesDir.absolutePath,
+                        cacheDir.absolutePath,
+                        rootfsManifest.name,
+                        "/usr/lib/chromium/chromium-headless-shell\n--no-sandbox\n--single-process" +
+                            "\n--no-zygote\n--disable-gpu\n--disable-dev-shm-usage" +
+                            "\n--user-data-dir=/tmp/cr1-profile\n--no-first-run" +
+                            "\n--no-default-browser-check\n--disable-crash-reporter\n--dump-dom" +
+                            "\ndata:text/html,<h1>ALR-CR1-OK</h1><div style=color:red>render</div>",
+                    )
+                    val cr1Rendered = crCr1.contains("ALR-CR1-OK")
+                    android.util.Log.i(
+                        "alr_loader",
+                        "chromium-CR1 (single-process headless render): " +
+                            "${if (cr1Rendered) "PASS rendered-DOM-has-marker" else "FAIL/incomplete"}\n$crCr1",
+                    )
+                }
             } catch (e: Throwable) {
                 android.util.Log.e("alr_loader", "chromium-boot EXC: ${android.util.Log.getStackTraceString(e)}")
             }
@@ -768,7 +775,7 @@ class MainActivity : Activity() {
             alrSeccompPathTrapProbe.lineStartingWith("alr sc PATH_MEDIATION_VIABLE=")
                 .substringAfter("PATH_MEDIATION_VIABLE=", "") == "yes"
 
-        val executionSummary = "build: 0.4.148-cr1-v148" +
+        val executionSummary = "build: 0.4.149-cr1-v149" +
             "\nexecution summary" +
             "\nROOTFS EXECUTION: ${if (rootfsExecutionPassed) "PASS" else "FAIL"}" +
             "\nSHELL SCRIPT EXECUTION: ${if (shellScriptExecutionPassed) "PASS" else "FAIL"}" +
