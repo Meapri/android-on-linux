@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MATRIX = ROOT / "docs" / "research" / "alr-compat-matrix.md"
 NETSURF_STEM = "2026-06-02-netsurf-browser-renders"
 ROUND4_STEM = "2026-06-02-round4-milestones-drain"
+ROUND6_STEM = "2026-06-02-round6-qt6-execreentry-vkrender"
 
 
 def _text() -> str:
@@ -73,28 +74,27 @@ def test_netsurf_row_records_multithread_and_frames():
     )
 
 
-def test_qt6_stays_staged_not_renders():
-    """qt6 stays STAGED with a round-5 closure caveat — never RENDERS/USABLE.
+def test_qt6_row_is_renders_round6():
+    """qt6 graduated to RENDERS in round-6 v138 (EGL→wl_shm fix).
 
-    (SDL2 graduated to RENDERS in round-4 drain#13 — see
-    test_sdl2_row_is_renders_drain13 below; only qt6 remains in-progress.)
+    The round-4/5 Qt-init SIGSEGV (EGL hwintegration) was fixed by excluding the EGL
+    QPA/HwIntegration plugins + QT_WAYLAND_DISABLE_HW_INTEGRATION=1, so Qt6 now
+    renders via the wl_shm backing store. The matrix's Qt6 row must be promoted to
+    RENDERS with the rendered=true device proof and cite the round-6 evidence.
     """
     text = _text()
     lines = text.splitlines()
-    rows = [ln for ln in lines if "Qt6" in ln and "|" in ln and "STAGED" in ln]
-    assert rows, "matrix must carry a Qt6 STAGED row"
-    for ln in rows:
-        assert "RENDERS" not in ln and "USABLE" not in ln, (
-            "Qt6 STAGED row must not overclaim a device render"
-        )
-    # Must explicitly mark the gap as round-5 in-progress, not just silent, and
-    # honestly attribute the Qt-init SIGSEGV (guest child crash, not app regression).
+    rows = [ln for ln in lines if "Qt6" in ln and "|" in ln and "RENDERS" in ln]
+    assert rows, "matrix must carry a Qt6 RENDERS row (round-6 v138 promotion)"
     joined = " ".join(rows)
-    assert "round-5" in joined or "진행중" in joined, (
-        "Qt6 row must mark its closure/launch as round-5 in-progress"
+    assert "rendered=true" in joined, (
+        "Qt6 RENDERS row must carry the rendered=true device proof"
     )
-    assert "SIGSEGV" in joined, (
-        "Qt6 row must honestly record the Qt-init SIGSEGV (guest child crash)"
+    assert "2215" in joined and "2216" in joined, (
+        "Qt6 RENDERS row must record the compositor frame advance 2215->2216"
+    )
+    assert ROUND6_STEM in joined, (
+        "Qt6 RENDERS row must cite the round-6 evidence (EGL→wl_shm fix)"
     )
 
 

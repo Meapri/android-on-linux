@@ -60,53 +60,47 @@ def test_matrix_records_babl_gegl_staged_but_filter_pending():
     )
 
 
-def test_toolkit_overlays_staged_launchable_pending():
-    """qt6: overlay STAGED but GUI demo not yet rendered on device.
+def test_toolkit_overlays_all_graduated_from_staged_set():
+    """All three drain#10 staged toolkits graduated to RENDERS by round-6.
 
-    Qt6 must appear on a row that says STAGED (the libs are there) yet stops short
-    of a device render. Round-4 reworded the launch caveat from "launchable binary
-    PENDING" to a round-5 in-progress note, so accept either phrasing as long as the
-    row does NOT overclaim a render. (netsurf was promoted to RENDERS in drain#12 and
-    SDL2 in drain#13, so both are intentionally dropped from this still-staged set —
-    see test_compat_matrix_netsurf_renders.py.)
+    drain#10 reported qt6/sdl2/netsurf overlays STAGED with launchable binary
+    PENDING. They then graduated one round at a time: netsurf in drain#12, SDL2 in
+    drain#13, and **Qt6 in round-6 v138** (EGL→wl_shm fix). None of the three may
+    still sit in the matrix as a STAGED-launch-pending row; each must instead carry a
+    RENDERS proof. (See test_compat_matrix_netsurf_renders.py +
+    test_round6_milestones_doc.py for the per-toolkit RENDERS pins.)
     """
     text = _text()
     lines = text.splitlines()
-    for toolkit in ("Qt6",):
-        rows = [
+    for toolkit in ("Qt6", "SDL2", "netsurf-gtk"):
+        # No still-staged launch-pending row may remain for a graduated toolkit.
+        stale = [
             ln for ln in lines
             if toolkit in ln
             and "STAGED" in ln
-            and ("PENDING" in ln or "진행중" in ln or "round-5" in ln)
             and "RENDERS" not in ln
-            and "USABLE" not in ln
+            and ("launchable binary PENDING" in ln or "launch pending" in ln.lower())
         ]
-        assert rows, (
-            f"matrix must carry a '{toolkit}: overlay STAGED, GUI launch pending' "
-            "row that does not overclaim a device render"
+        assert not stale, (
+            f"{toolkit} graduated to RENDERS; it must not still carry a STAGED "
+            f"launch-pending row: {stale}"
         )
 
 
-def test_toolkit_rows_do_not_overclaim_render_or_usable():
-    """The still-pending toolkit (qt6) may not be marked RENDERS/USABLE.
-
-    Qt6 has no device render yet (Qt-init SIGSEGV); claiming a render state would be
-    dishonest. (netsurf was device-proven RENDERS in drain#12 and SDL2 in drain#13,
-    so both are excluded.)
-    """
+def test_graduated_toolkits_marked_renders():
+    """qt6/sdl2/netsurf each now carry a device RENDERS row (all graduated)."""
     text = _text()
     lines = text.splitlines()
-    for toolkit in ("Qt6",):
-        for ln in lines:
-            if toolkit not in ln or "|" not in ln:
-                continue
-            if "STAGED" not in ln:
-                continue
-            for forbidden in ("RENDERS", "USABLE"):
-                assert forbidden not in ln, (
-                    f"{toolkit} row overclaims '{forbidden}' but launchable binary "
-                    "is still PENDING per drain#10"
-                )
+    for toolkit in ("Qt6", "SDL2", "netsurf-gtk"):
+        rows = [ln for ln in lines if toolkit in ln and "RENDERS" in ln]
+        assert rows, (
+            f"{toolkit} must carry a RENDERS row in the matrix (graduated from the "
+            "drain#10 staged set)"
+        )
+        joined = " ".join(rows)
+        assert "rendered=true" in joined, (
+            f"{toolkit} RENDERS row must carry the rendered=true device proof"
+        )
 
 
 def test_matrix_records_traps_reduction_135_to_99():
