@@ -46,7 +46,8 @@ device 없이 머지 후보 트리에서 전부 검증 가능. 하나라도 실�
   문서/compat-matrix 의 drift 가드(§3). **on-device 테스트는 여기 포함 안 됨**
   (`test_android_*` 류 probe 테스트도 host 에서 *소스/계약* 만 검증; 실제 device 실행은 수동).
 - 통과 조건: **ALL passed**. 1개라도 fail/error 면 게이트 FAIL.
-- 현재 수집: **432** passed (이 브랜치 기준).
+- 현재 수집: **514** passed (auto/r5-docs 기준; round-5 docs drift 가드 + loader-feature-gaps
+  SSOT 가드 추가). 수는 테스트 추가 때마다 늘어난다 — 게이트는 "전부 통과"이지 고정 숫자가 아님.
 
 ### 1.2 NDK native build (4-ABI) — 컴파일 정합
 - 명령: `JAVA_HOME=/opt/homebrew/opt/openjdk@17 ./gradlew :app:externalNativeBuildDebug`.
@@ -204,7 +205,7 @@ logcat 캡처에서 통합 세션이 직접 눈으로 확인**해야 하는 **PA
 
 | 검증 항목 | host-자동 (CI/세션) | device-수동 (통합 세션) |
 |-----------|--------------------|------------------------|
-| pytest 432 green | ✅ `uvx pytest tests/ -q` | — |
+| pytest green (현 514) | ✅ `uvx pytest tests/ -q` | — |
 | native 4-ABI 컴파일 | ✅ `gradlew externalNativeBuildDebug` | — |
 | guest-shim 빌드 + wire-check (GLES coverage seam) | ✅ `build-shim.sh` + `build-wire-check.sh` (zig, off-device; 19-op state-setter wire round-trip) | — |
 | version-stamp drift 없음 | ✅ (핀 정합 검사; bump 은 통합만) | — |

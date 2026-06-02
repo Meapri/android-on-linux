@@ -16,6 +16,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 MATRIX = ROOT / "docs" / "research" / "alr-compat-matrix.md"
 NETSURF_STEM = "2026-06-02-netsurf-browser-renders"
+ROUND4_STEM = "2026-06-02-round4-milestones-drain"
 
 
 def _text() -> str:
@@ -72,25 +73,58 @@ def test_netsurf_row_records_multithread_and_frames():
     )
 
 
-def test_qt6_sdl2_are_round4_in_progress_not_renders():
-    """qt6/sdl2 stay STAGED with a round-4 launch caveat — never RENDERS/USABLE."""
+def test_qt6_stays_staged_not_renders():
+    """qt6 stays STAGED with a round-5 closure caveat — never RENDERS/USABLE.
+
+    (SDL2 graduated to RENDERS in round-4 drain#13 — see
+    test_sdl2_row_is_renders_drain13 below; only qt6 remains in-progress.)
+    """
     text = _text()
     lines = text.splitlines()
-    for toolkit in ("Qt6", "SDL2"):
-        rows = [ln for ln in lines if toolkit in ln and "|" in ln and "STAGED" in ln]
-        assert rows, f"matrix must carry a {toolkit} STAGED row"
-        for ln in rows:
-            assert "RENDERS" not in ln and "USABLE" not in ln, (
-                f"{toolkit} STAGED row must not overclaim a device render"
-            )
-        # Must explicitly mark the launch as in-progress (round-4), not just silent.
-        assert any("round-4" in ln or "진행중" in ln for ln in rows), (
-            f"{toolkit} row must mark its GUI demo launch as round-4 in-progress"
+    rows = [ln for ln in lines if "Qt6" in ln and "|" in ln and "STAGED" in ln]
+    assert rows, "matrix must carry a Qt6 STAGED row"
+    for ln in rows:
+        assert "RENDERS" not in ln and "USABLE" not in ln, (
+            "Qt6 STAGED row must not overclaim a device render"
         )
+    # Must explicitly mark the gap as round-5 in-progress, not just silent, and
+    # honestly attribute the Qt-init SIGSEGV (guest child crash, not app regression).
+    joined = " ".join(rows)
+    assert "round-5" in joined or "진행중" in joined, (
+        "Qt6 row must mark its closure/launch as round-5 in-progress"
+    )
+    assert "SIGSEGV" in joined, (
+        "Qt6 row must honestly record the Qt-init SIGSEGV (guest child crash)"
+    )
 
 
-def test_babl_gegl_filter_use_marked_round4():
-    """babl/gegl modules STAGED; actual GIMP filter device use marked round-4."""
+def test_sdl2_row_is_renders_drain13():
+    """SDL2 testdraw2 was device-proved RENDERS in round-4 drain#13 (v135)."""
+    text = _text()
+    lines = text.splitlines()
+    rows = [ln for ln in lines if "SDL2" in ln and "|" in ln and "RENDERS" in ln]
+    assert rows, (
+        "matrix must promote the SDL2 row to RENDERS (round-4 drain#13 testdraw2)"
+    )
+    joined = " ".join(rows)
+    assert "rendered=true" in joined, (
+        "SDL2 RENDERS row must carry the rendered=true device proof"
+    )
+    assert "testdraw2" in joined, (
+        "SDL2 RENDERS row must name the testdraw2 demo binary"
+    )
+    assert ROUND4_STEM in joined, (
+        "SDL2 RENDERS row must cite the round-4 drain#13 evidence"
+    )
+
+
+def test_babl_gegl_filter_use_still_pending():
+    """babl/gegl modules STAGED + load-confirmed; actual GIMP filter output PENDING.
+
+    round-4 drain#13 confirmed the modules *load* (`gimp-filter: ... ok=true`),
+    but full filter output verification is still pending (it depends on
+    exec-re-entry for GIMP plugin fork+exec). The row must stay honest.
+    """
     text = _text()
     lines = text.splitlines()
     rows = [
@@ -100,13 +134,21 @@ def test_babl_gegl_filter_use_marked_round4():
         and "PENDING" in ln
     ]
     assert rows, "matrix must keep a babl/gegl STAGED-but-filter-PENDING row"
-    assert any("round-4" in ln for ln in rows), (
-        "babl/gegl filter device exercise must be marked round-4 in-progress"
+    joined = " ".join(rows)
+    assert "round-5" in joined or "exec-re-entry" in joined, (
+        "babl/gegl filter device exercise must be marked in-progress (round-5) "
+        "and/or attributed to the exec-re-entry loader gap"
     )
 
 
-def test_apt_install_marked_round4_maintainer_script():
-    """Real apt install stays PENDING, attributed to maintainer-script exec-re-entry."""
+def test_apt_install_marked_exec_re_entry_wall():
+    """Real apt install stays PENDING, attributed to maintainer-script exec-re-entry.
+
+    round-4 drain#13 device-confirmed the wall (`apt-install: ... exec=GUEST EXEC
+    FAIL`); the matrix must now record it as a WALL (not a speculative 'in
+    progress'), keep the honest PENDING caveat, and attribute it to the
+    exec-re-entry loader feature.
+    """
     text = _text()
     lines = text.splitlines()
     rows = [
@@ -115,9 +157,12 @@ def test_apt_install_marked_round4_maintainer_script():
     ]
     assert rows, "matrix must carry an 'apt install' PENDING row"
     joined = " ".join(rows)
-    assert "round-4" in joined, (
-        "apt install row must mark progress as round-4 in-progress"
+    assert "WALL" in joined, (
+        "apt install row must record the round-4 drain#13 device-confirmed WALL"
     )
     assert "maintainer-script" in joined and "exec-re-entry" in joined, (
         "apt install row must attribute the gap to maintainer-script exec-re-entry"
+    )
+    assert ROUND4_STEM in joined, (
+        "apt install row must cite the round-4 drain#13 evidence (device-confirmed wall)"
     )
