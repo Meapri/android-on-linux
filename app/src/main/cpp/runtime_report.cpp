@@ -77,6 +77,7 @@
 #include "alr_runtime/alr_perf.hpp"
 #include "alr_runtime/alr_procfs.hpp"
 #include "alr_runtime/alr_wx.hpp"
+#include "alr_inproc_reexec.h"
 #include "runtime_plan.hpp"
 
 #ifdef ALR_HAVE_WAYLAND
@@ -2296,32 +2297,9 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                 // re-validates the fd cache. argv (and argv[0]) stay byte-unchanged.
                 else if (is_exec) {
                     ++exec_traps;
-                    // === ADR-003-v3 STEP 1: in-process re-map redirect (NO execve) ===
-                    // Cancel the (W^X-forbidden) execve via NT_ARM_SYSTEM_CALL=-1 and
-                    // set pc -> the resident trampoline. &alr_inproc_reexec_probe is
-                    // identical in supervisor and tracee (fork-shared .text, never
-                    // unmapped), so the kernel skips execve and returns straight into
-                    // resident guest code. The rest of this branch's SETREGSET writes
-                    // preserve regs[32] (pc) and don't touch the syscall-nr regset, so
-                    // the redirect survives them; the kernel never runs execve.
-                    // aarch64-only (the trampoline asm + regs[32]=pc layout); the
-                    // device is arm64 and the other ABIs are non-functional stubs.
-#if defined(__aarch64__)
-                    if (inproc_reexec_on) {
-                        regs[32] = static_cast<uint64_t>(
-                            reinterpret_cast<uintptr_t>(&alr_inproc_reexec_probe));
-                        if (::ptrace(PTRACE_SETREGSET, w,
-                                     reinterpret_cast<void*>(NT_PRSTATUS), &io) == 0) {
-                            int newsys = -1;
-                            struct iovec sio{&newsys, sizeof(newsys)};
-                            if (::ptrace(PTRACE_SETREGSET, w,
-                                         reinterpret_cast<void*>(NT_ARM_SYSTEM_CALL),
-                                         &sio) == 0) {
-                                ++exec_inproc_redirected;
-                            }
-                        }
-                    }
-#endif
+                    // ADR-003-v3 in-process re-map redirect is at the END of this branch
+                    // (after the gp/med read), so it has the host target path + final say
+                    // on the regs. See the STEP-2 block before this branch's close.
                     // execve: path=x0. execveat: path=x1 (dirfd=x0). Pick the path reg
                     // by syscall nr so argv/envp are never mistaken for the path.
                     const bool is_at =
@@ -2356,6 +2334,75 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                                     first_exec_x0 = gp;
                                     first_exec_reason = med.reason;
                                 }
+                                // === ADR-003-v3 STEP 2: in-process re-map (NO execve) ===
+                                // Cancel the (W^X-forbidden) execve and PC-redirect the
+                                // tracee into the resident map+jump trampoline, which maps
+                                // the target ELF + guest ld.so in-process and jumps —
+                                // inheriting the seccomp filter + SEIZE, no kernel exec.
+                                // ABI: x19=host target path, x20=argv, x21=envp,
+                                // x22=rootfs (callee-saved -> survive the syscall-skip).
+                                // Strings go in the [sp-2048, sp) scratch (below sp, proven
+                                // writable; the B-3 envp window is BELOW sp-2048). Critical
+                                // regs (x19-x22, pc) and the syscall-nr regset are not
+                                // touched by the splice/B-1/B-3 SETREGSETs that follow, so
+                                // this redirect survives them.
+#if defined(__aarch64__)
+                                if (inproc_reexec_on) {
+                                    const std::string host =
+                                        med.should_rewrite ? med.host_path
+                                                           : std::string(gp);
+                                    const std::string& rootfs = config.rootfs_dir;
+                                    const uintptr_t sp =
+                                        static_cast<uintptr_t>(regs[31]);
+                                    const uintptr_t hp_addr =
+                                        (sp - 2048) & ~static_cast<uintptr_t>(0xf);
+                                    const uintptr_t rf_addr =
+                                        (hp_addr + host.size() + 16) &
+                                        ~static_cast<uintptr_t>(0xf);
+                                    if (rf_addr + rootfs.size() + 1 < sp - 16) {
+                                        const ssize_t w1 = ::pwrite(
+                                            mfd, host.c_str(), host.size() + 1,
+                                            static_cast<off_t>(hp_addr));
+                                        const ssize_t w2 = ::pwrite(
+                                            mfd, rootfs.c_str(), rootfs.size() + 1,
+                                            static_cast<off_t>(rf_addr));
+                                        if (w1 == static_cast<ssize_t>(host.size() + 1) &&
+                                            w2 == static_cast<ssize_t>(
+                                                      rootfs.size() + 1)) {
+                                            regs[19] = hp_addr;
+                                            regs[20] = is_at
+                                                ? static_cast<uint64_t>(regs[2])
+                                                : static_cast<uint64_t>(regs[1]);
+                                            regs[21] = is_at
+                                                ? static_cast<uint64_t>(regs[3])
+                                                : static_cast<uint64_t>(regs[2]);
+                                            regs[22] = rf_addr;
+                                            regs[32] = static_cast<uint64_t>(
+                                                reinterpret_cast<uintptr_t>(
+                                                    &alr_inproc_reexec_trampoline));
+                                            if (::ptrace(PTRACE_SETREGSET, w,
+                                                         reinterpret_cast<void*>(
+                                                             NT_PRSTATUS),
+                                                         &io) == 0) {
+                                                int newsys = -1;
+                                                struct iovec sio{&newsys,
+                                                                 sizeof(newsys)};
+                                                if (::ptrace(
+                                                        PTRACE_SETREGSET, w,
+                                                        reinterpret_cast<void*>(
+                                                            NT_ARM_SYSTEM_CALL),
+                                                        &sio) == 0) {
+                                                    ++exec_inproc_redirected;
+                                                    if (first_reentry_target
+                                                            .empty()) {
+                                                        first_reentry_target = host;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+#endif
                                 // === ADR-003-v2 (Option S): re-entry-stub splice ===
                                 // Prefer running the static re-entry stub (which the
                                 // kernel CAN execve, then re-maps the glibc target

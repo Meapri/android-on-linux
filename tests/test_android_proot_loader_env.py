@@ -33,4 +33,4 @@ def test_proot_launch_plan_and_report_show_actual_loader_environment():
 
 def test_visible_build_stamp_bumped_for_termux_pair_probe():
     text = MAIN.read_text()
-    assert "build: 0.4.141-r10-v141" in text
+    assert "build: 0.4.143-r10-v143" in text

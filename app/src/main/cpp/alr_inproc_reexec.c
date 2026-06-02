@@ -502,37 +502,48 @@ void alr_inproc_reexec_worker(const char* target, char** argv,
         diag("ALR-INPROC: target not ELF\n"); sys_exit(EX_ELF_TARGET);
     }
 
-    // ---- find PT_INTERP (dynamic guest). Static binaries are not supported on
-    //      this path (the in-process loader handles those at first launch). ----
+    // ---- find PT_INTERP. Dynamic targets carry a PT_INTERP (the guest ld.so);
+    //      STATIC targets have none — we map them directly and jump to their own
+    //      entry (no ld.so). Static-PIE (ET_DYN, no INTERP) self-relocates in its
+    //      _start using AT_PHDR; static-ET_EXEC runs at its fixed vaddr. ----
     const Elf64_Ehdr* teh = (const Elf64_Ehdr*)g_target_buf;
     const Elf64_Phdr* tph = (const Elf64_Phdr*)(g_target_buf + teh->e_phoff);
     const char* interp_str = 0;
     for (int i = 0; i < teh->e_phnum; ++i) {
         if (tph[i].p_type == PT_INTERP) { interp_str = g_target_buf + tph[i].p_offset; break; }
     }
-    if (!interp_str) { diag("ALR-INPROC: no PT_INTERP (static)\n"); sys_exit(EX_NO_INTERP); }
-    diag("ALR-INPROC: interp_str="); diag(interp_str); diag("\n");
+    const int is_static = (interp_str == 0);
+    if (is_static) {
+        diag("ALR-INPROC: static target (no PT_INTERP) — direct map+jump\n");
+    } else {
+        diag("ALR-INPROC: interp_str="); diag(interp_str); diag("\n");
+    }
 
     // ---- map the target's PT_LOADs --------------------------------------------
     MappedImage prog = map_elf_image(g_target_buf, (size_t)tlen, "ALR-INPROC PROG IREL=");
     if (!prog.ok) { diag("ALR-INPROC: prog map fail\n"); sys_exit(EX_MAP_TARGET); }
 
-    // ---- build <rootfs><interp> and map the guest ld.so -----------------------
-    size_t rl = s_len(rootfs);
-    if (rl + s_len(interp_str) + 1 >= sizeof(g_interp_path)) {
-        diag("ALR-INPROC: interp path too long\n"); sys_exit(EX_INTERP_PATH);
+    // ---- (dynamic only) build <rootfs><interp> and map the guest ld.so --------
+    MappedImage interp;
+    interp.base = 0; interp.entry = 0; interp.phdr = 0;
+    interp.phent = 0; interp.phnum = 0; interp.ok = 1;
+    if (!is_static) {
+        size_t rl = s_len(rootfs);
+        if (rl + s_len(interp_str) + 1 >= sizeof(g_interp_path)) {
+            diag("ALR-INPROC: interp path too long\n"); sys_exit(EX_INTERP_PATH);
+        }
+        s_cpy(g_interp_path, rootfs);
+        s_cpy(g_interp_path + rl, interp_str);   // interp_str begins with '/'
+        diag("ALR-INPROC: interp="); diag(g_interp_path); diag("\n");
+        long ilen = read_file(g_interp_path, g_interp_buf, FILEBUF_CAP);
+        if (ilen < 0) { diag("ALR-INPROC: interp open/read fail\n"); sys_exit(EX_OPEN_INTERP); }
+        if (ilen < (long)sizeof(Elf64_Ehdr) ||
+            g_interp_buf[0] != 0x7f || g_interp_buf[1] != 'E') {
+            diag("ALR-INPROC: interp not ELF\n"); sys_exit(EX_ELF_INTERP);
+        }
+        interp = map_elf_image(g_interp_buf, (size_t)ilen, "ALR-INPROC INTERP IREL=");
+        if (!interp.ok) { diag("ALR-INPROC: interp map fail\n"); sys_exit(EX_MAP_INTERP); }
     }
-    s_cpy(g_interp_path, rootfs);
-    s_cpy(g_interp_path + rl, interp_str);   // interp_str begins with '/'
-    diag("ALR-INPROC: interp="); diag(g_interp_path); diag("\n");
-    long ilen = read_file(g_interp_path, g_interp_buf, FILEBUF_CAP);
-    if (ilen < 0) { diag("ALR-INPROC: interp open/read fail\n"); sys_exit(EX_OPEN_INTERP); }
-    if (ilen < (long)sizeof(Elf64_Ehdr) ||
-        g_interp_buf[0] != 0x7f || g_interp_buf[1] != 'E') {
-        diag("ALR-INPROC: interp not ELF\n"); sys_exit(EX_ELF_INTERP);
-    }
-    MappedImage interp = map_elf_image(g_interp_buf, (size_t)ilen, "ALR-INPROC INTERP IREL=");
-    if (!interp.ok) { diag("ALR-INPROC: interp map fail\n"); sys_exit(EX_MAP_INTERP); }
     diag("ALR-INPROC: mapped\n");
 
     // ---- build the guest's SysV initial stack ---------------------------------
@@ -609,7 +620,9 @@ void alr_inproc_reexec_worker(const char* target, char** argv,
     w[k++] = 0;
     for (size_t i = 0; i < n_aux; ++i) w[k++] = aux[i];
 
-    uintptr_t jump_entry = interp.entry;  // dynamic: ld.so drives the program
+    // Dynamic: jump to ld.so (it drives the program). Static: jump straight to the
+    // program's own entry (AT_BASE=0 since interp.base==0 for the static case).
+    uintptr_t jump_entry = is_static ? prog.entry : interp.entry;
     diag("ALR-INPROC: mapped, jumping entry=");
     diag_hex("", (unsigned long)jump_entry);
     diag_hex("ALR-INPROC sp@", (unsigned long)start);
