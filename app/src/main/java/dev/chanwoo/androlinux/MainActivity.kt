@@ -557,6 +557,12 @@ class MainActivity : Activity() {
         val alrVkMarshalPassed =
             alrVkMarshalProbe.lineStartingWith("ALR VK ENUM MARSHAL:") ==
                 "ALR VK ENUM MARSHAL: PASS"
+        // §VK-M2 body: guest Vulkan device/queue/cmdbuf/clear-submit -> real Mali
+        // libvulkan -> AHB clear render -> readback. logcat tag alr_loader "vk-render:".
+        val alrVkRenderProbe = nativeAlrGpuVkRenderProbe()
+        val alrVkRenderPassed =
+            alrVkRenderProbe.lineStartingWith("ALR VK RENDER MARSHAL:") ==
+                "ALR VK RENDER MARSHAL: PASS"
         // Goal-2 (Chromium) prep: V8-style iterative W^X executable memory. PASS => V8
         // JIT runs without --jitless on this untrusted_app domain.
         val jitWxProbe = nativeJitWxProbe()
@@ -731,7 +737,7 @@ class MainActivity : Activity() {
             alrSeccompPathTrapProbe.lineStartingWith("alr sc PATH_MEDIATION_VIABLE=")
                 .substringAfter("PATH_MEDIATION_VIABLE=", "") == "yes"
 
-        val executionSummary = "build: 0.4.137-cp6-mr2-v137" +
+        val executionSummary = "build: 0.4.138-r6-v138" +
             "\nexecution summary" +
             "\nROOTFS EXECUTION: ${if (rootfsExecutionPassed) "PASS" else "FAIL"}" +
             "\nSHELL SCRIPT EXECUTION: ${if (shellScriptExecutionPassed) "PASS" else "FAIL"}" +
@@ -782,6 +788,7 @@ class MainActivity : Activity() {
             "\nALR GPU LIVE INTEGRATION (guest -> ring -> host executor -> AHB present, 8 frames on Mali): ${if (alrGpuLivePassed) "PASS" else "FAIL"}" +
             "\nALR GPU THROUGHPUT (same op-stream on Mali: ALR ring+executor vs direct, % of native): ${if (alrGpuThroughputPassed) "PASS" else "FAIL"}" +
             "\nALR VK ENUM MARSHAL (guest Vulkan enumerate/props -> ring -> real Mali libvulkan): ${if (alrVkMarshalPassed) "PASS" else "FAIL"}" +
+            "\nALR VK RENDER MARSHAL (guest Vulkan device+queue+cmdbuf+clear -> real Mali -> AHB readback): ${if (alrVkRenderPassed) "PASS" else "FAIL"}" +
             "\nALR JIT WX CYCLE (V8-style iterative RW<->RX exec memory; PASS => Chromium V8 needs no --jitless): ${if (jitWxPassed) "PASS" else "FAIL"}" +
             "\nHOST GPU EGL/GLES EXECUTION: ${if (hostGpuHardwareCandidate) "PASS" else "FAIL"}" +
             "\nANDROID HOST VULKAN PROBE EXECUTION: ${if (hostVulkanHardwareCandidate) "PASS" else "FAIL"}" +
@@ -2359,6 +2366,7 @@ class MainActivity : Activity() {
     private external fun nativeAlrGpuLiveProbe(): String
     private external fun nativeAlrGpuThroughputProbe(): String
     private external fun nativeAlrGpuVkMarshalProbe(): String
+    private external fun nativeAlrGpuVkRenderProbe(): String
 
     private external fun nativeJitWxProbe(): String
 

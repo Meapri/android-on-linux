@@ -1506,6 +1506,10 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     // ALR compositor is wl_shm-only (no wl-egl / dmabuf for clients); skip Qt's
     // client-side decoration plugin (a SIGSEGV suspect) so it uses the SHM path.
     guest_env.push_back("QT_WAYLAND_DISABLE_WINDOWDECORATION=1");
+    // Belt-and-braces with the r6 qt6 overlay (EGL/HW-integration plugins removed):
+    // also disable Qt's wayland client buffer HW (EGL/dmabuf) integration at runtime
+    // so it never tries eglGetDisplay (no ICD) — forces the wl_shm backing store.
+    guest_env.push_back("QT_WAYLAND_DISABLE_HW_INTEGRATION=1");
     // GTK/GIMP startup: render with cairo (no client GL yet), an in-memory
     // GSettings backend (no dconf/D-Bus), a UTF-8 locale, and rootfs-relative XDG
     // dirs. Service-file paths (fontconfig, gdk-pixbuf loaders, gschemas) are
@@ -5487,6 +5491,18 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeAlrGpuVkMarshalProbe(
     jobject /* thiz */) {
     const auto report = alr::gpu::run_vk_marshal_mali_probe();
     __android_log_print(ANDROID_LOG_INFO, "alr_loader", "vk-marshal:\n%s", report.c_str());
+    return env->NewStringUTF(report.c_str());
+}
+
+// §VK-M2 body: guest Vulkan device/queue/command-buffer/clear-submit marshalled to
+// the real Mali libvulkan, rendering a clear into an AHB-backed color attachment +
+// CPU readback (the Vulkan analogue of the GLES draw/AHB path).
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeAlrGpuVkRenderProbe(
+    JNIEnv* env,
+    jobject /* thiz */) {
+    const auto report = alr::gpu::run_vk_render_mali_probe();
+    __android_log_print(ANDROID_LOG_INFO, "alr_loader", "vk-render:\n%s", report.c_str());
     return env->NewStringUTF(report.c_str());
 }
 
