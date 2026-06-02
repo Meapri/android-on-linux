@@ -25,6 +25,13 @@
 #ifndef NT_PRSTATUS
 #define NT_PRSTATUS 1
 #endif
+#ifndef NT_ARM_SYSTEM_CALL
+// Writing -1 to this regset at a syscall-entry/seccomp stop CANCELS the pending
+// syscall (the kernel skips it, returns -ENOSYS). ADR-003-v3 uses this to neuter a
+// guest execve so we can PC-redirect the tracee into an in-process re-map instead of
+// a (W^X-forbidden) kernel execve.
+#define NT_ARM_SYSTEM_CALL 0x404
+#endif
 #ifndef R_AARCH64_IRELATIVE
 #define R_AARCH64_IRELATIVE 1032  // (1027 is R_AARCH64_RELATIVE; IRELATIVE is 1032)
 #endif
@@ -1160,6 +1167,31 @@ __asm__(
     "  mov x0, #0\n"
     "  br x3\n");
 
+// ADR-003-v3 MECHANISM PROOF (R10 step 1). A resident, freestanding raw-syscall
+// routine the supervisor PC-redirects the tracee to at an execve seccomp-trap (after
+// cancelling the execve via NT_ARM_SYSTEM_CALL=-1). It runs IN the guest process —
+// the loader's .text is inherited via fork and never unmapped, and &this function is
+// identical in supervisor and tracee — so reaching it proves the cancel+PC-redirect
+// path works WITHOUT any kernel execve. Step 2 replaces the body with the real
+// in-process map(ld.so+target)+jump. No libc/TLS/stack assumptions: pure svc #0.
+// Writes a marker to fd 2 (guest stderr → loader pipe → logcat) then _exit(123).
+extern "C" [[noreturn]] void alr_inproc_reexec_probe();
+__asm__(
+    ".globl alr_inproc_reexec_probe\n"
+    ".hidden alr_inproc_reexec_probe\n"
+    "alr_inproc_reexec_probe:\n"
+    "  mov x0, #2\n"            // fd = stderr
+    "  adr x1, 1f\n"           // buf
+    "  mov x2, #(2f - 1f)\n"   // len (assembler-computed)
+    "  mov x8, #64\n"          // __NR_write
+    "  svc #0\n"
+    "  mov x0, #123\n"         // exit code
+    "  mov x8, #93\n"          // __NR_exit
+    "  svc #0\n"
+    "  brk #0\n"               // unreachable
+    "1: .ascii \"ALR-REEXEC: inproc trampoline reached (no execve)\\n\"\n"
+    "2:\n");
+
 // Install a SECOND seccomp filter (stacked on the zygote's) that SECCOMP_RET_TRACEs
 // ONLY the path-taking syscalls, so the parent supervisor can rewrite a guest path
 // to its rootfs host path before the kernel dereferences it. This is the
@@ -1997,6 +2029,22 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         const char* e = ::getenv("ALR_EXEC_REENTRY");
         return e != nullptr && e[0] == '1';
     }();
+    // ADR-003-v3 (R10) in-process re-map. On a guest execve seccomp-trap, CANCEL the
+    // syscall (NT_ARM_SYSTEM_CALL=-1) and PC-redirect the tracee to a resident loader
+    // trampoline (no kernel execve — the W^X-forbidden primitive). STEP 1 (this build):
+    // the trampoline is a marker-print+exit probe, to prove the cancel+redirect path
+    // reaches resident code in the guest. STEP 2 swaps in the real map+jump. Default ON
+    // for the mechanism-proof drain (touches only the already-broken execve path).
+    // PROVEN (v141 drain#19, R10 step 1): the trampoline IS reached in-guest with NO
+    // kernel execve (`ALR-REEXEC: inproc trampoline reached`, inproc_redirected=1,
+    // child exit=123), no regression. Now gated default-OFF (ALR_REEXEC_INPROC=1 to
+    // opt in) until STEP 2 replaces the probe body with the real map(ld.so+target)+jump
+    // — until then the probe just exits 123, which would break any exec'ing guest.
+    const bool inproc_reexec_on = []{
+        const char* e = ::getenv("ALR_REEXEC_INPROC");
+        return e != nullptr && e[0] == '1';
+    }();
+    int exec_inproc_redirected = 0;  // execs PC-redirected into the in-process trampoline
     int exec_reentry_spliced = 0;   // execs spliced to run via the re-entry stub
     std::string first_reentry_target;  // first target the stub was asked to re-map
     std::string first_exec_x0;       // first exec target the guest requested
@@ -2248,6 +2296,32 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                 // re-validates the fd cache. argv (and argv[0]) stay byte-unchanged.
                 else if (is_exec) {
                     ++exec_traps;
+                    // === ADR-003-v3 STEP 1: in-process re-map redirect (NO execve) ===
+                    // Cancel the (W^X-forbidden) execve via NT_ARM_SYSTEM_CALL=-1 and
+                    // set pc -> the resident trampoline. &alr_inproc_reexec_probe is
+                    // identical in supervisor and tracee (fork-shared .text, never
+                    // unmapped), so the kernel skips execve and returns straight into
+                    // resident guest code. The rest of this branch's SETREGSET writes
+                    // preserve regs[32] (pc) and don't touch the syscall-nr regset, so
+                    // the redirect survives them; the kernel never runs execve.
+                    // aarch64-only (the trampoline asm + regs[32]=pc layout); the
+                    // device is arm64 and the other ABIs are non-functional stubs.
+#if defined(__aarch64__)
+                    if (inproc_reexec_on) {
+                        regs[32] = static_cast<uint64_t>(
+                            reinterpret_cast<uintptr_t>(&alr_inproc_reexec_probe));
+                        if (::ptrace(PTRACE_SETREGSET, w,
+                                     reinterpret_cast<void*>(NT_PRSTATUS), &io) == 0) {
+                            int newsys = -1;
+                            struct iovec sio{&newsys, sizeof(newsys)};
+                            if (::ptrace(PTRACE_SETREGSET, w,
+                                         reinterpret_cast<void*>(NT_ARM_SYSTEM_CALL),
+                                         &sio) == 0) {
+                                ++exec_inproc_redirected;
+                            }
+                        }
+                    }
+#endif
                     // execve: path=x0. execveat: path=x1 (dirfd=x0). Pick the path reg
                     // by syscall nr so argv/envp are never mistaken for the path.
                     const bool is_at =
@@ -2933,7 +3007,9 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     // via the static stub. The KEY gate for this milestone is exec_events>0 WITH
     // spliced>0 (the static-stub execve completed where the glibc execve could not).
     out << "\nalr exec reentry=" << (exec_reentry_on ? "on" : "off")
-        << " spliced=" << exec_reentry_spliced;
+        << " spliced=" << exec_reentry_spliced
+        << " inproc=" << (inproc_reexec_on ? "on" : "off")
+        << " inproc_redirected=" << exec_inproc_redirected;
     if (!first_reentry_target.empty()) {
         out << "\nalr exec reentry stub=" << config.rootfs_dir
             << "/usr/lib/androlinux/alr-reentry target=" << first_reentry_target;
