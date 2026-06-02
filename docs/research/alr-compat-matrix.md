@@ -42,7 +42,7 @@ on-device 실행**. 단, 실제 `apt install`(네트워크/소스 fetch+unpack)�
 | `dpkg-query -l libc6` | **RUNS** (`ok=true`, marker `[libc6]`) | 2026-06-02-5ws-fanout-renderer-getpwuid-pkgfunc | dpkg-db overlay(ws-3/ws-4 staged) 조회 OK |
 | `apt-get --version` | **RUNS** (`ok=true`, marker `[apt ]`) | 2026-06-02-5ws-fanout-renderer-getpwuid-pkgfunc | apt-config overlay 적재, 실행+버전 보고 |
 | `Xwayland -version` | **RUNS** (`ok=true`, marker `[Xwayland]`) | 2026-06-02-5ws-fanout-renderer-getpwuid-pkgfunc | x11 overlay; X11-only 앱 호스팅 기반 (전체 X11 앱 표시는 PENDING) |
-| 실제 `apt install <pkg>` (네트워크 fetch+unpack) | **WALL: exec-re-entry** (round-6 v138 device: `apt-install: unpacked=false`); B-1 execve path-rewrite 는 device-fires 하나 full dpkg chain 은 **PENDING (B-3 in-flight, round-7)** | 2026-06-02-round6-qt6-execreentry-vkrender, 2026-06-02-round4-milestones-drain | round-6 v138 에서 ADR-003 **B-1**(execve x0 path-rewrite)가 device-fires — 게스트 `execve(/bin/sh)` 가 EVENT_SECCOMP 에서 trap 되고 program path(x0)가 rootfs 로 재작성됨(`alr exec x0=/bin/sh reason=rewrite`, traps=1 rewrites=1 clone_events=7; no-exec 게스트는 0 무회귀). 단 `dpkg -i` 의 full fork+exec maintainer-script chain 은 여전히 `unpacked=false` — **B-3**(interposer 재주입: exec 된 child 의 envp 에 abs-rootfs `LD_PRELOAD` + `ALR_ROOTFS` 주입)이 필요하고 **round-7 진행 중**(device-pending). 잠금해제 범위·난이도·의존: `loader-feature-gaps.md`(G1) |
+| 실제 `apt install <pkg>` (네트워크 fetch+unpack) | **WALL: exec-re-entry** (round-6 v138 device: `apt-install: unpacked=false`); B-1 execve path-rewrite 는 device-fires 하나 full dpkg chain 은 **PENDING (B-3 in-flight, round-7)**. **non-root unpack 측은 host-ready**: fakeroot shim + apt-dpkg/fakeroot staging builder + DEVICE-REQ 준비 완료(아래 비고) | 2026-06-02-round6-qt6-execreentry-vkrender, 2026-06-02-round4-milestones-drain | round-6 v138 에서 ADR-003 **B-1**(execve x0 path-rewrite)가 device-fires — 게스트 `execve(/bin/sh)` 가 EVENT_SECCOMP 에서 trap 되고 program path(x0)가 rootfs 로 재작성됨(`alr exec x0=/bin/sh reason=rewrite`, traps=1 rewrites=1 clone_events=7; no-exec 게스트는 0 무회귀). 단 `dpkg -i` 의 full fork+exec maintainer-script chain 은 여전히 `unpacked=false` — **B-3**(interposer 재주입: exec 된 child 의 envp 에 abs-rootfs `LD_PRELOAD` + `ALR_ROOTFS` 주입)이 필요하고 **round-7 진행 중**(device-pending). **v2 파이프라인 host 진전(별도 트랙)**: non-root unpack 의 fakeroot 게이트(`requires superuser` + chown/chmod EPERM)는 **host-ready** — `tools/fakeroot/libalr_fakeroot.c`(23/23 심볼: getuid→0, chown no-op+(dev,ino) 메타DB, chmod, stat-family 오버레이; `dlsym(RTLD_NEXT)` 로 interposer 와 체인, W^X 무위반) + `tools/build_fakeroot_overlay.py`(zig→`fakeroot-stage.tar` 실빌드 검증: aarch64 ELF 73456B, `getuid/chown/stat/statx` global T) + `tools/build_apt_dpkg_overlay.py`(noble apt+dpkg closure + admindir scaffold + `hello.deb` fetch → `apt-dpkg-stage.tar`). **staging 실빌드 검증(2026-06-02)**: `fakeroot-stage.tar`(73456B aarch64 ELF, §5-E CONFORMANT 0err/0warn) + `apt-dpkg-stage.tar`(58-pkg closure 18.7MiB, 589 files, base 125 SONAME-subtracted, self-contained 14 front-ends 모두 aarch64 ELF, 0 violations, §5-E CONFORMANT) + `hello_2.10-3build1_arm64.deb`(25184B) 모두 host-side로 생성·검증. 빌더 selftest ALL PASS, pytest **39 passed**(offline) / **+3 network-gated PASS**(`ALR_V2_STAGING_NET=1`: live closure 0-unsat, self-contained overlay conformant, hello fetch). 한방 래퍼 `tools/build_v2_stage.sh`. 정직: 호스트=Darwin → host 증명 천장 = **staging+메커니즘**; `unpacked` 은 **여전히 PENDING-device**(exec-re-entry G1 선결 — dpkg 가 압축해제기 `zstd`/maintainer `sh` 를 fork+exec 하므로 메타연산[getuid/chown/stat]만 G1-독립, 종단 `unpacked=true` 는 최소 1회 exec-re-entry 통과 필요). DEVICE-REQ `ALR-V2-apt-unpack` + §5 launch 계약 SSOT: `docs/design/v2-apt-pipeline-ssot.md`. G1 잠금해제: `loader-feature-gaps.md`(G1) |
 
 mediation 불변식: `pcgate=1 interpose=1 traps=0 rewrites=0` (CLI 집합과 동일).
 
@@ -103,11 +103,42 @@ host 백본(decode/ring/AHB-FBO/zero-copy present)은 Mali-G615 MC2에 픽셀 �
 | guest-GUI XKB 키맵 | 수정됨 (SIGSEGV fix, v127) | v127-xkb-config-root-gui-keymap-segv-fixed | `XKB_CONFIG_ROOT`를 rootfs-absolute 경로로 설정 → sig=11 카운트 0 |
 | `zwp_linux_dmabuf` zero-copy present (AHB→external-OES) | **DEVICE-VERIFIED** (`ALR AHB ZEROCOPY IMPORT: PASS`; gtk3demo rendered=true frames 12→13, ws-3 WaylandPresenter, 단일 게이트 후 회귀 0) | 2026-06-01-drain5-cp4-dmabuf-present-single-gate, v114-ahb-zerocopy-present-live | CP-4 / ws-3 M2. AHB→EGLImage→external-OES import는 device 검증됨. 남은 정직한 nuance: guest-side dmabuf 프로토콜 광고(zwp_linux_dmabuf 게스트 advertise)는 WS-3 M2 잔여 디테일 |
 
+## apt 설치 후보 앱 (closure host-예측)
+> **이 섹션은 host closure 예측이지 device 설치 성공이 아니다.** `tools/breadth_catalog.py`(기존 `tools/deb_closure.py` 재사용)가
+> noble ports 인덱스(`main`+`universe`, arm64) 위에서 각 후보 앱의 런타임 의존성 closure 를 BFS 로 해소하고,
+> **0-unsat**(모든 Depends 엣지가 인덱스 내 실패키지로 떨어짐) 여부 + 다운로드/스테이지 크기를 산출한다.
+> 0-unsat 은 `apt install` 의 **필요조건**일 뿐 충분조건이 아니다 — 종단 `unpacked=true`/launch 는 여전히
+> **G1 exec-re-entry** 잠금해제에 매여 있다(위 "in-app apt/dpkg 실제 설치" 행 + `docs/research/loader-feature-gaps.md` G1).
+> 그래서 "결과"는 전부 **CLOSURE-OK (host-예측)** / device 는 **PENDING(G1)** 으로 정직하게 표기한다.
+>
+> live 측정 baseline: noble ports 인덱스(2026-06-02 fetch) × `rootfs/tiny-rootfs.tar`(188 base SONAME) base-subtraction.
+> `download` = closure .deb `Size` 합. `stage(base-sub)` = base-owned SONAME 패키지를 제외한 `Installed-Size` 합 × prune(man/doc/locale) 휴리스틱
+> — base 가 이미 ship 하는 libc/ncurses/… 를 빼므로 CLI 는 수십 MiB→1MiB 급으로 줄어든다(정직한 추정). 재현: `python3 -m tools.breadth_catalog --live`.
+
+| 앱 | 종류 | 카테고리 | closure(pkg) | unsat | 결과(host) | download | stage(base-sub) | device | 비고 |
+|----|------|----------|-------------:|------:|:----------:|---------:|----------------:|:------:|------|
+| `nano` | CLI | editor | 6 | 0 | **CLOSURE-OK** | 3.3MiB | 1.1MiB | PENDING(G1) | closure 바닥(거의 libc-only) |
+| `htop` | CLI | system | 8 | 0 | **CLOSURE-OK** | 3.2MiB | 1.0MiB | PENDING(G1) | ncurses; virtual dep(libnl) Provides 해소 |
+| `ncdu` | CLI | system | 6 | 0 | **CLOSURE-OK** | 3.0MiB | 0.6MiB | PENDING(G1) | ncurses disk usage |
+| `jq` | CLI | utility | 6 | 0 | **CLOSURE-OK** | 3.1MiB | 0.9MiB | PENDING(G1) | oniguruma dep |
+| `tree` | CLI | utility | 4 | 0 | **CLOSURE-OK** | 2.8MiB | 0.3MiB | PENDING(G1) | 최소 closure |
+| `mpv` | CLI | media | 249 | 0 | **CLOSURE-OK** | 126.0MiB | 242.0MiB | PENDING(G1) | A/V 코덱 대형 closure(상한 예시) |
+| `galculator` | GUI | utility | 157 | 0 | **CLOSURE-OK** | 47.1MiB | 109.3MiB | PENDING(G1) | GTK3 계산기 |
+| `xcalc`(x11-apps) | GUI | utility | 54 | 0 | **CLOSURE-OK** | 10.9MiB | 15.2MiB | PENDING(G1) | Xaw; noble 에선 `x11-apps` 번들로 제공(standalone `xcalc` 패키지 없음 — breadth 발견) |
+| `xterm` | GUI | terminal | 38 | 0 | **CLOSURE-OK** | 7.7MiB | 8.8MiB | PENDING(G1) | X11 터미널(Xwayland 호스팅) |
+| `feh` | GUI | viewer | 138 | 0 | **CLOSURE-OK** | 58.6MiB | 91.2MiB | PENDING(G1) | imlib2 이미지 뷰어; X11 |
+| `gnome-mahjongg` | GUI | game | 170 | 0 | **CLOSURE-OK** | 54.8MiB | 122.4MiB | PENDING(G1) | GTK3 타일 게임 |
+| `inkscape` | GUI | graphics | 242 | 0 | **CLOSURE-OK** | 94.5MiB | 236.9MiB | PENDING(G1) | GTK3 벡터 에디터(GUI 상한 예시) |
+
+**roll-up:** 후보 **12/12 가 0-unsat** host closure 해소(노블 main+universe, arm64) — CLI 5종 + GUI 7종(GTK3/Xaw/X11/SDL 계열 다양성). 전체 download ~415MiB, base-subtracted stage 합 ~830MiB.
+즉 **"여러 경량 GUI/CLI 앱이 closure 상으로는 설치 가능"** 이 host 에서 예측된다. 단 모든 행의 device 열이 **PENDING(G1)**: 실 설치(`apt install` → unpack → exec)는 exec-re-entry(B-3 round-7) 통과 후에야 device-증명 가능하다.
+검증: `python3 -m tools.breadth_catalog --selftest`(offline ALL PASS) + `pytest tests/test_breadth_catalog.py`(13 passed, live 1 = `ALR_BREADTH_NET=1` 게이트).
+
 ## 미지원 / 부분 (현재 한계)
 | 항목 | 상태 | 비고 |
 |------|------|------|
 | X11-only 앱 (실제 X11 클라이언트 표시) | PENDING | `Xwayland -version` 은 RUNS(drain#9, 위 패키지매니저 섹션) — Xwayland 바이너리는 게스트로 실행됨. 실제 X11 클라이언트를 Xwayland 에 붙여 화면에 띄우는 end-to-end 는 device 미검증 (WS-4 M4 잔여) |
-| in-app `apt`/`dpkg` 실제 설치 | WALL: exec-re-entry (round-6 v138: B-1 device-fires, B-3 round-7 진행) | `dpkg-query`/`apt-get`/`Xwayland` **버전 보고 실행**은 device-PROVEN(drain#9). round-6 v138 에서 ADR-003 **B-1 execve path-rewrite 가 device-fires**(`alr exec x0=/bin/sh reason=rewrite` traps=1 rewrites=1) — 게스트 execve 가 trap 되고 x0 가 rootfs 로 재작성됨. 단 `apt install` 의 full dpkg fork+exec maintainer-script chain 은 여전히 `unpacked=false` — **B-3**(exec 된 child envp 에 abs-rootfs `LD_PRELOAD`/`ALR_ROOTFS` 재주입)이 필요하고 **round-7 진행 중**(device-pending). SSOT: `loader-feature-gaps.md`(G1) |
+| in-app `apt`/`dpkg` 실제 설치 | WALL: exec-re-entry (round-6 v138: B-1 device-fires, B-3 round-7 진행); **non-root unpack 측 host-ready** | `dpkg-query`/`apt-get`/`Xwayland` **버전 보고 실행**은 device-PROVEN(drain#9). round-6 v138 에서 ADR-003 **B-1 execve path-rewrite 가 device-fires**(`alr exec x0=/bin/sh reason=rewrite` traps=1 rewrites=1) — 게스트 execve 가 trap 되고 x0 가 rootfs 로 재작성됨. 단 `apt install` 의 full dpkg fork+exec maintainer-script chain 은 여전히 `unpacked=false` — **B-3**(exec 된 child envp 에 abs-rootfs `LD_PRELOAD`/`ALR_ROOTFS` 재주입)이 필요하고 **round-7 진행 중**(device-pending). **v2 non-root unpack**(fakeroot + apt-dpkg staging)은 host-ready, device staging+drain 만 남음 — DEVICE-REQ `ALR-V2-apt-unpack` + 본체 §5 launch 계약: `docs/design/v2-apt-pipeline-ssot.md`. G1: `loader-feature-gaps.md` |
 | OpenCL / 벤더 GPU compute | 미추진 | non-root/public-API 계약 위반; GIMP GEGL은 CPU (v114 honest-scope) |
 
 ---
