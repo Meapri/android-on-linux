@@ -50,8 +50,13 @@ class MainActivity : Activity() {
         // harfbuzz 8.3.0 → pango 1.52.1 lost `hb_ot_color_has_paint` → all GTK apps +
         // GIMP exit=127. Keeping this overlay off preserves the rootfs's 8.3.0 stack
         // (and avoids re-extracting the 517MB tar on every cold start).
-        @Suppress("ConstantConditionIf")
-        if (false) Thread {
+        // CP-6 un-deferred (user direction 2026-06-02): chromium-headless-shell --version
+        // loads the full chromium closure in-process so the M-R2 (ADR-002) supervisor
+        // syscall-mix instrumentation captures its 'alr sc trace_hist/emul_hist/stime'
+        // distribution. Gated on chromium-stage.tar being adb-push'd to /data/local/tmp
+        // (the 541MB tar is not auto-present). --dump-dom (the heavier render storm) still
+        // hits the multithread ptrace deadlock (backlogged) — --version is the working path.
+        if (java.io.File("/data/local/tmp/chromium-stage.tar").isFile) Thread {
             try {
                 val crTar = java.io.File("/data/local/tmp/chromium-stage.tar")
                 // Marker keyed on tar size so re-pushing a fixed/updated stage tar
@@ -726,7 +731,7 @@ class MainActivity : Activity() {
             alrSeccompPathTrapProbe.lineStartingWith("alr sc PATH_MEDIATION_VIABLE=")
                 .substringAfter("PATH_MEDIATION_VIABLE=", "") == "yes"
 
-        val executionSummary = "build: 0.4.136-r5-v136" +
+        val executionSummary = "build: 0.4.137-cp6-mr2-v137" +
             "\nexecution summary" +
             "\nROOTFS EXECUTION: ${if (rootfsExecutionPassed) "PASS" else "FAIL"}" +
             "\nSHELL SCRIPT EXECUTION: ${if (shellScriptExecutionPassed) "PASS" else "FAIL"}" +

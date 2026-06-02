@@ -61,6 +61,7 @@
 #include <unordered_map>  // per-tid /proc/<tid>/mem fd cache + translate result cache
 #include <unordered_set>  // known-tid set: new-clone-child initial-stop vs group-stop
 #include <mutex>
+#include <sys/resource.h>  // M-R2 (ADR-002): getrusage(RUSAGE_CHILDREN) guest CPU/ctxt
 
 #include "alr_runtime/alr_config.hpp"
 #include "alr_runtime/alr_exec.hpp"
@@ -1954,6 +1955,13 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     int guest_threads = 0;
     int path_traps = 0;
     int path_rewrites = 0;
+    // M-R2 (ADR-002): storm decomposition — per-syscall-nr histograms at the two
+    // EXISTING trap sites (no new ptrace op, no hot-loop pollution). trace_hist =
+    // RET_TRACE/EVENT_SECCOMP (path-family + execve), emul_hist = SIGSYS-emulated
+    // (blocked nrs). The path vs non-path nr ratio directly answers where a raw-svc
+    // storm's round-trips originate (bench/syscall_mix.py parses these lines).
+    std::unordered_map<int, uint64_t> trace_hist;
+    std::unordered_map<int, uint64_t> emul_hist;
     std::string first_rewrite;
     bool captured = false;
     // Under PTRACE_SEIZE the options were installed ATOMICALLY at attach (the 4th arg
@@ -2077,6 +2085,7 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                 // path into the rootfs is a deliberate follow-up; until then never treat
                 // an exec syscall's x1 as a path.
                 const uint64_t sysno = regs[8];
+                ++trace_hist[static_cast<int>(sysno)];  // M-R2 storm decomposition
                 const bool is_exec =
                     (sysno == static_cast<uint64_t>(__NR_execve) ||
                      sysno == static_cast<uint64_t>(__NR_execveat));
@@ -2300,6 +2309,7 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
             uint64_t regs[34] = {0};
             struct iovec io{regs, sizeof(regs)};
             if (::ptrace(PTRACE_GETREGSET, w, reinterpret_cast<void*>(NT_PRSTATUS), &io) == 0) {
+                ++emul_hist[static_cast<int>(regs[8])];  // M-R2 storm decomposition
                 if (emulated_syscalls < 64) {
                     emulated_list[emulated_syscalls] = static_cast<int>(regs[8]);
                 }
@@ -2317,9 +2327,12 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                 ::ptrace(PTRACE_CONT, w, nullptr,
                          reinterpret_cast<void*>(static_cast<long>(stopsig)));
             }
-            if (emulated_syscalls > 8192) {
-                // Runaway backstop: kill the guest leader; the multi-tracee loop
-                // reaps the rest as they're orphaned.
+            if (emulated_syscalls > (1 << 20)) {
+                // Runaway backstop. Raised from 8192 to ~1M for M-R2 (ADR-002): a
+                // syscall-storm guest (chromium) legitimately emulates far more than
+                // 8192 blocked nrs, and the alarm() already bounds wall-time, so the
+                // lower cap truncated the measured distribution. Still catches a true
+                // runaway, just far above any real guest's emulate count.
                 ::kill(pid, SIGKILL);
             }
             continue;
@@ -2419,6 +2432,36 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         for (int i = 0; i < shown; ++i) {
             out << emulated_list[i] << (i + 1 < shown ? "," : "");
         }
+    }
+    // M-R2 (ADR-002) storm decomposition: per-nr histograms (sorted by count desc) +
+    // guest CPU/ctxt via getrusage(RUSAGE_CHILDREN) — robust after the guest is reaped
+    // (no /proc/<pid>/stat race). bench/syscall_mix.py parses these 'alr sc ...' lines.
+    {
+        // Dump the busiest TOP_HIST=16 nrs (matches bench/syscall_mix.py's saturation
+        // contract: len>=16 => the distribution may be truncated).
+        auto dump_hist = [&out](const char* tag, const std::unordered_map<int, uint64_t>& h) {
+            std::vector<std::pair<int, uint64_t>> v(h.begin(), h.end());
+            std::sort(v.begin(), v.end(),
+                      [](const std::pair<int, uint64_t>& a, const std::pair<int, uint64_t>& b) {
+                          return a.second > b.second;
+                      });
+            out << "\nalr sc " << tag;
+            const size_t shown = v.size() < 16 ? v.size() : 16;
+            for (size_t i = 0; i < shown; ++i) out << " " << v[i].first << ":" << v[i].second;
+        };
+        dump_hist("trace_hist", trace_hist);
+        dump_hist("emul_hist", emul_hist);
+        struct rusage ru {};
+        ::getrusage(RUSAGE_CHILDREN, &ru);
+        const uint64_t stime_us =
+            static_cast<uint64_t>(ru.ru_stime.tv_sec) * 1000000ull + ru.ru_stime.tv_usec;
+        const uint64_t utime_us =
+            static_cast<uint64_t>(ru.ru_utime.tv_sec) * 1000000ull + ru.ru_utime.tv_usec;
+        // nonvol_ctxt = involuntary context switches (getrusage ru_nivcsw == the
+        // aggregate of /proc/<tid>/status nonvoluntary_ctxt_switches the ADR specifies).
+        out << "\nalr sc stime_us=" << stime_us << " utime_us=" << utime_us
+            << " nonvol_ctxt=" << ru.ru_nivcsw
+            << " traps=" << path_traps << " emul=" << emulated_syscalls;
     }
     if (fault_pc != 0) {
         out << "\nalr native loader fault pc-base-offset=0x" << std::hex << (fault_pc - 0x400000) << std::dec;
