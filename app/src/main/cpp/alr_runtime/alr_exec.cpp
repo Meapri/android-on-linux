@@ -232,6 +232,73 @@ const char* exec_continuation_kind_name(ExecContinuationKind kind) {
     return "execve";
 }
 
+namespace {
+
+// Path-prefix containment with a component boundary: "/proc" matches "/proc"
+// and "/proc/foo" but NOT "/process". Byte-identical to the supervisor's
+// `under` lambda (runtime_report.cpp EVENT_SECCOMP handler) so the host-tested
+// decision here and the on-device rewrite classify paths the same way.
+bool path_under(std::string_view path, std::string_view dir) {
+    if (dir.empty()) {
+        return false;
+    }
+    if (path.size() < dir.size()) {
+        return false;
+    }
+    if (path.compare(0, dir.size(), dir) != 0) {
+        return false;
+    }
+    if (path.size() == dir.size()) {
+        return true;
+    }
+    return path[dir.size()] == '/';
+}
+
+}  // namespace
+
+ExecPathMediation decide_exec_path_mediation(
+    std::string_view rootfs_dir,
+    std::string_view guest_path) {
+    ExecPathMediation out;
+    out.guest_path.assign(guest_path);
+    if (guest_path.empty()) {
+        out.reason = "empty";
+        return out;
+    }
+    // Relative paths resolve against the guest cwd; the supervisor leaves them
+    // native (the path-family rewrite only mediates absolute guest paths).
+    if (guest_path.front() != '/') {
+        out.reason = "relative";
+        return out;
+    }
+    // Kernel virtual filesystems have no rootfs backing — leaving them native
+    // keeps /proc/self/exe and friends valid (ADR-003 §3, §4-가정-3). NOTE: this
+    // means a guest that execs /proc/self/exe is intentionally NOT redirected
+    // into the rootfs; that is a device-only correctness question (the loaded
+    // image may then be the host binary), tracked as ADR-003 §4-가정-3.
+    if (path_under(guest_path, "/proc") || path_under(guest_path, "/sys") ||
+        path_under(guest_path, "/dev")) {
+        out.reason = "sysdir";
+        return out;
+    }
+    // Idempotency guard: a path the guest already presents as a rootfs host path
+    // (e.g. learned from /proc/self/maps, or rewritten by the interposer) must
+    // not be re-prefixed into <rootfs><rootfs>/… (the open would fail).
+    if (path_under(guest_path, rootfs_dir)) {
+        out.reason = "already-host";
+        return out;
+    }
+    // Any other absolute guest path is mediated into the rootfs. translate_
+    // rootfs_path is pure in (rootfs_dir, cwd, path); cwd is irrelevant for an
+    // absolute path, so "/" is passed deterministically (matches the supervisor,
+    // which fixes cwd="/" for the run).
+    const auto t = translate_rootfs_path(rootfs_dir, "/", guest_path);
+    out.host_path = t.host_path;
+    out.should_rewrite = true;
+    out.reason = "rewrite";
+    return out;
+}
+
 ExecutableResolution resolve_guest_executable(
     const RuntimeConfig& config,
     std::string_view requested_program) {

@@ -105,6 +105,63 @@ int main() {
     require(spawn_plan.planned, "posix_spawn continuation planned");
     require(spawn_plan.report.find("ALR POSIX_SPAWN CHILD PLAN: PASS") != std::string::npos, "posix_spawn continuity report");
 
+    // === ADR-003 §3 (B-1): execve program-path mediation decision model ===
+    // This is the PURE classifier the supervisor's exec branch (runtime_report.cpp)
+    // consumes to decide whether/how to rewrite x0 (execve) / x1 (execveat). It must
+    // mirror the path-family branch's exclusions exactly. Fixture strings exercise
+    // every reason path with no real ptrace.
+    const std::string rootfs = "/data/rootfs";
+
+    // (1) A normal rootfs-bound absolute exec target (chromium gpu/zygote, apt/dpkg
+    //     helper) is rewritten to <rootfs><path>.
+    {
+        const auto m = alr::runtime::decide_exec_path_mediation(rootfs, "/usr/lib/chromium/chrome");
+        require(m.should_rewrite, "exec rewrite: absolute path rewritten");
+        require(m.host_path == "/data/rootfs/usr/lib/chromium/chrome", "exec rewrite: host path");
+        require(m.reason == "rewrite", "exec rewrite: reason");
+        require(m.guest_path == "/usr/lib/chromium/chrome", "exec rewrite: guest echo");
+    }
+    // (2) /proc/self/exe and other kernel virtual fs are NEVER redirected (ADR-003
+    //     §4-가정-3): leaving them native keeps /proc valid; the device decides
+    //     whether such an exec lands on the host image.
+    for (const char* sys : {"/proc/self/exe", "/proc/123/exe", "/sys/x", "/dev/null"}) {
+        const auto m = alr::runtime::decide_exec_path_mediation(rootfs, sys);
+        require(!m.should_rewrite, "exec sysdir: not rewritten");
+        require(m.reason == "sysdir", "exec sysdir: reason");
+        require(m.host_path.empty(), "exec sysdir: no host path");
+    }
+    // (2b) Boundary: /process must NOT match the /proc exclusion (component boundary).
+    {
+        const auto m = alr::runtime::decide_exec_path_mediation(rootfs, "/process/run");
+        require(m.should_rewrite, "exec boundary: /process is not /proc");
+        require(m.reason == "rewrite", "exec boundary: reason");
+    }
+    // (3) Idempotency: a path already under the rootfs is left as-is (no double
+    //     prefix) — the guest may present a host path learned from /proc/self/maps.
+    {
+        const auto m = alr::runtime::decide_exec_path_mediation(rootfs, "/data/rootfs/bin/sh");
+        require(!m.should_rewrite, "exec idempotent: already-host not rewritten");
+        require(m.reason == "already-host", "exec idempotent: reason");
+    }
+    // (3b) Exact rootfs root is also already-host (boundary at dir.size()).
+    {
+        const auto m = alr::runtime::decide_exec_path_mediation(rootfs, "/data/rootfs");
+        require(!m.should_rewrite, "exec idempotent: exact rootfs root");
+        require(m.reason == "already-host", "exec idempotent: exact reason");
+    }
+    // (4) Relative exec target (resolved against guest cwd) is left native.
+    {
+        const auto m = alr::runtime::decide_exec_path_mediation(rootfs, "bin/sh");
+        require(!m.should_rewrite, "exec relative: not rewritten");
+        require(m.reason == "relative", "exec relative: reason");
+    }
+    // (5) Empty path (defensive: x0 pread returned nothing) is a no-op.
+    {
+        const auto m = alr::runtime::decide_exec_path_mediation(rootfs, "");
+        require(!m.should_rewrite, "exec empty: not rewritten");
+        require(m.reason == "empty", "exec empty: reason");
+    }
+
     std::filesystem::remove_all(root);
     std::cout << "alr runtime exec native test ok\n";
     return EXIT_SUCCESS;

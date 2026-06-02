@@ -1955,6 +1955,15 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     int guest_threads = 0;
     int path_traps = 0;
     int path_rewrites = 0;
+    // ADR-003 exec re-entry instrumentation (M-R4-execmap counters). These are
+    // ZERO for every guest that never execs (GIMP/foot/chromium --version), so
+    // the no-exec path is byte-unchanged; they only advance on the new is_exec
+    // branch below.
+    int exec_traps = 0;       // execve/execveat EVENT_SECCOMP traps seen
+    int exec_rewrites = 0;    // x0 program-path rewrites into the rootfs (B-1)
+    int exec_events = 0;      // PTRACE_EVENT_EXEC stops (new image entered) (B-2)
+    std::string first_exec_x0;       // first exec target the guest requested
+    std::string first_exec_reason;   // its mediation reason (rewrite/sysdir/…)
     // M-R2 (ADR-002): storm decomposition — per-syscall-nr histograms at the two
     // EXISTING trap sites (no new ptrace op, no hot-loop pollution). trace_hist =
     // RET_TRACE/EVENT_SECCOMP (path-family + execve), emul_hist = SIGSYS-emulated
@@ -2078,12 +2087,12 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
             struct iovec io{regs, sizeof(regs)};
             if (::ptrace(PTRACE_GETREGSET, w, reinterpret_cast<void*>(NT_PRSTATUS), &io) == 0) {
                 // aarch64 carries the syscall nr in x8 at the seccomp-entry stop. In
-                // PCGATE=1 the loader also RET_TRACEs execve/execveat (a future exec
-                // re-entry hook), so those traps reach this handler too — but only the
-                // 9 path syscalls put the pathname in x1; execve's x1 is argv (a char**),
-                // so blindly rewriting x1 would corrupt argv. Rewriting an exec'd program
-                // path into the rootfs is a deliberate follow-up; until then never treat
-                // an exec syscall's x1 as a path.
+                // PCGATE=1 the loader also RET_TRACEs execve/execveat, so those traps
+                // reach this handler too. The 9 path syscalls put the pathname in x1,
+                // but execve(path,argv,envp) puts it in x0 (x1=argv char**, x2=envp);
+                // rewriting x1 for an exec would corrupt argv. So exec takes a SEPARATE
+                // branch below (ADR-003 §3 (B-1)) that reads x0 and never touches
+                // x1/x2. The non-exec path-family branch is unchanged.
                 const uint64_t sysno = regs[8];
                 ++trace_hist[static_cast<int>(sysno)];  // M-R2 storm decomposition
                 const bool is_exec =
@@ -2188,7 +2197,117 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                         // a stale-fd error above.
                     }
                 }
+                // === ADR-003 §3 (B-1): execve/execveat program-path mediation ===
+                // A guest fork()+execve()'d a rootfs binary (chromium zygote/gpu/
+                // utility; apt/dpkg helpers; GIMP plugins). The tracee is frozen at
+                // syscall-entry, so we rewrite the PROGRAM PATH (x0 for execve; x1 for
+                // execveat(dirfd, path, argv, envp, flags)) into its rootfs
+                // host location — TOCTOU-safe — exactly like the path-family branch but
+                // reading the EXEC-correct register and NEVER touching argv/envp. The
+                // kernel then loads the rootfs ELF, which (man seccomp.2 / ptrace.2)
+                // keeps the new image under the SAME stacked seccomp filter + SEIZE
+                // trace, so no loader re-map is needed; PTRACE_EVENT_EXEC (below) just
+                // re-validates the fd cache. argv (and argv[0]) stay byte-unchanged.
+                else if (is_exec) {
+                    ++exec_traps;
+                    // execve: path=x0. execveat: path=x1 (dirfd=x0). Pick the path reg
+                    // by syscall nr so argv/envp are never mistaken for the path.
+                    const bool is_at =
+                        (sysno == static_cast<uint64_t>(__NR_execveat));
+                    const uintptr_t exec_path_addr =
+                        is_at ? static_cast<uintptr_t>(regs[1])
+                              : static_cast<uintptr_t>(regs[0]);
+                    if (exec_path_addr != 0) {
+                        int mfd = mem_fd_for(w);
+                        if (mfd >= 0) {
+                            char gp[512] = {0};
+                            ssize_t got = ::pread(mfd, gp, sizeof(gp) - 1,
+                                                  static_cast<off_t>(exec_path_addr));
+                            if (got < 0 &&
+                                (errno == ESRCH || errno == EIO || errno == EBADF)) {
+                                mem_fd_evict(w);
+                                mfd = mem_fd_for(w);
+                                if (mfd >= 0) {
+                                    got = ::pread(mfd, gp, sizeof(gp) - 1,
+                                                  static_cast<off_t>(exec_path_addr));
+                                }
+                            }
+                            if (got > 0) {
+                                gp[got] = '\0';
+                                // Pure, host-tested classifier (alr_exec.cpp): decides
+                                // whether to rewrite and to what, with the SAME sysdir/
+                                // already-host exclusions as the path-family branch.
+                                const auto med =
+                                    alr::runtime::decide_exec_path_mediation(
+                                        config.rootfs_dir, gp);
+                                if (first_exec_x0.empty()) {
+                                    first_exec_x0 = gp;
+                                    first_exec_reason = med.reason;
+                                }
+                                if (med.should_rewrite) {
+                                    const uintptr_t sp =
+                                        static_cast<uintptr_t>(regs[31]);
+                                    const uintptr_t scratch =
+                                        (sp - 2048) & ~static_cast<uintptr_t>(0xf);
+                                    const std::string& host = med.host_path;
+                                    ssize_t wr = ::pwrite(mfd, host.c_str(),
+                                                          host.size() + 1,
+                                                          static_cast<off_t>(scratch));
+                                    if (wr < 0 && (errno == ESRCH || errno == EIO ||
+                                                   errno == EBADF)) {
+                                        mem_fd_evict(w);
+                                        mfd = mem_fd_for(w);
+                                        if (mfd >= 0) {
+                                            wr = ::pwrite(mfd, host.c_str(),
+                                                          host.size() + 1,
+                                                          static_cast<off_t>(scratch));
+                                        }
+                                    }
+                                    if (wr == static_cast<ssize_t>(host.size() + 1)) {
+                                        // Rewrite ONLY the program-path register; argv
+                                        // (x1)/envp (x2) for execve, and dirfd (x0)/
+                                        // argv (x2)/envp (x3) for execveat, are left
+                                        // exactly as the guest set them.
+                                        if (is_at) {
+                                            regs[1] = scratch;
+                                        } else {
+                                            regs[0] = scratch;
+                                        }
+                                        if (::ptrace(PTRACE_SETREGSET, w,
+                                                     reinterpret_cast<void*>(NT_PRSTATUS),
+                                                     &io) == 0) {
+                                            ++exec_rewrites;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
+            ::ptrace(PTRACE_CONT, w, nullptr, nullptr);
+            continue;
+        }
+        if (event == PTRACE_EVENT_EXEC) {
+            // === ADR-003 §3 (B-2): a tracee completed execve into a NEW image ===
+            // PTRACE_O_TRACEEXEC reports this stop AFTER the kernel swapped the address
+            // space. The cached /proc/<tid>/mem fd now maps a DIFFERENT image, so we
+            // MUST evict it (else the next path/exec rewrite would pread/pwrite into the
+            // wrong address space). The stale-fd recovery on ESRCH/EIO/EBADF already
+            // catches this lazily, but an explicit evict here is the robust, race-free
+            // signal ADR-003 §2 (B-2) calls for. The seccomp filter + SEIZE trace are
+            // inherited across exec by the kernel, so we simply re-validate state and
+            // CONT — no loader re-map, no re-SETOPTIONS. The tid may differ from the
+            // exec'ing thread's (a non-leader thread that execs becomes the new leader,
+            // adopting the group tid); PTRACE_GETEVENTMSG gives the FORMER tid whose
+            // mem fd is now stale, so we evict both.
+            ++exec_events;
+            unsigned long former = 0;
+            if (::ptrace(PTRACE_GETEVENTMSG, w, nullptr, &former) == 0 &&
+                static_cast<pid_t>(former) != w) {
+                mem_fd_evict(static_cast<pid_t>(former));
+            }
+            mem_fd_evict(w);
             ::ptrace(PTRACE_CONT, w, nullptr, nullptr);
             continue;
         }
@@ -2424,6 +2543,20 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         << " interpose=" << (interpose_off ? "off" : "on") << ")";
     if (!first_rewrite.empty()) {
         out << "\nalr native loader first path rewrite=" << first_rewrite;
+    }
+    // ADR-003 exec re-entry telemetry (M-R4-execmap / M-R4-fork gate). For a guest
+    // that never execs (GIMP/foot/chromium --version) all four are 0 and the first-
+    // exec lines are omitted, so this is a strict superset add — the no-exec report
+    // body is unchanged. clone_events==guest_threads is reported via the existing
+    // 'guest threads spawned' line; exec_events>0 means the guest crossed the exec
+    // wall (B), exec_events==0 with a forking guest means it stayed fork-only (A).
+    out << "\nalr exec traps=" << exec_traps
+        << " rewrites=" << exec_rewrites
+        << " exec_events=" << exec_events
+        << " clone_events=" << guest_threads;
+    if (!first_exec_x0.empty()) {
+        out << "\nalr exec x0=" << first_exec_x0
+            << " reason=" << first_exec_reason;
     }
     out << "\nalr native loader seccomp-emulated syscalls=" << emulated_syscalls;
     if (emulated_syscalls > 0) {
