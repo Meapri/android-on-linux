@@ -42,6 +42,8 @@
 #define VK_USE_PLATFORM_ANDROID_KHR 1
 #endif
 #include <vulkan/vulkan.h>
+#include <android/hardware_buffer.h>  // VK-M2 body: AHB-backed clear render target
+#include <utility>                    // std::pair (real_pool/real_cmd maps)
 #endif
 
 namespace alr::gpu {
@@ -55,6 +57,7 @@ public:
     bool u8(uint8_t& v) { return take(&v, 1); }
     bool u32(uint32_t& v) { return take(&v, 4); }
     bool i32(int32_t& v) { return take(&v, 4); }
+    bool f32(float& v) { return take(&v, 4); }
     bool blob(const uint8_t*& data, uint32_t& len) {
         if (!u32(len)) return false;
         if (pos_ + len > n_) return false;
@@ -85,6 +88,7 @@ public:
     void u8(uint8_t v) { buf_.push_back(v); }
     void u32(uint32_t v) { raw(&v, 4); }
     void i32(int32_t v) { raw(&v, 4); }
+    void f32(float v) { raw(&v, 4); }
     void blob(const void* p, uint32_t n) {
         u32(n);
         if (n) raw(p, n);
@@ -117,20 +121,45 @@ struct VkPhysProps {
     std::vector<QF> queue_families;
 };
 
-// Host decode state: virtual instance/physical-device ids -> the props the host
-// resolved for them. (The real VkInstance/VkPhysicalDevice live behind these only on
-// the device build; the wire test populates props_ directly.) Mirrors HostState.
+// The clear a CMD_BEGIN_CLEAR recorded into a virtual command buffer, plus the geometry
+// of the offscreen target it renders into. Held until the matching QUEUE_SUBMIT replays
+// it. Decoupled from <vulkan.h> so the wire test can drive it with no SDK.
+struct VkClearRecord {
+    bool recorded = false;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    float clear[4] = {0, 0, 0, 0};  // RGBA, 0..1
+};
+
+// Host decode state: virtual instance/physical-device/device/queue/pool/cmd ids -> the
+// host resources behind them. (The real Vulkan handles live in the real_* maps only on
+// the device build; the wire test populates props_/clears_ directly.) Mirrors HostState.
 struct VkDecodeState {
     std::map<uint32_t, bool> instances;            // vinst -> created
     std::map<uint32_t, uint32_t> enum_base;        // vinst -> vphys_base assigned
     std::map<uint32_t, uint32_t> enum_count;       // vinst -> device count
     std::map<uint32_t, VkPhysProps> props;         // vphys -> resolved props
+    std::map<uint32_t, bool> devices;              // vdev -> created
+    std::map<uint32_t, bool> queues;               // vqueue -> bound
+    std::map<uint32_t, bool> pools;                // vpool -> created
+    std::map<uint32_t, bool> cmds;                 // vcmd -> allocated
+    std::map<uint32_t, VkClearRecord> clears;      // vcmd -> pending clear record
     bool ok = true;
     int decoded = 0;  // request ops dispatched
 
 #ifdef ALR_VK_DECODE_REAL
     std::map<uint32_t, VkInstance> real_inst;      // vinst -> real VkInstance
     std::map<uint32_t, VkPhysicalDevice> real_phys;// vphys -> real VkPhysicalDevice
+    // VK-M2 body: real logical-device objects, keyed by their virtual ids.
+    struct RealDevice {
+        VkPhysicalDevice phys = VK_NULL_HANDLE;
+        VkDevice dev = VK_NULL_HANDLE;
+        uint32_t gfx_family = 0;
+    };
+    std::map<uint32_t, RealDevice> real_dev;       // vdev -> logical device
+    std::map<uint32_t, VkQueue> real_queue;        // vqueue -> queue
+    std::map<uint32_t, std::pair<uint32_t, VkCommandPool>> real_pool;  // vpool -> (vdev, pool)
+    std::map<uint32_t, std::pair<uint32_t, VkCommandBuffer>> real_cmd; // vcmd -> (vdev, cmd)
 #endif
 };
 
@@ -224,6 +253,311 @@ inline void vk_real_destroy_instance(VkDecodeState& st, uint32_t vinst) {
     }
     st.instances.erase(vinst);
 }
+
+// ---- VK-M2 body, real Mali path: device + queue + command-buffer + clear-submit. ----
+
+// Find a graphics queue family on a real physical device. Returns false if none.
+inline bool vk_real_gfx_family(VkPhysicalDevice phys, uint32_t& family_out) {
+    uint32_t nqf = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(phys, &nqf, nullptr);
+    if (nqf == 0) return false;
+    std::vector<VkQueueFamilyProperties> qf(nqf);
+    vkGetPhysicalDeviceQueueFamilyProperties(phys, &nqf, qf.data());
+    for (uint32_t i = 0; i < nqf; ++i) {
+        if (qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) { family_out = i; return true; }
+    }
+    return false;
+}
+
+// Create a real logical VkDevice (one graphics queue) on the real physical device behind
+// virtual `vphys`. Returns the VkResult; on success fills st.real_dev[vdev] and records
+// the graphics family used in `gfx_family_out`.
+inline VkResult vk_real_create_device(VkDecodeState& st, uint32_t vphys, uint32_t vdev,
+                                      uint32_t& gfx_family_out) {
+    auto it = st.real_phys.find(vphys);
+    if (it == st.real_phys.end()) return VK_ERROR_INITIALIZATION_FAILED;
+    VkPhysicalDevice phys = it->second;
+    uint32_t family = 0;
+    if (!vk_real_gfx_family(phys, family)) return VK_ERROR_INITIALIZATION_FAILED;
+    const float prio = 1.0f;
+    VkDeviceQueueCreateInfo qci{};
+    qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    qci.queueFamilyIndex = family;
+    qci.queueCount = 1;
+    qci.pQueuePriorities = &prio;
+    VkDeviceCreateInfo dci{};
+    dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    dci.queueCreateInfoCount = 1;
+    dci.pQueueCreateInfos = &qci;
+    VkDevice dev = VK_NULL_HANDLE;
+    VkResult r = vkCreateDevice(phys, &dci, nullptr, &dev);
+    if (r == VK_SUCCESS) {
+        VkDecodeState::RealDevice rd;
+        rd.phys = phys;
+        rd.dev = dev;
+        rd.gfx_family = family;
+        st.real_dev[vdev] = rd;
+        gfx_family_out = family;
+    }
+    return r;
+}
+
+inline void vk_real_get_queue(VkDecodeState& st, uint32_t vdev, uint32_t queue_index,
+                              uint32_t vqueue) {
+    auto it = st.real_dev.find(vdev);
+    if (it == st.real_dev.end()) return;
+    VkQueue q = VK_NULL_HANDLE;
+    vkGetDeviceQueue(it->second.dev, it->second.gfx_family, queue_index, &q);
+    if (q != VK_NULL_HANDLE) st.real_queue[vqueue] = q;
+}
+
+inline VkResult vk_real_create_pool(VkDecodeState& st, uint32_t vdev, uint32_t vpool) {
+    auto it = st.real_dev.find(vdev);
+    if (it == st.real_dev.end()) return VK_ERROR_INITIALIZATION_FAILED;
+    VkCommandPoolCreateInfo pci{};
+    pci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    pci.queueFamilyIndex = it->second.gfx_family;
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkResult r = vkCreateCommandPool(it->second.dev, &pci, nullptr, &pool);
+    if (r == VK_SUCCESS) st.real_pool[vpool] = {vdev, pool};
+    return r;
+}
+
+inline VkResult vk_real_alloc_cmd(VkDecodeState& st, uint32_t vdev, uint32_t vpool,
+                                  uint32_t vcmd) {
+    auto dit = st.real_dev.find(vdev);
+    auto pit = st.real_pool.find(vpool);
+    if (dit == st.real_dev.end() || pit == st.real_pool.end())
+        return VK_ERROR_INITIALIZATION_FAILED;
+    VkCommandBufferAllocateInfo cbai{};
+    cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cbai.commandPool = pit->second.second;
+    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbai.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkResult r = vkAllocateCommandBuffers(dit->second.dev, &cbai, &cmd);
+    if (r == VK_SUCCESS) st.real_cmd[vcmd] = {vdev, cmd};
+    return r;
+}
+
+// Replay a CLEAR-only render into an AHB-backed COLOR_ATTACHMENT on the real Mali GPU,
+// submitting `vcmd` on `vqueue`, then read the cleared center pixel back on the CPU. This
+// is the device twin of alr_gpu_vk.hpp::run_vk_ahb_render_probe but driven by the virtual
+// handles the guest shipped. Returns an AlrVkRenderResult; fills px[4] (RGBA 0..255).
+// Self-contained (allocates+frees its own AHB/image/view/renderpass/framebuffer per call).
+inline int vk_real_clear_submit(VkDecodeState& st, uint32_t vdev, uint32_t vqueue,
+                                uint32_t vcmd, const VkClearRecord& rec, uint8_t px[4]) {
+    px[0] = px[1] = px[2] = px[3] = 0;
+    if (!rec.recorded) return ALR_VK_RENDER_NO_CLEAR_RECORDED;
+    auto dit = st.real_dev.find(vdev);
+    auto qit = st.real_queue.find(vqueue);
+    auto cit = st.real_cmd.find(vcmd);
+    if (dit == st.real_dev.end() || qit == st.real_queue.end() || cit == st.real_cmd.end())
+        return ALR_VK_RENDER_NO_DEVICE;
+    VkDevice dev = dit->second.dev;
+    VkQueue queue = qit->second;
+    VkCommandBuffer cmd = cit->second.second;
+    const uint32_t w = rec.width ? rec.width : 64;
+    const uint32_t h = rec.height ? rec.height : 64;
+
+    // ---- AHB color target (GPU framebuffer + CPU readable) ----
+    auto p_ahb_props = reinterpret_cast<PFN_vkGetAndroidHardwareBufferPropertiesANDROID>(
+        vkGetDeviceProcAddr(dev, "vkGetAndroidHardwareBufferPropertiesANDROID"));
+    if (!p_ahb_props) return ALR_VK_RENDER_TARGET_ALLOC;
+    AHardwareBuffer_Desc d{};
+    d.width = w;
+    d.height = h;
+    d.layers = 1;
+    d.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+    d.usage = AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER | AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN;
+    AHardwareBuffer* ahb = nullptr;
+    if (AHardwareBuffer_allocate(&d, &ahb) != 0 || ahb == nullptr)
+        return ALR_VK_RENDER_TARGET_ALLOC;
+
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkRenderPass rp = VK_NULL_HANDLE;
+    VkFramebuffer fb = VK_NULL_HANDLE;
+    int result = ALR_VK_RENDER_OK;
+    auto cleanup = [&]() {
+        if (fb) vkDestroyFramebuffer(dev, fb, nullptr);
+        if (rp) vkDestroyRenderPass(dev, rp, nullptr);
+        if (view) vkDestroyImageView(dev, view, nullptr);
+        if (image) vkDestroyImage(dev, image, nullptr);
+        if (mem) vkFreeMemory(dev, mem, nullptr);
+        AHardwareBuffer_release(ahb);
+    };
+
+    VkAndroidHardwareBufferFormatPropertiesANDROID fmt_props{};
+    fmt_props.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID;
+    VkAndroidHardwareBufferPropertiesANDROID ahb_props{};
+    ahb_props.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID;
+    ahb_props.pNext = &fmt_props;
+    if (p_ahb_props(dev, ahb, &ahb_props) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_TARGET_ALLOC; }
+    VkFormat color_fmt = (fmt_props.format != VK_FORMAT_UNDEFINED) ? fmt_props.format
+                                                                   : VK_FORMAT_R8G8B8A8_UNORM;
+
+    VkExternalMemoryImageCreateInfo ext_img{};
+    ext_img.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+    ext_img.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
+    VkImageCreateInfo img_ci{};
+    img_ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    img_ci.pNext = &ext_img;
+    img_ci.imageType = VK_IMAGE_TYPE_2D;
+    img_ci.format = color_fmt;
+    img_ci.extent = {w, h, 1};
+    img_ci.mipLevels = 1;
+    img_ci.arrayLayers = 1;
+    img_ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    img_ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    img_ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    img_ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    img_ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(dev, &img_ci, nullptr, &image) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_TARGET_ALLOC; }
+
+    uint32_t mem_type = 0;
+    bool found_type = false;
+    for (uint32_t i = 0; i < 32; ++i)
+        if (ahb_props.memoryTypeBits & (1u << i)) { mem_type = i; found_type = true; break; }
+    if (!found_type) { cleanup(); return ALR_VK_RENDER_TARGET_ALLOC; }
+    VkImportAndroidHardwareBufferInfoANDROID import_info{};
+    import_info.sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID;
+    import_info.buffer = ahb;
+    VkMemoryDedicatedAllocateInfo dedicated{};
+    dedicated.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+    dedicated.image = image;
+    dedicated.pNext = &import_info;
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.pNext = &dedicated;
+    mai.allocationSize = ahb_props.allocationSize;
+    mai.memoryTypeIndex = mem_type;
+    if (vkAllocateMemory(dev, &mai, nullptr, &mem) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_TARGET_ALLOC; }
+    if (vkBindImageMemory(dev, image, mem, 0) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_TARGET_ALLOC; }
+
+    VkImageViewCreateInfo vci{};
+    vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vci.image = image;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = color_fmt;
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (vkCreateImageView(dev, &vci, nullptr, &view) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_TARGET_ALLOC; }
+
+    VkAttachmentDescription att{};
+    att.format = color_fmt;
+    att.samples = VK_SAMPLE_COUNT_1_BIT;
+    att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    att.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    VkAttachmentReference att_ref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sub{};
+    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount = 1;
+    sub.pColorAttachments = &att_ref;
+    VkRenderPassCreateInfo rpci{};
+    rpci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    rpci.attachmentCount = 1;
+    rpci.pAttachments = &att;
+    rpci.subpassCount = 1;
+    rpci.pSubpasses = &sub;
+    if (vkCreateRenderPass(dev, &rpci, nullptr, &rp) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_RECORD; }
+
+    VkFramebufferCreateInfo fbci{};
+    fbci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    fbci.renderPass = rp;
+    fbci.attachmentCount = 1;
+    fbci.pAttachments = &view;
+    fbci.width = w;
+    fbci.height = h;
+    fbci.layers = 1;
+    if (vkCreateFramebuffer(dev, &fbci, nullptr, &fb) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_RECORD; }
+
+    // ---- record the CLEAR into the guest's command buffer ----
+    vkResetCommandBuffer(cmd, 0);
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(cmd, &bi) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_RECORD; }
+    VkClearValue clear{};
+    clear.color = {{rec.clear[0], rec.clear[1], rec.clear[2], rec.clear[3]}};
+    VkRenderPassBeginInfo rbi{};
+    rbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rbi.renderPass = rp;
+    rbi.framebuffer = fb;
+    rbi.renderArea.extent = {w, h};
+    rbi.clearValueCount = 1;
+    rbi.pClearValues = &clear;
+    vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdEndRenderPass(cmd);
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_RECORD; }
+
+    // ---- submit + fence-wait ----
+    VkFence fence = VK_NULL_HANDLE;
+    VkFenceCreateInfo fci{};
+    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    vkCreateFence(dev, &fci, nullptr, &fence);
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    if (vkQueueSubmit(queue, 1, &si, fence) != VK_SUCCESS) {
+        if (fence) vkDestroyFence(dev, fence, nullptr);
+        cleanup();
+        return ALR_VK_RENDER_SUBMIT;
+    }
+    if (fence) {
+        vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX);
+        vkDestroyFence(dev, fence, nullptr);
+    } else {
+        vkQueueWaitIdle(queue);
+    }
+
+    // ---- read the AHB back and sample the center pixel ----
+    AHardwareBuffer_Desc got{};
+    AHardwareBuffer_describe(ahb, &got);
+    void* cpu = nullptr;
+    if (AHardwareBuffer_lock(ahb, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN, -1, nullptr, &cpu) == 0 &&
+        cpu != nullptr) {
+        const uint32_t stride_px = got.stride ? got.stride : w;
+        const auto* base = static_cast<const unsigned char*>(cpu);
+        const size_t off = (static_cast<size_t>(h / 2) * stride_px + (w / 2)) * 4;
+        for (int i = 0; i < 4; ++i) px[i] = base[off + i];
+        AHardwareBuffer_unlock(ahb, nullptr);
+    } else {
+        cleanup();
+        return ALR_VK_RENDER_READBACK;
+    }
+
+    cleanup();
+    return result;
+}
+
+inline void vk_real_destroy_device(VkDecodeState& st, uint32_t vdev) {
+    auto it = st.real_dev.find(vdev);
+    if (it == st.real_dev.end()) return;
+    VkDevice dev = it->second.dev;
+    vkDeviceWaitIdle(dev);
+    // command buffers are freed with their pool; destroy pools owned by this device.
+    for (auto pit = st.real_pool.begin(); pit != st.real_pool.end();) {
+        if (pit->second.first == vdev) {
+            vkDestroyCommandPool(dev, pit->second.second, nullptr);
+            pit = st.real_pool.erase(pit);
+        } else {
+            ++pit;
+        }
+    }
+    for (auto cit = st.real_cmd.begin(); cit != st.real_cmd.end();) {
+        if (cit->second.first == vdev) cit = st.real_cmd.erase(cit);
+        else ++cit;
+    }
+    vkDestroyDevice(dev, nullptr);
+    st.real_dev.erase(it);
+}
 #endif  // ALR_VK_DECODE_REAL
 
 // ---------------------------------------------------------------------------
@@ -248,6 +582,18 @@ struct VkProvider {
     // For props: fill `out` for vphys; return true if the id was known.
     bool (*props)(void* ctx, uint32_t vphys, VkPhysProps& out) = nullptr;
     void (*destroy_instance)(void* ctx, uint32_t vinst) = nullptr;
+    // ---- VK-M2 body seams (synthetic = wire mode; null callbacks are no-ops). ----
+    // Create a logical device on vphys; return VkResult (0 == success), set gfx_family.
+    int (*create_device)(void* ctx, uint32_t vphys, uint32_t vdev,
+                         uint32_t* gfx_family_out) = nullptr;
+    void (*get_queue)(void* ctx, uint32_t vdev, uint32_t queue_index,
+                      uint32_t vqueue) = nullptr;
+    int (*create_pool)(void* ctx, uint32_t vdev, uint32_t vpool) = nullptr;
+    int (*alloc_cmd)(void* ctx, uint32_t vdev, uint32_t vpool, uint32_t vcmd) = nullptr;
+    // Replay the clear+submit; fill px[4] (RGBA 0..255); return AlrVkRenderResult.
+    int (*clear_submit)(void* ctx, uint32_t vdev, uint32_t vqueue, uint32_t vcmd,
+                        const VkClearRecord& rec, uint8_t px[4]) = nullptr;
+    void (*destroy_device)(void* ctx, uint32_t vdev) = nullptr;
     void* ctx = nullptr;
 };
 
@@ -337,6 +683,130 @@ inline bool decode_vk_batch(const uint8_t* data, size_t len, VkDecodeState& st,
                 break;
             }
 
+            // ---- VK-M2 body ops ----
+            case ALR_VK_OP_CREATE_DEVICE: {
+                uint32_t vinst = 0, vphys = 0, vdev = 0;
+                if (!r.u32(vinst) || !r.u32(vphys) || !r.u32(vdev)) { st.ok = false; break; }
+                int res = -1;
+                uint32_t gfx_family = 0;
+#ifdef ALR_VK_DECODE_REAL
+                if (!provider)
+                    res = static_cast<int>(vk_real_create_device(st, vphys, vdev, gfx_family));
+#endif
+                if (provider && provider->create_device)
+                    res = provider->create_device(provider->ctx, vphys, vdev, &gfx_family);
+                if (res == 0) st.devices[vdev] = true;
+                reply.u8(static_cast<uint8_t>(ALR_VK_REPLY_DEVICE));
+                reply.u32(vdev);
+                reply.i32(res);
+                reply.u32(gfx_family);
+                st.decoded++;
+                break;
+            }
+
+            case ALR_VK_OP_GET_DEVICE_QUEUE: {
+                uint32_t vdev = 0, queue_index = 0, vqueue = 0;
+                if (!r.u32(vdev) || !r.u32(queue_index) || !r.u32(vqueue)) { st.ok = false; break; }
+#ifdef ALR_VK_DECODE_REAL
+                if (!provider) vk_real_get_queue(st, vdev, queue_index, vqueue);
+#endif
+                if (provider && provider->get_queue)
+                    provider->get_queue(provider->ctx, vdev, queue_index, vqueue);
+                st.queues[vqueue] = true;  // client-side virtual id, no reply needed
+                st.decoded++;
+                break;
+            }
+
+            case ALR_VK_OP_CREATE_COMMAND_POOL: {
+                uint32_t vdev = 0, vpool = 0;
+                if (!r.u32(vdev) || !r.u32(vpool)) { st.ok = false; break; }
+                int res = -1;
+#ifdef ALR_VK_DECODE_REAL
+                if (!provider) res = static_cast<int>(vk_real_create_pool(st, vdev, vpool));
+#endif
+                if (provider && provider->create_pool)
+                    res = provider->create_pool(provider->ctx, vdev, vpool);
+                if (res == 0) st.pools[vpool] = true;
+                st.decoded++;
+                break;
+            }
+
+            case ALR_VK_OP_ALLOCATE_COMMAND_BUFFERS: {
+                uint32_t vdev = 0, vpool = 0, vcmd = 0;
+                if (!r.u32(vdev) || !r.u32(vpool) || !r.u32(vcmd)) { st.ok = false; break; }
+                int res = -1;
+#ifdef ALR_VK_DECODE_REAL
+                if (!provider) res = static_cast<int>(vk_real_alloc_cmd(st, vdev, vpool, vcmd));
+#endif
+                if (provider && provider->alloc_cmd)
+                    res = provider->alloc_cmd(provider->ctx, vdev, vpool, vcmd);
+                if (res == 0) st.cmds[vcmd] = true;
+                st.decoded++;
+                break;
+            }
+
+            case ALR_VK_OP_CMD_BEGIN_CLEAR: {
+                uint32_t vdev = 0, vcmd = 0, w = 0, h = 0;
+                float cr = 0, cg = 0, cb = 0, ca = 0;
+                if (!r.u32(vdev) || !r.u32(vcmd) || !r.u32(w) || !r.u32(h) ||
+                    !r.f32(cr) || !r.f32(cg) || !r.f32(cb) || !r.f32(ca)) {
+                    st.ok = false;
+                    break;
+                }
+                // The clear is RECORDED here (no GPU work yet); QUEUE_SUBMIT replays it.
+                VkClearRecord rec;
+                rec.recorded = true;
+                rec.width = w;
+                rec.height = h;
+                rec.clear[0] = cr; rec.clear[1] = cg; rec.clear[2] = cb; rec.clear[3] = ca;
+                st.clears[vcmd] = rec;
+                st.decoded++;
+                break;
+            }
+
+            case ALR_VK_OP_QUEUE_SUBMIT: {
+                uint32_t vdev = 0, vqueue = 0, vcmd = 0;
+                if (!r.u32(vdev) || !r.u32(vqueue) || !r.u32(vcmd)) { st.ok = false; break; }
+                int submit_res = 0;
+                int render_res = ALR_VK_RENDER_NO_CLEAR_RECORDED;
+                uint8_t px[4] = {0, 0, 0, 0};
+                auto cit = st.clears.find(vcmd);
+                const VkClearRecord rec = (cit != st.clears.end()) ? cit->second : VkClearRecord{};
+#ifdef ALR_VK_DECODE_REAL
+                if (!provider)
+                    render_res = vk_real_clear_submit(st, vdev, vqueue, vcmd, rec, px);
+#endif
+                if (provider && provider->clear_submit)
+                    render_res = provider->clear_submit(provider->ctx, vdev, vqueue, vcmd, rec, px);
+                if (render_res != ALR_VK_RENDER_OK && render_res != ALR_VK_RENDER_NO_CLEAR_RECORDED)
+                    submit_res = -1;  // a host stage failed; surface a non-success submit code
+                if (cit != st.clears.end()) st.clears.erase(cit);  // consume the recorded clear
+                reply.u8(static_cast<uint8_t>(ALR_VK_REPLY_SUBMIT));
+                reply.u32(vdev);
+                reply.u32(vcmd);
+                reply.i32(submit_res);
+                reply.i32(render_res);
+                reply.u8(px[0]);
+                reply.u8(px[1]);
+                reply.u8(px[2]);
+                reply.u8(px[3]);
+                st.decoded++;
+                break;
+            }
+
+            case ALR_VK_OP_DESTROY_DEVICE: {
+                uint32_t vdev = 0;
+                if (!r.u32(vdev)) { st.ok = false; break; }
+#ifdef ALR_VK_DECODE_REAL
+                if (!provider) vk_real_destroy_device(st, vdev);
+#endif
+                if (provider && provider->destroy_device)
+                    provider->destroy_device(provider->ctx, vdev);
+                st.devices.erase(vdev);
+                st.decoded++;
+                break;
+            }
+
             default:
                 // Unknown opcode: fail-stop (same policy as the GLES decoder) — never
                 // emit an op not in alr_gpu_vk_proto.hpp.
@@ -361,10 +831,24 @@ struct VkReplyPhysCount {
     uint32_t count = 0;
     int32_t result = 0;
 };
+struct VkReplyDevice {
+    uint32_t vdev = 0;
+    int32_t result = 0;
+    uint32_t gfx_family = 0;
+};
+struct VkReplySubmit {
+    uint32_t vdev = 0;
+    uint32_t vcmd = 0;
+    int32_t submit_result = 0;
+    int32_t render_result = 0;  // AlrVkRenderResult
+    uint8_t px[4] = {0, 0, 0, 0};
+};
 struct VkDecodedReply {
     std::vector<VkReplyInstance> instances;
     std::vector<VkReplyPhysCount> enumerations;
     std::map<uint32_t, VkPhysProps> props;  // vphys -> props
+    std::vector<VkReplyDevice> devices;      // VK-M2 body
+    std::vector<VkReplySubmit> submits;      // VK-M2 body
     bool ok = true;
 };
 
@@ -416,6 +900,26 @@ inline bool decode_vk_reply(const uint8_t* data, size_t len, VkDecodedReply& out
                 if (!r.u8(is_sw)) { out.ok = false; return false; }
                 p.is_software = (is_sw != 0);
                 out.props[vphys] = p;
+                break;
+            }
+            case ALR_VK_REPLY_DEVICE: {
+                VkReplyDevice rd{};
+                if (!r.u32(rd.vdev) || !r.i32(rd.result) || !r.u32(rd.gfx_family)) {
+                    out.ok = false;
+                    return false;
+                }
+                out.devices.push_back(rd);
+                break;
+            }
+            case ALR_VK_REPLY_SUBMIT: {
+                VkReplySubmit rs{};
+                if (!r.u32(rs.vdev) || !r.u32(rs.vcmd) || !r.i32(rs.submit_result) ||
+                    !r.i32(rs.render_result) || !r.u8(rs.px[0]) || !r.u8(rs.px[1]) ||
+                    !r.u8(rs.px[2]) || !r.u8(rs.px[3])) {
+                    out.ok = false;
+                    return false;
+                }
+                out.submits.push_back(rs);
                 break;
             }
             default:
