@@ -43,6 +43,37 @@ class AccessMode(Enum):
     READ_WRITE = "rw"
 
 
+class BridgeMode(Enum):
+    """마운트가 _희망_ 하는 브리지 메커니즘(`AccessMode` 와 직교).
+
+    docs/design/saf-proxy.md §0/§5.
+      COPY  = 게스트 open 을 rootfs 임시파일 copy-in/out 으로(폴백, 최대 호환).
+      PROXY = 게스트 open 결과 fd 를 SAF 가 연 라이브 fd 로 치환(직통, 진짜
+              마운트感). 실제 동작은 런타임 능력에 따라 copy 로 강등될 수 있다.
+
+    `bridge_mode` 는 _희망_ 일 뿐, escape/ro 정책이 항상 이긴다(§5 불변식 3).
+    """
+
+    COPY = "copy"
+    PROXY = "proxy"
+
+
+class BridgeDecision(Enum):
+    """supervisor(`runtime_report.cpp` trap 핸들러)가 게스트 openat 트랩에서
+    내릴 결정. file-bridge-saf.md §5-F 의 C++ `SafDecision` 과 1:1.
+
+      FALLTHROUGH   = SAF 무관: 기존 rootfs path rewrite 로 처리(현행 동작).
+      REWRITE_PATH  = copy 모드: copy-in 한 host 경로로 in-place x1 rewrite.
+      SUBSTITUTE_FD = proxy 모드: ALR 가 연 SAF fd 를 게스트 fd 로 치환(§3-C).
+      DENY          = 정책 위반(ro 위반/escape): EACCES/EROFS 로 실패.
+    """
+
+    FALLTHROUGH = "fallthrough"
+    REWRITE_PATH = "rewrite_path"
+    SUBSTITUTE_FD = "substitute_fd"
+    DENY = "deny"
+
+
 class Operation(Enum):
     """게스트가 요청하는 파일 연산의 의도(쓰기 권한 강제에 사용)."""
 
@@ -89,6 +120,8 @@ class SafMount:
     tree_uri: str
     label: str
     mode: AccessMode = AccessMode.READ_ONLY
+    # 희망 브리지 메커니즘. 기본 COPY(가장 안전한 폴백). `mode`(ro/rw)와 직교.
+    bridge_mode: BridgeMode = BridgeMode.COPY
 
     def __post_init__(self) -> None:
         if not _LABEL_RE.match(self.label):
@@ -122,6 +155,8 @@ class ResolvedPath:
     mode: AccessMode
     # 마운트 루트 기준 상대 경로 컴포넌트(빈 리스트 = 마운트 루트 자체).
     rel_components: tuple[str, ...]
+    # 이 마운트가 희망하는 브리지 메커니즘(런타임 decision 매핑 입력).
+    bridge_mode: BridgeMode = BridgeMode.COPY
 
     @property
     def rel_path(self) -> str:
@@ -130,6 +165,15 @@ class ResolvedPath:
     @property
     def is_mount_root(self) -> bool:
         return len(self.rel_components) == 0
+
+    @property
+    def mount_prefix(self) -> str:
+        """이 해석의 게스트 마운트 루트(예 /mnt/android/downloads).
+
+        proxy fd-주입 대상 판정에서 supervisor 가 "이 트랩 경로가 어느 SAF
+        마운트 prefix 인가"를 모호함 없이 알게 하는 값.
+        """
+        return f"{SAF_MOUNT_ROOT}/{self.label}"
 
 
 def _is_tree_uri(uri: str) -> bool:
@@ -252,7 +296,119 @@ class SafBridge:
             label=mount.label,
             mode=mount.mode,
             rel_components=tuple(rel),
+            bridge_mode=mount.bridge_mode,
         )
+
+
+# --- §5-F decision 매핑 (host 절반: trap 결정 모델) ---------------------------
+#
+# file-bridge-saf.md §5-F / saf-proxy.md §5. 게스트 openat 트랩에서 supervisor 가
+# 어떤 decision 을 내려야 하는지의 **순수 함수**. Android API/JNI 호출 0 — fd 를
+# 실제로 열거나 복사하거나 주입하지 않는다. "어느 트랩에서 어떤 결정을, 어떤
+# 페이로드로" 만 고정한다(실 fd/copy 는 런타임 책임).
+
+# DENY 에 실리는 errno(런타임이 게스트에 반환). file-bridge-saf.md §5-F 매핑.
+_EACCES = 13  # escape/정책 위반
+_EROFS = 30   # read-only 마운트에 쓰기
+
+
+@dataclass(frozen=True)
+class ProxyTarget:
+    """SUBSTITUTE_FD 결정의 페이로드 = proxy fd-주입 _대상_ 메타데이터.
+
+    supervisor(saf-proxy.md §3-C)가 이 값으로 SAF URI 를 만들어 fd 를 열고
+    게스트 fd 로 치환한다. `mount_prefix` 가 정확히 `/mnt/android/<label>` 이고
+    `rel_path` 가 그 아래 상대경로임이 보장된다(prefix 밖이면 애초에
+    FALLTHROUGH — fd-주입 비대상).
+    """
+
+    tree_uri: str
+    label: str
+    mount_prefix: str   # /mnt/android/<label> — fd-주입 대상 prefix 판정
+    rel_path: str       # mount_prefix 아래 상대경로(마운트 루트면 "")
+    read_only: bool     # ro 마운트면 openFileDescriptor(uri, "r")
+
+
+@dataclass(frozen=True)
+class SafResolution:
+    """`decide()` 결과 = trap decision + 모드별 페이로드.
+
+    런타임(`alr_saf_resolve`)이 이 값을 C++ `SafResolveResult` 로 옮긴다.
+      - FALLTHROUGH : 둘 다 None — 기존 rootfs 중재로 폴백.
+      - DENY        : deny_errno(13/30) — 게스트에 EACCES/EROFS.
+      - REWRITE_PATH: resolved + copy_writeback(쓰기면 close 에서 write-back).
+                      실제 copy-in host 경로는 런타임이 채운다(모델 밖).
+      - SUBSTITUTE_FD: proxy_target — supervisor 가 fd 를 열어 치환.
+    """
+
+    decision: BridgeDecision
+    resolved: Optional[ResolvedPath] = None
+    deny_errno: Optional[int] = None
+    proxy_target: Optional[ProxyTarget] = None
+    copy_writeback: bool = False
+
+
+def decide(
+    bridge: "SafBridge",
+    guest_path: str,
+    *,
+    write: bool = False,
+    create: bool = False,
+) -> SafResolution:
+    """게스트 openat 경로 + 쓰기/생성 의도 → trap decision(순수).
+
+    `write`/`create` 는 openat flags 에서 런타임이 뽑은 의도(O_WRONLY/O_RDWR =>
+    write, O_CREAT => create). 둘 다 변형 의도로 묶여 정책에 쓰인다.
+
+    분기(saf-proxy.md §5 표):
+      NOT_MAPPED            -> FALLTHROUGH
+      ro 마운트 + 변형 의도 -> DENY(EROFS)
+      ESCAPE               -> DENY(EACCES)
+      ok + PROXY           -> SUBSTITUTE_FD(proxy_target)
+      ok + COPY            -> REWRITE_PATH(copy_writeback=변형 의도)
+
+    escape/ro 정책은 모드 분기 _전에_ `resolve` 로 강제되므로, proxy 든 copy 든
+    /mnt/android/<label> 밖을 못 만지고 ro 에 못 쓴다(불변식 1·3).
+    """
+    mutates = write or create
+    op = (
+        Operation.CREATE if create else Operation.WRITE if write else Operation.READ
+    )
+    try:
+        resolved = bridge.resolve(guest_path, op)
+    except BridgeError as e:
+        if e.kind is BridgeErrorKind.NOT_MAPPED:
+            # SAF 밖 — 런타임이 기존 rootfs path rewrite 로 처리.
+            return SafResolution(BridgeDecision.FALLTHROUGH)
+        if e.kind is BridgeErrorKind.UNKNOWN_LABEL:
+            # /mnt/android/<없는라벨> — SAF 경로 모양이나 등록 안 됨. 게스트가
+            # 임의 라벨로 rootfs 를 침범하지 못하게 DENY(폴백 아님: prefix 안).
+            return SafResolution(BridgeDecision.DENY, deny_errno=_EACCES)
+        if e.kind is BridgeErrorKind.READ_ONLY_VIOLATION:
+            return SafResolution(BridgeDecision.DENY, deny_errno=_EROFS)
+        # ESCAPE / 그 외 정책 위반 -> EACCES.
+        return SafResolution(BridgeDecision.DENY, deny_errno=_EACCES)
+
+    # 여기 도달 = escape/ro 통과한 SAF 경로. 모드로만 분기.
+    if resolved.bridge_mode is BridgeMode.PROXY:
+        target = ProxyTarget(
+            tree_uri=resolved.tree_uri,
+            label=resolved.label,
+            mount_prefix=resolved.mount_prefix,
+            rel_path=resolved.rel_path,
+            read_only=resolved.mode is AccessMode.READ_ONLY,
+        )
+        return SafResolution(
+            BridgeDecision.SUBSTITUTE_FD,
+            resolved=resolved,
+            proxy_target=target,
+        )
+    # COPY: copy-in 후 host 경로 rewrite. 변형 의도면 close 에서 write-back.
+    return SafResolution(
+        BridgeDecision.REWRITE_PATH,
+        resolved=resolved,
+        copy_writeback=mutates,
+    )
 
 
 # --- share intent (ACTION_SEND / ACTION_SEND_MULTIPLE) 라우팅 ------------------
