@@ -28,4 +28,4 @@ def test_main_activity_reports_gpu_passthrough_boundary_verdict():
     assert "ALR GPU PASSTHROUGH BOUNDARY: " in text
     assert "gpuPassthroughBoundaryViable" in text
     assert "ALR guest->host GPU boundary cost probe:" in text
-    assert "build: 0.4.161-sd-v161" in text
+    assert "build: 0.4.162-sd-v162" in text

@@ -814,7 +814,7 @@ class MainActivity : Activity() {
             alrSeccompPathTrapProbe.lineStartingWith("alr sc PATH_MEDIATION_VIABLE=")
                 .substringAfter("PATH_MEDIATION_VIABLE=", "") == "yes"
 
-        val executionSummary = "build: 0.4.161-sd-v161" +
+        val executionSummary = "build: 0.4.162-sd-v162" +
             "\nexecution summary" +
             "\nROOTFS EXECUTION: ${if (rootfsExecutionPassed) "PASS" else "FAIL"}" +
             "\nSHELL SCRIPT EXECUTION: ${if (shellScriptExecutionPassed) "PASS" else "FAIL"}" +
@@ -1367,6 +1367,19 @@ class MainActivity : Activity() {
                     val wlStart = nativeWaylandCompositorStart(
                         cacheDir.absolutePath, holder.surface, dm.densityDpi, dm.xdpi, dm.ydpi,
                         outW, outH, refreshMhz)
+                    // chromium-test fast path: when a CR-test flag is set, the chromium probe
+                    // thread (started in onCreate) needs the loader's guest-launch lock
+                    // immediately. This GUI guest battery (wl/pixman/gtk/foot/GIMP — GIMP alone
+                    // holds the lock up to its 1800s alarm) otherwise makes chromium wait ~250s,
+                    // so CR-1/CR-2 drains keep missing the window. Skip it here: the compositor
+                    // is already up (above) and headless chromium (--disable-gpu) needs none of
+                    // these. Normal cold starts (no flag) are byte-identical.
+                    if (java.io.File("/data/local/tmp/.alr-cr1").isFile ||
+                        java.io.File("/data/local/tmp/.alr-cr2").isFile) {
+                        android.util.Log.i("alr_loader",
+                            "chromium-test mode: skipping GUI guest battery so chromium gets the loader lock")
+                        return
+                    }
                     val wlClient = nativeAlrNativeLoaderProbe(
                         packageName,
                         applicationInfo.nativeLibraryDir,
