@@ -299,6 +299,114 @@ ExecPathMediation decide_exec_path_mediation(
     return out;
 }
 
+namespace {
+
+// Split a "KEY=VALUE" (or bare "KEY") env entry at the FIRST '='. A bare "KEY"
+// (no '=') yields {key, ""} — matched as a present-but-empty var, which is the
+// POSIX convention for environ entries. Mirrors how getenv() keys on the prefix
+// up to the first '='.
+std::pair<std::string_view, std::string_view> split_env_entry(std::string_view entry) {
+    const std::size_t eq = entry.find('=');
+    if (eq == std::string_view::npos) {
+        return {entry, std::string_view{}};
+    }
+    return {entry.substr(0, eq), entry.substr(eq + 1)};
+}
+
+// True iff `needle` appears as a whole colon-delimited element of `list` (an
+// LD_PRELOAD value). "/a/b.so" is contained in "/a/b.so:/c.so" but NOT in
+// "/x/a/b.so.0" — element boundaries are the ':' separators (and string ends).
+bool colon_list_contains(std::string_view list, std::string_view needle) {
+    if (needle.empty()) {
+        return false;
+    }
+    std::size_t start = 0;
+    while (start <= list.size()) {
+        const std::size_t colon = list.find(':', start);
+        const std::size_t end = colon == std::string_view::npos ? list.size() : colon;
+        if (list.substr(start, end - start) == needle) {
+            return true;
+        }
+        if (colon == std::string_view::npos) {
+            break;
+        }
+        start = colon + 1;
+    }
+    return false;
+}
+
+}  // namespace
+
+ExecEnvpInjection decide_exec_envp_injection(
+    std::string_view rootfs_dir,
+    const std::vector<std::string>& env_entries) {
+    ExecEnvpInjection out;
+    // The interposer self-disables (pure passthrough) when ALR_ROOTFS is unset, so
+    // with no rootfs there is nothing to mediate — leave the child's envp alone.
+    if (rootfs_dir.empty()) {
+        out.reason = "already";
+        return out;
+    }
+    // Derive the two target values purely from rootfs_dir. These are the SAME
+    // strings the parent loader pushes into the first guest's env (runtime_report
+    // env-setup): LD_PRELOAD must be the ABSOLUTE ROOTFS host path (R3 finding) and
+    // ALR_ROOTFS is the rootfs dir itself.
+    out.rootfs_value.assign(rootfs_dir);
+    out.interpose_so = std::string(rootfs_dir) + "/usr/lib/androlinux/libalr_interpose.so";
+
+    // Scan the child's existing envp for the two vars (first occurrence wins, as
+    // libc's environ lookup does). We capture the existing LD_PRELOAD value so we
+    // can PREPEND the interpose .so while preserving the guest's own preloads.
+    bool have_ld_preload = false;
+    bool ld_preload_satisfied = false;
+    std::string_view existing_ld_preload;
+    bool have_rootfs = false;
+    for (const auto& entry : env_entries) {
+        const auto [key, value] = split_env_entry(entry);
+        if (!have_ld_preload && key == "LD_PRELOAD") {
+            have_ld_preload = true;
+            existing_ld_preload = value;
+            ld_preload_satisfied = colon_list_contains(value, out.interpose_so);
+        } else if (!have_rootfs && key == "ALR_ROOTFS") {
+            have_rootfs = true;
+        }
+    }
+
+    const bool need_ld = !ld_preload_satisfied;       // absent OR present-without-interpose
+    const bool need_rootfs = !have_rootfs;
+
+    if (need_ld) {
+        if (have_ld_preload) {
+            // Guest set its own LD_PRELOAD without our .so: prepend the interpose
+            // .so (FIRST so its wrappers take precedence) and preserve the rest.
+            // The supervisor must DROP the old LD_PRELOAD entry from the rebuilt
+            // array and append this combined one.
+            out.replace_ld_preload = true;
+            out.ld_preload_value =
+                out.interpose_so + ":" + std::string(existing_ld_preload);
+        } else {
+            // No guest LD_PRELOAD: a fresh append.
+            out.ld_preload_value = out.interpose_so;
+        }
+        out.add_entries.push_back("LD_PRELOAD=" + out.ld_preload_value);
+    }
+    if (need_rootfs) {
+        out.add_entries.push_back("ALR_ROOTFS=" + out.rootfs_value);
+    }
+
+    out.should_inject = !out.add_entries.empty() || out.replace_ld_preload;
+    if (!out.should_inject) {
+        out.reason = "already";
+    } else if (need_ld && need_rootfs) {
+        out.reason = out.replace_ld_preload ? "prepend-ld" : "inject-both";
+    } else if (need_ld) {
+        out.reason = out.replace_ld_preload ? "prepend-ld" : "inject-ld";
+    } else {
+        out.reason = "inject-rootfs";
+    }
+    return out;
+}
+
 ExecutableResolution resolve_guest_executable(
     const RuntimeConfig& config,
     std::string_view requested_program) {

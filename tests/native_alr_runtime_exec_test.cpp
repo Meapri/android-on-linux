@@ -162,6 +162,112 @@ int main() {
         require(m.reason == "empty", "exec empty: reason");
     }
 
+    // === ADR-003 §3 (B-3): execve child envp re-injection decision model ===
+    // The PURE classifier the supervisor's exec branch (runtime_report.cpp) consumes
+    // to rebuild the exec'd child's envp so the new image re-enters ALR interpose
+    // mediation (LD_PRELOAD=<abs rootfs .so>, ALR_ROOTFS=<rootfs>). The supervisor
+    // owns the tracee-memory plumbing; this fixes the var-set logic with no ptrace.
+    const std::string interpose_so = rootfs + "/usr/lib/androlinux/libalr_interpose.so";
+
+    // (B1) A bare child envp (dpkg → sh → dpkg-deb, no preload) gets BOTH vars added.
+    {
+        const std::vector<std::string> env = {"PATH=/usr/bin:/bin", "HOME=/root"};
+        const auto inj = alr::runtime::decide_exec_envp_injection(rootfs, env);
+        require(inj.should_inject, "envp both: should inject");
+        require(inj.reason == "inject-both", "envp both: reason");
+        require(!inj.replace_ld_preload, "envp both: no LD_PRELOAD to replace");
+        require(inj.interpose_so == interpose_so, "envp both: interpose .so path");
+        require(inj.rootfs_value == rootfs, "envp both: rootfs value");
+        require(inj.ld_preload_value == interpose_so, "envp both: fresh LD_PRELOAD value");
+        require(inj.add_entries.size() == 2, "envp both: two add entries");
+        require(inj.add_entries[0] == "LD_PRELOAD=" + interpose_so, "envp both: add LD_PRELOAD");
+        require(inj.add_entries[1] == "ALR_ROOTFS=" + rootfs, "envp both: add ALR_ROOTFS");
+    }
+
+    // (B2) Idempotent re-exec: a child whose parent we already injected inherits a
+    //      satisfied envp (interpose .so in LD_PRELOAD + ALR_ROOTFS) → NO-OP. This is
+    //      what keeps the dpkg→sh→dpkg-deb chain from re-rebuilding every hop.
+    {
+        const std::vector<std::string> env = {
+            "PATH=/usr/bin:/bin",
+            "LD_PRELOAD=" + interpose_so,
+            "ALR_ROOTFS=" + rootfs,
+        };
+        const auto inj = alr::runtime::decide_exec_envp_injection(rootfs, env);
+        require(!inj.should_inject, "envp already: no-op");
+        require(inj.reason == "already", "envp already: reason");
+        require(inj.add_entries.empty(), "envp already: no add entries");
+        require(!inj.replace_ld_preload, "envp already: no replace");
+    }
+
+    // (B3) Guest set its OWN LD_PRELOAD (e.g. a fakeroot/sanitizer .so) without our
+    //      interpose .so: PREPEND ours (first, so its wrappers win) preserving theirs,
+    //      and signal the supervisor to DROP the old LD_PRELOAD entry. ALR_ROOTFS also
+    //      missing here → reason stays prepend-ld (LD path dominates the label).
+    {
+        const std::vector<std::string> env = {
+            "PATH=/usr/bin:/bin",
+            "LD_PRELOAD=/opt/fakeroot/libfakeroot.so",
+        };
+        const auto inj = alr::runtime::decide_exec_envp_injection(rootfs, env);
+        require(inj.should_inject, "envp prepend: should inject");
+        require(inj.replace_ld_preload, "envp prepend: replace flagged");
+        require(inj.reason == "prepend-ld", "envp prepend: reason");
+        require(inj.ld_preload_value == interpose_so + ":/opt/fakeroot/libfakeroot.so",
+                "envp prepend: interpose prepended to guest preload");
+        require(inj.add_entries.front() == "LD_PRELOAD=" + inj.ld_preload_value,
+                "envp prepend: combined LD_PRELOAD added");
+        // ALR_ROOTFS missing too → also appended.
+        require(inj.add_entries.back() == "ALR_ROOTFS=" + rootfs,
+                "envp prepend: ALR_ROOTFS still added");
+    }
+
+    // (B4) Guest LD_PRELOAD ALREADY contains our interpose .so among others → LD is
+    //      satisfied; only ALR_ROOTFS (missing) is added. No replace.
+    {
+        const std::vector<std::string> env = {
+            "LD_PRELOAD=/opt/x.so:" + interpose_so,
+        };
+        const auto inj = alr::runtime::decide_exec_envp_injection(rootfs, env);
+        require(inj.should_inject, "envp rootfs-only: should inject");
+        require(inj.reason == "inject-rootfs", "envp rootfs-only: reason");
+        require(!inj.replace_ld_preload, "envp rootfs-only: LD already satisfied");
+        require(inj.ld_preload_value.empty(), "envp rootfs-only: no LD value emitted");
+        require(inj.add_entries.size() == 1, "envp rootfs-only: one add entry");
+        require(inj.add_entries[0] == "ALR_ROOTFS=" + rootfs, "envp rootfs-only: ALR_ROOTFS");
+    }
+
+    // (B5) LD_PRELOAD missing but ALR_ROOTFS already present → only LD added (fresh).
+    {
+        const std::vector<std::string> env = {"ALR_ROOTFS=" + rootfs, "TERM=xterm"};
+        const auto inj = alr::runtime::decide_exec_envp_injection(rootfs, env);
+        require(inj.should_inject, "envp ld-only: should inject");
+        require(inj.reason == "inject-ld", "envp ld-only: reason");
+        require(!inj.replace_ld_preload, "envp ld-only: fresh append, no replace");
+        require(inj.add_entries.size() == 1, "envp ld-only: one add entry");
+        require(inj.add_entries[0] == "LD_PRELOAD=" + interpose_so, "envp ld-only: LD entry");
+    }
+
+    // (B6) Substring-not-element guard: a path whose name CONTAINS the interpose .so
+    //      as a substring but not as a whole colon element must NOT count as present.
+    {
+        const std::vector<std::string> env = {
+            "LD_PRELOAD=" + interpose_so + ".bak",
+        };
+        const auto inj = alr::runtime::decide_exec_envp_injection(rootfs, env);
+        require(inj.replace_ld_preload, "envp substr: .bak is not the interpose element");
+        require(inj.ld_preload_value == interpose_so + ":" + interpose_so + ".bak",
+                "envp substr: interpose prepended (not deduped against substring)");
+    }
+
+    // (B7) Empty rootfs (interposer self-disables) → unconditional no-op.
+    {
+        const std::vector<std::string> env = {"PATH=/usr/bin"};
+        const auto inj = alr::runtime::decide_exec_envp_injection("", env);
+        require(!inj.should_inject, "envp no-rootfs: no-op");
+        require(inj.reason == "already", "envp no-rootfs: reason");
+    }
+
     std::filesystem::remove_all(root);
     std::cout << "alr runtime exec native test ok\n";
     return EXIT_SUCCESS;
