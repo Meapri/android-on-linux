@@ -108,7 +108,11 @@ class MainActivity : Activity() {
                         "/usr/lib/chromium/chromium-headless-shell\n--no-sandbox\n--single-process" +
                             "\n--no-zygote\n--disable-gpu\n--disable-dev-shm-usage" +
                             "\n--user-data-dir=/tmp/cr1-profile\n--no-first-run" +
-                            "\n--no-default-browser-check\n--disable-crash-reporter\n--dump-dom" +
+                            "\n--no-default-browser-check\n--disable-crash-reporter" +
+                            // v159 post-ICU wedge diagnosis: chromium verbose init log to
+                            // stderr (merged into the captured guest output) — the LAST line
+                            // before the stall pinpoints which init stage blocks.
+                            "\n--enable-logging=stderr\n--v=1\n--dump-dom" +
                             "\ndata:text/html,<h1>ALR-CR1-OK</h1><div style=color:red>render</div>",
                     )
                     val cr1Rendered = crCr1.contains("ALR-CR1-OK")
@@ -775,7 +779,7 @@ class MainActivity : Activity() {
             alrSeccompPathTrapProbe.lineStartingWith("alr sc PATH_MEDIATION_VIABLE=")
                 .substringAfter("PATH_MEDIATION_VIABLE=", "") == "yes"
 
-        val executionSummary = "build: 0.4.158-sd-v158" +
+        val executionSummary = "build: 0.4.159-sd-v159" +
             "\nexecution summary" +
             "\nROOTFS EXECUTION: ${if (rootfsExecutionPassed) "PASS" else "FAIL"}" +
             "\nSHELL SCRIPT EXECUTION: ${if (shellScriptExecutionPassed) "PASS" else "FAIL"}" +
