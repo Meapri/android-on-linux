@@ -831,6 +831,14 @@ static int alr_open_emit(int dirfd, const char *path, int flags, mode_t mode) {
         if (rel[0] == '\0') rel = ".";
         long r = alr_tramp_syscall(__NR_openat2, g_rootfs_fd, (long)rel,
                                    (long)&how, (long)sizeof how, 0, 0);
+        /* G1 diag: spotlight absolute O_CREAT served via openat2(RESOLVE_IN_ROOT)
+         * (the dpkg .dpkg-new data-file create path) so a device drain shows the
+         * exact guest path, the rootfs-relative path actually opened, and the fd/
+         * errno — to localize the unpack "No such file or directory" timestamp
+         * failure. Diagnostic only; gated on g_diag, errno saved/restored. */
+        if (g_diag && (flags & O_CREAT)) {
+            alr_diag("abscreat-o2", path, rel, (r < 0 && r >= -4095) ? r : 0);
+        }
         return (int)alr_ret(r);
     }
     /* Fallback: string-prefix rewrite (absolute only) + plain openat. */
@@ -1592,7 +1600,57 @@ int utimensat(int dirfd, const char *path, const struct timespec times[2],
              "utimensat");
     char b[ALR_PBUF];
     const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
-    return real(dirfd, p, times, flags);
+    int r = real(dirfd, p, times, flags);
+    /* G1 diag: the dpkg unpack failure surfaces HERE ("error setting timestamps
+     * of '/usr/bin/hello.dpkg-new'"). Log guest path, rewritten path, and result
+     * so a device drain confirms whether the rewrite matches where the .dpkg-new
+     * file was actually created (abscreat-o2 above) — the ENOENT root cause.
+     * Diagnostic only; gated on g_diag, errno saved/restored by alr_diag. */
+    if (g_diag) {
+        alr_diag("utimensat", path, (p != path) ? p : "(norw)",
+                 (r == 0) ? 0 : -errno);
+    }
+    return r;
+}
+
+/* utimes/lutimes: the path-based timestamp setters dpkg ACTUALLY uses.
+ * --------------------------------------------------------------------------
+ * DEVICE-PROVEN ROOT CAUSE (G1 drain, /tmp/aptdrain13.log): dpkg 1.22 (arm64,
+ * glibc 2.39) sets a freshly-unpacked file's timestamps via utimes()/lutimes(),
+ * NOT utimensat() — dpkg's only UND timestamp symbols are `utimes` + `lutimes`.
+ * Its data-file create DOES go through our open() wrapper (abscreat-o2 shows the
+ * .dpkg-new created under the rootfs), but the subsequent timestamp call landed
+ * on the UNWRAPPED utimes(), which then hit the BARE literal path
+ * "/usr/bin/hello.dpkg-new" (not the rootfs) -> ENOENT -> dpkg aborts the unpack
+ * ("error setting timestamps of '/usr/bin/hello.dpkg-new'") -> configured=false.
+ * Wrapping utimes/lutimes with the same absolute-path rewrite as utime/utimensat
+ * closes the gap so the timestamp lands on the same rootfs file the open created.
+ * struct timeval is forwarded opaquely (only the pointer is passed through), so
+ * no <sys/time.h> dependency is added to this freestanding-style unit. */
+struct timeval;  /* opaque; we only forward the pointer */
+int utimes(const char *path, const struct timeval times[2]) {
+    static int (*real)(const char *, const struct timeval[2]);
+    ALR_REAL(real, int (*)(const char *, const struct timeval[2]), "utimes");
+    char b[ALR_PBUF];
+    const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
+    int r = real(p, times);
+    if (g_diag) {
+        alr_diag("utimes", path, (p != path) ? p : "(norw)",
+                 (r == 0) ? 0 : -errno);
+    }
+    return r;
+}
+int lutimes(const char *path, const struct timeval times[2]) {
+    static int (*real)(const char *, const struct timeval[2]);
+    ALR_REAL(real, int (*)(const char *, const struct timeval[2]), "lutimes");
+    char b[ALR_PBUF];
+    const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
+    int r = real(p, times);
+    if (g_diag) {
+        alr_diag("lutimes", path, (p != path) ? p : "(norw)",
+                 (r == 0) ? 0 : -errno);
+    }
+    return r;
 }
 
 /* =================================================================== */

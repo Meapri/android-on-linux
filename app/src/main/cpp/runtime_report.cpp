@@ -2595,7 +2595,15 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                                 // writable; the B-3 envp window is BELOW sp-2048). Critical
                                 // regs (x19-x22, pc) and the syscall-nr regset are not
                                 // touched by the splice/B-1/B-3 SETREGSETs that follow, so
-                                // this redirect survives them.
+                                // this redirect survives them — EXCEPT that B-3 rebuilds the
+                                // envp and re-points x2; since the worker reads envp from x21
+                                // (a snapshot of x2 taken HERE), B-3 must also re-point x21 at
+                                // the augmented array or the in-process guest runs WITHOUT the
+                                // LD_PRELOAD interposer/fakeroot (the data-extract child then
+                                // writes *.dpkg-new to bare Android fs -> unpack/configure
+                                // fails). We track the redirect with this flag so B-3 can
+                                // mirror its envp re-point into x21 (G1 fix).
+                                bool inproc_redirected_this_trap = false;
 #if defined(__aarch64__)
                                 // G1 seqint: SCOPE the inproc redirect. The trampoline can
                                 // only map a rootfs glibc target; redirecting everything
@@ -2689,6 +2697,7 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                                                             NT_ARM_SYSTEM_CALL),
                                                         &sio) == 0) {
                                                     ++exec_inproc_redirected;
+                                                    inproc_redirected_this_trap = true;
                                                     if (first_reentry_target
                                                             .empty()) {
                                                         first_reentry_target = host;
@@ -3047,6 +3056,20 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                                                         regs[3] = arr_base;
                                                     } else {
                                                         regs[2] = arr_base;
+                                                    }
+                                                    // G1 fix: if this exec was PC-redirected
+                                                    // into the in-process worker, the worker
+                                                    // reads envp from x21 (a snapshot of x2
+                                                    // taken at redirect time, BEFORE this
+                                                    // augmentation). Mirror the new envp into
+                                                    // x21 so the re-mapped guest sees the
+                                                    // augmented array (LD_PRELOAD interposer +
+                                                    // fakeroot + ALR_ROOTFS) — without this the
+                                                    // worker runs the un-augmented envp and the
+                                                    // dpkg data-extract child writes *.dpkg-new
+                                                    // to the bare Android fs (unpack fails).
+                                                    if (inproc_redirected_this_trap) {
+                                                        regs[21] = arr_base;
                                                     }
                                                     if (::ptrace(
                                                             PTRACE_SETREGSET, w,
