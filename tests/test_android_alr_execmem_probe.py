@@ -25,6 +25,6 @@ def test_main_activity_reports_execmem_gate():
     assert "alrExecmemProbe" in text
     assert "ALR EXECMEM ANON RX NATIVE EXEC: " in text
     assert "ALR execmem anon RX native exec probe:" in text
-    assert "build: 0.4.138-r6-v138" in text
+    assert "build: 0.4.139-r7-v139" in text
 
 
