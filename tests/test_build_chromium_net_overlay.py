@@ -29,12 +29,17 @@ import pytest
 from tools import build_chromium_net_overlay as bcn
 from tools.build_chromium_net_overlay import (
     CA_BUNDLE_PATH,
+    DOH_PROVIDERS,
+    HOSTS_PATH,
     NSSWITCH_PATH,
     RESOLV_CONF_PATH,
     TEST_PAGE_PATH,
     TEST_PAGE_SRC,
     assemble_ca_bundle,
     build_chromium_net_overlay,
+    build_hosts_body,
+    doh_chromium_flags,
+    doh_host_resolver_rules,
     page_external_resources,
 )
 from tools.stage_tar_spec import validate_stage_tar
@@ -143,10 +148,90 @@ def test_overlay_is_stage_tar_conformant(tmp_path: Path):
     assert rep.conformant, rep.errors
 
 
-def test_overlay_reports_four_files(built_overlay):
+def test_overlay_reports_five_files(built_overlay):
     res, _, _ = built_overlay
-    assert res.file_count == 4
+    assert res.file_count == 5  # resolv.conf, nsswitch, hosts, ca bundle, page
     assert res.ca_cert_count == 3
+
+
+# --------------------------------------------------------------------------- #
+# CR-2 DNS — DoH (DNS-over-HTTPS) over port 443 + bootstrap pin
+# --------------------------------------------------------------------------- #
+
+def test_overlay_ships_etc_hosts_with_loopback(built_overlay):
+    _, names, bodies = built_overlay
+    assert "./" + HOSTS_PATH in names
+    assert HOSTS_PATH == "etc/hosts"
+    body = bodies["./" + HOSTS_PATH]
+    assert b"127.0.0.1\tlocalhost" in body
+
+
+def test_default_doh_pins_google_host_in_etc_hosts(built_overlay):
+    # default provider = google → /etc/hosts must pin dns.google to its anycast IP
+    _, _, bodies = built_overlay
+    body = bodies["./" + HOSTS_PATH]
+    assert b"8.8.8.8\tdns.google" in body
+    assert b"8.8.4.4\tdns.google" in body
+
+
+def test_doh_chromium_flags_secure_mode_and_template():
+    flags = doh_chromium_flags("google")
+    assert "--dns-over-https-mode=secure" in flags
+    assert "--dns-over-https-templates=https://dns.google/dns-query" in flags
+    # the bootstrap pin is the third flag (host-resolver-rules MAP)
+    assert any(f.startswith("--host-resolver-rules=") for f in flags)
+
+
+def test_doh_host_resolver_rules_pin_the_template_host():
+    rules = doh_host_resolver_rules("google")
+    assert "MAP dns.google 8.8.8.8" in rules
+    assert "MAP dns.google 8.8.4.4" in rules
+
+
+@pytest.mark.parametrize("key", sorted(DOH_PROVIDERS))
+def test_every_doh_provider_self_consistent(key):
+    p = DOH_PROVIDERS[key]
+    # template host appears inside the template URL
+    assert p.host in p.template
+    assert p.template.startswith("https://")
+    assert p.template.endswith("/dns-query")
+    # every bootstrap IP is pinned host->IP in /etc/hosts AND MAPped in the flags
+    hosts = build_hosts_body(key)
+    rules = doh_host_resolver_rules(key)
+    for ip in p.bootstrap:
+        assert f"{ip}\t{p.host}" in hosts
+        assert f"MAP {p.host} {ip}" in rules
+
+
+def test_cloudflare_provider_overlay_pins_cloudflare_not_google(tmp_path: Path):
+    out = tmp_path / "cf.tar"
+    res = build_chromium_net_overlay(
+        out, ca_bundle=SYNTH_BUNDLE, ca_cert_count=3, ca_deb_filename="(synthetic)",
+        doh_provider="cloudflare",
+    )
+    with tarfile.open(out) as t:
+        hosts = t.extractfile("./" + HOSTS_PATH).read()
+    assert b"1.1.1.1\tcloudflare-dns.com" in hosts
+    assert b"dns.google" not in hosts
+    assert res.doh_provider == "cloudflare"
+    assert "--dns-over-https-templates=https://cloudflare-dns.com/dns-query" in res.doh_flags
+
+
+def test_unknown_doh_provider_rejected():
+    with pytest.raises(ValueError):
+        doh_chromium_flags("does-not-exist")
+
+
+def test_doh_overlay_still_stage_tar_conformant(tmp_path: Path):
+    # adding /etc/hosts must not break §5-E conformance for any provider
+    for key in DOH_PROVIDERS:
+        out = tmp_path / f"{key}.tar"
+        build_chromium_net_overlay(
+            out, ca_bundle=SYNTH_BUNDLE, ca_cert_count=3,
+            ca_deb_filename="(synthetic)", doh_provider=key,
+        )
+        rep = validate_stage_tar(str(out))
+        assert rep.conformant, (key, rep.errors)
 
 
 # --------------------------------------------------------------------------- #
