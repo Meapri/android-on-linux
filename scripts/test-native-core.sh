@@ -172,3 +172,15 @@ cxx="${CXX:-g++}"
   -o /tmp/alr-native-gpu-ring-test
 
 /tmp/alr-native-gpu-ring-test
+
+# GPU Vulkan enumerate/props marshalling (Phase 4 / VK-M2 first step): the
+# request -> ring -> host-decode -> reply -> ring -> guest-decode round trip,
+# proven host-side with a synthetic Mali provider (NO Vulkan SDK needed). The
+# same codec runs on the real vendor libvulkan on device (ALR_VK_DECODE_REAL).
+# Header-only (alr_gpu/alr_gpu_vk_{proto,decode,marshal_probe}.hpp).
+"$cxx" -std=c++20 -Wall -Wextra -Werror \
+  -Iapp/src/main/cpp \
+  tests/native_vk_marshal_test.cpp \
+  -o /tmp/alr-native-vk-marshal-test
+
+/tmp/alr-native-vk-marshal-test
