@@ -120,6 +120,7 @@
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdlib.h>     /* getenv */
+#include <stdio.h>      /* FILE (fopen/freopen fd-finisher) */
 #include <fcntl.h>
 #include <time.h>       /* struct timespec (utimensat) */
 #include <sys/types.h>
@@ -1086,6 +1087,30 @@ ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz) {
     const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
     return real(dirfd, p, buf, bufsiz);
 }
+/* FORTIFY (_FORTIFY_SOURCE) variants. glibc adds a trailing destination-buffer
+ * size arg used only for the __chk overflow guard; the kernel readlinkat ignores
+ * it. We honor the guard exactly as glibc does (bufsiz must not exceed buflen)
+ * then emit the same trampoline readlinkat, so the trusted PC collapses these
+ * traps too. */
+ssize_t __readlink_chk(const char *path, char *buf, size_t bufsiz, size_t buflen) {
+    if (bufsiz > buflen) { errno = EINVAL; return -1; }   /* matches __chk_fail intent */
+    if (g_pcgate) return alr_readlink_emit(AT_FDCWD, path, buf, bufsiz);
+    static ssize_t (*real)(const char *, char *, size_t, size_t);
+    ALR_REAL(real, ssize_t (*)(const char *, char *, size_t, size_t), "__readlink_chk");
+    char b[ALR_PBUF];
+    return real(rw(path, b, sizeof b), buf, bufsiz, buflen);
+}
+ssize_t __readlinkat_chk(int dirfd, const char *path, char *buf, size_t bufsiz,
+                         size_t buflen) {
+    if (bufsiz > buflen) { errno = EINVAL; return -1; }
+    if (g_pcgate) return alr_readlink_emit(dirfd, path, buf, bufsiz);
+    static ssize_t (*real)(int, const char *, char *, size_t, size_t);
+    ALR_REAL(real, ssize_t (*)(int, const char *, char *, size_t, size_t),
+             "__readlinkat_chk");
+    char b[ALR_PBUF];
+    const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
+    return real(dirfd, p, buf, bufsiz, buflen);
+}
 
 /* =================================================================== */
 /* directory enumeration                                               */
@@ -1139,12 +1164,22 @@ void *opendir(const char *path) {
 }
 
 /* scandir/scandir64 stay on the RTLD_NEXT + string-rewrite path. They internally
- * opendir() the directory (a traced openat), so they still trap once per call —
- * but scandir is comparatively rare at GUI startup vs opendir, and re-expressing
- * scandir without its libc body (qsort + dirent alloc/filter callbacks) would be
- * far higher risk than its trap saving warrants. The string rewrite continues to
- * mediate correctly; deferred to USER_NOTIF (ADR-001 §4 candidate 1) if it ever
- * dominates a measured trace count. */
+ * opendir() the directory (one traced openat, rewritten by the supervisor), so
+ * they still trap once per call.
+ *
+ * DELIBERATELY NOT re-routed through the trampoline (analyzed, rejected): the
+ * obvious "open the dir fd via the trampoline, then call scandirat(fd, '.', ...)"
+ * trick — the shape that works for opendir/fopen — does NOT help here. glibc's
+ * scandirat internally __opendirat()s by issuing its OWN openat(dirfd, ".",
+ * O_RDONLY|O_DIRECTORY) from a NON-trampoline PC, so the trap is merely moved (to
+ * a relative-path openat the supervisor still RET_TRACEs), and we would ADD a
+ * redundant trampoline open on top — strictly MORE syscalls than the single
+ * absolute-path trap the stock scandir pays today. Re-expressing scandir's full
+ * body (getdents loop + dirent alloc + caller filter/compar + qsort) ourselves
+ * would avoid the inner open but is far higher risk than its one-trap saving
+ * warrants, and scandir is comparatively rare at startup vs open/fopen/opendir.
+ * The string rewrite continues to mediate correctly; deferred to USER_NOTIF
+ * (ADR-001 §4 candidate 1) if it ever dominates a measured trace count. */
 int scandir(const char *path, void *namelist, void *filter, void *compar) {
     static int (*real)(const char *, void *, void *, void *);
     ALR_REAL(real, int (*)(const char *, void *, void *, void *), "scandir");
@@ -1156,6 +1191,122 @@ int scandir64(const char *path, void *namelist, void *filter, void *compar) {
     ALR_REAL(real, int (*)(const char *, void *, void *, void *), "scandir64");
     char b[ALR_PBUF];
     return real(rw(path, b, sizeof b), namelist, filter, compar);
+}
+
+/* =================================================================== */
+/* buffered stdio open family (fopen/freopen)                          */
+/* =================================================================== */
+/*
+ * fopen/fopen64/freopen/freopen64 — PCGATE=1: open the file fd THROUGH THE
+ * TRAMPOLINE, then wrap it with glibc's fdopen. Same trap-reduction shape as
+ * opendir/scandir (ADR-001 §4): the stock fopen is a compositional wrapper whose
+ * internal open() runs from a NON-trampoline PC, so its underlying openat(56)
+ * escapes the PC gate -> RET_TRACE -> a supervisor round-trip per fopen.
+ * Chromium, ICU, glibc's own locale/nsswitch/gconv, fontconfig and GLib all
+ * fopen() many files at startup, so each was a trap; routing the open through
+ * the trampoline ALLOWs it without tracing. The buffered-stream bookkeeping that
+ * fdopen does afterward issues only NON-path syscalls (fstat on the fd) that
+ * never trap.
+ *
+ * The mode string is translated to open(2) flags exactly as glibc's __fopen does
+ * (r/w/a base, '+' = O_RDWR, plus the 'e'=O_CLOEXEC, 'x'=O_EXCL modifiers; 'b'
+ * and 'm'/'c'/'t' are stdio buffering/text hints with no open-flag effect). On
+ * any mode we cannot classify we fall back to the original RTLD_NEXT + string
+ * rewrite, so an exotic/garbage mode is handled by glibc verbatim (it will set
+ * EINVAL just as before). fdopen takes ownership of the fd on success; on
+ * failure it does NOT close it, so we close it ourselves (errno preserved) —
+ * matching glibc's contract and the opendir wrapper. PCGATE=0 reverts to the
+ * original RTLD_NEXT + string-rewrite path verbatim.
+ *
+ * freopen: glibc reopens onto an EXISTING FILE* (flushing/closing the old fd and
+ * rebinding the stream). There is no public "associate this fd with that FILE*"
+ * primitive we can drive from a trampoline-opened fd without reimplementing
+ * freopen's stream surgery, so freopen keeps the RTLD_NEXT + string-rewrite path
+ * (its single internal open still traps once, but freopen is rare vs fopen).
+ */
+
+/* Translate an fopen(3) mode string to open(2) flags. Returns -1 if the leading
+ * mode char is not one of r/w/a (so the caller falls back to libc). Mirrors
+ * glibc __fopen_internal's flag derivation. */
+static int alr_fopen_flags(const char *mode) {
+    if (!mode) return -1;
+    int flags;
+    switch (mode[0]) {
+        case 'r': flags = O_RDONLY; break;
+        case 'w': flags = O_WRONLY | O_CREAT | O_TRUNC; break;
+        case 'a': flags = O_WRONLY | O_CREAT | O_APPEND; break;
+        default:  return -1;            /* unknown base mode -> libc fallback */
+    }
+    /* Scan the modifiers. '+' upgrades to O_RDWR (clearing the r/w-only bits). */
+    for (const char *m = mode + 1; *m; ++m) {
+        switch (*m) {
+            case '+': flags = (flags & ~(O_RDONLY | O_WRONLY)) | O_RDWR; break;
+            case 'e': flags |= O_CLOEXEC; break;
+            case 'x': flags |= O_EXCL;    break;
+            case 'b': case 'm': case 'c': case 't': break;  /* stdio hints, no flag */
+            default: return -1;          /* unrecognized modifier -> libc fallback */
+        }
+    }
+    return flags;
+}
+
+static FILE *alr_fopen_emit(const char *path, const char *mode) {
+    int flags = alr_fopen_flags(mode);
+    if (flags < 0 || !path || path[0] != '/') return (FILE *)(void *)-1; /* sentinel: use libc */
+    int fd = alr_open_emit(AT_FDCWD, path, flags,
+                           (flags & O_CREAT) ? 0666 : 0);
+    if (fd < 0) return NULL;             /* errno already set by alr_ret */
+    static FILE *(*real_fdopen)(int, const char *);
+    if (!real_fdopen) real_fdopen = (FILE *(*)(int, const char *))dlsym(RTLD_NEXT, "fdopen");
+    if (!real_fdopen) {                  /* never on glibc */
+        alr_tramp_syscall(__NR_close, fd, 0, 0, 0, 0, 0);
+        errno = ENOSYS;
+        return NULL;
+    }
+    FILE *f = real_fdopen(fd, mode);
+    if (!f) {
+        int e = errno;                   /* preserve fdopen's errno */
+        alr_tramp_syscall(__NR_close, fd, 0, 0, 0, 0, 0);
+        errno = e;
+    }
+    return f;
+}
+
+FILE *fopen(const char *path, const char *mode) {
+    if (g_pcgate) {
+        FILE *f = alr_fopen_emit(path, mode);
+        if (f != (FILE *)(void *)-1) return f;   /* handled (incl. NULL/errno) */
+    }
+    static FILE *(*real)(const char *, const char *);
+    ALR_REAL(real, FILE *(*)(const char *, const char *), "fopen");
+    char b[ALR_PBUF];
+    return real(rw(path, b, sizeof b), mode);
+}
+FILE *fopen64(const char *path, const char *mode) {
+    if (g_pcgate) {
+        FILE *f = alr_fopen_emit(path, mode);
+        if (f != (FILE *)(void *)-1) return f;
+    }
+    static FILE *(*real)(const char *, const char *);
+    ALR_REAL(real, FILE *(*)(const char *, const char *), "fopen64");
+    char b[ALR_PBUF];
+    return real(rw(path, b, sizeof b), mode);
+}
+FILE *freopen(const char *path, const char *mode, FILE *stream) {
+    /* Keep RTLD_NEXT + string rewrite: freopen rebinds an existing stream and
+     * has no fd-takeover primitive we can drive from a trampoline-opened fd. */
+    static FILE *(*real)(const char *, const char *, FILE *);
+    ALR_REAL(real, FILE *(*)(const char *, const char *, FILE *), "freopen");
+    char b[ALR_PBUF];
+    const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
+    return real(p, mode, stream);
+}
+FILE *freopen64(const char *path, const char *mode, FILE *stream) {
+    static FILE *(*real)(const char *, const char *, FILE *);
+    ALR_REAL(real, FILE *(*)(const char *, const char *, FILE *), "freopen64");
+    char b[ALR_PBUF];
+    const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
+    return real(p, mode, stream);
 }
 
 /* =================================================================== */
@@ -1365,6 +1516,24 @@ int mkfifoat(int dirfd, const char *path, mode_t mode) {
     return real(dirfd, p, mode);
 }
 
+/* name_to_handle_at — previously UNWRAPPED (a pre-existing correctness gap: an
+ * absolute path was not rewritten into the rootfs). Its underlying
+ * __NR_name_to_handle_at is NOT in the traced 9, so it forwards via RTLD_NEXT
+ * after a string rewrite, matching the *at string-rewrite pattern. Chromium's
+ * sandbox/file probing and some glibc realpath fast paths touch it. (Its mate,
+ * open_by_handle_at, takes an opaque handle + mount fd, NOT a path, so it needs
+ * no rewrite and is intentionally not wrapped.) The trailing args
+ * (handle/mount_id/flags) are forwarded verbatim. */
+int name_to_handle_at(int dirfd, const char *path, struct file_handle *handle,
+                      int *mount_id, int flags) {
+    static int (*real)(int, const char *, struct file_handle *, int *, int);
+    ALR_REAL(real, int (*)(int, const char *, struct file_handle *, int *, int),
+             "name_to_handle_at");
+    char b[ALR_PBUF];
+    const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
+    return real(dirfd, p, handle, mount_id, flags);
+}
+
 /* =================================================================== */
 /* non-path, result-only, side-effect-free getters (process credentials) */
 /* =================================================================== */
@@ -1466,6 +1635,15 @@ char *canonicalize_file_name(const char *path) {
     ALR_REAL(real, char *(*)(const char *), "canonicalize_file_name");
     char b[ALR_PBUF];
     return real(rw(path, b, sizeof b));
+}
+/* FORTIFY (_FORTIFY_SOURCE) variant of realpath: glibc adds a resolved-buffer
+ * size arg for its __chk guard. We rewrite the input path and forward to the
+ * real __realpath_chk so its overflow guard still fires identically. */
+char *__realpath_chk(const char *path, char *resolved, size_t resolvedlen) {
+    static char *(*real)(const char *, char *, size_t);
+    ALR_REAL(real, char *(*)(const char *, char *, size_t), "__realpath_chk");
+    char b[ALR_PBUF];
+    return real(rw(path, b, sizeof b), resolved, resolvedlen);
 }
 
 /* =================================================================== */
