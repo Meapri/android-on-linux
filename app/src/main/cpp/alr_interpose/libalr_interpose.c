@@ -711,6 +711,20 @@ static void alr_emit_svcscan_if_gated(void) {
  */
 __attribute__((constructor(101)))
 static void alr_ctor(void) {
+    /* v2 DIAG: RAW svc write as the VERY FIRST ctor statement, BEFORE alr_init(),
+     * to prove the init_array entry is even reached (vs alr_init faulting first).
+     * Gated inline on ALR_INTERPOSE_DIAG so it is silent in normal runs. */
+    {
+        const char *idg = getenv("ALR_INTERPOSE_DIAG");
+        if (idg && idg[0] != '0' && idg[0] != '\0') {
+            const char m[] = "ALR-IPRAW ctor-entered\n";
+            register long x8 __asm__("x8") = __NR_write;
+            register long x0 __asm__("x0") = 2;
+            register long x1 __asm__("x1") = (long)m;
+            register long x2 __asm__("x2") = (long)sizeof(m) - 1;
+            __asm__ __volatile__("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2) : "memory");
+        }
+    }
     alr_init();                         /* sets g_rootfs / g_rootfs_len (idempotent) */
 
     /* Trampoline range FIRST: needed by the BPF and by every emit/probe. */

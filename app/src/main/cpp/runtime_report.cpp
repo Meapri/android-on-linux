@@ -1951,6 +1951,29 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
             ::write(dg, "PROGB=", 6); diag_hex(dg, prog.base);
             ::write(dg, "INTRE@", 6); diag_hex(dg, interp.entry);
         }
+        // v2 DIAG (ALR_INTERPOSE_DIAG): dump the LD_PRELOAD / ALR_INTERPOSE_DIAG
+        // entries actually present on the handoff stack envp, so a drain can SEE
+        // whether the guest ld.so received the chained preload at all (vs the
+        // interposer ctor silently not running). Reads the same envp the guest gets.
+        {
+            const char* edg = ::getenv("ALR_INTERPOSE_DIAG");
+            if (edg != nullptr && edg[0] != '0' && edg[0] != '\0') {
+                for (std::size_t i = 0; i < n_env; ++i) {
+                    const char* e = reinterpret_cast<const char*>(envp_ptrs[i]);
+                    bool is_pre = e[0]=='L'&&e[1]=='D'&&e[2]=='_'&&e[3]=='P';
+                    bool is_dia = e[0]=='A'&&e[1]=='L'&&e[2]=='R'&&e[3]=='_'&&e[4]=='I';
+                    if (is_pre || is_dia) {
+                        ::write(dg, "\nENVP[", 6);
+                        char nb[4]; int ni=0, v=(int)i; if(v==0)nb[ni++]='0';
+                        char tmp[4]; int t=0; while(v){tmp[t++]=(char)('0'+v%10);v/=10;}
+                        while(t)nb[ni++]=tmp[--t]; ::write(dg, nb, ni);
+                        ::write(dg, "]=", 2);
+                        std::size_t L=0; while(e[L]&&L<512)++L; ::write(dg, e, L);
+                    }
+                }
+                ::write(dg, "\n", 1);
+            }
+        }
         ::write(dg, "JUMPING;", 8);
         // Stack the seccomp filter LAST, after the loader's own file reads (the
         // rootfs opens at the open() above and the ELF reads), so the guest runs

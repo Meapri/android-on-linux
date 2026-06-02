@@ -91,6 +91,7 @@
 #include <stdlib.h>     /* getenv */
 #include <fcntl.h>      /* AT_FDCWD, AT_SYMLINK_NOFOLLOW */
 #include <errno.h>
+#include <unistd.h>     /* write — ctor liveness diag */
 #include <sys/types.h>
 #include <sys/stat.h>
 
@@ -122,7 +123,22 @@ static void fr_init(void) {
 }
 
 __attribute__((constructor(102)))   /* after libalr_interpose's 101 ctor */
-static void fr_ctor(void) { fr_init(); }
+static void fr_ctor(void) {
+    fr_init();
+    /* v2 DIAG (ALR_INTERPOSE_DIAG, OFF by default): one liveness line to fd 2
+     * proving THIS .so's ctor ran in the guest image. Raw write(2) — the fakeroot
+     * shim installs no seccomp filter, so no trampoline is needed (unlike the
+     * interposer's alr_emit_fd2). errno is saved/restored. Zero output when unset. */
+    const char *dg = getenv("ALR_INTERPOSE_DIAG");
+    if (dg && dg[0] != '0' && dg[0] != '\0') {
+        int saved = errno;
+        const char *m = "ALR-FRDIAG ctor-live uid="; (void)write(2, m, 25);
+        char b[8]; int n = 0; unsigned v = (unsigned)g_fake_uid;
+        if (v == 0) b[n++] = '0'; else { char t[8]; int k=0; while(v){t[k++]=(char)('0'+v%10);v/=10;} while(k)b[n++]=t[--k]; }
+        (void)write(2, b, (size_t)n); (void)write(2, "\n", 1);
+        errno = saved;
+    }
+}
 
 /* ----- fake-ownership DB: open-addressing hash keyed by (dev, ino) ----- */
 
