@@ -134,6 +134,29 @@ host 백본(decode/ring/AHB-FBO/zero-copy present)은 Mali-G615 MC2에 픽셀 �
 즉 **"여러 경량 GUI/CLI 앱이 closure 상으로는 설치 가능"** 이 host 에서 예측된다. 단 모든 행의 device 열이 **PENDING(G1)**: 실 설치(`apt install` → unpack → exec)는 exec-re-entry(B-3 round-7) 통과 후에야 device-증명 가능하다.
 검증: `python3 -m tools.breadth_catalog --selftest`(offline ALL PASS) + `pytest tests/test_breadth_catalog.py`(13 passed, live 1 = `ALR_BREADTH_NET=1` 게이트).
 
+## apt 완전설치 stage-tar (install-AND-launch — galculator 패턴 일반화)
+> closure 예측(위)과 달리, **이 섹션은 실제로 빌드·검증된 install-AND-launch stage-tar** 다 — galculator-stage 패턴
+> (closure overlay + 리프 `.deb` 를 `var/cache/apt/archives/<pkg>_<ver>_arm64.deb` 에 주입)을 임의 카탈로그 앱으로
+> 일반화한 `tools/build_install_stage.py`(`tools/build_galculator_stage.inject_deb_into_cache` + `tools/deb_closure.build_minimal_overlay` 재사용)가 산출.
+> 한 tar 가 **두 페이로드**를 함께 싣는다: (1) 온디바이스 `dpkg -i` 대상 `.deb`, (2) 컴포지터/터미널이 경로로 직접 띄우는 base-subtracted 클로저(엔트리포인트 ELF 포함).
+>
+> **device 칸이 STAGED(device-pending)** 인 이유 — 정직: stage-tar 는 host 에서 ARM-READY/§5-E CONFORMANT 로 검증됐으나,
+> 온디바이스 `dpkg -i` unpack/configure 는 **G1 exec-re-entry** 잠금해제에 매여 있고(위 패키지매니저 섹션 / `loader-feature-gaps.md` G1),
+> **추가로** 본체 `MainActivity.aptDrainTargetFor` 가 해당 패키지를 인지해야 자동 드레인이 fire 한다(현재 인지: `galculator`, `hello`).
+> 새 앱(htop/nano/xterm)의 드레인 타깃 한 줄 추가는 본체(native/kt) 변경이라 **DEVICE-REQ `ALR-V2-staged-apps`** 로 남긴다(이 host 트랙은 본체 수정 금지).
+
+| 앱 | 종류 | closure(pkg) | stage-tar (host-built) | 크기 | 엔트리포인트(ELF arm64) | `.deb`@apt-cache | 결과(host) | device |
+|----|------|-------------:|------------------------|-----:|-------------------------|------------------|:----------:|:------:|
+| `galculator` | GUI(GTK3) | 157 | `galculator-stage.tar` (`build_galculator_stage`) | 1.04MiB | `/usr/bin/galculator` | `galculator_2.1.4-1.2build2_arm64.deb` | **ARM-READY** | **reported INSTALLED**¹ |
+| `htop` | CLI(ncurses) | 8 | `out/v2-stage/htop-stage.tar` | 1.07MiB | `/usr/bin/htop` | `htop_3.3.0-4build1_arm64.deb` (170728B) | **ARM-READY** | STAGED(pending)² |
+| `nano` | CLI(editor) | 6 | `out/v2-stage/nano-stage.tar` | 0.94MiB | `/usr/bin/nano` | `nano_7.2-2build1_arm64.deb` (280802B) | **ARM-READY** | STAGED(pending)² |
+| `xterm` | GUI(X11) | 38 | `out/v2-stage/xterm-stage.tar` | 2.66MiB | `/usr/bin/xterm` | `xterm_390-1ubuntu3_arm64.deb` (886428B) | **ARM-READY** | STAGED(pending)² |
+
+¹ `hello`(CLI, `/usr/bin/hello`)+`galculator`(GTK3 GUI)의 **apt 완전설치 device 달성**(`configured=true installed=true`, 컴포지터 `rendered=true`)은 통합/디바이스 트랙의 **보고치**다 — 이 host 트랙에서 독립 재현하지 못했고(이 머신=Darwin, device 미사용) 위 패키지매니저/한계 섹션의 git-tracked 텍스트는 아직 `unpacked=false`(WALL) 상태이므로, device-evidence 파일이 커밋되면 그 행과 함께 INSTALLED 로 승급한다.
+² htop/nano/xterm: stage-tar 는 host 에서 ARM-READY(0-unsat closure + `.deb`@apt-cache + 엔트리포인트 ELF arm64 + §5-E CONFORMANT 0err/0warn, `stage_tar_spec --base rootfs/tiny-rootfs.tar`). 온디바이스 설치/실행은 G1 + 본체 드레인타깃 등록 후 가능 — **DEVICE-REQ `ALR-V2-staged-apps`**.
+
+재현: `python3 -m tools.build_install_stage --app htop --app nano --app xterm --base rootfs/tiny-rootfs.tar --out-dir out/v2-stage`(network, noble main+universe). 빌더 로직: `python3 -m tools.build_install_stage --selftest`(offline ALL PASS) + `pytest tests/test_build_install_stage.py`.
+
 ## 미지원 / 부분 (현재 한계)
 | 항목 | 상태 | 비고 |
 |------|------|------|

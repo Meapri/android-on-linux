@@ -15,6 +15,7 @@ second copy. The difference is the *catalog*: this module ships the small,
 broadly-representative end-user apps
 
     nano        CLI editor      /usr/bin/nano               (closure floor; near libc-only)
+    htop        CLI sysmon      /usr/bin/htop               (ncurses; ships .desktop)
     xterm       GUI terminal    /usr/bin/xterm              (X11 / Xwayland host)
     galculator  GUI calculator  /usr/bin/galculator         (GTK3)
 
@@ -106,8 +107,9 @@ class AppStage:
             raise ValueError(f"{self.name}: at least one package is required")
 
 
-# Three 0-unsat lightweight apps (verified against the live noble index):
+# Four 0-unsat lightweight apps (verified against the live noble index):
 #   nano        closure 6   — CLI editor, near-libc-only (closure floor)
+#   htop        closure 8   — ncurses process monitor; ships a .desktop
 #   xterm       closure 38  — X11 terminal (Xwayland host); ships .desktop
 #   galculator  closure 157 — GTK3 calculator (mostly base GTK3 → subtracted)
 # Entrypoints + .desktop paths confirmed by extracting each leaf .deb.
@@ -119,6 +121,14 @@ APPS: dict[str, AppStage] = {
         desktop=None,                      # nano is CLI — no .desktop
         kind="cli",
         note="tiny ncurses editor; near-libc-only closure (closure floor)",
+    ),
+    "htop": AppStage(
+        name="htop",
+        packages=("htop",),
+        entrypoint="/usr/bin/htop",
+        desktop="/usr/share/applications/htop.desktop",
+        kind="cli",                        # ncurses TUI — runs in a terminal (foot), not the compositor directly
+        note="ncurses process monitor; closure 8 (libncursesw6/libnl); ships a .desktop",
     ),
     "xterm": AppStage(
         name="xterm",
@@ -454,19 +464,22 @@ def _selftest() -> int:
         print(f"  [{'PASS' if cond else 'FAIL'}] {label}")
 
     # --- catalog invariants ------------------------------------------------ #
-    check("3 apps defined (nano, xterm, galculator)",
-          set(APPS) == {"nano", "xterm", "galculator"})
+    check("4 apps defined (nano, htop, xterm, galculator)",
+          set(APPS) == {"nano", "htop", "xterm", "galculator"})
     check("every entrypoint is rootfs-absolute (/...)",
           all(a.entrypoint.startswith("/") for a in APPS.values()))
     check("every app names at least one package",
           all(a.packages for a in APPS.values()))
     check("nano is CLI with no .desktop",
           APPS["nano"].kind == "cli" and APPS["nano"].desktop is None)
+    check("htop is CLI and ships a .desktop",
+          APPS["htop"].kind == "cli" and APPS["htop"].desktop is not None)
     check("xterm + galculator are GUI and ship a .desktop",
           all(APPS[n].kind == "gui" and APPS[n].desktop is not None
               for n in ("xterm", "galculator")))
     check("entrypoints are the real packaged binaries",
           APPS["nano"].entrypoint == "/usr/bin/nano"
+          and APPS["htop"].entrypoint == "/usr/bin/htop"
           and APPS["xterm"].entrypoint == "/usr/bin/xterm"
           and APPS["galculator"].entrypoint == "/usr/bin/galculator")
 

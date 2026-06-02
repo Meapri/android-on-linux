@@ -42,8 +42,8 @@ from tools.build_app_stage import (
 # --------------------------------------------------------------------------- #
 # Catalog / recipe invariants (pure)
 # --------------------------------------------------------------------------- #
-def test_three_apps_defined():
-    assert set(APPS) == {"nano", "xterm", "galculator"}
+def test_catalog_apps_defined():
+    assert set(APPS) == {"nano", "htop", "xterm", "galculator"}
     assert all(isinstance(a, AppStage) for a in APPS.values())
 
 
@@ -51,6 +51,7 @@ def test_entrypoints_are_rootfs_absolute_real_binaries():
     # rootfs-absolute, and the exact binary each leaf .deb installs (confirmed by
     # extracting the noble debs).
     assert APPS["nano"].entrypoint == "/usr/bin/nano"
+    assert APPS["htop"].entrypoint == "/usr/bin/htop"
     assert APPS["xterm"].entrypoint == "/usr/bin/xterm"
     assert APPS["galculator"].entrypoint == "/usr/bin/galculator"
     for a in APPS.values():
@@ -59,8 +60,11 @@ def test_entrypoints_are_rootfs_absolute_real_binaries():
 
 
 def test_kind_and_desktop_consistency():
-    # nano is CLI → no .desktop; the two GUI apps ship a real .desktop launcher.
+    # nano is CLI → no .desktop; htop is a CLI/ncurses TUI that still ships a
+    # .desktop; the two GUI apps ship a real .desktop launcher.
     assert APPS["nano"].kind == "cli" and APPS["nano"].desktop is None
+    assert APPS["htop"].kind == "cli"
+    assert APPS["htop"].desktop == "/usr/share/applications/htop.desktop"
     assert APPS["xterm"].kind == "gui"
     assert APPS["xterm"].desktop == "/usr/share/applications/debian-xterm.desktop"
     assert APPS["galculator"].kind == "gui"
