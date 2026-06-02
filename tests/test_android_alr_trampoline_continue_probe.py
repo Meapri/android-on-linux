@@ -24,7 +24,7 @@ def test_main_activity_reports_android_packaged_trampoline_continue_gate():
     assert "ALR PACKAGED TRAMPOLINE CONTINUE EXECUTION:" in text
     assert "alr packaged trampoline continue passed=" in text
     assert "ALR packaged trampoline continue probe:" in text
-    assert "build: 0.4.149-cr1-v149" in text
+    assert "build: 0.4.150-sd-v150" in text
 
 
 def test_execution_backend_docs_require_android_packaged_trampoline_probe():

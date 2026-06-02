@@ -29,4 +29,4 @@ def test_main_activity_reports_jit_wx_gate():
     assert "jitWxProbe" in text
     assert "jitWxPassed" in text
     assert "ALR JIT WX CYCLE" in text
-    assert "build: 0.4.149-cr1-v149" in text
+    assert "build: 0.4.150-sd-v150" in text

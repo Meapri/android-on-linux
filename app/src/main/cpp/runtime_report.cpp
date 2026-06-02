@@ -2124,6 +2124,17 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     // real group-stop (LISTEN). Without this split, GETSIGINFO==EINVAL on a new child's
     // first stop would wrongly LISTEN-park it, hanging the guest at the first clone.
     std::unordered_set<pid_t> known_tids{pid};
+    // listening_tids: tids currently PTRACE_LISTEN-parked (group-stop BEGIN). THE
+    // CHROMIUM DEADLOCK FIX (sd-design+sd-model, evidence 2026-06-02-cr1...): a
+    // LISTEN-parked tid re-reports EVENT_STOP at the group-stop END (SIGCONT trailing
+    // edge) whose GETSIGINFO is STILL EINVAL, so the old code re-classified it as a
+    // fresh group-stop and re-LISTEN-ed it FOREVER — a sibling futex-waiting (nr 98,
+    // un-traced) on it then never woke, the leader never exited, and waitpid blocked
+    // forever (chromium --dump-dom, ~20 threads, 600s-immune hang). Fix: a KNOWN+EINVAL
+    // stop from an ALREADY-listening tid is the END -> PTRACE_CONT it back to RUNNING
+    // (never re-LISTEN across a SIGCONT). A fresh group-stop (not yet listening) still
+    // LISTENs once.
+    std::unordered_set<pid_t> listening_tids;
     std::unordered_map<pid_t, int> mem_fds;
     // mem_fd_for: return a cached O_RDWR /proc/<tid>/mem fd for `tid`, opening it
     // on first use. Returns -1 if the open fails (caller then skips, exactly as the
@@ -2923,14 +2934,32 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
             const long gsi = ::ptrace(PTRACE_GETSIGINFO, w, nullptr, &esi);
             const bool group_stop = (gsi != 0 && errno == EINVAL);
             if (group_stop) {
-                // Group-stop: keep the thread parked with LISTEN (do NOT run it). This
-                // is the single/multi-thread-safe handling that classic TRACEME lacked.
-                // ESRCH (tid raced away) is benign — just loop.
+                if (listening_tids.find(w) != listening_tids.end()) {
+                    // GROUP-STOP END (SIGCONT trailing edge): an already-LISTEN-parked
+                    // tid re-reports EVENT_STOP, GETSIGINFO STILL EINVAL. Re-LISTEN here
+                    // would re-park it forever (THE chromium deadlock). Resume it to
+                    // RUNNING with signal 0 so its futex-waiting siblings can wake.
+                    listening_tids.erase(w);
+                    if (::ptrace(PTRACE_CONT, w, nullptr, nullptr) != 0 &&
+                        errno == ESRCH) {
+                        continue;
+                    }
+                    continue;
+                }
+                // GROUP-STOP BEGIN (first time): park the thread with LISTEN (do NOT run
+                // it) — the single/multi-thread-safe handling. Record it so its END
+                // re-report (above) resumes instead of re-parking. ESRCH is benign.
+                listening_tids.insert(w);
                 if (::ptrace(PTRACE_LISTEN, w, nullptr, nullptr) != 0 && errno == ESRCH) {
+                    listening_tids.erase(w);
                     continue;
                 }
                 continue;
             }
+            // A known tid that is NOT a group-stop (new-thread/INTERRUPT stop, or a
+            // LISTEN-parked tid re-reporting with a non-EINVAL siginfo) is about to be
+            // CONT-ed below — it is no longer parked, so drop it from the listening set.
+            listening_tids.erase(w);
             // New-thread initial stop (or PTRACE_INTERRUPT): it is already auto-attached
             // and inherits the leader's SEIZE options, so just resume it with signal 0.
             // (We never reach the old TRACEME w!=pid SETOPTIONS dance here — SEIZE option
