@@ -27,6 +27,20 @@
         <!-- 기존 probe 하니스 — LAUNCHER 강등(진단 전용, 외부 진입 불요). -->
         <activity
             android:name=".MainActivity"
-            android:exported="false" />
+            android:exported="true" />
+
+        <!-- Standalone Chromium 앱 진입점: 탭하면 MainActivity 가 LEAN chromium-only
+             경로(runChromiumStandalone)로 분기 — GPU/probe/GIMP/toolkit 전부 스킵해
+             메모리를 chromium(browser+renderer)에 양보. 별도 런처 아이콘 "ALR Chromium". -->
+        <activity-alias
+            android:name=".ui.ChromiumStandalone"
+            android:targetActivity=".MainActivity"
+            android:exported="true"
+            android:label="ALR Chromium">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
     </application>
 </manifest>

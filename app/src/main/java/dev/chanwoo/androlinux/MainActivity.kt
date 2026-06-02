@@ -27,6 +27,22 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         System.loadLibrary("alr_loader")
 
+        // Standalone Chromium app entry (launched via the .ui.ChromiumStandalone
+        // activity-alias "ALR Chromium", or the adb marker /data/local/tmp/.alr-cronly):
+        // a LEAN chromium-only path that SKIPS the entire heavy MainActivity onCreate
+        // (GPU live executor + ~40 native probes + 17 toolkit overlays + GIMP). The full
+        // app baseline (~400MB resident before chromium even starts) was OOM-ing the full
+        // GUI chromium browser (browser + renderer, each a ~800MB in-process re-map) on
+        // this 5.5GB device. Stripping the baseline to ~just the compositor frees the
+        // headroom chromium needs. Reuses the SAME native loader + Wayland compositor +
+        // rootfs as MainActivity (zero native change).
+        if (componentName.className.endsWith("ChromiumStandalone") ||
+            File("/data/local/tmp/.alr-cronly").isFile
+        ) {
+            runChromiumStandalone()
+            return
+        }
+
         val rootfsManifest = RootfsManifest(
             name = "debian-arm64",
             version = "bookworm-slim-2026-05-gui-gpu-v40",
@@ -1887,6 +1903,116 @@ class MainActivity : Activity() {
         // Android re-shows the system bars after dialogs/notifications steal focus;
         // re-hide them whenever we regain focus so the Linux GUI stays edge-to-edge.
         if (hasFocus) applyImmersive()
+    }
+
+    // Lean standalone Chromium browser window (see the onCreate gate). Stands up ONLY
+    // the in-app Wayland compositor on a fullscreen SurfaceView and launches the full
+    // GUI chromium browser (ozone-wayland) — no GPU probe battery, no toolkit zoo, no
+    // GIMP — so the process stays small enough for chromium's browser+renderer to fit.
+    // Same native path that renders GIMP's window to wl_shm -> SurfaceView; offline page.
+    private fun runChromiumStandalone() {
+        val rootfsManifest = RootfsManifest(
+            name = "debian-arm64",
+            version = "bookworm-slim-2026-05-gui-gpu-v40",
+            assets = listOf(
+                RootfsAsset(
+                    path = "rootfs.tar.zst",
+                    sha256 = "0000000000000000000000000000000000000000000000000000000000000000",
+                    sizeBytes = 0,
+                ),
+            ),
+        )
+        val rootfsStatus = RootfsInstaller(this).prepareBundledTinyRootfs()
+        val rootfsDir = rootfsStatus.rootfsDir
+        // Extract only the overlays chromium needs (its libs + the LD_PRELOAD path
+        // interposer + TLS/NSS + net + C.UTF-8 locale). Gated on each tar being
+        // adb-push'd to /data/local/tmp; the base rootfs already ships the GTK/X/font
+        // stack. No GPU shim / toolkit / GIMP overlays here (lean).
+        Thread {
+            for (name in listOf("interpose", "nss", "chromium-net", "xkb-gegl", "chromium-gui")) {
+                try {
+                    val tar = File("/data/local/tmp/$name-stage.tar")
+                    val marker = File(rootfsDir, ".$name-staged-${tar.length()}")
+                    if (tar.isFile && !marker.isFile) {
+                        android.util.Log.i("alr_loader", "cronly $name-stage: extracting (${tar.length()} bytes)")
+                        val ovr = RootfsInstaller(this).extractOverlayTar(tar, rootfsDir)
+                        marker.writeText("staged\n")
+                        android.util.Log.i("alr_loader", "cronly $name-stage: done (extracted=${ovr.extracted} skipped=${ovr.skipped.size})")
+                    }
+                } catch (e: Throwable) {
+                    android.util.Log.e("alr_loader", "cronly $name-stage EXC: ${android.util.Log.getStackTraceString(e)}")
+                }
+            }
+        }.start()
+
+        val surfaceView = SurfaceView(this)
+        surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
+            override fun surfaceCreated(holder: SurfaceHolder) {
+                Thread {
+                    try {
+                        val dm = resources.displayMetrics
+                        val disp = if (Build.VERSION.SDK_INT >= 30) display
+                            else @Suppress("DEPRECATION") windowManager.defaultDisplay
+                        val realSize = android.graphics.Point()
+                        @Suppress("DEPRECATION") disp?.getRealSize(realSize)
+                        val outW = if (realSize.x > 0) realSize.x else dm.widthPixels
+                        val outH = if (realSize.y > 0) realSize.y else dm.heightPixels
+                        val refreshMhz = Math.round((disp?.refreshRate ?: 60f) * 1000f)
+                        val wlStart = nativeWaylandCompositorStart(
+                            cacheDir.absolutePath, holder.surface, dm.densityDpi, dm.xdpi, dm.ydpi,
+                            outW, outH, refreshMhz,
+                        )
+                        android.util.Log.i("alr_loader", "cronly: compositor ${wlStart.lineSequence().firstOrNull()}")
+                        // wait (bounded) for the chromium-gui overlay to finish extracting
+                        val chromiumBin = File(rootfsDir, "usr/lib/chromium/chromium")
+                        var waited = 0
+                        while (waited < 180000 && !chromiumBin.isFile) { Thread.sleep(1000); waited += 1000 }
+                        try {
+                            val demoSrc = File("/data/local/tmp/alr-demo.html")
+                            val demoDst = File(rootfsDir, "root/demo.html")
+                            demoDst.parentFile?.mkdirs()
+                            if (demoSrc.isFile) demoSrc.copyTo(demoDst, overwrite = true)
+                            else demoDst.writeText("<!doctype html><meta charset=utf-8><body style='margin:0;background:#10101e;color:#fff;font-family:sans-serif;text-align:center'><h1 style='padding-top:30vh'>ALR - Chromium on Android</h1><p>ALR-CR4-OK</p></body>")
+                        } catch (_: Throwable) {}
+                        android.util.Log.i("alr_loader", "cronly: chromium bin=${chromiumBin.isFile} (waited ${waited}ms); launching ozone-wayland window")
+                        android.system.Os.setenv("ALR_REEXEC_INPROC", "1", true)
+                        val out = nativeAlrNativeLoaderProbe(
+                            packageName,
+                            applicationInfo.nativeLibraryDir,
+                            filesDir.absolutePath,
+                            cacheDir.absolutePath,
+                            rootfsManifest.name,
+                            "/usr/lib/chromium/chromium\n--ozone-platform=wayland" +
+                                "\n--no-sandbox\n--no-zygote\n--renderer-process-limit=1\n--disable-gpu" +
+                                "\n--disable-dev-shm-usage\n--user-data-dir=/tmp/cr4-profile" +
+                                "\n--no-first-run\n--no-default-browser-check" +
+                                "\n--disable-crash-reporter\n--start-maximized" +
+                                "\n--window-size=1200,1920\n--enable-logging=stderr\n--v=1" +
+                                "\nfile:///root/demo.html",
+                        )
+                        android.util.Log.i("alr_loader", "cronly chromium exited:\n$out")
+                    } catch (e: Throwable) {
+                        android.util.Log.e("alr_loader", "cronly EXC: ${android.util.Log.getStackTraceString(e)}")
+                    }
+                }.start()
+            }
+
+            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) = Unit
+            override fun surfaceDestroyed(holder: SurfaceHolder) = Unit
+        })
+        // Fullscreen surface; route touch into the focused Wayland client for scroll/click.
+        surfaceView.setOnTouchListener { _, ev ->
+            val phase = when (ev.actionMasked) {
+                android.view.MotionEvent.ACTION_DOWN, android.view.MotionEvent.ACTION_POINTER_DOWN -> 0
+                android.view.MotionEvent.ACTION_MOVE -> 1
+                else -> 2
+            }
+            nativeWaylandInjectTouch(ev.getPointerId(ev.actionIndex), ev.x, ev.y, phase)
+            true
+        }
+        setContentView(surfaceView)
+        applyImmersive()
+        surfaceView.post { surfaceView.requestFocus() }
     }
 
     // WS-4 §10(b): run apt/dpkg/X11 FUNCTIONALLY through the ALR native loader and emit
