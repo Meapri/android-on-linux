@@ -9,7 +9,8 @@
 > 소유: WS-5 (L5). HOST-ONLY — 새 device 측정 없음, 기존 `docs/evidence/` 인용만. 벤치 문서 아님
 > (성능 숫자는 `docs/PERFORMANCE.md`/`cp2-gpu-ratio-glmark2.md`/`cp3-cpu-overhead-ratio.md`).
 >
-> baseline: 통합 트리 v143 (round-10 step2 device-proven `docs/evidence/2026-06-02-round10-step2-inproc-remap-mapjump.md`;
+> baseline: 통합 트리 v144 (round-11 device-proven `docs/evidence/2026-06-02-round11-remap-sigill-fixed.md`;
+> round-10 step2 `docs/evidence/2026-06-02-round10-step2-inproc-remap-mapjump.md`;
 > round-10 step1 `docs/evidence/2026-06-02-round10-step1-inproc-reexec-mechanism-proven.md`;
 > round-9 `docs/evidence/2026-06-02-round9-optionS-dead-wx-execve.md`;
 > round-7 drain `docs/evidence/2026-06-02-round7-vkrender-pass-drain.md`;
@@ -32,6 +33,25 @@
 > **"재-맵 메커니즘 + map/jump device-proven; 남은 것 = 재-맵된 게스트 실행 정확성(static glibc startup
 > SIGILL) + `/proc/self/exe` pass-through + 비-root `dpkg` superuser"**로 전진한다. 단 셀 승급은
 > 아직: 재-맵된 게스트가 깨끗이 실행되기 전엔 apt/dpkg/GIMP-plugin 체인이 device-동작하지 않는다.
+>
+> **round-11 device 갱신(v144, G1 — SIGILL 해소):** round-10 의 잔여 게이트였던 "재-맵 static glibc
+> 게스트가 자기 startup 에서 SIGILL"이 **device-FIXED** 됐다(`docs/evidence/2026-06-02-round11-remap-sigill-fixed.md`).
+> 근인은 `map_elf_image` 가 PT_LOAD 마다 `MAP_FIXED` 로 매핑 → 두 PT_LOAD 가 한 페이지를 공유할 때
+> 두 번째 `MAP_FIXED` 가 그 경계 페이지를 fresh 0-anon 으로 교체해 첫 세그먼트가 이미 복사한 바이트
+> (code/`.rela.plt`/IFUNC)를 **clobber** → `__libc_start_main` 에서 SIGILL. fix = 전체
+> `[min_vaddr,max_vaddr)` span 을 **단일 anon RW 매핑**으로 예약 + 세그먼트별 `memcpy`(재-mmap 없음 →
+> clobber 없음) + 페이지별 union `mprotect` + 실 `AT_HWCAP`(0x119fff)을 IRELATIVE resolver 에 전달.
+> device: 재-맵 `/bin/sh` 가 `signal 4` 0(`sp_align=ok`, `bss_zeroed`, `entry=0x400640` 점프). 따라서
+> in-process 재-맵 **매퍼는 이제 정확**하다(개념/매퍼 미지수 소진). **그러나 셀 미승급**: `inproc` 는
+> `ALR_REEXEC_INPROC=1` opt-in(기본 OFF) — 전역 ON 시 onCreate 직렬 프로브 시퀀스가 PERF 후 정지(직렬
+> supervision + `/proc/self/exe` 엣지). 남은 것 = **시퀀스-레벨 통합(per-exec scoping · `/proc/self/exe`
+> pass-through · 비-root apt/dpkg fakeroot)**, 개념적 벽이 아님.
+>
+> **(R12 in-flight) 6-lane 드레인 — device-pending.** v144 토대 위에서 6 lane 이 병렬 진행 중이며
+> **아직 어느 것도 device-검증으로 셀 승급되지 않았다**(host-clean increment + device 게이트 대기).
+> 통합 드레인 체크리스트와 lane 별 device-req 게이트는 **`docs/research/r12-remaining-gaps-status.md`**
+> (WS-1 단일 드레인 SSOT)가 소유한다. 아래 갭 섹션에 각 lane 의 `(R12 in-flight)` 노트를 단다 —
+> 이들은 **device-pending(셀 미승급)**, 즉 진행 중이며 완료가 아니다.
 >
 > **round-6 device-verified 요약(이 갱신):** G1(최고 레버리지 exec-re-entry)은 **ADR-003 B-1(execve
 > x0 path-rewrite)이 device-fires**(`alr exec x0=/bin/sh reason=rewrite` traps=1 rewrites=1; no-exec
@@ -130,6 +150,19 @@ PT_LOAD 를 `mmap(PROT_EXEC)`(W^X-허용) 로 in-process map → 새 SysV stack(
 - `apt install` 은 여전히 `unpacked=false` 이나 핵심 driver 가 **exec-re-entry 와 독립**으로 드러남:
   `dpkg: error: requires superuser privilege`(비-root dpkg 가 unpack 거부) → **fakeroot/root-emulation**
   경로 별도 필요.
+
+**(R12 in-flight) lane g1-seqint — sequence integration (device-pending, NOT DONE).** round-11 v144 가
+SIGILL 을 고쳐 매퍼는 정확해졌으나(`docs/evidence/2026-06-02-round11-remap-sigill-fixed.md`), `inproc`
+전역 ON 은 onCreate 직렬 프로브 시퀀스를 PERF 프로브 후 정지시킨다(직렬 supervision + `/proc/self/exe`
+엣지) → `ALR_REEXEC_INPROC=1` opt-in(기본 OFF). 따라서 R12 의 g1-seqint lane 은 세 조각을 정복된 매퍼
+위에 통합한다: **(1) inproc-redirect scoping** — 전역 re-map 대신 per-exec 단위로 재-맵을 켜고
+(rootfs-내 절대경로 자식만), 직렬 supervision 이 wedge 되지 않게 non-blocking 처리; **(2) `/proc/self/exe`
+pass-through** — 게스트가 `/proc/self/exe`(interp `/system/bin/linker64`, chromium zygote 가 *Android* 앱
+바이너리를 re-exec)를 exec 할 때는 rootfs-바이너리 재-맵과 **구분**해 통과(Debian rootfs 로 매개 불가);
+**(3) apt fakeroot** — 비-root `dpkg: requires superuser` 를 fakeroot/root-emulation 으로 우회(아래
+apt-fakeroot lane 과 짝). **이 lane 이 device-검증되기 전엔 G1 셀(RUNS) 승급 금지** — 매퍼 정확성 ≠ apt/
+dpkg/GIMP-plugin 체인 device-동작. device-req 게이트 = `r12-remaining-gaps-status.md` g1-seqint 행
+(전역 inproc ON 으로 onCreate 시퀀스 완주 + 재-맵 자식이 깨끗이 exit).
 
 **device 증거(B-1+B-3 결정은 device-fires 하나 `exec_events=0` ⇒ execve 자체가 미완 — THE WALL).**
 round-7 v139(`docs/evidence/2026-06-02-round7-vkrender-pass-drain.md`):
@@ -261,9 +294,17 @@ Mali proprietary Vulkan 한계(no transform_feedback/geometry/tess)는 전략 �
 **의존.** GPU ring/AHB present 인프라(CP-2/CP-4, device-verified✓) 재사용. G5(GLES3) 와 일부 공유
 (ANGLE 경로). G1 무관.
 
----
-
-## G4 — netsurf 네트워크/입력 interaction
+**(R12 in-flight) lane g3-vk — render breadth toward ICD (device-pending, NOT DONE).** round-7 v139
+가 clear `vkQueueSubmit`=VK_SUCCESS 로 render 경로 device-검증을 마쳤다(enumerate + clear 둘 다 PASS).
+R12 의 g3-vk lane 은 그 다음 breadth 를 진행한다: **(a) textured draw** — vertex/index buffer + sampler
++ texture upload 를 거치는 실제 draw call(`vkCmdDraw`/`vkCmdDrawIndexed`)을 마샬해 AHB color-attach 로
+렌더; **(b) multi-draw / 다중 파이프라인** — 여러 draw 와 state 전환이 한 command buffer 안에서 정확히
+replay 되는지; **(c) ICD(VK-M3)** — 게스트 `libvulkan_alr.so` ICD + manifest 로 게스트가 표준
+`libvulkan.so` loader 경로를 통해 ALR 마샬 device 를 잡게 함(현재는 직접 링크). clear-only PASS 에서
+textured/multi-draw 로 확장하는 것이 ICD 로 가는 길의 분자다. **clear 가 device-PASS 라도 textured/
+multi-draw 는 미검증** — G3 는 PARTIAL 유지(셀 승급 금지). device-req 게이트 =
+`r12-remaining-gaps-status.md` g3-vk 행(textured draw 가 AHB 로 렌더되고 컴포지터 sample, multi-draw
+정확성). Mali proprietary 한계(no transform_feedback/geometry/tess)는 전략 문서에 기록(불변).
 
 **무엇이 막혔나.** netsurf-gtk 가 정적 `about:welcome` 을 **RENDERS**(drain#12, rendered=true,
 5 threads)하지만, 실제 웹 페이지 로드(네트워크 자산 fetch)와 클릭/스크롤 입력 interaction 은 미검증.
@@ -279,9 +320,17 @@ frames 2214→2217, 그러나 잔여(증분, 회귀 아님)로 "전체 페이지
 
 **의존.** WS-3 입력(M4). G1 무관(단일 프로세스 브라우저). round-4/5 증분.
 
----
-
-## G5 — GLES3 전체 scene 커버리지
+**(R12 in-flight) lane g4-input — GUI text input breadth (device-pending, NOT DONE).** GIMP 에서 포인터
+입력 주입은 USABLE✓(`alr-gui-android-native-polish` 메모리: 터치로 메뉴/다이얼로그까지 동작)이나
+**텍스트 입력**(키보드)은 좁다. R12 의 g4-input lane 은 키보드 입력의 세 축을 채운다: **(1) modifiers**
+— Shift/Ctrl/Alt/Super 가 `wl_keyboard.modifiers`(mods_depressed/latched/locked/group)로 정확히
+전달돼 대문자·단축키가 동작; **(2) key repeat** — `wl_keyboard.repeat_info`(rate/delay) + Android
+long-press → 게스트가 반복 입력을 받음; **(3) keymap** — `wl_keyboard.keymap`(XKB_V1) 가 rootfs xkb-data
+(`ws4-xkb-data-present` 메모리: base 가 이미 `/usr/share/X11/xkb` + libxkbcommon 동봉)로 해석돼
+NO_KEYMAP SEGV 없이 키코드→keysym 매핑(WS-3 의 `XKB_CONFIG_ROOT`→rootfs 경로 fix 와 짝). **포인터
+USABLE 이라도 텍스트 입력 modifiers/repeat/keymap 은 미검증** — G4 입력 셀 승급 금지. device-req 게이트 =
+`r12-remaining-gaps-status.md` g4-input 행(GTK/Qt 텍스트 위젯에 대문자+단축키+반복 입력이 device 에서
+들어가고 NO_KEYMAP crash 0).
 
 **무엇이 막혔나.** glmark2 가 **build+texture 2-scene** 으로 Mali 에 렌더(Score~1000+,
 software=false, device-verified)하지만, **전체 14-scene** 과 GLES3+ 기능(현재 GLES2 19-op
@@ -300,6 +349,17 @@ decoder replay + wire-check 케이스 추가(host 게이트, off-device round-tr
 duration↑ 또는 분할 launch.
 
 **의존.** WS-2 shim/decoder. G3(Vulkan/ANGLE) 와 ANGLE 경로 공유 가능. G1 무관.
+
+**(R12 in-flight) lane g5-gles3 — GLES3 scene coverage (device-pending, NOT DONE).** glmark2 가
+build+texture **2-scene** 으로 Mali 에 렌더(Score~1000+, software=false)하나 **전체 14-scene** 과 GLES3+
+entry point 는 미완(현 GLES2 19-op state-setter 커버리지). R12 의 g5-gles3 lane 은 shim op 커버리지를
+GLES3 까지 확장한다: **(a) GLES3 entry point** — VAO/UBO/`glDrawElementsInstanced`/sampler object/MRT
+등 GLES3 호출을 shim → ring → host decoder 로 마샬(host Mali context 는 이미 GLES **3.2** 확인됨); **(b)
+추가 scene** — glmark2 14-scene 중 shading/bump/refract/conditionals 등 더 많은 scene 을 렌더(duration↑
+또는 분할 launch); **(c) host wire-check 라운드트립** — 새 op 마다 decoder replay + wire-check 케이스
+(off-device host 게이트). **GLES2 2-scene 이 device-PASS 라도 GLES3/14-scene 은 미검증** — G5 PARTIAL
+유지(셀 승급 금지). device-req 게이트 = `r12-remaining-gaps-status.md` g5-gles3 행(GLES3 scene 이 실 Mali
+에 software=false 로 렌더 + GL_RENDERER passthrough).
 
 ---
 
@@ -339,3 +399,11 @@ duration↑ 또는 분할 launch.
   수"에 근거. 새 갭은 같은 기준으로 #0 표에 끼워 넣는다.
 - **CP-6/chromium 은 보류** — 사용자 보류 상태이므로 이 SSOT 의 레버리지 목록에 올리지 않는다.
   CP-6 진행/분기는 `docs/research/cp6-status.md`(별도 SSOT, ADR-001/002/003 상호참조)가 소유.
+- **round-11→R12 전이(v144)**: round-10 의 G1 잔여 게이트(재-맵 게스트 SIGILL)가 **device-FIXED**
+  (`docs/evidence/2026-06-02-round11-remap-sigill-fixed.md`, 단일-span 매핑 + 실 HWCAP) → in-process
+  재-맵 매퍼는 정확하나 `inproc` 는 여전히 opt-in(기본 OFF)이고 G1 셀은 미승급(시퀀스 통합 잔여).
+  v144 위에서 **6 lane(g1-seqint · g3-vk · g5-gles3 · g4-input · apt-fakeroot · docs)**가 병렬 진행 중이며
+  각 갭 섹션(G1/G3/G4/G5)에 `(R12 in-flight)` 노트를 달았다 — 이들은 **device-pending(셀 미승급)**, 진행
+  중이며 완료가 아니다(host-clean increment + device 게이트 대기). 6 lane 의 단일 드레인 체크리스트와 lane 별 device-req
+  게이트는 **`docs/research/r12-remaining-gaps-status.md`**(WS-1 드레인 SSOT)가 소유한다. R11/R12 진전은
+  device evidence 전까지 BLOCKED/PARTIAL→DONE 승급 금지(매퍼 정확성·host 프로토타입 ≠ 셀 RUNS).
