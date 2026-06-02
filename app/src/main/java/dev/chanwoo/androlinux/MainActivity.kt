@@ -86,21 +86,12 @@ class MainActivity : Activity() {
                     "/usr/lib/chromium/chromium-headless-shell\n--no-sandbox\n--version",
                 )
                 android.util.Log.i("alr_loader", "chromium-boot:\n$crReport")
-                // CP-6 storm re-diagnosis (PR #2 measure-first): run the HEAVY --dump-dom
-                // render path under the chromium 120s alarm window (runtime_report gives a
-                // chromium guest the larger window). The supervisor's clone_events line then
-                // device-decides whether chromium reaches its first worker clone (>0 = the
-                // "1-thread deadlock" was a misdiagnosis = the 25s window; still 0 = a real
-                // stall). about:blank keeps the closure to the chromium binary itself.
-                val crStorm = nativeAlrNativeLoaderProbe(
-                    packageName,
-                    applicationInfo.nativeLibraryDir,
-                    filesDir.absolutePath,
-                    cacheDir.absolutePath,
-                    rootfsManifest.name,
-                    "/usr/lib/chromium/chromium-headless-shell\n--no-sandbox\n--headless\n--dump-dom\nabout:blank",
-                )
-                android.util.Log.i("alr_loader", "chromium-storm (--dump-dom):\n$crStorm")
+                // CP-6 storm re-diagnosis (PR #2 measure-first): the heavy --dump-dom path
+                // is NOT run inline here — a device drain (v144) showed it hangs the whole
+                // onCreate probe sequence (the native loader probe serializes guest
+                // supervision, so a --dump-dom that stalls blocks every later GPU/GUI probe).
+                // The chromium guest now gets a 120s alarm window (runtime_report) for when
+                // --dump-dom is run in a DEDICATED isolated drain; inlining it is deferred.
             } catch (e: Throwable) {
                 android.util.Log.e("alr_loader", "chromium-boot EXC: ${android.util.Log.getStackTraceString(e)}")
             }
@@ -752,7 +743,7 @@ class MainActivity : Activity() {
             alrSeccompPathTrapProbe.lineStartingWith("alr sc PATH_MEDIATION_VIABLE=")
                 .substringAfter("PATH_MEDIATION_VIABLE=", "") == "yes"
 
-        val executionSummary = "build: 0.4.143-r10-v143" +
+        val executionSummary = "build: 0.4.144-r11-v144" +
             "\nexecution summary" +
             "\nROOTFS EXECUTION: ${if (rootfsExecutionPassed) "PASS" else "FAIL"}" +
             "\nSHELL SCRIPT EXECUTION: ${if (shellScriptExecutionPassed) "PASS" else "FAIL"}" +
