@@ -82,6 +82,8 @@ REQUIRED_SYMBOLS = (
     "chown", "lchown", "fchown", "fchownat",
     # mode -> try real, else record + succeed
     "chmod", "fchmod", "fchmodat",
+    # hard link -> try real, else copy-fallback (f2fs protected_hardlinks EPERM)
+    "link", "linkat",
     # stat family -> overlay faked owner/mode
     "stat", "lstat", "fstat", "fstatat", "newfstatat", "statx",
 )
@@ -400,6 +402,12 @@ def _selftest() -> int:
           "FAKEROOTUID" in src and "FAKEROOTGID" in src)
     check("stat overlays the faked owner via fr_apply_stat",
           "fr_apply_stat(" in src)
+    check("link falls back to a content copy on EPERM (protected_hardlinks)",
+          "int link(const char *oldp" in src
+          and "fr_link_copy_fallback(" in src
+          and "EPERM" in src)
+    check("link copy-fallback creates a real dest file (no bare fake-success)",
+          "fr_copy_file(" in src and "O_CREAT | O_EXCL | O_WRONLY" in src)
     # W^X: assert no CALL SITE for exec-memory / seccomp / ptrace (the words may
     # appear in the header comment that promises their absence — match `name(`).
     code = _strip_c_comments(src)

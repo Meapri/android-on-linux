@@ -578,6 +578,50 @@ static void alr_emit_fd2(const char *s, size_t n) {
     alr_tramp_syscall(__NR_write, 2, (long)s, (long)n, 0, 0, 0);
 }
 
+/* ----- ALR_INTERPOSE_DIAG: cwd/relative-open diagnostic (OFF by default) -----
+ *
+ * Set ALR_INTERPOSE_DIAG=1 in the guest env to make this .so emit one stderr
+ * line per chdir() and per AT_FDCWD-relative open with O_CREAT, so a device
+ * drain can confirm exactly which syscall dpkg uses to create
+ * var/lib/dpkg/updates/tmp.i and whether cwd lands inside the rootfs. Zero cost
+ * and zero output when unset/"0". Strictly diagnostic — never changes behavior.
+ * errno is saved/restored by callers around the emit. */
+static int g_diag = 0;   /* read once in ctor from ALR_INTERPOSE_DIAG */
+
+/* Emit "ALR-IDIAG <tag> <a>[ <b>][ =<r>]\n" through the trampoline write.
+ * All args are bytewise-copied (no libc string calls in the trusted path). */
+static void alr_diag(const char *tag, const char *a, const char *b, long r) {
+    if (!g_diag) return;
+    int saved = errno;
+    char line[1280];
+    size_t o = 0;
+    const char *pre = "ALR-IDIAG ";
+    for (size_t i = 0; pre[i] && o < sizeof line - 1; ++i) line[o++] = pre[i];
+    for (size_t i = 0; tag && tag[i] && o < sizeof line - 1; ++i) line[o++] = tag[i];
+    if (a) {
+        if (o < sizeof line - 1) line[o++] = ' ';
+        for (size_t i = 0; a[i] && o < sizeof line - 1; ++i) line[o++] = a[i];
+    }
+    if (b) {
+        if (o < sizeof line - 1) line[o++] = ' ';
+        for (size_t i = 0; b[i] && o < sizeof line - 1; ++i) line[o++] = b[i];
+    }
+    /* " =<r>" as a signed decimal */
+    if (o < sizeof line - 3) { line[o++] = ' '; line[o++] = '='; }
+    {
+        char num[24]; int ni = 0; long v = r; int neg = 0;
+        if (v < 0) { neg = 1; }
+        unsigned long u = neg ? (unsigned long)(-(v + 1)) + 1UL : (unsigned long)v;
+        if (u == 0) num[ni++] = '0';
+        while (u && ni < (int)sizeof num) { num[ni++] = (char)('0' + (u % 10)); u /= 10; }
+        if (neg && o < sizeof line - 1) line[o++] = '-';
+        while (ni > 0 && o < sizeof line - 1) line[o++] = num[--ni];
+    }
+    if (o < sizeof line) line[o++] = '\n';
+    alr_emit_fd2(line, o);
+    errno = saved;
+}
+
 /*
  * ALR_SVCSCAN diagnostic gate (OFF by default, zero cost unless set).
  *
@@ -667,6 +711,20 @@ static void alr_emit_svcscan_if_gated(void) {
  */
 __attribute__((constructor(101)))
 static void alr_ctor(void) {
+    /* v2 DIAG: RAW svc write as the VERY FIRST ctor statement, BEFORE alr_init(),
+     * to prove the init_array entry is even reached (vs alr_init faulting first).
+     * Gated inline on ALR_INTERPOSE_DIAG so it is silent in normal runs. */
+    {
+        const char *idg = getenv("ALR_INTERPOSE_DIAG");
+        if (idg && idg[0] != '0' && idg[0] != '\0') {
+            const char m[] = "ALR-IPRAW ctor-entered\n";
+            register long x8 __asm__("x8") = __NR_write;
+            register long x0 __asm__("x0") = 2;
+            register long x1 __asm__("x1") = (long)m;
+            register long x2 __asm__("x2") = (long)sizeof(m) - 1;
+            __asm__ __volatile__("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2) : "memory");
+        }
+    }
     alr_init();                         /* sets g_rootfs / g_rootfs_len (idempotent) */
 
     /* Trampoline range FIRST: needed by the BPF and by every emit/probe. */
@@ -677,6 +735,15 @@ static void alr_ctor(void) {
      * DEFAULT "1"; only an explicit "0" disables. */
     const char *g = getenv("ALR_PCGATE");
     g_pcgate = (g != NULL && g[0] == '0') ? 0 : 1;
+
+    /* ALR_INTERPOSE_DIAG gate (OFF unless first char is non-'0'). Read before
+     * any wrapper can fire so the chdir/relative-open trace is complete. */
+    const char *dg = getenv("ALR_INTERPOSE_DIAG");
+    g_diag = (dg != NULL && dg[0] != '0' && dg[0] != '\0') ? 1 : 0;
+    /* Liveness marker: proves THIS process actually loaded the interposer (vs a
+     * static/raw-syscall guest where the wrappers never fire => rewrites=0). */
+    alr_diag("ctor-live rootfs", (g_rootfs_len > 0) ? g_rootfs : "(none)", 0,
+             (long)g_rootfs_len);
 
     /* rootfs anchor + openat2 probe, then the faccessat2 probe. Both use the
      * trampoline and tolerate the rootfs being unset (self-disable). These run
@@ -764,12 +831,26 @@ static int alr_open_emit(int dirfd, const char *path, int flags, mode_t mode) {
         if (rel[0] == '\0') rel = ".";
         long r = alr_tramp_syscall(__NR_openat2, g_rootfs_fd, (long)rel,
                                    (long)&how, (long)sizeof how, 0, 0);
+        /* G1 diag: spotlight absolute O_CREAT served via openat2(RESOLVE_IN_ROOT)
+         * (the dpkg .dpkg-new data-file create path) so a device drain shows the
+         * exact guest path, the rootfs-relative path actually opened, and the fd/
+         * errno — to localize the unpack "No such file or directory" timestamp
+         * failure. Diagnostic only; gated on g_diag, errno saved/restored. */
+        if (g_diag && (flags & O_CREAT)) {
+            alr_diag("abscreat-o2", path, rel, (r < 0 && r >= -4095) ? r : 0);
+        }
         return (int)alr_ret(r);
     }
     /* Fallback: string-prefix rewrite (absolute only) + plain openat. */
     char b[ALR_PBUF];
     const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
     long r = alr_tramp_syscall(__NR_openat, dirfd, (long)p, flags, mode, 0, 0);
+    /* Diagnostic: spotlight AT_FDCWD-relative creations (dpkg journal tmp.i is
+     * exactly this: open("updates/tmp.i", O_CREAT) after chdir to admindir). */
+    if (g_diag && path && path[0] != '/' && dirfd == AT_FDCWD && (flags & O_CREAT)) {
+        alr_diag("relcreat", path, (dirfd == AT_FDCWD) ? "AT_FDCWD" : "fd",
+                 (r < 0 && r >= -4095) ? r : 0);
+    }
     return (int)alr_ret(r);
 }
 
@@ -1486,7 +1567,10 @@ int chdir(const char *path) {
     static int (*real)(const char *);
     ALR_REAL(real, int (*)(const char *), "chdir");
     char b[ALR_PBUF];
-    return real(rw(path, b, sizeof b));
+    const char *p = rw(path, b, sizeof b);
+    int r = real(p);
+    alr_diag("chdir", path, (p != path) ? p : "(norw)", (r == 0) ? 0 : -errno);
+    return r;
 }
 int chmod(const char *path, mode_t mode) {
     static int (*real)(const char *, mode_t);
@@ -1516,7 +1600,57 @@ int utimensat(int dirfd, const char *path, const struct timespec times[2],
              "utimensat");
     char b[ALR_PBUF];
     const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
-    return real(dirfd, p, times, flags);
+    int r = real(dirfd, p, times, flags);
+    /* G1 diag: the dpkg unpack failure surfaces HERE ("error setting timestamps
+     * of '/usr/bin/hello.dpkg-new'"). Log guest path, rewritten path, and result
+     * so a device drain confirms whether the rewrite matches where the .dpkg-new
+     * file was actually created (abscreat-o2 above) — the ENOENT root cause.
+     * Diagnostic only; gated on g_diag, errno saved/restored by alr_diag. */
+    if (g_diag) {
+        alr_diag("utimensat", path, (p != path) ? p : "(norw)",
+                 (r == 0) ? 0 : -errno);
+    }
+    return r;
+}
+
+/* utimes/lutimes: the path-based timestamp setters dpkg ACTUALLY uses.
+ * --------------------------------------------------------------------------
+ * DEVICE-PROVEN ROOT CAUSE (G1 drain, /tmp/aptdrain13.log): dpkg 1.22 (arm64,
+ * glibc 2.39) sets a freshly-unpacked file's timestamps via utimes()/lutimes(),
+ * NOT utimensat() — dpkg's only UND timestamp symbols are `utimes` + `lutimes`.
+ * Its data-file create DOES go through our open() wrapper (abscreat-o2 shows the
+ * .dpkg-new created under the rootfs), but the subsequent timestamp call landed
+ * on the UNWRAPPED utimes(), which then hit the BARE literal path
+ * "/usr/bin/hello.dpkg-new" (not the rootfs) -> ENOENT -> dpkg aborts the unpack
+ * ("error setting timestamps of '/usr/bin/hello.dpkg-new'") -> configured=false.
+ * Wrapping utimes/lutimes with the same absolute-path rewrite as utime/utimensat
+ * closes the gap so the timestamp lands on the same rootfs file the open created.
+ * struct timeval is forwarded opaquely (only the pointer is passed through), so
+ * no <sys/time.h> dependency is added to this freestanding-style unit. */
+struct timeval;  /* opaque; we only forward the pointer */
+int utimes(const char *path, const struct timeval times[2]) {
+    static int (*real)(const char *, const struct timeval[2]);
+    ALR_REAL(real, int (*)(const char *, const struct timeval[2]), "utimes");
+    char b[ALR_PBUF];
+    const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
+    int r = real(p, times);
+    if (g_diag) {
+        alr_diag("utimes", path, (p != path) ? p : "(norw)",
+                 (r == 0) ? 0 : -errno);
+    }
+    return r;
+}
+int lutimes(const char *path, const struct timeval times[2]) {
+    static int (*real)(const char *, const struct timeval[2]);
+    ALR_REAL(real, int (*)(const char *, const struct timeval[2]), "lutimes");
+    char b[ALR_PBUF];
+    const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
+    int r = real(p, times);
+    if (g_diag) {
+        alr_diag("lutimes", path, (p != path) ? p : "(norw)",
+                 (r == 0) ? 0 : -errno);
+    }
+    return r;
 }
 
 /* =================================================================== */

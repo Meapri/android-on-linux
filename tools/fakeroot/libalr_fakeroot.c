@@ -39,6 +39,10 @@
  *     chown lchown fchown fchownat   -> remember (uid,gid) for the target, return 0
  *   mode (try real chmod; on EPERM remember the mode and fake success):
  *     chmod fchmod fchmodat          -> real chmod, else remember mode + return 0
+ *   hard link (try real link; on EPERM copy the contents — f2fs
+ *   protected_hardlinks refuses a non-CAP_FOWNER link even of an owned file):
+ *     link linkat                    -> real link, else copy src->dst (real file)
+ *     symlinkat                      -> forwarded verbatim (symlink needs no priv)
  *   stat family (overlay the faked uid/gid/mode onto the real result):
  *     stat lstat fstat fstatat statx and the glibc __xstat/__lxstat/__fxstatat
  *     (+ *64) vtable variants                     -> real stat, then patch buf
@@ -91,6 +95,7 @@
 #include <stdlib.h>     /* getenv */
 #include <fcntl.h>      /* AT_FDCWD, AT_SYMLINK_NOFOLLOW */
 #include <errno.h>
+#include <unistd.h>     /* write — ctor liveness diag */
 #include <sys/types.h>
 #include <sys/stat.h>
 
@@ -122,7 +127,22 @@ static void fr_init(void) {
 }
 
 __attribute__((constructor(102)))   /* after libalr_interpose's 101 ctor */
-static void fr_ctor(void) { fr_init(); }
+static void fr_ctor(void) {
+    fr_init();
+    /* v2 DIAG (ALR_INTERPOSE_DIAG, OFF by default): one liveness line to fd 2
+     * proving THIS .so's ctor ran in the guest image. Raw write(2) — the fakeroot
+     * shim installs no seccomp filter, so no trampoline is needed (unlike the
+     * interposer's alr_emit_fd2). errno is saved/restored. Zero output when unset. */
+    const char *dg = getenv("ALR_INTERPOSE_DIAG");
+    if (dg && dg[0] != '0' && dg[0] != '\0') {
+        int saved = errno;
+        const char *m = "ALR-FRDIAG ctor-live uid="; (void)write(2, m, 25);
+        char b[8]; int n = 0; unsigned v = (unsigned)g_fake_uid;
+        if (v == 0) b[n++] = '0'; else { char t[8]; int k=0; while(v){t[k++]=(char)('0'+v%10);v/=10;} while(k)b[n++]=t[--k]; }
+        (void)write(2, b, (size_t)n); (void)write(2, "\n", 1);
+        errno = saved;
+    }
+}
 
 /* ----- fake-ownership DB: open-addressing hash keyed by (dev, ino) ----- */
 
@@ -344,6 +364,149 @@ int fchmodat(int dirfd, const char *path, mode_t mode, int flags) {
         return 0;
     }
     return rc;
+}
+
+/* =================================================================== */
+/* link / linkat — try the real hard link; on EPERM, copy-fallback      */
+/* =================================================================== */
+/*
+ * Why a wrapper at all
+ * --------------------
+ * On the device /data is f2fs with fs.protected_hardlinks=1 (the standard
+ * Android/hardened kernel default). Under that protection link(2) returns
+ * EPERM unless the caller OWNS the source inode's on-disk owner OR holds
+ * CAP_FOWNER in the inode's userns. ALR runs as a normal untrusted_app: the
+ * fakeroot shim fakes the *libc* getuid() view, but the kernel's real fsuid is
+ * unchanged and we have no CAP_FOWNER — so even a same-directory hard link of a
+ * file WE just created EPERMs (device-verified: ln of an owned 0666 file in the
+ * app's own dir fails EPERM, no SELinux AVC; symlink in the same dir succeeds).
+ *
+ * dpkg's unpack uses link(tmp, final) to atomically commit its per-package
+ * info DB files (e.g. /var/lib/dpkg/info/<pkg>.list) and to back up/replace data
+ * files. It does NOT rely on the two names sharing an inode afterwards — it just
+ * needs the destination to be a real, readable regular file with the source's
+ * contents (it later fopen()s the .list back, renames over it, etc.). So when the
+ * real hard link is refused we satisfy dpkg with a CONTENT COPY: an independent
+ * regular file at the destination. A bare fake-success (rc=0 with no file) would
+ * leave the destination ABSENT and the next stat()/fopen() would ENOENT — worse
+ * than the EPERM. The copy is the honest, dpkg-correct fallback.
+ *
+ * Chaining (CRITICAL): both path args are real filesystem locations, so we pass
+ * them UNCHANGED to the next link()/openat() via RTLD_NEXT — libalr_interpose's
+ * own link/openat wrappers do the guest->rootfs path rewrite underneath us (the
+ * fakeroot shim must never rewrite paths itself). symlink CONTENTS (the target of
+ * symlinkat) are link data, not a path to resolve, so they are never touched.
+ */
+
+/* Copy regular-file contents from an already-open src fd to a freshly-created
+ * dest path (opened O_CREAT|O_EXCL|O_WRONLY through the next openat, so the
+ * interposer rewrites `dst`). Preserves the source's permission bits. Returns 0
+ * on success; on any failure removes a partial dest and returns -1 with errno
+ * set. Uses only RTLD_NEXT libc primitives (no heap, no exec memory). */
+static int fr_copy_file(int src_fd, int at_dirfd, const char *dst) {
+    static int     (*real_openat)(int, const char *, int, ...);
+    static ssize_t (*real_read)(int, void *, size_t);
+    static ssize_t (*real_write)(int, const void *, size_t);
+    static int     (*real_close)(int);
+    static int     (*real_fstat)(int, struct stat *);
+    static int     (*real_unlinkat)(int, const char *, int);
+    if (!real_openat)  real_openat  = (int (*)(int, const char *, int, ...))dlsym(RTLD_NEXT, "openat");
+    if (!real_read)    real_read    = (ssize_t (*)(int, void *, size_t))dlsym(RTLD_NEXT, "read");
+    if (!real_write)   real_write   = (ssize_t (*)(int, const void *, size_t))dlsym(RTLD_NEXT, "write");
+    if (!real_close)   real_close   = (int (*)(int))dlsym(RTLD_NEXT, "close");
+    if (!real_fstat)   real_fstat   = (int (*)(int, struct stat *))dlsym(RTLD_NEXT, "fstat");
+    if (!real_unlinkat) real_unlinkat = (int (*)(int, const char *, int))dlsym(RTLD_NEXT, "unlinkat");
+    if (!real_openat || !real_read || !real_write || !real_close) {
+        errno = ENOSYS; return -1;
+    }
+
+    /* lift the source's permission bits so the copy isn't more permissive */
+    mode_t mode = 0644;
+    struct stat sst;
+    if (real_fstat && real_fstat(src_fd, &sst) == 0) mode = sst.st_mode & 07777;
+
+    int dfd = real_openat(at_dirfd, dst, O_CREAT | O_EXCL | O_WRONLY, mode);
+    if (dfd < 0) return -1;   /* dest exists (EEXIST) or dir unwritable — surface it */
+
+    char buf[65536];
+    for (;;) {
+        ssize_t r = real_read(src_fd, buf, sizeof buf);
+        if (r < 0) { if (errno == EINTR) continue; goto fail; }
+        if (r == 0) break;
+        ssize_t off = 0;
+        while (off < r) {
+            ssize_t w = real_write(dfd, buf + off, (size_t)(r - off));
+            if (w < 0) { if (errno == EINTR) continue; goto fail; }
+            off += w;
+        }
+    }
+    real_close(dfd);
+    return 0;
+fail: {
+        int saved = errno;
+        real_close(dfd);
+        if (real_unlinkat) real_unlinkat(at_dirfd, dst, 0);   /* drop the partial dest */
+        errno = saved;
+        return -1;
+    }
+}
+
+/* Open `oldp` (existing source) read-only through the next openat so the
+ * interposer rewrites it, then copy it to `newp`. dirfds default to AT_FDCWD for
+ * the link()/relative-linkat case (the interposer rewrites only absolute paths,
+ * leaving relative ones bound to the real cwd, which matches what link() did). */
+static int fr_link_copy_fallback(int old_dirfd, const char *oldp,
+                                 int new_dirfd, const char *newp) {
+    static int (*real_openat)(int, const char *, int, ...);
+    static int (*real_close)(int);
+    if (!real_openat) real_openat = (int (*)(int, const char *, int, ...))dlsym(RTLD_NEXT, "openat");
+    if (!real_close)  real_close  = (int (*)(int))dlsym(RTLD_NEXT, "close");
+    if (!real_openat || !real_close) { errno = ENOSYS; return -1; }
+
+    int sfd = real_openat(old_dirfd, oldp, O_RDONLY);
+    if (sfd < 0) return -1;   /* source gone -> same ENOENT link() would give */
+    int rc = fr_copy_file(sfd, new_dirfd, newp);
+    int saved = errno;
+    real_close(sfd);
+    errno = saved;
+    return rc;
+}
+
+int link(const char *oldp, const char *newp) {
+    static int (*real)(const char *, const char *);
+    if (!real) real = (int (*)(const char *, const char *))dlsym(RTLD_NEXT, "link");
+    int rc = real ? real(oldp, newp) : -1;
+    if (rc == 0) return 0;                       /* real hard link worked */
+    if (!real || (errno != EPERM && errno != EACCES && errno != EXDEV))
+        return rc;                               /* not the protected-link case */
+    /* protected_hardlinks / cross-device refusal -> copy the contents instead */
+    return fr_link_copy_fallback(AT_FDCWD, oldp, AT_FDCWD, newp);
+}
+
+int linkat(int olddirfd, const char *oldp, int newdirfd, const char *newp, int flags) {
+    static int (*real)(int, const char *, int, const char *, int);
+    if (!real) real = (int (*)(int, const char *, int, const char *, int))dlsym(RTLD_NEXT, "linkat");
+    int rc = real ? real(olddirfd, oldp, newdirfd, newp, flags) : -1;
+    if (rc == 0) return 0;
+    if (!real || (errno != EPERM && errno != EACCES && errno != EXDEV))
+        return rc;
+    /* AT_SYMLINK_FOLLOW only affects whether a symlink SOURCE is dereferenced;
+     * our O_RDONLY open of the source follows symlinks by default, which matches
+     * the common (follow) case dpkg uses. The dest dirfd/path are passed through
+     * to openat unchanged so the interposer rewrites an absolute newp. */
+    return fr_link_copy_fallback(olddirfd, oldp, newdirfd, newp);
+}
+
+/* symlinkat — adjacency: ALR's interposer already wraps symlink/symlinkat for
+ * the path rewrite, and a symlink needs no privilege on f2fs (device-verified
+ * success), so there is nothing for fakeroot to fake here. We forward verbatim
+ * via RTLD_NEXT purely so the LD_PRELOAD chain order stays uniform (fakeroot
+ * outermost) and a future credential-sensitive symlink policy has a hook. The
+ * link target (symlink CONTENTS) is never rewritten. */
+int symlinkat(const char *target, int newdirfd, const char *linkpath) {
+    static int (*real)(const char *, int, const char *);
+    if (!real) real = (int (*)(const char *, int, const char *))dlsym(RTLD_NEXT, "symlinkat");
+    return real ? real(target, newdirfd, linkpath) : -1;
 }
 
 /* =================================================================== */

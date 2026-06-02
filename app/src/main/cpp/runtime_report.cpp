@@ -1622,6 +1622,17 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         const char* p = ::getenv("ALR_PCGATE");
         return !(p != nullptr && p[0] == '0');
     }();
+    // ALR_FAKEROOT (default OFF): when the app-process sets it to "1" right before a
+    // dpkg/apt drain (gated behind the .alr-aptdrain device marker), chain the
+    // fakeroot .so FIRST in LD_PRELOAD (so its credential wrappers — getuid->0,
+    // chown/stat no-ops — sit OUTSIDE the interposer) and push FAKEROOTUID/GID=0.
+    // Read from the HOST (app) env via ::getenv, exactly like ALR_DISABLE_INTERPOSE
+    // and ALR_PCGATE above — keeps the JNI signature fixed. When unset every line
+    // below is byte-identical to the pre-fakeroot env, so normal launch is no-op.
+    const bool fakeroot_on = []{
+        const char* f = ::getenv("ALR_FAKEROOT");
+        return f != nullptr && f[0] == '1';
+    }();
     if (!interpose_off) {
         // R3 / bootstrap: LD_PRELOAD MUST be the ABSOLUTE ROOTFS HOST path, not the
         // guest path. In PCGATE=1 the loader no longer traces path syscalls, so ld.so's
@@ -1630,10 +1641,33 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         // interposer's PC-gate filter would never install (no speedup AND no mediation).
         // The host-absolute path opens with no mediation needed, and is idempotently
         // left alone by the PCGATE=0 supervisor too, so it is correct in both A/B arms.
-        guest_env.push_back("LD_PRELOAD=" + config.rootfs_dir +
-                            "/usr/lib/androlinux/libalr_interpose.so");
+        std::string preload =
+            config.rootfs_dir + "/usr/lib/androlinux/libalr_interpose.so";
+        if (fakeroot_on) {
+            // fakeroot FIRST (credential outer layer), interpose KEPT. Both are
+            // ABSOLUTE ROOTFS host paths (R3), matching chain_ld_preload() in the
+            // host model tools/aptdrain_env_model.py.
+            preload = config.rootfs_dir +
+                      "/usr/lib/androlinux/libalr_fakeroot.so:" + preload;
+        }
+        guest_env.push_back("LD_PRELOAD=" + preload);
+    }
+    if (fakeroot_on) {
+        // fakeroot identity contract: make the guest see uid/gid 0 so dpkg's
+        // chown/stat root:root checks pass under a non-root Android process.
+        guest_env.push_back("FAKEROOTUID=0");
+        guest_env.push_back("FAKEROOTGID=0");
     }
     guest_env.push_back(pcgate_on ? "ALR_PCGATE=1" : "ALR_PCGATE=0");
+    // ALR_INTERPOSE_DIAG (default OFF): when the app-process sets it, propagate
+    // to the guest so the interposer emits its one-line chdir/relative-create
+    // trace to stderr. Read from the HOST env like ALR_PCGATE; pure diagnostic.
+    {
+        const char* idiag = ::getenv("ALR_INTERPOSE_DIAG");
+        if (idiag != nullptr && idiag[0] != '0' && idiag[0] != '\0') {
+            guest_env.push_back(std::string("ALR_INTERPOSE_DIAG=") + idiag);
+        }
+    }
     // Record both arms in the report so each run is self-identifying for A/B.
     out << "\nalr native loader pcgate=" << (pcgate_on ? "on" : "off")
         << " interpose=" << (interpose_off ? "off" : "on");
@@ -1841,7 +1875,12 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         // Disable glibc's rseq registration: bionic already owns this thread's
         // rseq area, and a second registration conflicts in-process.
         // Push all envp strings (built in the parent, COW-inherited here).
-        constexpr std::size_t kMaxEnv = 32;
+        // Headroom: base env (~23) + ALR_ROOTFS/ALR_GUEST_EXE + LD_PRELOAD +
+        // FAKEROOTUID/GID + ALR_PCGATE + ALR_INTERPOSE_DIAG + the GpuRing env block
+        // can exceed 32; an undersized cap would silently TRUNCATE the tail
+        // (dropping the GpuRing vars, or LD_PRELOAD itself if reordered), so keep
+        // generous headroom. envp_ptrs[] is sized to match.
+        constexpr std::size_t kMaxEnv = 48;
         const std::size_t n_env = guest_env.size() < kMaxEnv ? guest_env.size() : kMaxEnv;
         uintptr_t envp_ptrs[kMaxEnv] = {0};
         for (std::size_t i = n_env; i-- > 0;) {
@@ -1911,6 +1950,29 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
             ::write(dg, "PROGE=", 6); diag_hex(dg, prog.entry);
             ::write(dg, "PROGB=", 6); diag_hex(dg, prog.base);
             ::write(dg, "INTRE@", 6); diag_hex(dg, interp.entry);
+        }
+        // v2 DIAG (ALR_INTERPOSE_DIAG): dump the LD_PRELOAD / ALR_INTERPOSE_DIAG
+        // entries actually present on the handoff stack envp, so a drain can SEE
+        // whether the guest ld.so received the chained preload at all (vs the
+        // interposer ctor silently not running). Reads the same envp the guest gets.
+        {
+            const char* edg = ::getenv("ALR_INTERPOSE_DIAG");
+            if (edg != nullptr && edg[0] != '0' && edg[0] != '\0') {
+                for (std::size_t i = 0; i < n_env; ++i) {
+                    const char* e = reinterpret_cast<const char*>(envp_ptrs[i]);
+                    bool is_pre = e[0]=='L'&&e[1]=='D'&&e[2]=='_'&&e[3]=='P';
+                    bool is_dia = e[0]=='A'&&e[1]=='L'&&e[2]=='R'&&e[3]=='_'&&e[4]=='I';
+                    if (is_pre || is_dia) {
+                        ::write(dg, "\nENVP[", 6);
+                        char nb[4]; int ni=0, v=(int)i; if(v==0)nb[ni++]='0';
+                        char tmp[4]; int t=0; while(v){tmp[t++]=(char)('0'+v%10);v/=10;}
+                        while(t)nb[ni++]=tmp[--t]; ::write(dg, nb, ni);
+                        ::write(dg, "]=", 2);
+                        std::size_t L=0; while(e[L]&&L<512)++L; ::write(dg, e, L);
+                    }
+                }
+                ::write(dg, "\n", 1);
+            }
         }
         ::write(dg, "JUMPING;", 8);
         // Stack the seccomp filter LAST, after the loader's own file reads (the
@@ -2533,7 +2595,15 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                                 // writable; the B-3 envp window is BELOW sp-2048). Critical
                                 // regs (x19-x22, pc) and the syscall-nr regset are not
                                 // touched by the splice/B-1/B-3 SETREGSETs that follow, so
-                                // this redirect survives them.
+                                // this redirect survives them — EXCEPT that B-3 rebuilds the
+                                // envp and re-points x2; since the worker reads envp from x21
+                                // (a snapshot of x2 taken HERE), B-3 must also re-point x21 at
+                                // the augmented array or the in-process guest runs WITHOUT the
+                                // LD_PRELOAD interposer/fakeroot (the data-extract child then
+                                // writes *.dpkg-new to bare Android fs -> unpack/configure
+                                // fails). We track the redirect with this flag so B-3 can
+                                // mirror its envp re-point into x21 (G1 fix).
+                                bool inproc_redirected_this_trap = false;
 #if defined(__aarch64__)
                                 // G1 seqint: SCOPE the inproc redirect. The trampoline can
                                 // only map a rootfs glibc target; redirecting everything
@@ -2627,6 +2697,7 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                                                             NT_ARM_SYSTEM_CALL),
                                                         &sio) == 0) {
                                                     ++exec_inproc_redirected;
+                                                    inproc_redirected_this_trap = true;
                                                     if (first_reentry_target
                                                             .empty()) {
                                                         first_reentry_target = host;
@@ -2874,7 +2945,8 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                                     if (envp_read_ok) {
                                         const auto inj =
                                             alr::runtime::decide_exec_envp_injection(
-                                                config.rootfs_dir, env_entries);
+                                                config.rootfs_dir, env_entries,
+                                                /*fakeroot=*/fakeroot_on);
                                         if (first_exec_envp_reason.empty()) {
                                             first_exec_envp_reason = inj.reason;
                                         }
@@ -2984,6 +3056,20 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                                                         regs[3] = arr_base;
                                                     } else {
                                                         regs[2] = arr_base;
+                                                    }
+                                                    // G1 fix: if this exec was PC-redirected
+                                                    // into the in-process worker, the worker
+                                                    // reads envp from x21 (a snapshot of x2
+                                                    // taken at redirect time, BEFORE this
+                                                    // augmentation). Mirror the new envp into
+                                                    // x21 so the re-mapped guest sees the
+                                                    // augmented array (LD_PRELOAD interposer +
+                                                    // fakeroot + ALR_ROOTFS) — without this the
+                                                    // worker runs the un-augmented envp and the
+                                                    // dpkg data-extract child writes *.dpkg-new
+                                                    // to the bare Android fs (unpack fails).
+                                                    if (inproc_redirected_this_trap) {
+                                                        regs[21] = arr_base;
                                                     }
                                                     if (::ptrace(
                                                             PTRACE_SETREGSET, w,

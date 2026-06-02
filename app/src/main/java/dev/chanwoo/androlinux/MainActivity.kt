@@ -282,6 +282,15 @@ class MainActivity : Activity() {
         // ALR native loader and emits version/exit/summary to logcat tag alr_loader, so the
         // integration device drain can capture functional evidence (not just "staged").
         launchPackageManagerProbes(rootfsStatus.rootfsDir, rootfsManifest.name)
+        // v2 apt-pipeline (research/apt-launch SSOT §5 R-V2-LAUNCH): MARKER-GATED
+        // `dpkg -i hello.deb` under the fakeroot+interpose chain. Distinct from the
+        // launchPackageManagerProbes apt-install probe above (that one runs the base
+        // alr-smoke .deb WITHOUT fakeroot — it dies on `requires superuser`/EPERM for a
+        // non-root uid). This block extracts the fakeroot + apt-dpkg stage overlays, flips
+        // the ALR_FAKEROOT host-env hook the loader reads, and runs the real `hello` .deb.
+        // Gated on /data/local/tmp/.alr-aptdrain so normal cold starts never run it (same
+        // convention as .alr-cr1/.alr-cr2). See docs/design/v2-apt-pipeline-ssot.md §5/§7.
+        launchAptDrainProbe(rootfsStatus.rootfsDir, rootfsManifest.name)
         // WS-4 §10(b) toolkit launch FUNCTIONAL probes: run a lightweight smoke of the
         // SDL2 / Qt6 / netsurf binaries (from the sdl2/qt6/netsurf overlays staged above)
         // through the ALR native loader and Log.i(tag=alr_loader, "toolkit-<name>: ...") the
@@ -1888,6 +1897,311 @@ class MainActivity : Activity() {
                 android.util.Log.e("alr_loader", "pkgfunc EXC: ${android.util.Log.getStackTraceString(e)}")
             }
         }.start()
+    }
+
+    // v2 apt-pipeline drain (research/apt-launch SSOT §5 R-V2-LAUNCH / §7 DEVICE-REQ
+    // ALR-V2-apt-unpack). MARKER-GATED `dpkg -i hello.deb` under the fakeroot+interpose
+    // chain so a NON-ROOT (uid 10xxx) guest can clear dpkg's `requires superuser` gate +
+    // chown/chmod EPERM and actually UNPACK a real Debian/Ubuntu .deb in-process.
+    //
+    // Mirrors the chromium-stage probe (onCreate L59+) pattern exactly: size-keyed extract
+    // markers (.{name}-staged-<size>) via the WS-4 M1 guarded extractOverlayTar (can never
+    // downgrade a base lib), a bounded wait for the staged binaries, and a flag-file gate so
+    // normal cold starts are a strict no-op (only an explicit integration/device drain that
+    // `adb shell touch /data/local/tmp/.alr-aptdrain` arms it — same convention as .alr-cr1).
+    //
+    // T1/T2 SPLIT (IMPORTANT — see SSOT §5 + runtime_report.cpp L1617-1636): the native JNI
+    // entry `nativeAlrNativeLoaderProbe(package,libDir,filesDir,cacheDir,rootfsName,program)`
+    // is a FIXED 6-arg signature — it takes NO extra-env parameter. The loader decides the
+    // guest LD_PRELOAD itself and currently HARDCODES the single
+    // `<rootfs>/usr/lib/androlinux/libalr_interpose.so` (runtime_report.cpp L1633). It reads
+    // its A/B gates only from the HOST (app) process env via ::getenv (ALR_DISABLE_INTERPOSE,
+    // ALR_PCGATE). So MainActivity's ONLY clean, signature-stable hook is to set an
+    // `ALR_FAKEROOT=1` host-env var before the probe; the loader (T2, runtime_report.cpp —
+    // WS-1 territory) must then chain fakeroot FIRST:
+    //   LD_PRELOAD=<rootfs>/usr/lib/androlinux/libalr_fakeroot.so
+    //             :<rootfs>/usr/lib/androlinux/libalr_interpose.so
+    //   + FAKEROOTUID=0 FAKEROOTGID=0  (ALR_ROOTFS is already injected by the loader).
+    // Until that loader diff lands (SSOT §5 proposed diff A), the chain is NOT yet wired:
+    // this block extracts the overlays + arms the marker + sets ALR_FAKEROOT + runs the dpkg
+    // argv, and the unpack will only flip to true once T2 honors ALR_FAKEROOT. The dpkg argv
+    // here is verbatim `tools/build_fakeroot_overlay.py --device-cmd`
+    // (`dpkg --force-not-root --force-bad-path -i <deb>`).
+    // One apt-install drain target: the dpkg `-i` package, its .deb (in the apt
+    // cache), the extra stage tar that ships it, and the per-package unpack/configure
+    // markers dpkg prints (these embed the package NAME, so they must be pkg-driven —
+    // a hardcoded "hello" would never match galculator's output). SSOT for the drain's
+    // package so generalizing from hello→galculator is one descriptor, not scattered edits.
+    private data class AptDrainTarget(
+        val pkg: String,
+        val debCachePath: String,   // rootfs-rel, under var/cache/apt/archives/
+        val stageTar: String?,      // extra /data/local/tmp/<name>-stage.tar to extract (null = none)
+        val unpackedMarkers: List<String>,
+        val configuredMarker: String,
+    )
+
+    private fun aptDrainTargetFor(pkg: String): AptDrainTarget = when (pkg) {
+        // v2 breadth: a real GTK3 GUI app installed via dpkg, then launched on the
+        // compositor. Its deb + unpacked closure ride galculator-stage.tar.
+        "galculator" -> AptDrainTarget(
+            pkg = "galculator",
+            debCachePath = "var/cache/apt/archives/galculator_2.1.4-1.2build2_arm64.deb",
+            stageTar = "galculator",
+            unpackedMarkers = listOf(
+                "Unpacking galculator",
+                "Preparing to unpack",
+                "Selecting previously unselected package galculator",
+            ),
+            configuredMarker = "Setting up galculator",
+        )
+        // default: the original v2 hello.deb proof (its deb rides apt-dpkg-stage.tar,
+        // so no extra stage tar is needed).
+        else -> AptDrainTarget(
+            pkg = "hello",
+            debCachePath = "var/cache/apt/archives/hello_2.10-3build1_arm64.deb",
+            stageTar = null,
+            unpackedMarkers = listOf(
+                "Unpacking hello",
+                "Preparing to unpack",
+                "Selecting previously unselected package hello",
+            ),
+            configuredMarker = "Setting up hello",
+        )
+    }
+
+    private fun launchAptDrainProbe(rootfsDir: File, rootfsName: String) {
+        val marker = java.io.File("/data/local/tmp/.alr-aptdrain")
+        if (!marker.isFile) return
+        // The marker CONTENT names the package to install (default: hello). e.g.
+        //   adb shell 'echo galculator > /data/local/tmp/.alr-aptdrain'
+        // arms the galculator drain; an empty marker keeps the original hello proof.
+        val target = aptDrainTargetFor(
+            runCatching { marker.readText().trim() }.getOrDefault("").ifEmpty { "hello" },
+        )
+        Thread {
+            try {
+                android.util.Log.i("alr_loader", "aptdrain: marker present — v2 apt-pipeline drain armed (pkg=${target.pkg})")
+                // (L1 — SSOT §5) Extract the fakeroot + apt-dpkg stage overlays through the
+                // SAME guarded extractOverlayTar the chromium/foot/toolkit blocks use, keyed on
+                // tar size so re-pushing a rebuilt stage auto-re-extracts. fakeroot-stage.tar
+                // ships usr/lib/androlinux/libalr_fakeroot.so (0755); apt-dpkg-stage.tar ships
+                // usr/bin/{dpkg,apt,tar,…} + var/lib/dpkg admindir + var/cache/apt/archives/hello_*.deb.
+                // ORDER MATTERS (v2 admindir fix): apt-dpkg-stage ships the admindir SCAFFOLD
+                // (the empty var/lib/dpkg/{updates,triggers,alternatives}/ DIRECTORY entries +
+                // zero-byte status), while dpkg-db-stage ships the POPULATED status (72KB) +
+                // info/*.list but carries NO directory entries. v163 died at
+                // `var/lib/dpkg/updates/tmp.i: No such file or directory` because the scaffold's
+                // updates/ dir was missing (dpkg-db alone never creates it). So extract apt-dpkg
+                // FIRST (creates updates/ etc.), then dpkg-db LAST so its real status overwrites
+                // the scaffold's empty one while the scaffold's updates/ dir survives. All three
+                // (fakeroot, apt-dpkg, dpkg-db) MUST land before the dpkg run below.
+                // Use aptdrain-scoped markers (NOT the shared .{name}-staged-<size> the onCreate
+                // toolkit loop uses for dpkg-db) so this sequential, ordered extract is never
+                // pre-empted/skipped by that concurrent thread — guaranteeing apt-dpkg's scaffold
+                // lands before dpkg-db's populated status every armed cold start.
+                // The base three (fakeroot/apt-dpkg/dpkg-db) PLUS the target's own stage tar
+                // (galculator-stage.tar ships its .deb at var/cache/apt/archives/ + the unpacked
+                // closure so the compositor can launch /usr/bin/galculator). hello needs no extra
+                // tar — its .deb already rides apt-dpkg-stage.tar — so target.stageTar is null there.
+                val stageNames = listOf("fakeroot", "apt-dpkg", "dpkg-db") + listOfNotNull(target.stageTar)
+                for (name in stageNames) {
+                    val tar = java.io.File("/data/local/tmp/$name-stage.tar")
+                    val marker = java.io.File(rootfsDir, ".aptdrain-$name-staged-${tar.length()}")
+                    if (tar.isFile && !marker.isFile) {
+                        android.util.Log.i("alr_loader", "aptdrain: $name-stage extracting overlay (${tar.length()} bytes)")
+                        val ovr = RootfsInstaller(this@MainActivity).extractOverlayTar(tar, rootfsDir)
+                        marker.writeText("staged\n")
+                        android.util.Log.i("alr_loader", "aptdrain: $name-stage overlay done (extracted=${ovr.extracted} skipped=${ovr.skipped.size})")
+                        if (ovr.skipped.isNotEmpty()) android.util.Log.w("alr_loader", "aptdrain: $name-stage guard skipped downgrades:\n${ovr.skipped.joinToString("\n")}")
+                    } else if (!tar.isFile) {
+                        android.util.Log.i("alr_loader", "aptdrain: $name-stage.tar absent (push it to /data/local/tmp to arm the drain)")
+                    }
+                }
+                // The fakeroot .so + dpkg + the hello .deb must all be present before we probe;
+                // the overlays land via the loop above (or a prior cold start's markers).
+                val fakerootSo = java.io.File(rootfsDir, "usr/lib/androlinux/libalr_fakeroot.so")
+                val dpkgBin = java.io.File(rootfsDir, "usr/bin/dpkg")
+                // The target .deb in the apt cache: hello rides apt-dpkg-stage's --fetch-test-deb
+                // asset; galculator rides galculator-stage.tar (var/cache/apt/archives/galculator_*.deb).
+                val targetDeb = java.io.File(rootfsDir, target.debCachePath)
+                // v2 ROOT CAUSE FIX (device-confirmed, /tmp/aptdrain9.log): the
+                // libalr_interpose.so under usr/lib/androlinux/ is (re)written IN PLACE by
+                // the SEPARATE onCreate overlay-staging Thread (the "interpose-stage"
+                // extractOverlayTar). That thread ran CONCURRENTLY with this dpkg probe —
+                // its extract window (interpose-stage: extracting → overlay done) bracketed
+                // the dpkg launch. When the guest ld.so mmap'd libalr_interpose.so mid-
+                // rewrite (truncate+write), the LD_PRELOAD of the interposer FAILED to load
+                // (non-fatally: glibc skips a broken preload and proceeds), so the
+                // interposer's init_array/ctor never ran → NO path mediation → dpkg's
+                // relative opens hit literal Android paths → var/lib/dpkg/updates/tmp.i
+                // ENOENT → unpacked=false. fakeroot.so was staged earlier and settled, so
+                // ITS ctor ran (ALR-FRDIAG), which is why the two preloads diverged.
+                // FIX: also WAIT for the interpose-stage marker (written only AFTER the
+                // extract fully completes) so the .so is stable before any guest LD_PRELOADs
+                // it. The marker is name-versioned by tar size (.interpose-staged-<len>); we
+                // accept any .interpose-staged-* so a re-pushed tar of a different size still
+                // gates correctly. Absent tar (interpose shipped only in the base rootfs) →
+                // no marker is ever written, so don't block on it in that case.
+                val interposeStageTar = java.io.File("/data/local/tmp/interpose-stage.tar")
+                val interposeStaging = {
+                    interposeStageTar.isFile &&
+                        (rootfsDir.listFiles { f ->
+                            f.name.startsWith(".interpose-staged-")
+                        }?.isEmpty() ?: true)
+                }
+                var waited = 0
+                while (waited < 20000 &&
+                    !(fakerootSo.isFile && dpkgBin.isFile && targetDeb.isFile && !interposeStaging())) {
+                    Thread.sleep(500)
+                    waited += 500
+                }
+                val interposeStaged = !interposeStaging()
+                android.util.Log.i(
+                    "alr_loader",
+                    "aptdrain: fakeroot.so=${fakerootSo.isFile} dpkg=${dpkgBin.isFile} " +
+                        "${target.pkg}.deb=${targetDeb.isFile} interpose-staged=$interposeStaged (waited ${waited}ms)",
+                )
+                if (!(fakerootSo.isFile && dpkgBin.isFile && targetDeb.isFile)) {
+                    android.util.Log.w("alr_loader", "aptdrain: prerequisites missing — skipping dpkg -i (push fakeroot-stage.tar + apt-dpkg-stage.tar" + (target.stageTar?.let { " + $it-stage.tar" } ?: "") + ")")
+                    return@Thread
+                }
+                // (L2 — SSOT §5) Flip the host-env hook the loader reads. Setting ALR_FAKEROOT=1
+                // on THIS app process env is the signature-stable trigger for the loader (T2,
+                // runtime_report.cpp) to chain libalr_fakeroot.so FIRST ahead of the interpose
+                // .so and push FAKEROOTUID/GID=0. We restore it immediately after the probe so
+                // every OTHER probe path stays on the plain interpose-only chain (no regression).
+                android.system.Os.setenv("ALR_FAKEROOT", "1", true)
+                // (v2) Enable static re-map for dpkg's fork+exec children (zstd/sh/tar). dpkg
+                // shells out to the extract helper + maintainer scripts; without INPROC those
+                // statically-linked children don't get the in-process re-map and the unpack
+                // stage stalls. Scoped to the drain (unset in finally) so no other path changes.
+                android.system.Os.setenv("ALR_REEXEC_INPROC", "1", true)
+                // (v2 diag) Arm the interposer's chdir/relative-create trace so the
+                // device drain reveals exactly which syscall dpkg uses to create
+                // var/lib/dpkg/updates/tmp.i and whether cwd lands inside the rootfs.
+                // Scoped to the drain (unset in finally); pure diagnostic, no behavior change.
+                android.system.Os.setenv("ALR_INTERPOSE_DIAG", "1", true)
+                try {
+                    // (L3 effected) dpkg -i <target>.deb. argv is verbatim the builder's
+                    // --device-cmd: --force-not-root (bypass the superuser gate; fakeroot makes
+                    // getuid()==0 but this is belt-and-suspenders) + --force-bad-path. The deb is
+                    // referenced by its rootfs-relative path (the loader/interpose map it under
+                    // the rootfs). The package is the marker-driven target (hello | galculator | …).
+                    val out = nativeAlrNativeLoaderProbe(
+                        packageName,
+                        applicationInfo.nativeLibraryDir,
+                        filesDir.absolutePath,
+                        cacheDir.absolutePath,
+                        rootfsName,
+                        "/usr/bin/dpkg\n--force-not-root\n--force-bad-path\n-i\n" +
+                            "/" + target.debCachePath,
+                    )
+                    val exec = out.lineStartingWith("ALR NATIVE LOADER GUEST EXEC:")
+                    // §7 DEVICE-REQ markers: unpack-stage success (the extract child re-map must
+                    // pass for the data.tar to actually unpack — G1 gated per SSOT §6). The markers
+                    // embed the package name, so they come from the target descriptor.
+                    val unpacked = target.unpackedMarkers.any { out.contains(it) }
+                    // Configure stage = maintainer-script /bin/sh fork+exec (G1 too).
+                    val configured = out.contains(target.configuredMarker)
+                    android.util.Log.i(
+                        "alr_loader",
+                        "aptdrain: pkg=${target.pkg} unpacked=$unpacked configured=$configured exec=[$exec] " +
+                            "ALR_FAKEROOT=1 (fakeroot-chain wiring = T2/runtime_report.cpp; " +
+                            "extract+maintainer-script need G1 exec-re-entry per SSOT §6)",
+                    )
+                    android.util.Log.i("alr_loader", "aptdrain-out:\n$out")
+                    // §7 stretch: post-install status query (proves the admin DB recorded the pkg).
+                    val statusOut = nativeAlrNativeLoaderProbe(
+                        packageName,
+                        applicationInfo.nativeLibraryDir,
+                        filesDir.absolutePath,
+                        cacheDir.absolutePath,
+                        rootfsName,
+                        "/usr/bin/dpkg\n--status\n" + target.pkg,
+                    )
+                    val installed = statusOut.contains("Status: install ok installed")
+                    android.util.Log.i("alr_loader", "aptdrain: installed=$installed (dpkg --status ${target.pkg})")
+
+                    // STEP 3 (v2 breadth): for the galculator GUI target, launch the binary on
+                    // the ALR Wayland compositor (same render path as foot/netsurf/gtk3-widget-
+                    // factory: loader → GDK → wl_shm → SurfaceView; rendered = the compositor
+                    // frame counter advanced). Guarded to galculator so the hello (CLI) drain is
+                    // unchanged. We launch regardless of the dpkg `installed`/`configured` verdict:
+                    // /usr/bin/galculator is present from galculator-stage.tar's pre-unpacked
+                    // closure (and the dpkg unpack lays it too), so the render proof stands on the
+                    // binary's presence, not on the device install having fully succeeded.
+                    if (target.pkg == "galculator") {
+                        launchGalculatorOnCompositor(rootfsDir, rootfsName)
+                    }
+                } finally {
+                    // Restore: every other probe stays on interpose-only (strict no-regression).
+                    android.system.Os.unsetenv("ALR_FAKEROOT")
+                    android.system.Os.unsetenv("ALR_REEXEC_INPROC")
+                    android.system.Os.unsetenv("ALR_INTERPOSE_DIAG")
+                }
+            } catch (e: Throwable) {
+                android.util.Log.e("alr_loader", "aptdrain EXC: ${android.util.Log.getStackTraceString(e)}")
+            }
+        }.start()
+    }
+
+    // STEP 3 (v2 breadth): launch the apt-INSTALLED galculator on the ALR Wayland
+    // compositor — the headline "real GUI app, installed via dpkg, then RUN". Same
+    // render path as foot/netsurf/gtk3-widget-factory: the loader runs the guest GTK3
+    // binary, GDK binds the in-app compositor, draws into wl_shm, the WaylandPresenter
+    // uploads to the SurfaceView. rendered = the compositor frame counter advanced.
+    //
+    // This runs on the aptdrain thread, which fires EARLY in onCreate — long before the
+    // SurfaceView's surfaceCreated stands up the compositor (nativeWaylandCompositorStart).
+    // So we first WAIT (bounded) for the compositor to report "running" AND the galculator
+    // binary to exist (the dpkg unpack lays /usr/bin/galculator, or galculator-stage.tar's
+    // pre-unpacked closure already shipped it). Only then do we sample frames / launch.
+    private fun launchGalculatorOnCompositor(rootfsDir: File, rootfsName: String) {
+        try {
+            val bin = java.io.File(rootfsDir, "usr/bin/galculator")
+            // Bounded wait: compositor running + entrypoint present. 60s covers the
+            // SurfaceView coming up + the GUI battery ahead of us on the GUI thread.
+            var waited = 0
+            while (waited < 60000 &&
+                !(bin.isFile && nativeWaylandCompositorStatus().contains("STATUS: running"))
+            ) {
+                Thread.sleep(1000)
+                waited += 1000
+            }
+            if (!bin.isFile) {
+                android.util.Log.w("alr_loader", "galculator-launch: /usr/bin/galculator absent — skipping (push galculator-stage.tar)")
+                return
+            }
+            if (!nativeWaylandCompositorStatus().contains("STATUS: running")) {
+                android.util.Log.w("alr_loader", "galculator-launch: compositor not running after ${waited}ms — skipping render")
+                return
+            }
+            val framesBefore = nativeWaylandCompositorStatus().intFieldAfter("alr wl frames=")
+            // galculator is a GTK3 client; the loader injects GDK_BACKEND=wayland +
+            // WAYLAND_DISPLAY for the gtk program family (same as gtk3-widget-factory),
+            // so it binds the ALR compositor with no extra args. It opens its main window
+            // immediately (no document/file needed), so the watchdog isn't required.
+            val client = nativeAlrNativeLoaderProbe(
+                packageName,
+                applicationInfo.nativeLibraryDir,
+                filesDir.absolutePath,
+                cacheDir.absolutePath,
+                rootfsName,
+                "/usr/bin/galculator",
+            )
+            val status = nativeWaylandCompositorStatus()
+            val framesAfter = status.intFieldAfter("alr wl frames=")
+            val rendered = framesAfter > framesBefore
+            val exec = client.lineStartingWith("ALR NATIVE LOADER GUEST EXEC:")
+            android.util.Log.i(
+                "alr_loader",
+                "galculator-launch: rendered=$rendered frames=$framesBefore->$framesAfter exec=[$exec] (waited ${waited}ms)",
+            )
+            android.util.Log.i("alr_loader", "galculator-client:\n$client")
+            android.util.Log.i("alr_loader", "galculator-status:\n$status")
+        } catch (e: Throwable) {
+            android.util.Log.e("alr_loader", "galculator-launch EXC: ${android.util.Log.getStackTraceString(e)}")
+        }
     }
 
     // WS-4 §10(b): toolkit launch FUNCTIONAL probes. The sdl2/qt6/netsurf overlays stage
