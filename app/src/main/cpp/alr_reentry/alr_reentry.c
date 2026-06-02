@@ -112,7 +112,12 @@ typedef struct {
 #define DT_RELA    7
 #define DT_RELASZ  8
 #define DT_RELAENT 9
-#define R_AARCH64_IRELATIVE 1027
+// ARM ABI (aaelf64): 1027=R_AARCH64_RELATIVE (base-relative: *slot += base),
+// 1032=R_AARCH64_IRELATIVE (ifunc resolver). The old `IRELATIVE 1027` was the
+// RELATIVE value — it ran every RELATIVE entry through the ifunc path (calling a
+// data address -> SIGILL) and skipped the real IRELATIVEs. Match runtime_report.cpp:36.
+#define R_AARCH64_RELATIVE  1027
+#define R_AARCH64_IRELATIVE 1032
 #define ELF64_R_TYPE(i) ((i) & 0xffffffff)
 
 typedef struct { Elf64_Addr r_offset; Elf64_Xword r_info; Elf64_Sxword r_addend; } Elf64_Rela;
@@ -143,6 +148,7 @@ typedef struct { Elf64_Addr r_offset; Elf64_Xword r_info; Elf64_Sxword r_addend;
 #define SYS_close       57
 #define SYS_read        63
 #define SYS_write       64
+#define SYS_brk         214
 #define SYS_mmap        222
 #define SYS_mprotect    226
 #define SYS_exit        93
@@ -324,9 +330,14 @@ static MappedImage map_elf_image(const char* img, size_t len, const char* tag) {
         }
     }
 
-    // Apply R_AARCH64_IRELATIVE via PT_DYNAMIC's DT_RELA (required for ld.so, which
-    // is section-header-stripped). NB: ifunc resolvers may read HWCAP; we pass 0
-    // for the PoC (the loader threads real AT_HWCAP — a TODO to wire here too).
+    // Apply relocations via PT_DYNAMIC's DT_RELA (required for ld.so, which is
+    // section-header-stripped). Handle BOTH R_AARCH64_RELATIVE (base-relative:
+    // *(base+offset) = base + addend, the bulk of a static-PIE/ET_DYN image's
+    // startup fixups) and R_AARCH64_IRELATIVE (ifunc resolver). The old code only
+    // matched "IRELATIVE 1027" — actually the RELATIVE value — so it called every
+    // RELATIVE slot as an ifunc (data-as-code -> SIGILL) and skipped the true
+    // IRELATIVEs (1032). NB: ifunc resolvers may read HWCAP; we pass 0 for the PoC
+    // (the loader threads real AT_HWCAP — a TODO to wire here too).
     const Elf64_Phdr* dynph = 0;
     for (int i = 0; i < eh->e_phnum; ++i) {
         if (ph[i].p_type == PT_DYNAMIC) { dynph = &ph[i]; break; }
@@ -343,11 +354,15 @@ static MappedImage map_elf_image(const char* img, size_t len, const char* tag) {
         if (rela && relaent) {
             for (size_t off = 0; off < relasz; off += relaent) {
                 const Elf64_Rela* r = (const Elf64_Rela*)(rela + off);
-                if (ELF64_R_TYPE(r->r_info) != R_AARCH64_IRELATIVE) continue;
-                typedef unsigned long (*Resolver)(unsigned long, const void*);
-                Resolver res = (Resolver)(base + r->r_addend);
-                *(uint64_t*)(base + r->r_offset) = res(0, 0);  // TODO: thread HWCAP
-                ++irel;
+                unsigned long rtype = ELF64_R_TYPE(r->r_info);
+                if (rtype == R_AARCH64_RELATIVE) {
+                    *(uintptr_t*)(base + r->r_offset) = base + (uintptr_t)r->r_addend;
+                } else if (rtype == R_AARCH64_IRELATIVE) {
+                    typedef unsigned long (*Resolver)(unsigned long, const void*);
+                    Resolver res = (Resolver)(base + r->r_addend);
+                    *(uint64_t*)(base + r->r_offset) = res(0, 0);  // TODO: thread HWCAP
+                    ++irel;
+                }
             }
         }
     }
@@ -378,16 +393,22 @@ static MappedImage map_elf_image(const char* img, size_t len, const char* tag) {
     return R;
 }
 
-// Transfer control to the guest entry with a freshly built SysV stack. Mirrors
-// runtime_report.cpp:alr_enter_guest, but the stub does NOT msr tpidr_el0: glibc's
-// ld.so installs its own TLS, and this stub (unlike the in-process loader running
-// inside bionic) has no foreign TCB to hide from. Naked: never returns.
-__attribute__((noreturn)) static void enter_guest(void* sp, void* entry) {
+// Transfer control to the guest entry with a freshly built SysV stack. Mirrors the
+// device-proven loader's alr_enter_guest(sp, entry, tcb) (runtime_report.cpp
+// L1160-1169). Even as a fresh kernel-execve'd static ELF, TPIDR_EL0 starts at 0,
+// and glibc's pre-TLS-init startup (_dl_aux_init/__tunables_init) is built with
+// -fstack-protector and reads the canary via THREAD_SELF (=TPIDR_EL0) BEFORE
+// __libc_setup_tls installs glibc's own TLS — a TP=0 load faults near address 0
+// (SIGSEGV). Point TP at a fresh ZEROED 16 KiB region (caller passes its center) so
+// those reads land in mapped-zero until ld.so/__libc_setup_tls takes over. Naked:
+// never returns.
+__attribute__((noreturn)) static void enter_guest(void* sp, void* entry, void* tcb) {
     __asm__ volatile(
+        "msr tpidr_el0, %2\n"    // clean zeroed TCB: canary/THREAD_SELF reads land in mapped-zero
         "mov sp, %0\n"
         "mov x0, #0\n"
         "br  %1\n"
-        :: "r"(sp), "r"(entry) : "memory");
+        :: "r"(sp), "r"(entry), "r"(tcb) : "memory");
     __builtin_unreachable();
 }
 
@@ -569,8 +590,24 @@ __attribute__((used, noreturn)) void alr_reentry_main(unsigned long* sp_in) {
     uintptr_t jump_entry = dynamic ? interp.entry : prog.entry;
     diag_hex("ALR-REENTRY E@", (unsigned long)jump_entry);
     diag_hex("ALR-REENTRY sp@", (unsigned long)start);
+
+    // brk(0) reads the current program break so glibc's __libc_setup_tls ->
+    // _dl_early_allocate -> __sbrk(0) sees a materialized value. As a fresh
+    // kernel-execve'd image the kernel already armed mm->brk, so this is mostly
+    // belt-and-suspenders (and keeps parity with the in-process trampoline); failure
+    // is non-fatal (glibc 2.36+ has an mmap fallback).
+    long cur_brk = sys1(SYS_brk, 0);
+    diag_hex("ALR-REENTRY: brk0=", (unsigned long)cur_brk);
+
+    // Clean zeroed TCB: glibc's pre-TLS-init csu reads the canary via TPIDR_EL0; a
+    // fresh 16 KiB zero region (loader pattern) keeps that read off NULL. center+8192.
+    void* tcb_region = (void*)sys6_(SYS_mmap, 0, 16384, PROT_READ | PROT_WRITE,
+                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void* tcb = (tcb_region == MAP_FAILED) ? (void*)0 : (void*)((char*)tcb_region + 8192);
+    diag_hex("ALR-REENTRY: tcb@", (unsigned long)tcb);
+
     diag("ALR-REENTRY: jumping\n");
-    enter_guest((void*)start, (void*)jump_entry);
+    enter_guest((void*)start, (void*)jump_entry, tcb);
     sys_exit(99);  // unreachable
 }
 
