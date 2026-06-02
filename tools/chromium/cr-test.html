@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<!--
+  ALR chromium CR-1 local render probe — ZERO network.
+
+  Self-contained: every resource is inline (no link rel, no script src, no img
+  src, no web-font fetch, no CSS import of a URL). A single string, no external
+  fetch — so a
+  headless single-process chromium can render it with networking entirely absent
+  (or the net stage tar unstaged). Render markers below let the device-side
+  --dump-dom / screenshot probe assert a non-trivial layout:
+
+    * an <h1> text node (font/glyph + layout)
+    * a CSS-colored <div> (style resolution + paint, no image decode)
+    * an inline <svg> (the SVG/2D paint path — same code path GTK pixbuf-svg
+      exercised on the GUI side, but here purely in-renderer)
+
+  CR-1 launch (device, single-process, no net/GPU/multiproc):
+    chromium-headless-shell --single-process --no-zygote --no-sandbox \
+      --dump-dom file:///root/cr-test.html
+  or, with no file at all (data: URL — proves zero-FS too):
+    chromium-headless-shell ... --dump-dom 'data:text/html,<h1>ALR</h1>'
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ALR CR-1</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0b1021; color: #e6e6e6;
+               font-family: sans-serif; }
+  .wrap { padding: 24px; }
+  h1 { font-size: 28px; margin: 0 0 16px 0; color: #8ad6ff; }
+  /* CSS-colored div: a gradient box, no image decode, pure paint. */
+  #swatch { width: 240px; height: 80px; border-radius: 12px;
+            background: linear-gradient(90deg, #ff5f6d 0%, #ffc371 100%);
+            box-shadow: 0 2px 8px rgba(0,0,0,0.5); }
+  #marker { font-size: 13px; color: #7fe07f; margin-top: 16px; }
+  svg { margin-top: 16px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1 id="title">ALR chromium renders.</h1>
+  <div id="swatch"></div>
+  <!-- inline SVG: exercises the SVG paint path with no external resource. -->
+  <svg width="120" height="120" viewBox="0 0 120 120"
+       xmlns="http://www.w3.org/2000/svg" role="img" aria-label="ALR mark">
+    <rect x="4" y="4" width="112" height="112" rx="16"
+          fill="#1d2440" stroke="#8ad6ff" stroke-width="3"/>
+    <circle cx="60" cy="60" r="34" fill="none" stroke="#ff5f6d" stroke-width="6"/>
+    <polygon points="60,30 78,84 42,84" fill="#ffc371"/>
+  </svg>
+  <p id="marker">ALR-CR1-OK no-network local render</p>
+</div>
+</body>
+</html>
