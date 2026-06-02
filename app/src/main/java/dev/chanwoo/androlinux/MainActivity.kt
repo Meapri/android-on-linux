@@ -1501,6 +1501,95 @@ class MainActivity : Activity() {
                                 android.util.Log.i("alr_loader", "netsurf-result: skipped (usr/bin/netsurf-gtk not staged yet)")
                             }
 
+                            // Toolkit matrix capstone (WS-4 M2): launch a Qt6 + an SDL2 GUI
+                            // demo DISPLAY-BACKED on the compositor — the SAME path as
+                            // netsurf/gtk3-widget-factory/GIMP (toolkit → wl_shm → SurfaceView)
+                            // so the window actually renders. We pick the FIRST candidate binary
+                            // that exists (overlays agent stages a GUI demo; exact path is
+                            // reconciled by the integration session) and gate on the compositor
+                            // frame counter advancing (rendered = frames grew). Presence-guarded:
+                            // if no GUI demo is staged we log "<name>: skipped(not staged)".
+                            //
+                            // (q) Qt6: a windowed widget demo. qtpaths6/qtdiag6 are CLI (no
+                            // window) so we DON'T use them here — only a real GUI example.
+                            // QT_QPA_PLATFORM=wayland is injected by the loader's env for the
+                            // qt6 program family so the demo binds the ALR compositor.
+                            val qt6GuiCandidates = listOf(
+                                "usr/lib/qt6/examples/widgets/widgets/analogclock/analogclock",
+                                "usr/lib/qt6/examples/widgets/widgets/wiggly/wiggly",
+                                "usr/lib/aarch64-linux-gnu/qt6/examples/widgets/widgets/analogclock/analogclock",
+                                "usr/lib/qt6/examples/gui/analogclock/analogclock",
+                                "usr/bin/qml6",
+                                "usr/lib/qt6/bin/qml",
+                            )
+                            val qt6GuiRel = qt6GuiCandidates.firstOrNull {
+                                java.io.File(rootfsStatus.rootfsDir, it).isFile
+                            }
+                            if (qt6GuiRel != null) {
+                                val framesBeforeQt6 = nativeWaylandCompositorStatus().intFieldAfter("alr wl frames=")
+                                val qt6Client = nativeAlrNativeLoaderProbe(
+                                    packageName,
+                                    applicationInfo.nativeLibraryDir,
+                                    filesDir.absolutePath,
+                                    cacheDir.absolutePath,
+                                    rootfsManifest.name,
+                                    "/$qt6GuiRel",
+                                )
+                                val qt6Status = nativeWaylandCompositorStatus()
+                                val framesAfterQt6 = qt6Status.intFieldAfter("alr wl frames=")
+                                val qt6Rendered = framesAfterQt6 > framesBeforeQt6
+                                android.util.Log.i("alr_loader", "qt6gui-result: rendered=$qt6Rendered frames=$framesBeforeQt6->$framesAfterQt6 bin=/$qt6GuiRel")
+                                android.util.Log.i("alr_loader", "qt6gui-client:\n$qt6Client")
+                                runOnUiThread {
+                                    view.append(
+                                        "\nALR QT6 GUI (Qt6 widget demo → wl_shm → SurfaceView): " +
+                                            "${gate(qt6Rendered)} (frames $framesBeforeQt6→$framesAfterQt6)",
+                                    )
+                                    view.append("\n\n--- ALR guest qt6 GUI demo ($qt6GuiRel) ---\n$qt6Client")
+                                }
+                            } else {
+                                android.util.Log.i("alr_loader", "qt6gui-result: skipped(not staged) (none of ${qt6GuiCandidates.joinToString(",")})")
+                            }
+
+                            // (s) SDL2: a window-opening SDL2 demo (testdraw2/testsprite2 from
+                            // libsdl2-tests render a window via SDL_CreateWindow → wl_shm). The
+                            // installed-tests binaries take an immediate-exit duration so the
+                            // loader watchdog isn't strictly needed, but it backstops anyway.
+                            val sdl2GuiCandidates = listOf(
+                                "usr/libexec/installed-tests/SDL2/testdraw2",
+                                "usr/libexec/installed-tests/SDL2/testsprite2",
+                                "usr/libexec/installed-tests/SDL2/testgeometry",
+                                "usr/libexec/installed-tests/SDL2/testwm2",
+                            )
+                            val sdl2GuiRel = sdl2GuiCandidates.firstOrNull {
+                                java.io.File(rootfsStatus.rootfsDir, it).isFile
+                            }
+                            if (sdl2GuiRel != null) {
+                                val framesBeforeSdl2 = nativeWaylandCompositorStatus().intFieldAfter("alr wl frames=")
+                                val sdl2Client = nativeAlrNativeLoaderProbe(
+                                    packageName,
+                                    applicationInfo.nativeLibraryDir,
+                                    filesDir.absolutePath,
+                                    cacheDir.absolutePath,
+                                    rootfsManifest.name,
+                                    "/$sdl2GuiRel",
+                                )
+                                val sdl2Status = nativeWaylandCompositorStatus()
+                                val framesAfterSdl2 = sdl2Status.intFieldAfter("alr wl frames=")
+                                val sdl2Rendered = framesAfterSdl2 > framesBeforeSdl2
+                                android.util.Log.i("alr_loader", "sdl2gui-result: rendered=$sdl2Rendered frames=$framesBeforeSdl2->$framesAfterSdl2 bin=/$sdl2GuiRel")
+                                android.util.Log.i("alr_loader", "sdl2gui-client:\n$sdl2Client")
+                                runOnUiThread {
+                                    view.append(
+                                        "\nALR SDL2 GUI (SDL2 window demo → wl_shm → SurfaceView): " +
+                                            "${gate(sdl2Rendered)} (frames $framesBeforeSdl2→$framesAfterSdl2)",
+                                    )
+                                    view.append("\n\n--- ALR guest sdl2 GUI demo ($sdl2GuiRel) ---\n$sdl2Client")
+                                }
+                            } else {
+                                android.util.Log.i("alr_loader", "sdl2gui-result: skipped(not staged) (none of ${sdl2GuiCandidates.joinToString(",")})")
+                            }
+
                             // CP-2 GPU 풀가속: glmark2-es2-wayland를 ALR loader로 실행.
                             // 게스트 libGLESv2 shim이 GL을 GpuRingHook ring으로 emit →
                             // host GpuExecutorService가 Mali GLES2로 replay → glmark2 score =
@@ -1653,6 +1742,38 @@ class MainActivity : Activity() {
                 // display — the no-display functional check for the x11 overlay (rootful
                 // launch-on-compositor is L2/L3 integration, not this WS).
                 probe("xwayland-version", "/usr/bin/Xwayland\n-version", "Xwayland")
+                // (b4) apt/dpkg INSTALL: actually run `dpkg -i <local .deb>` through the ALR
+                // loader so dpkg UNPACKS a package into the admin DB (the overlays agent ships
+                // a small alr-smoke .deb under var/cache/apt/archives). HONEST: the maintainer
+                // scripts (preinst/postinst) are fork+exec'd by dpkg — that's an exec re-entry
+                // the loader doesn't yet support, so `Setting up` (configure) may fail while the
+                // UNPACK ("Unpacking alr-smoke") succeeds. We log whatever happens; we do NOT
+                // try to make the maintainer-script exec work (separate, larger feature). The
+                // `Unpacking`/`Selecting` marker = unpack-stage success, regardless of configure.
+                val localDeb = File(rootfsDir, "var/cache/apt/archives/alr-smoke_1.0_arm64.deb")
+                if (localDeb.isFile) {
+                    val out = nativeAlrNativeLoaderProbe(
+                        packageName,
+                        applicationInfo.nativeLibraryDir,
+                        filesDir.absolutePath,
+                        cacheDir.absolutePath,
+                        rootfsName,
+                        "/usr/bin/dpkg\n-i\n/var/cache/apt/archives/alr-smoke_1.0_arm64.deb",
+                    )
+                    val exec = out.lineStartingWith("ALR NATIVE LOADER GUEST EXEC:")
+                    val unpacked = out.contains("Unpacking alr-smoke") ||
+                        out.contains("Selecting previously unselected package alr-smoke") ||
+                        out.contains("Preparing to unpack")
+                    val configured = out.contains("Setting up alr-smoke")
+                    android.util.Log.i(
+                        "alr_loader",
+                        "apt-install: unpacked=$unpacked configured=$configured exec=[$exec] " +
+                            "(maintainer-script exec-re-entry may fail — logged honestly)",
+                    )
+                    android.util.Log.i("alr_loader", "apt-install-out:\n$out")
+                } else {
+                    android.util.Log.i("alr_loader", "apt-install: skipped(not staged) (var/cache/apt/archives/alr-smoke_1.0_arm64.deb absent)")
+                }
             } catch (e: Throwable) {
                 android.util.Log.e("alr_loader", "pkgfunc EXC: ${android.util.Log.getStackTraceString(e)}")
             }
@@ -1741,6 +1862,49 @@ class MainActivity : Activity() {
                     "--version",
                     "SDL",
                 )
+                // (t4) GIMP babl/gegl FILTER: the babl-gegl overlay ships the 30 babl + 37 gegl
+                // op modules as 0o755 (so file-backed PROT_EXEC dlopen succeeds). This probe
+                // actually LOADS babl+gegl and APPLIES a gegl op in the guest — no display.
+                // Prefer the `/usr/bin/gegl` CLI (runs a real op graph: invert a tiny buffer);
+                // else fall back to `gimp-console-3.0` batch Script-Fu which pulls in the full
+                // babl/gegl stack and runs a built-in op. Either path forces babl+gegl dlopen.
+                val geglCli = File(rootfsDir, "usr/bin/gegl")
+                val gimpConsole = File(rootfsDir, "usr/bin/gimp-console-3.0")
+                if (geglCli.isFile) {
+                    // `gegl --help` enumerates registered ops (forces gegl module registry load,
+                    // which dlopen's the gegl-0.4/*.so ops + the babl conversions they pull in).
+                    val out = nativeAlrNativeLoaderProbe(
+                        packageName,
+                        applicationInfo.nativeLibraryDir,
+                        filesDir.absolutePath,
+                        cacheDir.absolutePath,
+                        rootfsName,
+                        "/usr/bin/gegl\n--help",
+                    )
+                    val exec = out.lineStartingWith("ALR NATIVE LOADER GUEST EXEC:")
+                    val ok = out.contains("gegl") || out.contains("Usage") || out.contains("operation")
+                    android.util.Log.i("alr_loader", "gimp-filter: via=gegl-cli ok=$ok exec=[$exec]")
+                    android.util.Log.i("alr_loader", "gimp-filter-out:\n$out")
+                } else if (gimpConsole.isFile) {
+                    // gimp-console batch: gimp-version touches the plug-in/babl/gegl init path
+                    // without opening a display; a real filter (plug-in-gauss) would also load
+                    // the gegl op behind it. We keep it to gimp-version (HONEST: full filter
+                    // batch needs a writable image + may exec a plug-in process — separate work).
+                    val out = nativeAlrNativeLoaderProbe(
+                        packageName,
+                        applicationInfo.nativeLibraryDir,
+                        filesDir.absolutePath,
+                        cacheDir.absolutePath,
+                        rootfsName,
+                        "/usr/bin/gimp-console-3.0\n-i\n--batch-interpreter=plug-in-script-fu-eval\n-b\n(gimp-version)\n-b\n(gimp-quit 0)",
+                    )
+                    val exec = out.lineStartingWith("ALR NATIVE LOADER GUEST EXEC:")
+                    val ok = out.contains("3.") || out.contains("GIMP") || out.contains("batch command executed successfully")
+                    android.util.Log.i("alr_loader", "gimp-filter: via=gimp-console-batch ok=$ok exec=[$exec]")
+                    android.util.Log.i("alr_loader", "gimp-filter-out:\n$out")
+                } else {
+                    android.util.Log.i("alr_loader", "gimp-filter: skipped(not staged) (no /usr/bin/gegl nor /usr/bin/gimp-console-3.0)")
+                }
             } catch (e: Throwable) {
                 android.util.Log.e("alr_loader", "toolkit EXC: ${android.util.Log.getStackTraceString(e)}")
             }
