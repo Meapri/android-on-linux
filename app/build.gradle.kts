@@ -1,6 +1,7 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
 }
 
 android {
@@ -21,6 +22,12 @@ android {
 
     kotlinOptions {
         jvmTarget = "17"
+    }
+
+    buildFeatures {
+        // Kotlin 2.0: the Compose compiler ships with Kotlin and is enabled by the
+        // org.jetbrains.kotlin.plugin.compose plugin (no composeOptions block).
+        compose = true
     }
 
     packaging {
@@ -129,4 +136,33 @@ tasks.matching { it.name.startsWith("buildCMakeDebug") }.configureEach {
 
 dependencies {
     implementation("org.apache.commons:commons-compress:1.26.2")
+
+    // Compose BOM pins every individual compose artifact version below.
+    val composeBom = platform("androidx.compose:compose-bom:2024.09.00")
+    implementation(composeBom)
+    androidTestImplementation(composeBom)
+
+    // Compose core / UI (versions pinned by the BOM — coordinates only).
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.ui:ui-graphics")              // ColorPainter/Painter (AppDetailScreen)
+    implementation("androidx.compose.ui:ui-tooling-preview")       // @Preview (all screens)
+    implementation("androidx.compose.foundation:foundation")       // LazyVerticalGrid/LazyRow/combinedClickable
+    implementation("androidx.compose.material3:material3")          // Material3 (Scaffold/Card/Chip/…)
+    implementation("androidx.compose.material:material-icons-core") // Icons.Filled.{Add,Delete,Info,Search,Settings}
+
+    // Activity / Lifecycle / Navigation / ViewModel (Compose).
+    implementation("androidx.activity:activity-compose:1.9.2")             // setContent / ComponentActivity (LauncherActivity)
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")       // lifecycleScope/repeatOnLifecycle (RunningSurfaceActivity)
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6") // viewModel(factory=…) (AlrApp routes)
+    implementation("androidx.navigation:navigation-compose:2.8.1")         // NavHost/composable/rememberNavController (AlrApp)
+
+    // Coroutines (StateFlow/Flow — the whole runtime/ layer depends on it).
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+
+    // Icon bitmap loader (optional — screens fall back to a category badge without it).
+    implementation("io.coil-kt:coil-compose:2.7.0")
+
+    // Compose debug tooling (Preview render / layout inspector).
+    debugImplementation("androidx.compose.ui:ui-tooling")
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
 }

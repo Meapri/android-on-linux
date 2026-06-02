@@ -5,13 +5,28 @@
         android:allowBackup="false"
         android:label="AndroLinux Runtime Lab"
         android:theme="@style/AppTheme">
+
+        <!-- Compose 런처 진입점: MAIN/LAUNCHER (integration-guide §2). -->
         <activity
-            android:name=".MainActivity"
+            android:name=".ui.LauncherActivity"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- 게스트 실행화면 (내부 진입 — LauncherActivity 가 띄움). SurfaceView +
+             컴포지터가 surface 재생성에 민감하므로 회전/리사이즈를 자체 처리. -->
+        <activity
+            android:name=".ui.RunningSurfaceActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden|density"
+            android:theme="@style/AppTheme" />
+
+        <!-- 기존 probe 하니스 — LAUNCHER 강등(진단 전용, 외부 진입 불요). -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="false" />
     </application>
 </manifest>

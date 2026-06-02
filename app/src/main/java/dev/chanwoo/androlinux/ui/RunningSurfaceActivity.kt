@@ -39,7 +39,6 @@
  */
 package dev.chanwoo.androlinux.ui
 
-import android.app.Activity
 import android.os.Bundle
 import android.view.Gravity
 import android.view.SurfaceHolder
@@ -50,12 +49,13 @@ import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.ProgressBar
 import android.widget.TextView
+import androidx.activity.ComponentActivity
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import dev.chanwoo.androlinux.runtime.AlrRuntime
+import dev.chanwoo.androlinux.runtime.AlrRuntimeHolder
 import dev.chanwoo.androlinux.runtime.AppSession
-import dev.chanwoo.androlinux.runtime.FakeAlrRuntime
 import dev.chanwoo.androlinux.runtime.LaunchRequest
 import dev.chanwoo.androlinux.runtime.SessionState
 import dev.chanwoo.androlinux.runtime.StopReason
@@ -76,7 +76,7 @@ import kotlinx.coroutines.launch
  * Application 수준 싱글턴(또는 DI)으로 실 런타임을 주입하도록 [provideRuntime] 를
  * override/교체한다. 본 트랙은 device 런타임을 몰라도 흐름이 동작한다.
  */
-class RunningSurfaceActivity : Activity() {
+class RunningSurfaceActivity : ComponentActivity() {
 
     private lateinit var surfaceView: SurfaceView
     private lateinit var loadingOverlay: View
@@ -265,12 +265,12 @@ class RunningSurfaceActivity : Activity() {
     // ----------------------------------------------------------------------- //
 
     /**
-     * AlrRuntime 공급 — v1 기본은 [FakeAlrRuntime](런타임 없이 흐름 동작). 통합 세션이
-     * Application 싱글턴/DI 로 실 구현(nativeWaylandCompositorStart 래퍼)을 주입하도록
-     * 이 메서드를 교체한다. 같은 프로세스의 *공유 런타임* 이라야 INV-1~3(단일 포그라운드)이
-     * 전역으로 강제되므로, 실 구현은 반드시 프로세스 단일 인스턴스여야 한다.
+     * AlrRuntime 공급 — 프로세스 단일 인스턴스([AlrRuntimeHolder])를 반환한다. LauncherActivity
+     * 와 *같은 인스턴스* 를 봐야 INV-1~3(단일 포그라운드)이 전역으로 성립하므로 홀더로 가져온다.
+     * v1 홀더는 [FakeAlrRuntime]; §4-B/C 에서 홀더의 buildRuntime 한 곳만 실 런타임으로 바꾸면
+     * 이 화면도 자동 전환된다(런타임 없이 흐름 동작).
      */
-    protected open fun provideRuntime(): AlrRuntime = FakeAlrRuntime()
+    private fun provideRuntime(): AlrRuntime = AlrRuntimeHolder.get(applicationContext)
 
     // ----------------------------------------------------------------------- //
     // 뷰 구성 (순수 View — Compose 아님)

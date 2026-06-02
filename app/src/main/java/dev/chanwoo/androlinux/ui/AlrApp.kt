@@ -23,7 +23,6 @@ package dev.chanwoo.androlinux.ui
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
@@ -41,7 +40,6 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import dev.chanwoo.androlinux.runtime.AlrRuntime
 import dev.chanwoo.androlinux.runtime.CatalogApp
-import dev.chanwoo.androlinux.runtime.InstallProgress
 import dev.chanwoo.androlinux.runtime.InstalledApp
 import dev.chanwoo.androlinux.runtime.LaunchRequest
 import dev.chanwoo.androlinux.ui.theme.AlrTheme
@@ -49,7 +47,6 @@ import dev.chanwoo.androlinux.ui.viewmodel.AppDetailViewModel
 import dev.chanwoo.androlinux.ui.viewmodel.CatalogViewModel
 import dev.chanwoo.androlinux.ui.viewmodel.LauncherViewModel
 import dev.chanwoo.androlinux.ui.viewmodel.SettingsViewModel
-import kotlinx.coroutines.flow.Flow
 
 // --------------------------------------------------------------------------- //
 // 라우트 (ADR-004 §3)
@@ -226,66 +223,32 @@ private inline fun <reified T : ViewModel> alrViewModelFactory(
 // collectAsState 로 진행률을 구독(설치 버튼 클릭 시점에 호출). runtime 을 화면에 직접
 // 노출하지 않아 경계가 §5-F 데이터/콜백으로 닫힌다.
 
-/** 런처 화면 진입 시그니처 — Screens 트랙이 LauncherScreen.kt(AppEntry/LauncherUiState)로 구현. */
-@Composable
-fun LauncherRoute(
-    installedApps: List<InstalledApp>,
-    onLaunch: (InstalledApp) -> Unit,
-    onOpenCatalog: () -> Unit,
-    onOpenSettings: () -> Unit,
-    onOpenAppDetail: (String) -> Unit,
-) {
-    ScreenPlaceholder("Launcher", "${installedApps.size}개 설치됨")
-}
-
-/** 카탈로그 화면 진입 시그니처 — Screens 트랙이 구현(카드 리스트 + 검색/카테고리). */
-@Composable
-fun CatalogRoute(
-    catalog: List<CatalogApp>,
-    installedAppIds: Set<String>,
-    onOpenAppDetail: (String) -> Unit,
-    onBack: () -> Unit,
-) {
-    ScreenPlaceholder("Catalog", "${catalog.size}개 / 설치 ${installedAppIds.size}")
-}
+// LauncherRoute / CatalogRoute / AppDetailRoute 의 실 구현은 각각 LauncherScreen.kt /
+// CatalogScreen.kt / AppDetailScreen.kt 에 *같은 package·같은 시그니처* 로 존재한다. 따라서
+// AlrApp.kt 에는 그 3개의 placeholder 를 두지 않는다(두면 redeclaration). 위 destination
+// 함수들의 LauncherRoute(...)/CatalogRoute(...)/AppDetailRoute(...) 호출은 그 실 구현으로
+// 해석된다. Settings 만은 실 구현이 SettingsScreenRoute 라는 *다른 이름* 이라 충돌이 없어
+// 아래 위임 래퍼를 둔다(destination 이 부르는 이름 = SettingsRoute).
 
 /**
- * 앱 상세 화면 진입 시그니처 — Screens 트랙이 구현(메타+스크린샷 + 설치/열기/제거).
- * installProgress/uninstallProgress 는 설치/제거 버튼 클릭 시 호출하는 지연 Flow 생성자.
+ * 설정 화면 진입 — 실 구현 [SettingsScreenRoute](SettingsScreen.kt)로 위임. diagnostics/
+ * uiState/onPickFolder 는 기본값이 있어 2-인자 호출로 컴파일/동작한다(진단·SAF 결선은
+ * 통합 세션이 인자를 더해 붙임 — integration-guide §4-D/§5-B).
  */
-@Composable
-fun AppDetailRoute(
-    appId: String,
-    catalogApp: CatalogApp?,
-    installedApp: InstalledApp?,
-    installProgress: () -> Flow<InstallProgress>,
-    uninstallProgress: () -> Flow<InstallProgress>,
-    onOpen: (InstalledApp) -> Unit,
-    onBack: () -> Unit,
-) {
-    ScreenPlaceholder("AppDetail", catalogApp?.name ?: installedApp?.name ?: appId)
-}
-
-/** 설정 화면 진입 시그니처 — Screens 트랙이 구현(Storage/Permissions/Diagnostics 탭). */
 @Composable
 fun SettingsRoute(
     installedApps: List<InstalledApp>,
     onBack: () -> Unit,
 ) {
-    ScreenPlaceholder("Settings", "${installedApps.size}개 앱")
+    SettingsScreenRoute(
+        installedApps = installedApps,
+        onBack = onBack,
+    )
 }
 
 // --------------------------------------------------------------------------- //
-// placeholder (Screens 트랙이 실 화면으로 교체)
+// placeholder (RUNNING_SURFACE 라우트 — 디자인 Preview 용; 실 진입은 onLaunchApp 위임)
 // --------------------------------------------------------------------------- //
-
-@Composable
-private fun ScreenPlaceholder(title: String, subtitle: String) {
-    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        Text(text = title, style = MaterialTheme.typography.headlineSmall)
-        Text(text = subtitle, style = MaterialTheme.typography.bodyMedium)
-    }
-}
 
 @Composable
 private fun RunningSurfacePlaceholder(onBack: () -> Unit) {

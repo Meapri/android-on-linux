@@ -35,8 +35,10 @@ def test_file_exists_in_owned_ui_package():
     src = _src()
     assert "package dev.chanwoo.androlinux.ui" in src
     assert "class RunningSurfaceActivity" in src
-    # View 기반 Activity — Compose Activity 아님.
-    assert ": Activity()" in src
+    # androidx ComponentActivity 기반 — lifecycleScope/repeatOnLifecycle 은 LifecycleOwner
+    # 를 요구하므로 plain Activity 로는 컴파일이 안 된다(통합 시 ComponentActivity 로 결선).
+    # ComponentActivity 는 androidx.activity 소속이라 Compose 의존이 아니다(아래 test_view_based_not_compose).
+    assert ": ComponentActivity()" in src
 
 
 def test_view_based_not_compose():
@@ -151,13 +153,16 @@ def test_build_not_integrated_header_and_untouched_files():
     assert "신규" in src and "분리" in src
 
 
-def test_runtime_injection_seam_defaults_to_fake():
-    """런타임 주입 seam — v1 기본 FakeAlrRuntime, 통합 세션이 실 런타임 교체."""
+def test_runtime_injection_seam_uses_shared_holder():
+    """런타임 주입 seam — 통합 후 프로세스 단일 인스턴스(AlrRuntimeHolder)를 공급한다.
+
+    INV-1~3(단일 포그라운드)은 LauncherActivity 와 *같은 런타임 인스턴스* 일 때만 전역으로
+    성립하므로, provideRuntime() 은 AlrRuntimeHolder.get(...) 로 공유 인스턴스를 돌려준다.
+    v1 홀더는 FakeAlrRuntime; 실 런타임은 홀더의 buildRuntime 한 곳만 교체하면 된다.
+    """
     src = _src()
     assert "provideRuntime()" in src
-    assert "FakeAlrRuntime()" in src
-    # 통합 세션이 override/교체할 수 있게 open.
-    assert "protected open fun provideRuntime()" in src
+    assert "AlrRuntimeHolder.get(applicationContext)" in src
 
 
 def test_does_not_touch_main_activity_source():

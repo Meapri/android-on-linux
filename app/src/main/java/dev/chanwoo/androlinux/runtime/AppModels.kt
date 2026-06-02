@@ -1,7 +1,7 @@
 /*
  * AppModels — ALR 인앱 카탈로그/런처 UI 가 다루는 순수 데이터 모델(Kotlin).
  *
- * host-검증 파이썬 모델(tools/*)과 1:1 대응 — Kotlin 측은 *표시/상태* 만 들고,
+ * host-검증 파이썬 모델(tools 디렉터리)과 1:1 대응 — Kotlin 측은 표시/상태 만 들고,
  * 파싱·검증·closure 해결은 런타임(또는 빌드 파이프라인)이 그 파이썬 규칙으로 한다:
  *   InstalledApp / CatalogApp        ← tools/alr_manifest.py  AppManifest
  *   LaunchEntry                      ← tools/desktop_entry.py LauncherEntry / AppEntry
