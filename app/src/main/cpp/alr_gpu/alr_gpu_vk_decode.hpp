@@ -256,6 +256,31 @@ inline void vk_real_destroy_instance(VkDecodeState& st, uint32_t vinst) {
 
 // ---- VK-M2 body, real Mali path: device + queue + command-buffer + clear-submit. ----
 
+// The device extensions the clear-submit path NEEDS enabled at vkCreateDevice time. The
+// AHB color target is imported via VK_ANDROID_external_memory_android_hardware_buffer; its
+// device-level entry points (vkGetAndroidHardwareBufferPropertiesANDROID,
+// VkImportAndroidHardwareBufferInfoANDROID) are ONLY legal to use once the extension was
+// enabled on the logical device. Creating the device with NO extensions (the original
+// VK-M2 bug) made vkGetDeviceProcAddr return the AHB fn but the import / image-bind was
+// undefined, so the eventual vkQueueSubmit of a command buffer pointed at that broken
+// color attachment failed on Mali. We mirror the VK-M1 keystone (alr_gpu_vk.hpp), which
+// enables the AHB extension + its non-core dep.
+inline constexpr const char* kAlrVkAhbExt =
+    "VK_ANDROID_external_memory_android_hardware_buffer";
+
+// Is `want` present in the device's extension list?
+inline bool vk_real_dev_ext_present(VkPhysicalDevice phys, const char* want) {
+    uint32_t n = 0;
+    if (vkEnumerateDeviceExtensionProperties(phys, nullptr, &n, nullptr) != VK_SUCCESS || n == 0)
+        return false;
+    std::vector<VkExtensionProperties> ext(n);
+    if (vkEnumerateDeviceExtensionProperties(phys, nullptr, &n, ext.data()) != VK_SUCCESS)
+        return false;
+    for (const auto& e : ext)
+        if (std::strcmp(e.extensionName, want) == 0) return true;
+    return false;
+}
+
 // Find a graphics queue family on a real physical device. Returns false if none.
 inline bool vk_real_gfx_family(VkPhysicalDevice phys, uint32_t& family_out) {
     uint32_t nqf = 0;
@@ -285,10 +310,23 @@ inline VkResult vk_real_create_device(VkDecodeState& st, uint32_t vphys, uint32_
     qci.queueFamilyIndex = family;
     qci.queueCount = 1;
     qci.pQueuePriorities = &prio;
+    // Enable the AHB external-memory extension (+ its non-core dep if present) so the
+    // clear-submit path may legally import the AHB color target. Without this the device
+    // is valid but the AHB import is undefined, and the submit that consumes that color
+    // attachment fails on Mali — the original VK-M2 clear-submit failure. Mirrors the
+    // VK-M1 keystone (alr_gpu_vk.hpp). If the driver lacks the extension we create the
+    // device anyway (the import will then fail loudly with ALR_VK_RENDER_TARGET_ALLOC,
+    // which is more diagnosable than a silent submit failure).
+    std::vector<const char*> dev_ext;
+    if (vk_real_dev_ext_present(phys, kAlrVkAhbExt)) dev_ext.push_back(kAlrVkAhbExt);
+    if (vk_real_dev_ext_present(phys, "VK_EXT_queue_family_foreign"))
+        dev_ext.push_back("VK_EXT_queue_family_foreign");
     VkDeviceCreateInfo dci{};
     dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
+    dci.enabledExtensionCount = static_cast<uint32_t>(dev_ext.size());
+    dci.ppEnabledExtensionNames = dev_ext.empty() ? nullptr : dev_ext.data();
     VkDevice dev = VK_NULL_HANDLE;
     VkResult r = vkCreateDevice(phys, &dci, nullptr, &dev);
     if (r == VK_SUCCESS) {
@@ -453,18 +491,34 @@ inline int vk_real_clear_submit(VkDecodeState& st, uint32_t vdev, uint32_t vqueu
     att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     att.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    att.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    // The render pass resolves the attachment straight to GENERAL so the subsequent
+    // queue-family-release barrier (-> EXTERNAL, for the CPU AHB read) has a defined source
+    // layout. Leaving it in COLOR_ATTACHMENT_OPTIMAL and then CPU-reading the AHB on a
+    // tiler (Mali) yields undefined contents — the readback half of the clear-submit gap.
+    att.finalLayout = VK_IMAGE_LAYOUT_GENERAL;
     VkAttachmentReference att_ref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
     VkSubpassDescription sub{};
     sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     sub.colorAttachmentCount = 1;
     sub.pColorAttachments = &att_ref;
+    // Make the color write available + the GENERAL transition visible to anything that
+    // reads the attachment after the pass (the queue-family-release barrier below, then
+    // the host AHB lock). Without this dependency the store can race the readback.
+    VkSubpassDependency dep{};
+    dep.srcSubpass = 0;
+    dep.dstSubpass = VK_SUBPASS_EXTERNAL;
+    dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep.dstStageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+    dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dep.dstAccessMask = 0;
     VkRenderPassCreateInfo rpci{};
     rpci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
     rpci.attachmentCount = 1;
     rpci.pAttachments = &att;
     rpci.subpassCount = 1;
     rpci.pSubpasses = &sub;
+    rpci.dependencyCount = 1;
+    rpci.pDependencies = &dep;
     if (vkCreateRenderPass(dev, &rpci, nullptr, &rp) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_RECORD; }
 
     VkFramebufferCreateInfo fbci{};
@@ -494,13 +548,31 @@ inline int vk_real_clear_submit(VkDecodeState& st, uint32_t vdev, uint32_t vqueu
     rbi.pClearValues = &clear;
     vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdEndRenderPass(cmd);
+    // Release the AHB color image from the graphics queue to the external consumer (the
+    // CPU that locks the AHB) so it sees fully-flushed pixels. On a tiler the framebuffer
+    // lives in tile memory until this resolve/ownership transfer; the host-read destination
+    // makes the write available to a host read of the AHB. (Image is already in GENERAL via
+    // the render pass finalLayout.) VK_QUEUE_FAMILY_EXTERNAL is core in Vulkan 1.1, so this
+    // is valid without the optional VK_EXT_queue_family_foreign extension.
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.srcQueueFamilyIndex = dit->second.gfx_family;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+    barrier.image = image;
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
     if (vkEndCommandBuffer(cmd) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_RECORD; }
 
     // ---- submit + fence-wait ----
     VkFence fence = VK_NULL_HANDLE;
     VkFenceCreateInfo fci{};
     fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    vkCreateFence(dev, &fci, nullptr, &fence);
+    if (vkCreateFence(dev, &fci, nullptr, &fence) != VK_SUCCESS) fence = VK_NULL_HANDLE;
     VkSubmitInfo si{};
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
