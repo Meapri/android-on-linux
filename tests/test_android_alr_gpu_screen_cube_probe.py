@@ -39,4 +39,4 @@ def test_main_activity_invokes_screen_cube():
     assert "nativeAlrGpuScreenCube" in text
     assert "cubeReport" in text
     assert "ALR GPU SCREEN CUBE" in text
-    assert "build: 0.4.162-sd-v162" in text
+    assert "build: 0.4.163-sd-v163" in text

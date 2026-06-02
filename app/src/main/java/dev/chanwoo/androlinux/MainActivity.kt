@@ -236,7 +236,7 @@ class MainActivity : Activity() {
         // is wired separately. Device test = CP-5.
         Thread {
             try {
-                for (name in listOf("sdl2", "netsurf", "qt6", "xwayland", "babl-gegl", "microbench", "interpose", "dpkg-db", "x11", "apt-config", "chromium-net")) {
+                for (name in listOf("sdl2", "netsurf", "qt6", "xwayland", "babl-gegl", "microbench", "interpose", "dpkg-db", "x11", "apt-config", "chromium-net", "nss")) {
                     val tar = java.io.File("/data/local/tmp/$name-stage.tar")
                     val marker = java.io.File(rootfsStatus.rootfsDir, ".$name-staged-${tar.length()}")
                     if (tar.isFile && !marker.isFile) {
@@ -814,7 +814,7 @@ class MainActivity : Activity() {
             alrSeccompPathTrapProbe.lineStartingWith("alr sc PATH_MEDIATION_VIABLE=")
                 .substringAfter("PATH_MEDIATION_VIABLE=", "") == "yes"
 
-        val executionSummary = "build: 0.4.162-sd-v162" +
+        val executionSummary = "build: 0.4.163-sd-v163" +
             "\nexecution summary" +
             "\nROOTFS EXECUTION: ${if (rootfsExecutionPassed) "PASS" else "FAIL"}" +
             "\nSHELL SCRIPT EXECUTION: ${if (shellScriptExecutionPassed) "PASS" else "FAIL"}" +
