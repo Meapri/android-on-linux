@@ -1371,3 +1371,219 @@ char *canonicalize_file_name(const char *path) {
     char b[ALR_PBUF];
     return real(rw(path, b, sizeof b));
 }
+
+/* =================================================================== */
+/* M-R5-svcscan: read-only `svc`-rewrite availability / ROI probe       */
+/* =================================================================== */
+/*
+ * ADR-002 §2 (2a) M-R5-svcscan. This is a READ-ONLY scanner: it walks the
+ * guest's own executable mappings after load and counts ARM64 `svc #0`
+ * (0xD4000001) sites, plus the subset that is *safely rewritable* because the
+ * immediately-preceding instruction is a `mov x8,#nr` (MOVZ/MOVK targeting x8,
+ * the syscall-number register). It NEVER patches anything — the integration
+ * session calls it once, right after the guest is loaded, to log
+ *     ALR-SVCSCAN svc_sites=<n> rewritable=<n>/<n> ...
+ * so a human can judge the ROI of an eventual `svc`->trampoline binary rewrite
+ * BEFORE committing to that high-risk step. Side-effect-free: the only syscalls
+ * it issues are read-only (openat/read/close on /proc/self/maps) through the
+ * trampoline, and it saves/restores errno so a caller observes no change.
+ *
+ * The instruction bit logic here is byte-identical IN INTENT to the host-tested
+ * pure-python reference (tests/svc_match.py, exercised by
+ * tests/test_svc_rewrite_match.py): same svc mask/base, same MOVZ/MOVK-x8
+ * predecessor test, same "rewritable iff preceded by an x8 load" rule. Keep the
+ * two in lockstep; the python side is the unit-tested oracle for these masks.
+ *
+ * HONEST LIMITS (carried from ADR-002 §2 (2a) "위험"):
+ *   - Only mappings present in /proc/self/maps AT CALL TIME are scanned. A .so
+ *     dlopen'd LATER (e.g. a GTK module, or a plugin) is NOT counted; its svc
+ *     sites are invisible to a one-shot scan. (The integration session may
+ *     re-invoke after late loads, but a single post-load call undercounts.)
+ *   - V8/JIT code generated at RUNTIME into anonymous r-x pages is counted as
+ *     sites IF mapped, but such pages have no stable file identity and a static
+ *     pre-pass cannot anticipate code not yet emitted.
+ *   - "rewritable" is a NECESSARY condition (x8 set by a self-contained move
+ *     right before the svc), not a proof of safety: a real rewrite must still
+ *     prove the svc is reachable only with that x8 and is not a branch target.
+ *     This probe deliberately does the cheap, conservative count only.
+ */
+
+/* svc detection — identical masks to svc_match.is_svc / SVC0_WORD. */
+#define ALR_SVC_BASE      0xD4000001u   /* svc #0 */
+#define ALR_SVC_IMM_MASK  0xFFE0001Fu   /* fixed bits of the svc-with-imm16 form */
+
+/* 64-bit move-wide (MOVZ/MOVK) group — identical to svc_match._MOV_GROUP_*. */
+#define ALR_MOV_GROUP_MASK 0x9F800000u
+#define ALR_MOV_GROUP_VAL  0x92800000u  /* sf=1, bits[28:23]=100101 (opc-agnostic) */
+#define ALR_MOV_OPC_SHIFT  29
+#define ALR_MOV_OPC_MASK   0x3u
+#define ALR_MOVZ_OPC       0x2u         /* opc=10 -> MOVZ */
+#define ALR_MOVK_OPC       0x3u         /* opc=11 -> MOVK */
+#define ALR_MOV_RD_MASK    0x1Fu
+
+/* 1 iff `w` is an `svc #imm16` (any imm, incl. the #0 storm form). */
+static int alr_is_svc(uint32_t w) {
+    return (w & ALR_SVC_IMM_MASK) == ALR_SVC_BASE;
+}
+
+/* 1 iff `w` is a MOVZ/MOVK that targets x8 (Rd==8) — the predecessor that makes
+ * the following svc safely rewritable (mirrors svc_match.is_x8_load). */
+static int alr_is_x8_load(uint32_t w) {
+    if ((w & ALR_MOV_GROUP_MASK) != ALR_MOV_GROUP_VAL) return 0;
+    uint32_t opc = (w >> ALR_MOV_OPC_SHIFT) & ALR_MOV_OPC_MASK;
+    if (opc != ALR_MOVZ_OPC && opc != ALR_MOVK_OPC) return 0;
+    return (w & ALR_MOV_RD_MASK) == 8;
+}
+
+/* Append a non-negative decimal to buf at *pos (bounded). No libc. */
+static void alr_put_u64(char *buf, size_t buflen, size_t *pos, uint64_t v) {
+    char tmp[20];
+    int n = 0;
+    if (v == 0) tmp[n++] = '0';
+    while (v) { tmp[n++] = (char)('0' + (int)(v % 10)); v /= 10; }
+    while (n > 0 && *pos + 1 < buflen) buf[(*pos)++] = tmp[--n];
+}
+/* Append a NUL-terminated literal to buf at *pos (bounded). No libc. */
+static void alr_put_str(char *buf, size_t buflen, size_t *pos, const char *s) {
+    while (*s && *pos + 1 < buflen) buf[(*pos)++] = *s++;
+}
+
+/* Parse one lowercase-hex run starting at *p; advance *p past it. */
+static uint64_t alr_parse_hex(const char **p) {
+    uint64_t v = 0;
+    const char *s = *p;
+    for (;;) {
+        char c = *s;
+        unsigned d;
+        if (c >= '0' && c <= '9') d = (unsigned)(c - '0');
+        else if (c >= 'a' && c <= 'f') d = (unsigned)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') d = (unsigned)(c - 'A' + 10);
+        else break;
+        v = (v << 4) | d;
+        ++s;
+    }
+    *p = s;
+    return v;
+}
+
+/*
+ * Scan a single contiguous executable mapping [lo,hi) for svc sites.
+ *
+ * The bytes are read DIRECTLY from the mapping (it is r-x and present per
+ * /proc/self/maps, so file-backed text is safe to load word-by-word; we never
+ * write). For each 4-aligned word that is an svc, we look at the immediately
+ * preceding word (if any, and still inside this same mapping) to decide
+ * rewritability — matching svc_match.find_svc_sites, which treats the very
+ * first word of a blob as having no predecessor.
+ *
+ * *sites and *rewr are accumulated across regions.
+ */
+static void alr_svcscan_region(uint64_t lo, uint64_t hi,
+                               uint64_t *sites, uint64_t *rewr) {
+    if (hi <= lo) return;
+    lo = (lo + 3u) & ~(uint64_t)3u;     /* 4-byte align the start (defensive) */
+    if (lo >= hi) return;
+    const volatile uint32_t *base = (const volatile uint32_t *)(uintptr_t)lo;
+    uint64_t nwords = (hi - lo) / 4u;
+    for (uint64_t i = 0; i < nwords; ++i) {
+        uint32_t w = base[i];
+        if (!alr_is_svc(w)) continue;
+        ++(*sites);
+        if (i > 0 && alr_is_x8_load(base[i - 1])) ++(*rewr);
+    }
+}
+
+/*
+ * alr_svcscan_report — fill `buf` with a one-line ROI report and return `buf`.
+ *
+ * Format (stable; the integration session logs it verbatim):
+ *   ALR-SVCSCAN svc_sites=<n> rewritable=<n>/<n> exec_regions=<n> scanned_kb=<n>
+ *
+ * READ-ONLY and side-effect-free: it opens /proc/self/maps, reads it in chunks,
+ * walks each r-x region's words, and closes the fd — all via the trampoline.
+ * errno is saved and restored. It does NOT depend on g_pcgate (works in either
+ * mode) and never touches the PCGATE filter or any cached interposer state.
+ *
+ * Robust to a tiny/NULL buffer: with buflen<2 it just NUL-terminates if it can.
+ */
+char *alr_svcscan_report(char *buf, size_t buflen) {
+    if (!buf || buflen == 0) return buf;
+    int saved_errno = errno;
+    buf[0] = '\0';
+
+    uint64_t svc_sites = 0, rewritable = 0, exec_regions = 0, scanned_bytes = 0;
+
+    /* Open /proc/self/maps read-only through the trampoline (trusted PC). */
+    long fd = alr_tramp_syscall(__NR_openat, AT_FDCWD, (long)"/proc/self/maps",
+                                (long)(O_RDONLY | O_CLOEXEC), 0, 0, 0);
+    if (fd < 0) {
+        /* Could not read maps: emit a well-formed line with zeros + a note so
+         * the device gate still sees ALR-SVCSCAN and child exit is unaffected. */
+        size_t pos = 0;
+        alr_put_str(buf, buflen, &pos,
+                    "ALR-SVCSCAN svc_sites=0 rewritable=0/0 exec_regions=0 "
+                    "scanned_kb=0 err=maps_open");
+        buf[pos < buflen ? pos : buflen - 1] = '\0';
+        errno = saved_errno;
+        return buf;
+    }
+
+    /*
+     * Stream /proc/self/maps. It is generated on read and lines never split a
+     * field we need (addr range + perms are at the very start of each line), but
+     * a chunk boundary CAN fall mid-line, so we keep an incomplete trailing line
+     * in `line` and finish it on the next read. A maps line is short; 256 is
+     * ample for the "lo-hi perms offset dev inode path" prefix we parse.
+     */
+    char chunk[4096];
+    char line[256];
+    size_t linelen = 0;
+    for (;;) {
+        long n = alr_tramp_syscall(__NR_read, fd, (long)chunk, (long)sizeof chunk, 0, 0, 0);
+        if (n <= 0) break;          /* EOF (0) or error (<0): stop */
+        for (long ci = 0; ci < n; ++ci) {
+            char c = chunk[ci];
+            if (c == '\n') {
+                line[linelen] = '\0';
+                /* Parse "lo-hi perms ..." — only r-x lines contribute. */
+                const char *p = line;
+                uint64_t lo = alr_parse_hex(&p);
+                if (*p == '-') {
+                    ++p;
+                    uint64_t hi = alr_parse_hex(&p);
+                    /* perms field follows a single space: "r-xp" etc. */
+                    if (*p == ' ') ++p;
+                    /* perms = 4 chars: r w x p/s. We require r and x. */
+                    if (p[0] == 'r' && p[2] == 'x' && hi > lo) {
+                        ++exec_regions;
+                        scanned_bytes += (hi - lo);
+                        alr_svcscan_region(lo, hi, &svc_sites, &rewritable);
+                    }
+                }
+                linelen = 0;
+            } else if (linelen + 1 < sizeof line) {
+                line[linelen++] = c;
+            }
+            /* else: an over-long line prefix — we already captured the leading
+             * addr/perms fields we need, so dropping the tail is harmless. */
+        }
+    }
+    alr_tramp_syscall(__NR_close, fd, 0, 0, 0, 0, 0);
+
+    /* Compose the report line. */
+    size_t pos = 0;
+    alr_put_str(buf, buflen, &pos, "ALR-SVCSCAN svc_sites=");
+    alr_put_u64(buf, buflen, &pos, svc_sites);
+    alr_put_str(buf, buflen, &pos, " rewritable=");
+    alr_put_u64(buf, buflen, &pos, rewritable);
+    alr_put_str(buf, buflen, &pos, "/");
+    alr_put_u64(buf, buflen, &pos, svc_sites);
+    alr_put_str(buf, buflen, &pos, " exec_regions=");
+    alr_put_u64(buf, buflen, &pos, exec_regions);
+    alr_put_str(buf, buflen, &pos, " scanned_kb=");
+    alr_put_u64(buf, buflen, &pos, scanned_bytes / 1024u);
+    buf[pos < buflen ? pos : buflen - 1] = '\0';
+
+    errno = saved_errno;
+    return buf;
+}
