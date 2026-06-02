@@ -1622,6 +1622,17 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         const char* p = ::getenv("ALR_PCGATE");
         return !(p != nullptr && p[0] == '0');
     }();
+    // ALR_FAKEROOT (default OFF): when the app-process sets it to "1" right before a
+    // dpkg/apt drain (gated behind the .alr-aptdrain device marker), chain the
+    // fakeroot .so FIRST in LD_PRELOAD (so its credential wrappers — getuid->0,
+    // chown/stat no-ops — sit OUTSIDE the interposer) and push FAKEROOTUID/GID=0.
+    // Read from the HOST (app) env via ::getenv, exactly like ALR_DISABLE_INTERPOSE
+    // and ALR_PCGATE above — keeps the JNI signature fixed. When unset every line
+    // below is byte-identical to the pre-fakeroot env, so normal launch is no-op.
+    const bool fakeroot_on = []{
+        const char* f = ::getenv("ALR_FAKEROOT");
+        return f != nullptr && f[0] == '1';
+    }();
     if (!interpose_off) {
         // R3 / bootstrap: LD_PRELOAD MUST be the ABSOLUTE ROOTFS HOST path, not the
         // guest path. In PCGATE=1 the loader no longer traces path syscalls, so ld.so's
@@ -1630,8 +1641,22 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         // interposer's PC-gate filter would never install (no speedup AND no mediation).
         // The host-absolute path opens with no mediation needed, and is idempotently
         // left alone by the PCGATE=0 supervisor too, so it is correct in both A/B arms.
-        guest_env.push_back("LD_PRELOAD=" + config.rootfs_dir +
-                            "/usr/lib/androlinux/libalr_interpose.so");
+        std::string preload =
+            config.rootfs_dir + "/usr/lib/androlinux/libalr_interpose.so";
+        if (fakeroot_on) {
+            // fakeroot FIRST (credential outer layer), interpose KEPT. Both are
+            // ABSOLUTE ROOTFS host paths (R3), matching chain_ld_preload() in the
+            // host model tools/aptdrain_env_model.py.
+            preload = config.rootfs_dir +
+                      "/usr/lib/androlinux/libalr_fakeroot.so:" + preload;
+        }
+        guest_env.push_back("LD_PRELOAD=" + preload);
+    }
+    if (fakeroot_on) {
+        // fakeroot identity contract: make the guest see uid/gid 0 so dpkg's
+        // chown/stat root:root checks pass under a non-root Android process.
+        guest_env.push_back("FAKEROOTUID=0");
+        guest_env.push_back("FAKEROOTGID=0");
     }
     guest_env.push_back(pcgate_on ? "ALR_PCGATE=1" : "ALR_PCGATE=0");
     // Record both arms in the report so each run is self-identifying for A/B.
@@ -2874,7 +2899,8 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                                     if (envp_read_ok) {
                                         const auto inj =
                                             alr::runtime::decide_exec_envp_injection(
-                                                config.rootfs_dir, env_entries);
+                                                config.rootfs_dir, env_entries,
+                                                /*fakeroot=*/fakeroot_on);
                                         if (first_exec_envp_reason.empty()) {
                                             first_exec_envp_reason = inj.reason;
                                         }

@@ -339,7 +339,8 @@ bool colon_list_contains(std::string_view list, std::string_view needle) {
 
 ExecEnvpInjection decide_exec_envp_injection(
     std::string_view rootfs_dir,
-    const std::vector<std::string>& env_entries) {
+    const std::vector<std::string>& env_entries,
+    bool fakeroot) {
     ExecEnvpInjection out;
     // The interposer self-disables (pure passthrough) when ALR_ROOTFS is unset, so
     // with no rootfs there is nothing to mediate — leave the child's envp alone.
@@ -347,18 +348,28 @@ ExecEnvpInjection decide_exec_envp_injection(
         out.reason = "already";
         return out;
     }
-    // Derive the two target values purely from rootfs_dir. These are the SAME
-    // strings the parent loader pushes into the first guest's env (runtime_report
-    // env-setup): LD_PRELOAD must be the ABSOLUTE ROOTFS host path (R3 finding) and
-    // ALR_ROOTFS is the rootfs dir itself.
+    // Derive the target values purely from rootfs_dir. These are the SAME strings
+    // the parent loader pushes into the first guest's env (runtime_report env-setup):
+    // LD_PRELOAD must be the ABSOLUTE ROOTFS host path (R3 finding) and ALR_ROOTFS is
+    // the rootfs dir itself. Under fakeroot the fakeroot .so chains FIRST.
     out.rootfs_value.assign(rootfs_dir);
     out.interpose_so = std::string(rootfs_dir) + "/usr/lib/androlinux/libalr_interpose.so";
+    const std::string fakeroot_so =
+        std::string(rootfs_dir) + "/usr/lib/androlinux/libalr_fakeroot.so";
+
+    // The desired leading chain (our shims), in order. Mirrors chain_ld_preload()
+    // in tools/aptdrain_env_model.py: [fakeroot?] interpose. interpose is never
+    // dropped; fakeroot is FIRST so its credential wrappers run outermost.
+    std::vector<std::string> desired;
+    if (fakeroot) {
+        desired.push_back(fakeroot_so);
+    }
+    desired.push_back(out.interpose_so);
 
     // Scan the child's existing envp for the two vars (first occurrence wins, as
     // libc's environ lookup does). We capture the existing LD_PRELOAD value so we
-    // can PREPEND the interpose .so while preserving the guest's own preloads.
+    // can PREPEND our shims while preserving the guest's own preloads.
     bool have_ld_preload = false;
-    bool ld_preload_satisfied = false;
     std::string_view existing_ld_preload;
     bool have_rootfs = false;
     for (const auto& entry : env_entries) {
@@ -366,27 +377,75 @@ ExecEnvpInjection decide_exec_envp_injection(
         if (!have_ld_preload && key == "LD_PRELOAD") {
             have_ld_preload = true;
             existing_ld_preload = value;
-            ld_preload_satisfied = colon_list_contains(value, out.interpose_so);
         } else if (!have_rootfs && key == "ALR_ROOTFS") {
             have_rootfs = true;
         }
     }
 
-    const bool need_ld = !ld_preload_satisfied;       // absent OR present-without-interpose
+    // LD_PRELOAD is satisfied iff EVERY desired shim already appears as a whole
+    // colon-element (idempotent re-exec of a child the parent already injected).
+    bool ld_preload_satisfied = have_ld_preload;
+    for (const auto& so : desired) {
+        if (!colon_list_contains(existing_ld_preload, so)) {
+            ld_preload_satisfied = false;
+            break;
+        }
+    }
+
+    const bool need_ld = !ld_preload_satisfied;       // absent OR missing a desired shim
     const bool need_rootfs = !have_rootfs;
 
     if (need_ld) {
         if (have_ld_preload) {
-            // Guest set its own LD_PRELOAD without our .so: prepend the interpose
-            // .so (FIRST so its wrappers take precedence) and preserve the rest.
-            // The supervisor must DROP the old LD_PRELOAD entry from the rebuilt
-            // array and append this combined one.
+            // Guest set its own LD_PRELOAD (or a parent injected only part of our
+            // chain): rebuild as [desired shims FIRST] + [guest preloads minus our
+            // shims], de-duped, order preserved within the guest tail. The
+            // supervisor DROPs the old LD_PRELOAD entry and appends this combined one.
             out.replace_ld_preload = true;
-            out.ld_preload_value =
-                out.interpose_so + ":" + std::string(existing_ld_preload);
+            std::string built;
+            std::vector<std::string_view> seen;
+            const auto append = [&](std::string_view v) {
+                if (v.empty()) {
+                    return;
+                }
+                for (const auto& s : seen) {
+                    if (s == v) {
+                        return;
+                    }
+                }
+                seen.push_back(v);
+                if (!built.empty()) {
+                    built += ':';
+                }
+                built.append(v);
+            };
+            for (const auto& so : desired) {
+                append(so);
+            }
+            // Preserve guest preloads after ours, dropping duplicates of our shims.
+            std::size_t start = 0;
+            const std::string_view list = existing_ld_preload;
+            while (start <= list.size()) {
+                const std::size_t colon = list.find(':', start);
+                const std::size_t end =
+                    colon == std::string_view::npos ? list.size() : colon;
+                append(list.substr(start, end - start));
+                if (colon == std::string_view::npos) {
+                    break;
+                }
+                start = colon + 1;
+            }
+            out.ld_preload_value = std::move(built);
         } else {
-            // No guest LD_PRELOAD: a fresh append.
-            out.ld_preload_value = out.interpose_so;
+            // No guest LD_PRELOAD: a fresh append of just our shim chain.
+            std::string built;
+            for (const auto& so : desired) {
+                if (!built.empty()) {
+                    built += ':';
+                }
+                built += so;
+            }
+            out.ld_preload_value = std::move(built);
         }
         out.add_entries.push_back("LD_PRELOAD=" + out.ld_preload_value);
     }
@@ -397,10 +456,12 @@ ExecEnvpInjection decide_exec_envp_injection(
     out.should_inject = !out.add_entries.empty() || out.replace_ld_preload;
     if (!out.should_inject) {
         out.reason = "already";
+    } else if (out.replace_ld_preload) {
+        out.reason = fakeroot ? "prepend-fakeroot" : "prepend-ld";
     } else if (need_ld && need_rootfs) {
-        out.reason = out.replace_ld_preload ? "prepend-ld" : "inject-both";
+        out.reason = "inject-both";
     } else if (need_ld) {
-        out.reason = out.replace_ld_preload ? "prepend-ld" : "inject-ld";
+        out.reason = "inject-ld";
     } else {
         out.reason = "inject-rootfs";
     }

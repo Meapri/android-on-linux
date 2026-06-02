@@ -188,9 +188,17 @@ struct ExecEnvpInjection {
 //                                     it, idempotency across the exec chain)
 // When rootfs_dir is empty the interposer self-disables anyway, so this returns a
 // no-op (should_inject=false, reason="already").
+//
+// When `fakeroot` is true (dpkg/apt drain under the ALR_FAKEROOT gate) the desired
+// LD_PRELOAD chain becomes "<fakeroot_so>:<interpose_so>" (fakeroot FIRST, interpose
+// KEPT), so an exec'd child (zstd/sh/dpkg-deb) inherits the fakeroot credential
+// wrappers too. The chain is de-duped and the guest's own preloads are preserved,
+// matching chain_ld_preload() in tools/aptdrain_env_model.py. Default false keeps
+// every existing caller byte-identical.
 ExecEnvpInjection decide_exec_envp_injection(
     std::string_view rootfs_dir,
-    const std::vector<std::string>& env_entries);
+    const std::vector<std::string>& env_entries,
+    bool fakeroot = false);
 
 // Resolve and classify the first executable path that ALR would hand to a
 // future guest loader. This is clean-room planning logic only; it deliberately
