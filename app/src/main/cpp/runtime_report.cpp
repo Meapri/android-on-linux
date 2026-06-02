@@ -1943,7 +1943,18 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         // read clone_events: >0 = it reached worker clones (the deadlock was a
         // misdiagnosis, it was the window); still 0 at 120s = a real stall to chase.
         const bool is_chromium = host_path.find("chrom") != std::string::npos;
-        ::alarm(dynamic ? (is_chromium ? 120u : 25u) : 5u);
+        // GIMP (the Phase-6 interactive headline) has a HEAVY cold load — fontconfig
+        // cache build + plug-in query (each plug-in a fork+exec) + babl/gegl init —
+        // that does NOT finish inside the 25s verification window, so SIGALRM kills it
+        // MID-LOAD and it looks "frozen on the loading screen". It runs LAST in the
+        // sequence, so a long lifetime blocks nothing after it; give it a real
+        // interactive window so the load completes and the user can actually use it
+        // (this is the per-launch lifetime the old comment above promised). The 25s
+        // default still cycles the intermediate verification apps quickly.
+        const bool is_gimp = host_path.find("gimp") != std::string::npos;
+        const unsigned alarm_sec =
+            dynamic ? (is_gimp ? 1800u : (is_chromium ? 120u : 25u)) : 5u;
+        ::alarm(alarm_sec);
         alr_enter_guest(reinterpret_cast<void*>(start), reinterpret_cast<void*>(jump_entry),
                         reinterpret_cast<void*>(tcb));
         _exit(99);  // unreachable
