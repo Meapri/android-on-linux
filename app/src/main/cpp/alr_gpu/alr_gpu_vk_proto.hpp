@@ -61,7 +61,45 @@ enum AlrVkOp {
     ALR_VK_OP_GET_PHYSICAL_DEVICE_PROPERTIES = 202,  // u32 vinst, u32 vphys
 
     // destroy the instance `vinst` (releases the host's real VkInstance + virtual maps).
-    ALR_VK_OP_DESTROY_INSTANCE = 209  // u32 vinst
+    ALR_VK_OP_DESTROY_INSTANCE = 209,  // u32 vinst
+
+    // ---- VK-M2 BODY: device + queue + command-buffer + clear-submit marshalling ----
+    // These extend the enumerate/props round trip to the smallest GPU-driving path: a
+    // logical device, a graphics queue, a command pool + buffer, a clear-only render,
+    // and a submit + fence wait — all addressed by client-side virtual handles (no
+    // per-call round-trip; the host owns the virtual->real maps). The ONLY data that
+    // comes back is the create/submit VkResults + the clear readback (reply blob).
+
+    // create a logical VkDevice on virtual physical device `vphys` (must have been
+    // enumerated). The host picks the graphics queue family it found for `vphys` and
+    // creates one queue in it; `vdev` (guest-chosen, monotonic) names the device.
+    ALR_VK_OP_CREATE_DEVICE = 210,  // u32 vinst, u32 vphys, u32 vdev
+
+    // bind virtual queue `vqueue` to queue index `queue_index` of `vdev`'s graphics
+    // family. No round-trip: vkGetDeviceQueue can't fail; the guest names it locally.
+    ALR_VK_OP_GET_DEVICE_QUEUE = 211,  // u32 vdev, u32 queue_index, u32 vqueue
+
+    // create a command pool `vpool` on `vdev` (uses the device's graphics family).
+    ALR_VK_OP_CREATE_COMMAND_POOL = 212,  // u32 vdev, u32 vpool
+
+    // allocate one PRIMARY command buffer `vcmd` from pool `vpool` on `vdev`.
+    ALR_VK_OP_ALLOCATE_COMMAND_BUFFERS = 213,  // u32 vdev, u32 vpool, u32 vcmd
+
+    // record a CLEAR-only render into an offscreen R8G8B8A8 target of `width`×`height`
+    // on `vdev`, into command buffer `vcmd`. The host owns the render target (an AHB-
+    // backed color attachment on device, a host-memory image off-device); the guest
+    // only ships the clear color. This is the minimal render path — the heavy
+    // shader/pipeline/draw ops are a later VK-M3 step. RGBA clear is f32×4.
+    ALR_VK_OP_CMD_BEGIN_CLEAR = 214,
+    //   u32 vdev, u32 vcmd, u32 width, u32 height, f32 r, f32 g, f32 b, f32 a
+
+    // submit `vcmd` on `vqueue` (of `vdev`) and wait for completion (fence/queue-idle
+    // on the host). After this the host reads back the clear target's center pixel and
+    // returns it in the reply, so the guest can verify the GPU actually cleared it.
+    ALR_VK_OP_QUEUE_SUBMIT = 215,  // u32 vdev, u32 vqueue, u32 vcmd
+
+    // destroy the logical device `vdev` (frees queue/pool/cmd/render-target maps).
+    ALR_VK_OP_DESTROY_DEVICE = 216  // u32 vdev
 };
 
 // ---- Reply record opcodes (host -> guest), carried in the reply blob. The reply is
@@ -79,7 +117,7 @@ enum AlrVkReply {
 
     // result of GET_PHYSICAL_DEVICE_PROPERTIES: the identity/props of one device.
     // Strings are blobs (NUL not required; the guest treats them as length-counted).
-    ALR_VK_REPLY_PHYS_PROPS = 222
+    ALR_VK_REPLY_PHYS_PROPS = 222,
     //   u32 vphys
     //   u32 api_version          (VkPhysicalDeviceProperties::apiVersion, packed)
     //   u32 driver_version
@@ -90,6 +128,34 @@ enum AlrVkReply {
     //   u32 queue_family_count
     //   then queue_family_count × { u32 queue_flags, u32 queue_count }
     //   u8  is_software          (1 if the host classified it as a CPU/software rasterizer)
+
+    // ---- VK-M2 BODY replies ----
+    // result of CREATE_DEVICE: the VkResult + the graphics queue family the host used.
+    ALR_VK_REPLY_DEVICE = 223,  // u32 vdev, i32 vk_result, u32 gfx_queue_family
+
+    // result of QUEUE_SUBMIT: the submit VkResult + the readback of the clear target's
+    // center pixel (so the guest verifies the GPU clear landed). The render result is
+    // a separate code (0 == the whole device->submit chain succeeded; non-zero = the
+    // host-side stage that failed, see AlrVkRenderResult).
+    ALR_VK_REPLY_SUBMIT = 224
+    //   u32 vdev
+    //   u32 vcmd
+    //   i32 submit_result        (VkResult of vkQueueSubmit; 0 == VK_SUCCESS)
+    //   i32 render_result        (AlrVkRenderResult; 0 == clear rendered + read back)
+    //   u8  px_r, px_g, px_b, px_a  (center pixel of the cleared target, 0..255)
+};
+
+// Host-side render-path outcome carried in ALR_VK_REPLY_SUBMIT::render_result. 0 means
+// the clear genuinely rendered into the target and the readback succeeded; the rest name
+// the stage that failed so a device run is diagnosable without a debugger.
+enum AlrVkRenderResult {
+    ALR_VK_RENDER_OK = 0,
+    ALR_VK_RENDER_NO_DEVICE = 1,         // vdev/vqueue/vcmd not known to the host
+    ALR_VK_RENDER_TARGET_ALLOC = 2,      // could not allocate the offscreen/AHB target
+    ALR_VK_RENDER_RECORD = 3,            // command-buffer record (begin/renderpass) failed
+    ALR_VK_RENDER_SUBMIT = 4,            // vkQueueSubmit / wait failed
+    ALR_VK_RENDER_READBACK = 5,          // could not read the target back on the CPU
+    ALR_VK_RENDER_NO_CLEAR_RECORDED = 6  // submit with no prior CMD_BEGIN_CLEAR
 };
 
 // VkPhysicalDeviceType mirror (so the guest/self-test can name the type without
@@ -126,6 +192,7 @@ static inline void alr_vk_enc_raw(AlrVkEncoder *e, const void *p, size_t n) {
 static inline void alr_vk_enc_u8(AlrVkEncoder *e, uint8_t v)  { alr_vk_enc_raw(e, &v, 1); }
 static inline void alr_vk_enc_u32(AlrVkEncoder *e, uint32_t v){ alr_vk_enc_raw(e, &v, 4); }
 static inline void alr_vk_enc_i32(AlrVkEncoder *e, int32_t v) { alr_vk_enc_raw(e, &v, 4); }
+static inline void alr_vk_enc_f32(AlrVkEncoder *e, float v)   { alr_vk_enc_raw(e, &v, 4); }
 static inline void alr_vk_enc_blob(AlrVkEncoder *e, const void *p, uint32_t n) {
     alr_vk_enc_u32(e, n);
     if (n) alr_vk_enc_raw(e, p, n);
@@ -157,6 +224,60 @@ static inline void alr_vk_enc_get_phys_props(AlrVkEncoder *e, uint32_t vinst,
 static inline void alr_vk_enc_destroy_instance(AlrVkEncoder *e, uint32_t vinst) {
     alr_vk_enc_u8(e, (uint8_t)ALR_VK_OP_DESTROY_INSTANCE);
     alr_vk_enc_u32(e, vinst);
+}
+
+/* ---- VK-M2 body request builders ---- */
+static inline void alr_vk_enc_create_device(AlrVkEncoder *e, uint32_t vinst,
+                                            uint32_t vphys, uint32_t vdev) {
+    alr_vk_enc_u8(e, (uint8_t)ALR_VK_OP_CREATE_DEVICE);
+    alr_vk_enc_u32(e, vinst);
+    alr_vk_enc_u32(e, vphys);
+    alr_vk_enc_u32(e, vdev);
+}
+static inline void alr_vk_enc_get_device_queue(AlrVkEncoder *e, uint32_t vdev,
+                                              uint32_t queue_index, uint32_t vqueue) {
+    alr_vk_enc_u8(e, (uint8_t)ALR_VK_OP_GET_DEVICE_QUEUE);
+    alr_vk_enc_u32(e, vdev);
+    alr_vk_enc_u32(e, queue_index);
+    alr_vk_enc_u32(e, vqueue);
+}
+static inline void alr_vk_enc_create_command_pool(AlrVkEncoder *e, uint32_t vdev,
+                                                 uint32_t vpool) {
+    alr_vk_enc_u8(e, (uint8_t)ALR_VK_OP_CREATE_COMMAND_POOL);
+    alr_vk_enc_u32(e, vdev);
+    alr_vk_enc_u32(e, vpool);
+}
+static inline void alr_vk_enc_allocate_command_buffers(AlrVkEncoder *e, uint32_t vdev,
+                                                      uint32_t vpool, uint32_t vcmd) {
+    alr_vk_enc_u8(e, (uint8_t)ALR_VK_OP_ALLOCATE_COMMAND_BUFFERS);
+    alr_vk_enc_u32(e, vdev);
+    alr_vk_enc_u32(e, vpool);
+    alr_vk_enc_u32(e, vcmd);
+}
+static inline void alr_vk_enc_cmd_begin_clear(AlrVkEncoder *e, uint32_t vdev,
+                                             uint32_t vcmd, uint32_t width,
+                                             uint32_t height, float r, float g,
+                                             float b, float a) {
+    alr_vk_enc_u8(e, (uint8_t)ALR_VK_OP_CMD_BEGIN_CLEAR);
+    alr_vk_enc_u32(e, vdev);
+    alr_vk_enc_u32(e, vcmd);
+    alr_vk_enc_u32(e, width);
+    alr_vk_enc_u32(e, height);
+    alr_vk_enc_f32(e, r);
+    alr_vk_enc_f32(e, g);
+    alr_vk_enc_f32(e, b);
+    alr_vk_enc_f32(e, a);
+}
+static inline void alr_vk_enc_queue_submit(AlrVkEncoder *e, uint32_t vdev,
+                                          uint32_t vqueue, uint32_t vcmd) {
+    alr_vk_enc_u8(e, (uint8_t)ALR_VK_OP_QUEUE_SUBMIT);
+    alr_vk_enc_u32(e, vdev);
+    alr_vk_enc_u32(e, vqueue);
+    alr_vk_enc_u32(e, vcmd);
+}
+static inline void alr_vk_enc_destroy_device(AlrVkEncoder *e, uint32_t vdev) {
+    alr_vk_enc_u8(e, (uint8_t)ALR_VK_OP_DESTROY_DEVICE);
+    alr_vk_enc_u32(e, vdev);
 }
 
 /* aarch64-linux-gnu (the guest target) is little-endian, so the memcpy-of-native
