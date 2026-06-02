@@ -54,7 +54,27 @@ hang. Next: isolate via `--host-resolver-rules="MAP example.com <ip>"` (bypass D
 then fetches, DNS is the only remaining blocker (workaround: chromium DoH over 443, which
 connect permits), and connect+TLS are proven.
 
+## Caveat found: the bind fix is INCOMPLETE (chromium netlink-recv hang)
+Faking `bind`-success lets chromium's AddressTrackerLinux proceed PAST the bind to its
+`sendmsg(RTM_GETLINK)` + `recvmsg` enumeration. If SELinux also blocks the netlink
+send/recv (not just the multicast bind), `recvmsg` waits for a dump reply that never comes →
+intermittent hang. Device-observed: with the bind fix, chromium `--version` (which was a
+reliable ~1s exit-0 across many prior drains) once took **41s + exit=-1** — a flakiness the
+bind fix introduced. So the bind-only workaround is necessary-but-insufficient: the next
+iteration must ALSO short-circuit the netlink socket's `recvmsg` (return an empty/"done"
+NLMSG_DONE so AddressTracker completes its enumeration immediately) or emulate a minimal
+"1 interface up" reply — i.e. a fuller netlink emulation in the interposer, not just bind.
+
+## Connect+TLS isolation (IP-literal https://1.1.1.1/): INCONCLUSIVE
+Switched the CR-2 probe to an IP-literal URL to test connect+TLS without DNS, but the drain
+window (240s) was consumed by the 41s flaky `--version` + the CR-2 200s alarm, so CR-2 did
+not report. (Diagnostic reverted to keep ws-1 clean.) Re-run with a ≥360s window AND the
+netlink recvmsg short-circuit before drawing a connect/DNS conclusion.
+
 ## Status
-- CR-1 (engine + DOM render in-process): **ACHIEVED + reproduced 2/2** (v159).
-- CR-2 (network fetch): NETLINK connectivity blocker **CLEARED** (interposer bind fix);
-  chromium now issues the request; remaining = DNS/connect layer (isolation in flight).
+- CR-1 (engine + DOM render in-process): **ACHIEVED + reproduced 2/2** (v159, pre-bind-fix —
+  proof stands; re-verify CR-1 still renders WITH the netlink bind fix, given the flakiness).
+- CR-2 (network fetch): NETLINK connectivity bind blocker **addressed** (chromium now issues
+  the request) but the workaround is **incomplete/flaky** (netlink recvmsg hang) — next:
+  netlink recvmsg short-circuit, then re-isolate DNS vs connect. A deeper network-layer
+  effort.
