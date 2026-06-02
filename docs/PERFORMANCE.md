@@ -91,7 +91,7 @@ GL_VERSION:  OpenGL ES 3.2 v1.r44p1-01eac0.ed1fb6cfc1040479b92ddf50a952e57c
 |------|--------------|------|
 | 디스플레이 | 1920×1200 @ **90Hz** device-exact, present를 패널 refresh로 구동 | CP-1 |
 | zero-copy present | `zwp_linux_dmabuf_v1` + AHB→EGLImage import (CPU readback 0) | CP-4 |
-| GUI 앱 | **GIMP 3.0.2** 풀 렌더(터치 사용), gtk3-widget-factory, gtk3-demo(2213 프레임), foot 터미널, **netsurf-gtk 웹브라우저**(rendered=true, 5 threads) | [drain#9](evidence/2026-06-02-5ws-fanout-renderer-getpwuid-pkgfunc.md), [netsurf](evidence/2026-06-02-netsurf-browser-renders.md) |
+| GUI 앱 | **GIMP 3.0.2** 풀 렌더(터치 사용), gtk3-widget-factory, gtk3-demo(2213 프레임), foot 터미널, **netsurf-gtk 웹브라우저**(rendered=true, 5 threads), **SDL2 창**(testdraw2 rendered=true) | [drain#9](evidence/2026-06-02-5ws-fanout-renderer-getpwuid-pkgfunc.md), [netsurf](evidence/2026-06-02-netsurf-browser-renders.md), [round-4](evidence/2026-06-02-round4-milestones-drain.md) |
 | 범용성 | **apt-get / dpkg-query / Xwayland**가 ALR 로더로 실기기 실행(버전 출력) | drain#9 |
 
 ---
