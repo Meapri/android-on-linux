@@ -288,20 +288,40 @@ uint64_t g_fullscreen_gpu_serial = 0;
 
 // M4: real-modifier state derived from injected key events so wl_keyboard.modifiers
 // tells the client which mods are held (Shift/Ctrl/Alt/Super/AltGr) + Caps lock —
-// without it, modified keys never register on the client. Bit positions = the US
-// pc105 xkb default real-modifier indices (matching the keymap the compositor sends).
+// without it, modified keys never register on the client. Bit positions are the
+// real-modifier indices defined by the modifier_map of the keymap WE ACTUALLY SHIP
+// (alr_xkb_keymap_us.h); they must match it exactly or the client's xkb_state
+// diverges from the keys we inject. The shipped keymap binds (see modifier_map):
+//   Shift   = bit 0   { <LFSH>, <RTSH> }                  evdev 42, 54
+//   Lock    = bit 1   { <CAPS> }                          evdev 58 (locking, below)
+//   Control = bit 2   { <LCTL>, <RCTL> }                  evdev 29, 97
+//   Mod1    = bit 3   { <LALT>, <RALT>, <ALT>, <META> }   evdev 56, 100  (RALT==Alt_R)
+//   Mod4    = bit 6   { <LWIN>, <RWIN>, <SUPR> }           evdev 125, 126
+//   Mod5    = bit 7   { <LVL3> }                           evdev 84 (ISO_Level3/AltGr)
+// NOTE: in this keymap <RALT> (evdev 100) is plain Alt_R -> Mod1, NOT AltGr/Mod5.
+// AltGr/LevelThree is <LVL3> (evdev 84) only. A previous version mapped evdev 100
+// to Mod5, which made the client enter LevelThree on right-Alt and emit the wrong
+// glyphs (Shift/Ctrl still worked; right-Alt+key was corrupted).
 uint32_t g_mods_depressed = 0;  // momentary mods currently held
 uint32_t g_mods_locked = 0;     // locking mods (CapsLock)
 inline uint32_t evdev_to_mod_bit(uint32_t code) {
     switch (code) {
         case 42: case 54:   return 1u << 0;  // KEY_LEFT/RIGHTSHIFT -> Shift
         case 29: case 97:   return 1u << 2;  // KEY_LEFT/RIGHTCTRL  -> Control
-        case 56:            return 1u << 3;  // KEY_LEFTALT         -> Mod1
-        case 100:           return 1u << 7;  // KEY_RIGHTALT (AltGr)-> Mod5
+        case 56: case 100:  return 1u << 3;  // KEY_LEFT/RIGHTALT   -> Mod1 (RALT==Alt_R)
+        case 84:            return 1u << 7;  // KEY_LEVEL3/AltGr     -> Mod5 (<LVL3>)
         case 125: case 126: return 1u << 6;  // KEY_LEFT/RIGHTMETA  -> Mod4
         default:            return 0;
     }
 }
+// Clear momentary (depressed) modifiers when the keyboard leaves a surface. We inject
+// from a single Android keyboard source, so once focus moves the previous window's
+// held-mod assumptions are stale; if a modifier key-up was lost across the transition
+// (focus-follow tap, unmap, grab change) the depressed bit would otherwise leak into
+// the next wl_keyboard.enter and give the freshly-focused window phantom-held
+// Shift/Ctrl/Alt. Locked mods (CapsLock) intentionally persist — they model a latched
+// indicator state, not a held key. The fresh state is re-sent on the next enter.
+inline void clear_momentary_mods() { g_mods_depressed = 0; }
 std::vector<struct wl_resource*> g_pointers;
 std::vector<struct wl_resource*> g_keyboards;
 std::vector<struct wl_resource*> g_touches;
@@ -483,6 +503,7 @@ void surface_commit(struct wl_client*, struct wl_resource* resource) {
                                     k, wl_display_next_serial(comp->display()),
                                     g_focus_surface);
                         }
+                        clear_momentary_mods();  // fresh mods for the new toplevel/dialog
                         g_focus_surface = s->surface;
                         g_pointer_entered = false;
                         g_keyboard_entered = false;
@@ -518,6 +539,7 @@ void surface_commit(struct wl_client*, struct wl_resource* resource) {
                     wl_keyboard_send_leave(
                         k, wl_display_next_serial(comp->display()), s->surface);
             }
+            clear_momentary_mods();  // window gone: don't leak its held mods onward
             g_focus_surface = nullptr;
             g_pointer_entered = false;
             g_keyboard_entered = false;
@@ -1124,6 +1146,7 @@ void focus_follow_to_toplevel(SurfaceState* tgt) {
             wl_keyboard_send_leave(k, wl_display_next_serial(comp->display()),
                                    g_focus_surface);
     }
+    clear_momentary_mods();      // don't leak held Shift/Ctrl/Alt into the new focus
     g_focus_surface = tgt->surface;
     g_keyboard_entered = false;  // force a fresh wl_keyboard.enter on the next key
     zorder_raise(tgt);           // most-recently-activated window is on top
@@ -1218,6 +1241,7 @@ void toplevel_destroy(struct wl_client*, struct wl_resource* resource) {
         s->xdg_toplevel = nullptr;
         zorder_remove(s);
         if (g_focus_surface == s->surface) {
+            clear_momentary_mods();  // destroyed toplevel: don't leak held mods onward
             g_focus_surface = nullptr;
             g_pointer_entered = false;
             g_keyboard_entered = false;
@@ -1361,6 +1385,7 @@ void popup_grab(struct wl_client*, struct wl_resource* resource, struct wl_resou
         for (auto* k : g_keyboards)
             wl_keyboard_send_leave(k, wl_display_next_serial(comp->display()), prev);
     }
+    clear_momentary_mods();  // fresh mod state for the grabbing menu (re-sent on enter)
     g_keyboard_grab_surface = s->surface;
     g_keyboard_entered = false;
 }
@@ -1409,6 +1434,7 @@ void popup_resource_destroy(struct wl_resource* r) {
                     wl_keyboard_send_leave(k, wl_display_next_serial(comp->display()),
                                            s->surface);
             }
+            clear_momentary_mods();  // don't carry the menu's held mods back to the toplevel
             g_keyboard_grab_surface = nullptr;
             g_keyboard_entered = false;
         }
