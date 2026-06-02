@@ -174,6 +174,9 @@ void   glGetActiveUniform(GLuint program, GLuint index, GLsizei bufSize, GLsizei
                           GLint *size, GLenum *type, GLchar *name);
 void   glGetActiveAttrib(GLuint program, GLuint index, GLsizei bufSize, GLsizei *length,
                          GLint *size, GLenum *type, GLchar *name);
+/* constant generic vertex attributes (also absent from the GLES2-only khr header). */
+void   glVertexAttrib3f(GLuint index, GLfloat x, GLfloat y, GLfloat z);
+void   glVertexAttrib4fv(GLuint index, const GLfloat *v);
 
 /* ----- the cube GL sequence (drives the REAL shim entry points) ----- */
 static const char *kVS =
@@ -350,6 +353,17 @@ int main(int argc, char **argv) {
     glPolygonOffset(1.0f, 2.0f);                                /* OP_POLYGON_OFFSET */
     glLineWidth(2.0f);                                          /* OP_LINE_WIDTH */
     glSampleCoverage(0.5f, GL_TRUE);                            /* OP_SAMPLE_COVERAGE */
+
+    /* --- CONSTANT generic vertex attributes (the value a DISABLED attrib array reads).
+     *     glmark2's shading/bump/shadow/refract/conditionals/function/loop scenes set a
+     *     constant attrib for a non-array input; the old shim dropped these silently. Two
+     *     paths, mirroring the VAP coverage: a LITERAL index (glBindAttribLocation path)
+     *     -> OP_VERTEX_ATTRIB_F, and a packed glGetAttribLocation handle (a_nrm = "normal")
+     *     -> OP_VERTEX_ATTRIB_F_NAMED (host resolves the real location BY NAME). The 3f form
+     *     ships ncomp=3 {0.1,0.2,0.3}; the 4fv form ships ncomp=4 {1,0,0,1}. --- */
+    glVertexAttrib3f(2, 0.1f, 0.2f, 0.3f);          /* OP_VERTEX_ATTRIB_F  index 2, ncomp 3 */
+    GLfloat cattr4[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+    glVertexAttrib4fv(a_nrm, cattr4);               /* OP_VERTEX_ATTRIB_F_NAMED "normal", ncomp 4 */
 
     /* --- UNPACK row-alignment repack: a 3x2 RGB image at the GL DEFAULT alignment 4 has
      *     row = 3*3 = 9 source bytes padded UP to 12; the shim must repack to TIGHT 9-byte

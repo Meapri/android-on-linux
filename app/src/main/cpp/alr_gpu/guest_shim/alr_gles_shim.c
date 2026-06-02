@@ -1376,16 +1376,61 @@ void glShaderBinary(GLsizei n, const GLuint *sh, GLenum fmt, const void *bin, GL
     (void)n; (void)sh; (void)fmt; (void)bin; (void)len;  /* no online compiler binary path */
 }
 
-/* --- constant generic vertex attributes: the build scene's attribs are all array-backed
- *     (VBO), so a constant attrib is never read; accept + drop. --- */
-void glVertexAttrib1f(GLuint i, GLfloat x) { (void)i; (void)x; }
-void glVertexAttrib2f(GLuint i, GLfloat x, GLfloat y) { (void)i;(void)x;(void)y; }
-void glVertexAttrib3f(GLuint i, GLfloat x, GLfloat y, GLfloat z) { (void)i;(void)x;(void)y;(void)z; }
-void glVertexAttrib4f(GLuint i, GLfloat x, GLfloat y, GLfloat z, GLfloat w) { (void)i;(void)x;(void)y;(void)z;(void)w; }
-void glVertexAttrib1fv(GLuint i, const GLfloat *v) { (void)i; (void)v; }
-void glVertexAttrib2fv(GLuint i, const GLfloat *v) { (void)i; (void)v; }
-void glVertexAttrib3fv(GLuint i, const GLfloat *v) { (void)i; (void)v; }
-void glVertexAttrib4fv(GLuint i, const GLfloat *v) { (void)i; (void)v; }
+/* --- CONSTANT generic vertex attributes (glVertexAttrib{1..4}f[v]): the VALUE an
+ *     attribute reads when its array is DISABLED. REAL fire-and-forget wire ops now.
+ *     The build/texture scenes are all VBO-array-backed (never set a constant attrib),
+ *     but the harder glmark2 scenes (shading/bump/shadow/refract/conditionals/function/
+ *     loop) and many toolkit GL paths DO set a constant attrib for a non-array input;
+ *     dropping it left the attrib at the GL default (0,0,0,1) instead of the app's value
+ *     — a SILENT wrong-pixels bug. Same packed-handle by-NAME idiom as the VAA/VAP path:
+ *     a glGetAttribLocation handle (high 16 bits set) carries the NAME (host resolves the
+ *     real location); a literal glBindAttribLocation index uses the plain op. ncomp 1..4
+ *     selects glVertexAttrib{1,2,3,4}fv host-side; the host fills the unspecified trailing
+ *     components from the GL default (0,0,0,1), matching real glVertexAttrib{1,2,3}f. --- */
+struct VattribFArgs { uint32_t index; uint8_t ncomp; float v[4]; };
+static void build_vattrib_f(AlrEncoder *e, void *p) {
+    struct VattribFArgs *a = (struct VattribFArgs*)p;
+    alr_enc_u8(e, ALR_OP_VERTEX_ATTRIB_F);
+    alr_enc_u32(e, a->index);
+    alr_enc_u8(e, a->ncomp);
+    for (uint8_t i = 0; i < a->ncomp; ++i) alr_enc_f32(e, a->v[i]);
+}
+struct VattribFNamedArgs { uint32_t vprog; const char *name; uint8_t ncomp; float v[4]; };
+static void build_vattrib_f_named(AlrEncoder *e, void *p) {
+    struct VattribFNamedArgs *a = (struct VattribFNamedArgs*)p;
+    alr_enc_u8(e, ALR_OP_VERTEX_ATTRIB_F_NAMED);
+    alr_enc_u32(e, a->vprog);
+    alr_enc_str(e, a->name);
+    alr_enc_u8(e, a->ncomp);
+    for (uint8_t i = 0; i < a->ncomp; ++i) alr_enc_f32(e, a->v[i]);
+}
+static void emit_vertex_attrib_f(GLuint index, uint8_t ncomp, const GLfloat *v) {
+    /* A packed glGetAttribLocation handle (high 16 bits set) -> emit BY NAME so the host
+     * resolves the real location; a small literal index (glBindAttribLocation path) -> the
+     * plain index op. Identical recognition rule to glVertexAttribPointer. */
+    if ((index >> 16) != 0) {
+        uint32_t vprog = ALR_UNIFORM_VPROG(index);
+        const char *name = alr_shim_attrib_name(vprog, ALR_UNIFORM_IDX(index));
+        if (name) {
+            struct VattribFNamedArgs a = { vprog, name, ncomp, {0,0,0,0} };
+            for (uint8_t i = 0; i < ncomp; ++i) a.v[i] = v[i];
+            alr_shim_emit(build_vattrib_f_named, &a);
+            return;
+        }
+        /* unknown handle: fall through to the index path (defensive) */
+    }
+    struct VattribFArgs a = { (uint32_t)index, ncomp, {0,0,0,0} };
+    for (uint8_t i = 0; i < ncomp; ++i) a.v[i] = v[i];
+    alr_shim_emit(build_vattrib_f, &a);
+}
+void glVertexAttrib1f(GLuint i, GLfloat x) { GLfloat v[1] = {x}; emit_vertex_attrib_f(i, 1, v); }
+void glVertexAttrib2f(GLuint i, GLfloat x, GLfloat y) { GLfloat v[2] = {x,y}; emit_vertex_attrib_f(i, 2, v); }
+void glVertexAttrib3f(GLuint i, GLfloat x, GLfloat y, GLfloat z) { GLfloat v[3] = {x,y,z}; emit_vertex_attrib_f(i, 3, v); }
+void glVertexAttrib4f(GLuint i, GLfloat x, GLfloat y, GLfloat z, GLfloat w) { GLfloat v[4] = {x,y,z,w}; emit_vertex_attrib_f(i, 4, v); }
+void glVertexAttrib1fv(GLuint i, const GLfloat *v) { if (v) emit_vertex_attrib_f(i, 1, v); }
+void glVertexAttrib2fv(GLuint i, const GLfloat *v) { if (v) emit_vertex_attrib_f(i, 2, v); }
+void glVertexAttrib3fv(GLuint i, const GLfloat *v) { if (v) emit_vertex_attrib_f(i, 3, v); }
+void glVertexAttrib4fv(GLuint i, const GLfloat *v) { if (v) emit_vertex_attrib_f(i, 4, v); }
 
 /* --- glTexParameterf/fv/iv: route to the existing integer tex-param wire op. --- */
 void glTexParameterf(GLenum target, GLenum pname, GLfloat param) {
