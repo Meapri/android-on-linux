@@ -1090,6 +1090,48 @@ bool map_input_to_surface(SurfaceState* tgt, double in_x, double in_y,
     return true;
 }
 
+// Keyboard focus-follow: a press (pointer button down / touch down) on a DIFFERENT
+// toplevel than the one that currently holds the keyboard makes that toplevel the
+// keyboard-focused window, and raises it to the top of the z-order so the next
+// dialog/menu anchors to it (the convention: keyboard goes to zorder_top, never a
+// popup). Without this, two mapped toplevels (e.g. netsurf + a separate dialog, or
+// two GUI apps at once) would leave keys stuck on whichever window mapped last —
+// tapping the other window moved only the POINTER target, not keyboard focus.
+//
+// Honors an active popup keyboard grab: while a menu holds g_keyboard_grab_surface
+// the focus is the grab, not a toplevel, so we don't disturb it (a press outside the
+// menu is the client's own grab-dismiss path; the grab is released on popup teardown,
+// after which the next press lands here). Pure key/value comparison against live
+// SurfaceState — never dereferences a possibly-dangling parent/role resource (the
+// v106/v108 UAF discipline). No-op if `tgt` is null, not a mapped toplevel, already
+// the focus, or a keyboard grab is in effect.
+void focus_follow_to_toplevel(SurfaceState* tgt) {
+    if (!tgt || !tgt->surface || !tgt->xdg_toplevel || !tgt->mapped) return;
+    // A menu/combobox grabbing keys owns keyboard routing; don't override it here.
+    if (g_keyboard_grab_surface) return;
+    if (g_focus_surface == tgt->surface) {
+        // Same window — still make sure it's the raised one (a press re-activates it).
+        if (zorder_top() != tgt) { zorder_raise(tgt); g_scene_dirty = true; }
+        return;
+    }
+    Compositor* comp = instance();
+    if (!comp) return;
+    // Leave the previously-focused (still-ALIVE) surface so it stops believing it
+    // holds the keyboard (stuck modifiers / IME to the wrong window), mirroring the
+    // P0-1 map-time focus steal. The next Key event sends enter to the new focus.
+    if (g_keyboard_entered && g_focus_surface && g_focus_surface != tgt->surface) {
+        for (auto* k : g_keyboards)
+            wl_keyboard_send_leave(k, wl_display_next_serial(comp->display()),
+                                   g_focus_surface);
+    }
+    g_focus_surface = tgt->surface;
+    g_keyboard_entered = false;  // force a fresh wl_keyboard.enter on the next key
+    zorder_raise(tgt);           // most-recently-activated window is on top
+    g_scene_dirty = true;        // repaint: the raised window draws above the others
+    ALR_WL_LOGI("keyboard focus-follow -> key=%llu (tap raised toplevel)",
+                static_cast<unsigned long long>(tgt->key));
+}
+
 // =================== wl_region (accept + ignore) ===================
 void region_destroy(struct wl_client*, struct wl_resource* resource) {
     wl_resource_destroy(resource);
@@ -1977,6 +2019,17 @@ void Compositor::drain_input_queue() {
             // Button stays with the surface the pointer last entered (an implicit
             // pointer grab); we do NOT re-hit-test here, matching Wayland semantics.
             if (!g_input_target_surface || !g_pointer_entered) break;
+            // Keyboard focus-follow: a PRESS activates the toplevel under the cursor.
+            // The pointer target may be a popup (menu) — resolve its owning toplevel by
+            // KEY so keyboard focus lands on the window (zorder_top convention), never
+            // the popup. (focus_follow_to_toplevel is a no-op while a popup keyboard
+            // grab is active, so menu navigation is preserved.)
+            if (e.state) {
+                SurfaceState* ts = surface_state_for_wl(g_input_target_surface);
+                if (ts && ts->is_popup)
+                    ts = popup_owning_toplevel(ts, nullptr, nullptr);
+                focus_follow_to_toplevel(ts);
+            }
             const uint32_t serial = wl_display_next_serial(display_);
             for (auto* p : g_pointers) {
                 wl_pointer_send_button(p, serial, e.time_ms, e.button,
@@ -1992,8 +2045,23 @@ void Compositor::drain_input_queue() {
             const uint32_t a = e.axis == 1 ? WL_POINTER_AXIS_HORIZONTAL_SCROLL
                                            : WL_POINTER_AXIS_VERTICAL_SCROLL;
             for (auto* p : g_pointers) {
-                wl_pointer_send_axis(p, e.time_ms, a, wl_fixed_from_double(e.axis_value));
-                if (wl_resource_get_version(p) >= WL_POINTER_FRAME_SINCE_VERSION)
+                const int ver = wl_resource_get_version(p);
+                // wl_pointer v5+ groups a scroll as axis_source -> axis -> frame. GTK's
+                // wayland backend keys its smooth-scroll handling off axis_source; an
+                // axis with NO source (the prior behaviour) is treated ambiguously and a
+                // web page (netsurf) often won't scroll. Send WHEEL (discrete mouse/
+                // trackpad wheel) — the Android side maps a real scroll wheel / 2-finger
+                // wheel gesture to this. axis_stop (value 0) lets a kinetic client end the
+                // sequence cleanly.
+                if (ver >= WL_POINTER_AXIS_SOURCE_SINCE_VERSION)
+                    wl_pointer_send_axis_source(p, WL_POINTER_AXIS_SOURCE_WHEEL);
+                if (e.axis_value != 0.0) {
+                    wl_pointer_send_axis(p, e.time_ms, a,
+                                         wl_fixed_from_double(e.axis_value));
+                } else if (ver >= WL_POINTER_AXIS_STOP_SINCE_VERSION) {
+                    wl_pointer_send_axis_stop(p, e.time_ms, a);
+                }
+                if (ver >= WL_POINTER_FRAME_SINCE_VERSION)
                     wl_pointer_send_frame(p);
             }
             break;
@@ -2011,6 +2079,16 @@ void Compositor::drain_input_queue() {
             // (single-surface grab) but still delivered to the grabbed surface so the
             // client's touch-id bookkeeping stays consistent.
             if (g_touch_active == 0) g_touch_target = tgt_surf;
+            // Keyboard focus-follow on the first finger of a tap: activate the toplevel
+            // under the finger (the same press-activates-window behaviour as a mouse
+            // click). If the tap hit a popup, resolve its owning toplevel by KEY so
+            // keyboard focus lands on the window, not the menu (no-op under a popup
+            // keyboard grab, so menu navigation is preserved).
+            if (g_touch_active == 0) {
+                SurfaceState* act = (tgt && tgt->is_popup)
+                    ? popup_owning_toplevel(tgt, nullptr, nullptr) : tgt;
+                focus_follow_to_toplevel(act);
+            }
             struct wl_resource* deliver = g_touch_target ? g_touch_target : tgt_surf;
             double mx = e.x, my = e.y;
             SurfaceState* dtgt = surface_state_for_wl(deliver);
