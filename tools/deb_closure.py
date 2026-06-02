@@ -642,9 +642,16 @@ def reachable_overlay_libs(start_rels, needed_fn, soname_path: dict, base_soname
     return keep, missing
 
 
-def _leaf_file_paths(leaf_pkgs, index, mirror, cache: Path, opener) -> set[str]:
+def _leaf_file_paths(leaf_pkgs, index, mirror, cache: Path, opener, exclude_leaf=None) -> set[str]:
     """Extract each leaf .deb on its own and return the set of rootfs-rel paths it
-    installs (binaries + plugins + data) — these are kept ENTIRELY in a minimal build."""
+    installs (binaries + plugins + data) — these are kept ENTIRELY in a minimal build.
+
+    ``exclude_leaf(rel) -> bool`` (optional) drops a leaf-installed rootfs-rel path
+    from the kept set BEFORE the DT_NEEDED BFS runs. Dropping a leaf ELF here means
+    its private deps are never walked, so the libs only IT pulled in are never added
+    to the overlay (e.g. excluding Qt's wayland-egl platform plugin keeps the EGL
+    HwIntegration lib + libEGL out of a wl_shm-only build). Default keeps everything.
+    """
     import shutil
 
     paths: set[str] = set()
@@ -667,7 +674,10 @@ def _leaf_file_paths(leaf_pkgs, index, mirror, cache: Path, opener) -> set[str]:
             continue
         for dirpath, _dirs, files in os.walk(leaf_root):
             for fname in files:
-                paths.add((Path(dirpath) / fname).relative_to(leaf_root).as_posix())
+                rel = (Path(dirpath) / fname).relative_to(leaf_root).as_posix()
+                if exclude_leaf is not None and exclude_leaf(rel):
+                    continue
+                paths.add(rel)
     return paths
 
 
@@ -683,6 +693,7 @@ def build_minimal_overlay(
     cache_dir: str | Path | None = None,
     prune=DEFAULT_PRUNE_PREFIXES,
     keep_prefixes=(),
+    exclude_leaf=None,
     opener=_urlopen_ua,
 ) -> dict:
     """DT_NEEDED-MINIMAL overlay: keep the leaf package's own files + ONLY the shared
@@ -694,6 +705,13 @@ def build_minimal_overlay(
     (gdk-pixbuf loaders, pango modules) or in the leaf package itself (Qt's qtwayland
     platform plugin) — the leaf's own files are kept entirely, so those survive. Use
     ``keep_prefixes`` to force-keep extra data dirs if a toolkit needs them.
+
+    ``exclude_leaf(rootfs_rel_path) -> bool`` (optional) drops specific leaf-installed
+    files from the kept set. Because the DT_NEEDED BFS starts at the *kept* leaf ELFs,
+    excluding a leaf plugin also drops the private libs ONLY it pulled in. This is how
+    a wl_shm-only Qt build excludes the wayland-egl platform/integration plugins so
+    Qt never dlopens EGL (and libQt6WaylandEglClientHwIntegration + libEGL never enter
+    the overlay), forcing the generic SHM QPA platform. Default keeps everything.
     """
     from tools.elf_needed import read_elf_dynamic  # lazy: parser may post-date this import
 
@@ -729,7 +747,7 @@ def build_minimal_overlay(
         except Exception as exc:
             unsupported.append(f"{name} (extract failed: {exc})")
 
-    leaf_files = _leaf_file_paths(leaf_pkgs, index, mirror, cache, opener)
+    leaf_files = _leaf_file_paths(leaf_pkgs, index, mirror, cache, opener, exclude_leaf=exclude_leaf)
 
     # Map each SONAME provided by the overlay to its REAL file (skip symlinks; the
     # flat name is synthesized by build_stage_tar). Record which rel paths are ELF.

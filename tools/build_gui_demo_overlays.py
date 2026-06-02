@@ -122,27 +122,64 @@ class GuiDemo:
     require_plugin_dirs: tuple[str, ...] = ()
     require_sonames: tuple[str, ...] = ()
     inject_machine_id: bool = False
+    exclude_leaf_basenames: tuple[str, ...] = ()
+    exclude_leaf_substrings: tuple[str, ...] = ()
+    forbid_sonames: tuple[str, ...] = ()
     note: str = ""
+
+    def leaf_excluder(self):
+        """A ``exclude_leaf(rootfs_rel) -> bool`` callback (or None) that drops the
+        leaf-installed files whose basename is in ``exclude_leaf_basenames`` OR whose
+        rootfs-rel path contains any ``exclude_leaf_substrings`` entry. Passed to
+        build_minimal_overlay so the DT_NEEDED BFS never starts at (and so never pulls
+        the private deps of) the excluded plugins — the wl_shm-only EGL exclusion."""
+        if not (self.exclude_leaf_basenames or self.exclude_leaf_substrings):
+            return None
+        drop = set(self.exclude_leaf_basenames)
+        subs = self.exclude_leaf_substrings
+        return lambda rel: (
+            PurePosixPath(rel).name in drop or any(s in rel for s in subs)
+        )
 
 
 GUI_DEMOS: dict[str, GuiDemo] = {
     # Qt6 Widgets analog clock — a top-level QWidget RASTER window (wl_shm only, no
     # GL needed, which matches the ALR compositor). qt6-base-examples ships the
-    # prebuilt ELF; qt6-wayland is the leaf that carries the COMPLETE dlopen'd Wayland
-    # QPA closure: the platform plugins (platforms/libqwayland-generic.so — the SHM
-    # path — and platforms/libqwayland-egl.so), the shell-integration plugins
-    # (wayland-shell-integration/libxdg-shell.so &c), the decoration-client plugin
-    # (wayland-decoration-client/libbradient.so) and the graphics-integration-client
-    # plugins. None of these are DT_NEEDED by analogclock — they are dlopen'd at QPA
-    # init — so qt6-wayland being a LEAF (its files kept entirely) is what makes them
-    # survive, and build_minimal_overlay BFS-walking DT_NEEDED *from each plugin .so*
-    # is what pulls their private deps (libQt6WaylandClient.so.6 / libQt6Gui /
-    # libwayland-* / libxkbcommon) into the overlay. The round-4 SIGSEGV(rendered=false)
-    # was investigated host-side: the closure built by this recipe is ALREADY complete
-    # (35 reachable libs, missing_soname=0, every plugin .so forced 0o755, guard+spec
-    # OK) — so the remaining init crash is a RUNTIME platform/compositor concern (EGL
-    # platform selection or a compositor global), not a missing overlay file. We assert
-    # the closure here so a future overlay regression can never re-introduce a real gap.
+    # prebuilt ELF; qt6-wayland is the leaf that carries the dlopen'd Wayland QPA
+    # closure.
+    #
+    # round-6 SHM-path fix (the round-5 rendered=false crash). qt6-wayland ships TWO
+    # platforms/ plugins that BOTH advertise the QPA key "wayland":
+    #   * libqwayland-generic.so — the SHM/raster QPA backing store (QWaylandShm
+    #     BackingStore); NO EGL symbols at all.  ← the one we WANT.
+    #   * libqwayland-egl.so     — DT_NEEDEDs libQt6WaylandEglClientHwIntegration →
+    #     eglGetDisplay.  On the wl_shm-only ALR compositor there is no EGL ICD, so if
+    #     Qt resolves QT_QPA_PLATFORM=wayland to THIS plugin it SIGSEGVs in
+    #     eglGetDisplay at init. ← the crash.
+    # Removing libqwayland-egl.so leaves only the generic SHM plugin under platforms/,
+    # so "wayland" can only resolve to the SHM backing store.
+    #
+    # Two more EGL sources had to go, found host-side by walking DT_NEEDED of every
+    # leaf plugin:
+    #   (1) the client buffer-integration plugins that dlopen EGL — libqt-plugin-
+    #       wayland-egl.so (+ its libQt6WaylandEglClientHwIntegration.so.6), and the
+    #       libdrm-egl-server.so / libdmabuf-server.so dmabuf plugins (DT_NEEDED libEGL,
+    #       dmabuf is a GPU buffer path the compositor doesn't speak).
+    #   (2) the ENTIRE wayland-graphics-integration-server/ dir — these are COMPOSITOR-
+    #       side plugins (Qt as a server), never dlopen'd by a client app like
+    #       analogclock, and they DT_NEEDED libQt6WaylandCompositor + libQt6Wayland
+    #       EglCompositorHwIntegration + libEGL. Dropping the whole dir keeps the
+    #       compositor stack (and its EGL deps) out of a pure-client overlay.
+    # Excluding a leaf ELF from the BFS means build_minimal_overlay never walks its
+    # private deps, so those EGL/Compositor libs never enter the overlay.
+    #
+    # HONEST NOTE on libEGL: libQt6Gui.so.6 itself DT_NEEDEDs libEGL/libGLX/libOpenGL
+    # (the GL-backing-store code path is compiled in), so libEGL.so.1 is *mapped* by
+    # the dynamic linker regardless — that is harmless (no eglGetDisplay is called on
+    # the SHM/raster path). The crash is about the EGL *QPA platform plugin being
+    # selected*, which the exclusion above prevents. So we forbid the EGL HwIntegration
+    # plugins (client + compositor) — never libEGL itself. DEVICE belt-and-braces:
+    # QT_WAYLAND_DISABLE_HW_INTEGRATION=1 also vetoes the client EGL buffer path.
     "qt6gui": GuiDemo(
         name="qt6gui",
         leaf_packages=("qt6-base-examples", "qt6-wayland"),
@@ -157,7 +194,6 @@ GUI_DEMOS: dict[str, GuiDemo] = {
             "platforms",
             "wayland-shell-integration",
             "wayland-decoration-client",
-            "wayland-graphics-integration-client",
         ),
         # The private libs those plugins pull in. A gap here is the classic
         # "QPA plugin loaded but libQt6WaylandClient unresolved → SIGSEGV".
@@ -169,10 +205,34 @@ GUI_DEMOS: dict[str, GuiDemo] = {
             "libwayland-client.so.0",
         ),
         inject_machine_id=True,
-        note="QtWidgets RASTER window; run with QT_QPA_PLATFORM=wayland (the generic "
-        "SHM platform — NOT wayland-egl, the ALR compositor is wl_shm-only). qt6-wayland "
-        "leaf carries the full dlopen'd QPA plugin closure (all forced 0o755). "
-        "/etc/machine-id injected so Qt's D-Bus init is graceful (base has none).",
+        # wl_shm-only EGL exclusion (basename matches: the EGL QPA platform plugin +
+        # the EGL/dmabuf client buffer-integration plugins).
+        exclude_leaf_basenames=(
+            "libqwayland-egl.so",          # platforms/ — the EGL QPA plugin (key "wayland")
+            "libqt-plugin-wayland-egl.so", # graphics-integration-client — "wayland-egl" HW integ
+            "libdrm-egl-server.so",        # graphics-integration-client — DT_NEEDED libEGL
+            "libdmabuf-server.so",         # graphics-integration-client — DT_NEEDED libEGL
+        ),
+        # Drop the whole compositor-side graphics-integration dir — never used by a Qt
+        # client, and the sole reason libQt6WaylandCompositor + EglCompositorHwIntegration
+        # (and their libEGL) entered the overlay.
+        exclude_leaf_substrings=(
+            "/qt6/plugins/wayland-graphics-integration-server/",
+        ),
+        # Post-build assertion: the EGL HwIntegration plugins (client + compositor) must
+        # be orphaned out of the overlay. NOT libEGL itself — libQt6Gui DT_NEEDEDs it,
+        # so its presence is unavoidable and harmless on the SHM path (see note above).
+        forbid_sonames=(
+            "libQt6WaylandEglClientHwIntegration.so.6",
+            "libQt6WaylandEglCompositorHwIntegration.so.6",
+            "libQt6WaylandCompositor.so.6",
+        ),
+        note="QtWidgets RASTER window; run with QT_QPA_PLATFORM=wayland (resolves to the "
+        "generic SHM QPA plugin — the EGL platform/integration + compositor-server plugins "
+        "are EXCLUDED, the ALR compositor is wl_shm-only). qt6-wayland leaf carries the "
+        "remaining dlopen'd QPA plugin closure (all forced 0o755). /etc/machine-id injected "
+        "so Qt's D-Bus init is graceful (base has none). DEVICE-REQ env: "
+        "QT_QPA_PLATFORM=wayland + QT_WAYLAND_DISABLE_HW_INTEGRATION=1 (belt-and-braces).",
     ),
     # SDL2 bouncing-sprites demo — opens a window and renders sprites each frame.
     # libSDL2 has the Wayland video driver compiled in (SDL_VIDEODRIVER=wayland).
@@ -298,11 +358,15 @@ class ClosureCheck:
     sonames_reachable: tuple[str, ...]
     sonames_unreachable: tuple[str, ...]
     plugins_non_exec: tuple[str, ...]   # plugin .so members NOT 0o755 (dlopen would fail)
+    forbidden_present: tuple[str, ...] = ()  # sonames that MUST be absent but slipped in
 
     @property
     def ok(self) -> bool:
         return not (
-            self.plugin_dirs_missing or self.sonames_unreachable or self.plugins_non_exec
+            self.plugin_dirs_missing
+            or self.sonames_unreachable
+            or self.plugins_non_exec
+            or self.forbidden_present
         )
 
 
@@ -312,6 +376,7 @@ def check_plugin_closure(
     *,
     require_plugin_dirs: tuple[str, ...],
     require_sonames: tuple[str, ...],
+    forbid_sonames: tuple[str, ...] = (),
 ) -> ClosureCheck:
     """Assert the dlopen'd-plugin closure a Qt wayland window needs is COMPLETE.
 
@@ -325,7 +390,10 @@ def check_plugin_closure(
       * every ``require_sonames`` is satisfied either by an overlay member (flat or
         versioned) OR by the base (base libs win and are not re-shipped);
       * every plugin .so under .../qt6/plugins/ is 0o755 (ALR file-backed PROT_EXEC
-        dlopen rejects a non-x .so — a non-exec QPA plugin = no window).
+        dlopen rejects a non-x .so — a non-exec QPA plugin = no window);
+      * NONE of ``forbid_sonames`` is present as an overlay member (the wl_shm-only
+        EGL exclusion: libQt6WaylandEglClientHwIntegration / libEGL must be GONE so Qt
+        cannot take the EGL path that SIGSEGVs in eglGetDisplay on this compositor).
     """
     from tools.deb_closure import base_soname_set
     from tools.overlay_guard import parse_solib
@@ -365,12 +433,21 @@ def check_plugin_closure(
         else:
             unreachable.append(so)
 
+    # Forbidden sonames must NOT be shipped by the overlay. We only flag overlay
+    # members (a base-provided soname is irrelevant — the overlay never re-ships it,
+    # and a forbid entry is about what THIS overlay carries). overlay_sonames holds
+    # both the parsed SONAME and the bare flat basename, so e.g. "libEGL.so.1" or
+    # "libQt6WaylandEglClientHwIntegration.so.6" are caught however build_stage_tar
+    # spelled the member.
+    forbidden = tuple(so for so in forbid_sonames if so in overlay_sonames)
+
     return ClosureCheck(
         plugin_dirs_present=dirs_present,
         plugin_dirs_missing=dirs_missing,
         sonames_reachable=tuple(reachable),
         sonames_unreachable=tuple(unreachable),
         plugins_non_exec=tuple(sorted(plugins_non_exec)),
+        forbidden_present=forbidden,
     )
 
 
@@ -404,6 +481,10 @@ def build_gui_demo_overlay(
         arch=arch,
         components=components,
         cache_dir=cache_dir,
+        # wl_shm-only EGL exclusion: drop the EGL platform / dmabuf-EGL client buffer
+        # plugins from the leaf so the DT_NEEDED BFS never pulls libEGL / the EGL
+        # HwIntegration lib into the overlay (forces the generic SHM QPA plugin).
+        exclude_leaf=demo.leaf_excluder(),
     )
 
     # Force every dlopen'd .so (QPA platform + shell/decoration/graphics plugins)
@@ -420,11 +501,12 @@ def build_gui_demo_overlay(
     # private libs, or a non-executable plugin .so). Skipped for demos that declare
     # no plugin closure (e.g. sdl2gui — its drivers are compiled into libSDL2).
     closure: ClosureCheck | None = None
-    if demo.require_plugin_dirs or demo.require_sonames:
+    if demo.require_plugin_dirs or demo.require_sonames or demo.forbid_sonames:
         closure = check_plugin_closure(
             m["out_tar"], base,
             require_plugin_dirs=demo.require_plugin_dirs,
             require_sonames=demo.require_sonames,
+            forbid_sonames=demo.forbid_sonames,
         )
 
     from tools.stage_tar_spec import validate_stage_tar
@@ -644,6 +726,8 @@ def main(argv: list[str] | None = None) -> int:
                 c = b.closure
                 print(f"    plugin dirs:      {'OK ' + str(list(c.plugin_dirs_present)) if not c.plugin_dirs_missing else 'MISSING ' + str(list(c.plugin_dirs_missing))}")
                 print(f"    plugin sonames:   {'OK (' + str(len(c.sonames_reachable)) + ' reachable)' if not c.sonames_unreachable else 'UNREACHABLE ' + str(list(c.sonames_unreachable))}")
+                if demo.forbid_sonames:
+                    print(f"    EGL excluded:     {'OK (no EGL HwIntegration/libEGL)' if not c.forbidden_present else 'PRESENT ' + str(list(c.forbidden_present))}")
                 if c.plugins_non_exec:
                     print(f"    NON-EXEC plugins: {list(c.plugins_non_exec)}")
                 print(f"    plugin closure:   {'OK' if c.ok else 'INCOMPLETE'}")
@@ -732,6 +816,44 @@ def _selftest() -> int:
           <= set(qt.require_sonames))
     check("qt6gui injects a D-Bus machine-id (base ships none)",
           qt.inject_machine_id is True)
+    # round-6 wl_shm-only EGL exclusion: the EGL QPA platform plugin + the EGL/dmabuf
+    # client buffer-integration plugins are excluded from the leaf so Qt cannot take an
+    # EGL path (eglGetDisplay SIGSEGV on the wl_shm-only compositor); the EGL private
+    # libs must then be orphaned out of the overlay (forbid_sonames).
+    check("qt6gui excludes the EGL QPA platform plugin (libqwayland-egl.so)",
+          "libqwayland-egl.so" in qt.exclude_leaf_basenames)
+    check("qt6gui excludes the wayland-egl client HW integration plugin",
+          "libqt-plugin-wayland-egl.so" in qt.exclude_leaf_basenames)
+    check("qt6gui excludes the EGL/dmabuf graphics-integration client plugins",
+          {"libdrm-egl-server.so", "libdmabuf-server.so"} <= set(qt.exclude_leaf_basenames))
+    check("qt6gui excludes the whole compositor-server graphics-integration dir",
+          any("wayland-graphics-integration-server" in s for s in qt.exclude_leaf_substrings))
+    check("qt6gui forbids the client EGL HwIntegration lib in the overlay",
+          "libQt6WaylandEglClientHwIntegration.so.6" in qt.forbid_sonames)
+    check("qt6gui forbids the compositor EGL HwIntegration + Compositor libs",
+          {"libQt6WaylandEglCompositorHwIntegration.so.6", "libQt6WaylandCompositor.so.6"}
+          <= set(qt.forbid_sonames))
+    # libEGL.so.1 is DT_NEEDED by libQt6Gui (unavoidable, harmless on SHM path) — it
+    # must NOT be forbidden or the build would falsely fail.
+    check("qt6gui does NOT forbid libEGL.so.1 (libQt6Gui DT_NEEDEDs it)",
+          "libEGL.so.1" not in qt.forbid_sonames)
+    check("qt6gui keeps the generic SHM platform via the platforms dir requirement",
+          "platforms" in qt.require_plugin_dirs)
+    check("qt6gui does NOT require the graphics-integration-client dir "
+          "(its only non-EGL plugins are optional; EGL ones are excluded)",
+          "wayland-graphics-integration-client" not in qt.require_plugin_dirs)
+    # leaf_excluder builds a working predicate matching by basename + substring
+    exc = qt.leaf_excluder()
+    check("qt6gui leaf_excluder drops the EGL platform plugin by path",
+          exc("usr/lib/aarch64-linux-gnu/qt6/plugins/platforms/libqwayland-egl.so"))
+    check("qt6gui leaf_excluder drops the whole compositor-server dir",
+          exc("usr/lib/aarch64-linux-gnu/qt6/plugins/wayland-graphics-integration-server/"
+              "libqt-wayland-compositor-wayland-egl.so"))
+    check("qt6gui leaf_excluder keeps the generic SHM platform plugin",
+          not exc("usr/lib/aarch64-linux-gnu/qt6/plugins/platforms/libqwayland-generic.so"))
+    check("qt6gui leaf_excluder keeps the xdg-shell integration plugin",
+          not exc("usr/lib/aarch64-linux-gnu/qt6/plugins/wayland-shell-integration/libxdg-shell.so"))
+    check("sdl2gui has no leaf excluder (None)", GUI_DEMOS["sdl2gui"].leaf_excluder() is None)
     sdl = GUI_DEMOS["sdl2gui"]
     check("sdl2gui leaf set includes libsdl2-tests (window demos)",
           "libsdl2-tests" in sdl.leaf_packages)
@@ -881,6 +1003,8 @@ def _selftest() -> int:
             good_tar, base,
             require_plugin_dirs=("platforms", "wayland-shell-integration"),
             require_sonames=("libQt6WaylandClient.so.6", "libwayland-client.so.0"),
+            # the EGL libs are NOT in good_tar, so forbidding them must pass clean
+            forbid_sonames=("libQt6WaylandEglClientHwIntegration.so.6", "libEGL.so.1"),
         )
         check("closure OK: plugin dirs present", not cc.plugin_dirs_missing)
         check("closure OK: overlay soname reachable",
@@ -888,7 +1012,34 @@ def _selftest() -> int:
         check("closure OK: base-provided soname counts as reachable",
               "libwayland-client.so.0" in cc.sonames_reachable)
         check("closure OK: no non-exec plugin", not cc.plugins_non_exec)
+        check("closure OK: forbidden EGL libs absent from overlay",
+              not cc.forbidden_present)
         check("ClosureCheck.ok True when complete", cc.ok)
+
+        # FORBIDDEN overlay: same as good but the EGL HwIntegration lib slipped back
+        # in — forbid_sonames must flag it and flip .ok to False.
+        egl_tar = Path(tmp) / "egl.tar"
+        with tarfile.open(egl_tar, "w") as t:
+            for arc in (
+                "./usr/lib/aarch64-linux-gnu/qt6/plugins/platforms/libqwayland-generic.so",
+                "./usr/lib/aarch64-linux-gnu/qt6/plugins/wayland-shell-integration/libxdg-shell.so",
+                "./usr/lib/aarch64-linux-gnu/libQt6WaylandClient.so.6",
+                "./usr/lib/aarch64-linux-gnu/libQt6WaylandEglClientHwIntegration.so.6",
+            ):
+                ti = tarfile.TarInfo(arc)
+                ti.size = 4
+                ti.mode = 0o755
+                t.addfile(ti, io.BytesIO(b"\x7fELF"))
+        cc_egl = check_plugin_closure(
+            egl_tar, base,
+            require_plugin_dirs=("platforms", "wayland-shell-integration"),
+            require_sonames=("libQt6WaylandClient.so.6",),
+            forbid_sonames=("libQt6WaylandEglClientHwIntegration.so.6", "libEGL.so.1"),
+        )
+        check("closure FORBID: EGL HwIntegration lib flagged when present",
+              "libQt6WaylandEglClientHwIntegration.so.6" in cc_egl.forbidden_present)
+        check("ClosureCheck.ok False when a forbidden EGL lib is present",
+              not cc_egl.ok)
 
         # BAD overlay: missing the shell-integration dir, plugin .so left 0o644,
         # a required private soname absent from both overlay and base.
@@ -920,10 +1071,14 @@ def _selftest() -> int:
     bad_conf = GuiDemoBuild("x", "/tmp/x.tar", "/usr/bin/x", 3, (), (), (), 1, True, False)
     ok_closure = ClosureCheck(("platforms",), (), ("libQt6Core.so.6",), (), ())
     bad_closure = ClosureCheck((), ("platforms",), (), ("libQt6Core.so.6",), ())
+    forbid_closure = ClosureCheck(
+        ("platforms",), (), ("libQt6Core.so.6",), (), (), ("libEGL.so.1",))
     good_with_closure = GuiDemoBuild(
         "x", "/tmp/x.tar", "/usr/bin/x", 3, ("liba",), (), (), 1, True, True, ok_closure)
     bad_with_closure = GuiDemoBuild(
         "x", "/tmp/x.tar", "/usr/bin/x", 3, ("liba",), (), (), 1, True, True, bad_closure)
+    forbid_with_closure = GuiDemoBuild(
+        "x", "/tmp/x.tar", "/usr/bin/x", 3, ("liba",), (), (), 1, True, True, forbid_closure)
     check("GuiDemoBuild.ok True when clean + exec present", good.ok)
     check("GuiDemoBuild.ok False when exec missing", not bad_missing.ok)
     check("GuiDemoBuild.ok False on guard violation", not bad_guard.ok)
@@ -931,6 +1086,8 @@ def _selftest() -> int:
     check("GuiDemoBuild.ok False when non-conformant", not bad_conf.ok)
     check("GuiDemoBuild.ok True when plugin closure is complete", good_with_closure.ok)
     check("GuiDemoBuild.ok False when plugin closure incomplete", not bad_with_closure.ok)
+    check("GuiDemoBuild.ok False when a forbidden EGL lib is present",
+          not forbid_with_closure.ok)
 
     apt_good = AptDemoBuild("/tmp/a.tar", "/root/hello.deb", 100, "hello", "2.10", (), True, ())
     apt_bad = AptDemoBuild("/tmp/a.tar", "/root/hello.deb", 0, "hello", "2.10", (), True, ())
