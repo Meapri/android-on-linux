@@ -643,6 +643,35 @@ void registry_remove(SurfaceState* s) {
     return nullptr;
 }
 
+// Climb a popup's parent_key chain to the toplevel that ultimately owns it,
+// summing the popup offsets along the way. GTK opens submenus as a popup anchored
+// to ANOTHER popup (File > Export As > ...): such a nested popup's parent_key is
+// the parent popup's key, NOT a toplevel key, so present_composited's per-toplevel
+// match (`pp->parent_key == toplevel->key`) never catches it and the submenu was
+// drawn nowhere (input still worked — surface_screen_rect already climbs). This
+// returns the owning toplevel (or null) and, if out_off_x/out_off_y are given, the
+// accumulated popup offset relative to that toplevel's placement origin, so the
+// snapshot builder can paint nested popups at the right spot. Key-based throughout
+// (surface_state_for_key) — never dereferences a possibly-dangling parent resource
+// (the v106/v108 UAF discipline). Bounded by a 32-deep guard against cycles.
+SurfaceState* popup_owning_toplevel(SurfaceState* popup, int32_t* out_off_x,
+                                    int32_t* out_off_y) {
+    int32_t ox = 0, oy = 0;
+    SurfaceState* toplevel = nullptr;
+    SurfaceState* cur = popup;
+    for (int guard = 0; guard < 32 && cur && cur->is_popup; ++guard) {
+        ox += cur->popup_x;
+        oy += cur->popup_y;
+        SurfaceState* parent = surface_state_for_key(cur->parent_key);
+        if (!parent) break;                       // parent gone; can't anchor
+        if (!parent->is_popup) { toplevel = parent; break; }  // reached a toplevel
+        cur = parent;                             // nested submenu: keep climbing
+    }
+    if (out_off_x) *out_off_x = ox;
+    if (out_off_y) *out_off_y = oy;
+    return toplevel;
+}
+
 // Raise `s` to the top of the z-order (most-recently-activated wins). Idempotent.
 void zorder_raise(SurfaceState* s) {
     g_zorder.erase(std::remove(g_zorder.begin(), g_zorder.end(), s), g_zorder.end());
@@ -822,18 +851,33 @@ void present_composited() {
             snap.push_back(sq);
         }
 
-        // Append popups anchored to this toplevel, on top of it, at their offset.
+        // Append popups OWNED by this toplevel, on top of it, at their offset.
+        // "Owned" follows the full parent_key chain (popup_owning_toplevel), so a
+        // nested submenu (popup anchored to another popup) paints above its toplevel
+        // too — not just popups whose direct parent is this toplevel. Collect first,
+        // then emit in map order (innermost submenu last = on top), so a child
+        // submenu always draws over the parent menu it opened from.
+        struct PopupHit { SurfaceState* pp; int32_t off_x; int32_t off_y; };
+        std::vector<PopupHit> hits;
         for (SurfaceState* pp : g_all_surfaces) {
             if (!pp || pp == s) continue;  // defensive: skip stray entries / self
             if (!pp->is_popup || !pp->mapped || pp->pixels.empty()) continue;
-            if (pp->parent_key != s->key) continue;
+            int32_t off_x = 0, off_y = 0;
+            if (popup_owning_toplevel(pp, &off_x, &off_y) != s) continue;
+            hits.push_back({pp, off_x, off_y});
+        }
+        std::sort(hits.begin(), hits.end(), [](const PopupHit& a, const PopupHit& b) {
+            return a.pp->map_serial < b.pp->map_serial;
+        });
+        for (const PopupHit& hit : hits) {
+            SurfaceState* pp = hit.pp;
             PresentSurface pq;
             pq.pixels = pp->pixels.data();
             pq.width = pp->buf_w;
             pq.height = pp->buf_h;
-            // Popup offset is relative to the parent toplevel's placement origin.
-            int32_t px = r.x + pp->popup_x;
-            int32_t py = r.y + pp->popup_y;
+            // Offset accumulated up the popup chain, relative to the toplevel origin.
+            int32_t px = r.x + hit.off_x;
+            int32_t py = r.y + hit.off_y;
             int32_t pw = pp->buf_w > 0 ? pp->buf_w : pp->popup_w;
             int32_t ph = pp->buf_h > 0 ? pp->buf_h : pp->popup_h;
             // Clamp into the view.
@@ -938,17 +982,9 @@ Rect surface_screen_rect(SurfaceState* tgt, int32_t out_w, int32_t out_h) {
         return place_toplevel(tgt, out_w, out_h);
     }
     // Walk parent_key -> ... -> toplevel, summing popup offsets along the way.
+    // Shared with present_composited so input lands EXACTLY where the popup draws.
     int32_t off_x = 0, off_y = 0;
-    SurfaceState* cur = tgt;
-    SurfaceState* toplevel = nullptr;
-    for (int guard = 0; guard < 32 && cur; ++guard) {
-        off_x += cur->popup_x;
-        off_y += cur->popup_y;
-        SurfaceState* parent = surface_state_for_key(cur->parent_key);
-        if (!parent) break;          // parent gone; best effort with what we have
-        if (!parent->is_popup) { toplevel = parent; break; }  // reached a toplevel
-        cur = parent;                // nested submenu: keep climbing
-    }
+    SurfaceState* toplevel = popup_owning_toplevel(tgt, &off_x, &off_y);
     Rect base = toplevel ? place_toplevel(toplevel, out_w, out_h)
                          : Rect{0, 0, out_w, out_h};
     Rect r;
@@ -1064,6 +1100,7 @@ void send_initial_configure(SurfaceState* s) {
 void toplevel_destroy(struct wl_client*, struct wl_resource* resource) {
     auto* s = static_cast<SurfaceState*>(wl_resource_get_user_data(resource));
     if (s) {
+        Compositor* comp = instance();
         s->mapped = false;
         s->xdg_toplevel = nullptr;
         zorder_remove(s);
@@ -1072,6 +1109,34 @@ void toplevel_destroy(struct wl_client*, struct wl_resource* resource) {
             g_pointer_entered = false;
             g_keyboard_entered = false;
             if (SurfaceState* nt = zorder_top()) g_focus_surface = nt->surface;
+        }
+        // The xdg_toplevel ROLE is gone but s->surface is still ALIVE here (GTK can
+        // destroy the role and reuse the wl_surface). If this surface was the pointer
+        // target or held the keyboard grab, drop it WITH a real leave so the client
+        // doesn't keep believing it owns input on a now-unmapped window — symmetric
+        // with the P0-2 null-buffer unmap path and popup_resource_destroy. Without
+        // this the next drain_input_queue would send a leave to a surface that may be
+        // torn down before the next tick (no role-vs-surface destroy order guarantee).
+        if (g_input_target_surface == s->surface) {
+            if (g_pointer_entered && comp) {
+                for (auto* p : g_pointers) {
+                    wl_pointer_send_leave(p, wl_display_next_serial(comp->display()),
+                                          s->surface);
+                    if (wl_resource_get_version(p) >= WL_POINTER_FRAME_SINCE_VERSION)
+                        wl_pointer_send_frame(p);
+                }
+            }
+            g_input_target_surface = nullptr;
+            g_pointer_entered = false;
+        }
+        if (g_keyboard_grab_surface == s->surface) {
+            if (g_keyboard_entered && comp) {
+                for (auto* k : g_keyboards)
+                    wl_keyboard_send_leave(k, wl_display_next_serial(comp->display()),
+                                           s->surface);
+            }
+            g_keyboard_grab_surface = nullptr;
+            g_keyboard_entered = false;
         }
         g_scene_dirty = true;  // repaint on next tick (single coalesced present path)
     }
