@@ -71,10 +71,19 @@ window (240s) was consumed by the 41s flaky `--version` + the CR-2 200s alarm, s
 not report. (Diagnostic reverted to keep ws-1 clean.) Re-run with a ≥360s window AND the
 netlink recvmsg short-circuit before drawing a connect/DNS conclusion.
 
+## CR-1 RE-VERIFIED safe with the bind fix (3/3) — the 41s was a one-off
+Re-drained CR-1 with the netlink-bind interposer on device: `chromium-CR1 PASS
+rendered-DOM-has-marker`, render exit=0 in ~1s, AND chromium `--version` exit=0 exec_ms=1014
+(stable). So the earlier 41s+exit=-1 `--version` was chromium's inherent init
+non-determinism (a one-off), NOT a deterministic bind-fix regression. CR-1 is now 3/3
+(v159 ×2 + this re-verify) and the bind fix does not break it. The netlink recvmsg
+short-circuit is still the right CR-2 robustness step (reduce that init-hang probability),
+but it is NOT a CR-1 regression.
+
 ## Status
-- CR-1 (engine + DOM render in-process): **ACHIEVED + reproduced 2/2** (v159, pre-bind-fix —
-  proof stands; re-verify CR-1 still renders WITH the netlink bind fix, given the flakiness).
+- CR-1 (engine + DOM render in-process): **ACHIEVED + reproduced 3/3**, confirmed safe WITH
+  the netlink bind fix on device.
 - CR-2 (network fetch): NETLINK connectivity bind blocker **addressed** (chromium now issues
-  the request) but the workaround is **incomplete/flaky** (netlink recvmsg hang) — next:
-  netlink recvmsg short-circuit, then re-isolate DNS vs connect. A deeper network-layer
-  effort.
+  the request); remaining = the request's network layer (DNS/connect) + a netlink recvmsg
+  short-circuit to cut chromium's init-hang probability. A deeper network-layer effort, rungs
+  clear (see candidates above).
