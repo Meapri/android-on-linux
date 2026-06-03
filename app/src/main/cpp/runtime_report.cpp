@@ -2700,11 +2700,17 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         const char* p = ::getenv("ALR_PERSIST_GUEST");
         return p != nullptr && p[0] == '1';
     }();
+    // Xwayland is a PERSISTENT X server (a long-lived wl client like GIMP/chromium): it
+    // must stay up for its X client (xcalc) to connect, draw, and commit a surface. The
+    // bare 40s ceiling SIGKILLed it mid-startup (device: exit sig=9 at exec_ms=40066,
+    // right as the keymap finished compiling), so give it the interactive GUI budget. The
+    // no-progress timer below still kills a genuinely wedged server quickly.
     const unsigned watchdog_sec =
         (host_path.find("chrom") != std::string::npos ||
          host_path.find("/dpkg") != std::string::npos ||
          host_path.find("/apt") != std::string::npos) ? 200u
-        : (host_path.find("gimp") != std::string::npos ? 1830u : 40u);
+        : ((host_path.find("gimp") != std::string::npos ||
+            host_path.find("Xwayland") != std::string::npos) ? 1830u : 40u);
     // PROGRESS-AWARE no-progress timeout. The OLD watchdog was a FIXED deadline: it
     // killed any guest still alive at watchdog_sec, even one making steady progress —
     // which is why a legitimately-slow dpkg install (unpack+configure of galculator,
@@ -4261,9 +4267,18 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                     }
                     if (!already && seen_cnt < 24) {
                         seen_nrs[seen_cnt++] = blocked_nr;
+                        // nr=99 (set_robust_list) and the cred-drop family (143-159)
+                        // are emulated as SUCCESS(0); everything else as -ENOSYS. The
+                        // exact value is decided just below; log which class this nr is.
+                        const bool succ0 =
+                            (blocked_nr == 99 || blocked_nr == 143 || blocked_nr == 144 ||
+                             blocked_nr == 145 || blocked_nr == 146 || blocked_nr == 147 ||
+                             blocked_nr == 149 || blocked_nr == 151 || blocked_nr == 152 ||
+                             blocked_nr == 159);
                         __android_log_print(ANDROID_LOG_WARN, "alr_loader",
-                            "alr CR4 blocked-syscall nr=%d -> ENOSYS (tid=%d, distinct#%d)",
-                            blocked_nr, static_cast<int>(w), seen_cnt);
+                            "alr CR4 blocked-syscall nr=%d -> %s (tid=%d, distinct#%d)",
+                            blocked_nr, succ0 ? "OK(0)" : "ENOSYS",
+                            static_cast<int>(w), seen_cnt);
                     }
                 }
                 // Default: return -ENOSYS. glibc ignores the result of
@@ -4283,7 +4298,43 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                 // state — they only gate on the return code. This removes the one ENOSYS the
                 // crash correlates with. (rseq nr=293 and the faccessat2 fallback class keep
                 // ENOSYS — only nr=99 is special-cased.)
-                regs[0] = (blocked_nr == 99) ? 0u : static_cast<uint64_t>(-38);  // 0 for set_robust_list, else -ENOSYS
+                //
+                // === GRANDCHILD-EXEC FIX: setuid/setgid family -> SUCCESS (0) ===
+                // Device-root-caused (ALR_SUPDIAG, leader=Xwayland): the ROOTFUL X
+                // server compiles its keymap by fork()+exec(xkbcomp) via the Xserver's
+                // Popen()/System() (os/utils.c). The FORKED CHILD, before execve, drops
+                // privileges to its own uid/gid:
+                //     if (setgid(getgid())) _exit(127);
+                //     if (setuid(getuid())) _exit(127);
+                // The Android app sandbox's BASE seccomp filter SECCOMP_RET_TRAPs setgid
+                // (and the rest of the cred family) for an untrusted_app — and TRAP
+                // (0x30000) outranks our stacked RET_TRACE (0x7ff00000), so the kernel
+                // raises SIGSYS on setgid BEFORE the child ever reaches the execve our
+                // tracer would trap+redirect. The old default emulated that SIGSYS as
+                // -ENOSYS, so setgid returned -1 and the child _exit(127)'d — xkbcomp
+                // NEVER ran, the keymap never compiled, "XKB: Failed to compile keymap",
+                // Xwayland died before binding X0 (and apt's gpgv-method fork drops to
+                // _apt the same way -> gpgv never ran -> "not signed"). This is why the
+                // grandchild's execve "escaped" the trampoline: it was killed one syscall
+                // EARLIER, at the cred-drop guard, not at the exec.
+                // FIX: emulate the whole setuid/setgid/setgroups/setfs{u,g}id family as
+                // SUCCESS (0). The child only ever drops to its CURRENT uid/gid
+                // (setgid(getgid())/setuid(getuid())) — a no-op the real kernel returns 0
+                // for — so faking 0 is semantically correct, NOT a privilege grant (we
+                // cancelled the syscall; kernel creds are unchanged). It is also exactly
+                // the fake-root model the rest of ALR already uses (fakeroot LD_PRELOAD,
+                // fake uid/gid=0). With the guard passing, the child proceeds to execve,
+                // which NOW hits our RET_TRACE filter and is in-process re-mapped.
+                // aarch64 cred syscalls: 143 setregid, 144 setgid, 145 setreuid,
+                // 146 setuid, 147 setresuid, 149 setresgid, 151 setfsuid, 152 setfsgid,
+                // 159 setgroups.
+                const bool is_cred_drop =
+                    (blocked_nr == 143 || blocked_nr == 144 || blocked_nr == 145 ||
+                     blocked_nr == 146 || blocked_nr == 147 || blocked_nr == 149 ||
+                     blocked_nr == 151 || blocked_nr == 152 || blocked_nr == 159);
+                regs[0] = (blocked_nr == 99 || is_cred_drop)
+                              ? 0u
+                              : static_cast<uint64_t>(-38);  // 0 for set_robust_list + cred-drop, else -ENOSYS
                 ++emulated_syscalls;
                 ::ptrace(PTRACE_SETREGSET, w, reinterpret_cast<void*>(NT_PRSTATUS), &io);
                 ::ptrace(PTRACE_CONT, w, nullptr, nullptr);  // suppress SIGSYS
