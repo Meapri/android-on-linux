@@ -5981,6 +5981,111 @@ struct WaylandPresenter {
 
 WaylandPresenter g_wl_presenter;
 
+// ===========================================================================
+// Clipboard bridge JNI glue (Android <-> Linux-guest selection). See
+// docs/design/android-clipboard-bridge.md §5/§10c. This keeps alr_compositor.cpp
+// free of any <jni.h> dependency: it only knows the std::function sinks declared
+// in alr_compositor.hpp; the native->Kotlin up-calls live here.
+//
+// The compositor thread is a raw pthread, so the up-call lambdas must
+// AttachCurrentThread before touching JNI. We cache the JavaVM* and a global ref
+// to the MainActivity (captured in nativeWaylandCompositorStart) + the callback
+// method IDs, and release them in nativeWaylandCompositorStop.
+// ===========================================================================
+JavaVM* g_clip_jvm = nullptr;
+jobject g_clip_activity = nullptr;       // global ref to MainActivity
+jmethodID g_clip_mid_offer = nullptr;    // onGuestClipboardOffer(String)
+jmethodID g_clip_mid_text = nullptr;     // onGuestClipboardText(String,String)
+jmethodID g_clip_mid_image = nullptr;    // onGuestClipboardImage(byte[])
+
+// Attach the (compositor) thread to the JVM if needed; returns the env + whether
+// the caller must DetachCurrentThread when done.
+JNIEnv* clip_attach_env(bool* out_must_detach) {
+    *out_must_detach = false;
+    if (g_clip_jvm == nullptr) return nullptr;
+    JNIEnv* env = nullptr;
+    jint st = g_clip_jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+    if (st == JNI_OK) return env;
+    if (st == JNI_EDETACHED) {
+        if (g_clip_jvm->AttachCurrentThread(&env, nullptr) == JNI_OK) {
+            *out_must_detach = true;
+            return env;
+        }
+    }
+    return nullptr;
+}
+
+// Install the alr::wayland clipboard sinks so the compositor can up-call Kotlin.
+// Captures the JVM + a global ref to `activity` + the three callback method IDs.
+void clip_install_sink(JNIEnv* env, jobject activity) {
+    if (env->GetJavaVM(&g_clip_jvm) != JNI_OK) g_clip_jvm = nullptr;
+    if (g_clip_activity != nullptr) { env->DeleteGlobalRef(g_clip_activity); g_clip_activity = nullptr; }
+    g_clip_activity = env->NewGlobalRef(activity);
+    jclass cls = env->GetObjectClass(activity);
+    g_clip_mid_offer = env->GetMethodID(cls, "onGuestClipboardOffer", "(Ljava/lang/String;)V");
+    g_clip_mid_text  = env->GetMethodID(cls, "onGuestClipboardText",
+                                        "(Ljava/lang/String;Ljava/lang/String;)V");
+    g_clip_mid_image = env->GetMethodID(cls, "onGuestClipboardImage", "([B)V");
+    if (env->ExceptionCheck()) env->ExceptionClear();  // tolerate a missing method
+    env->DeleteLocalRef(cls);
+
+    alr::wayland::alr_wayland_set_clipboard_sink(
+        // onGuestClipboardOffer(mimes joined by ',')
+        [](const std::vector<std::string>& mimes) {
+            if (g_clip_activity == nullptr || g_clip_mid_offer == nullptr) return;
+            bool detach = false;
+            JNIEnv* e = clip_attach_env(&detach);
+            if (e == nullptr) return;
+            std::string joined;
+            for (size_t i = 0; i < mimes.size(); ++i) {
+                if (i) joined += ",";
+                joined += mimes[i];
+            }
+            jstring js = e->NewStringUTF(joined.c_str());
+            e->CallVoidMethod(g_clip_activity, g_clip_mid_offer, js);
+            if (e->ExceptionCheck()) e->ExceptionClear();
+            if (js) e->DeleteLocalRef(js);
+            if (detach) g_clip_jvm->DetachCurrentThread();
+        },
+        // onGuestClipboardText(mime, utf8)
+        [](const std::string& mime, const std::string& utf8) {
+            if (g_clip_activity == nullptr || g_clip_mid_text == nullptr) return;
+            bool detach = false;
+            JNIEnv* e = clip_attach_env(&detach);
+            if (e == nullptr) return;
+            jstring jm = e->NewStringUTF(mime.c_str());
+            jstring jt = e->NewStringUTF(utf8.c_str());
+            e->CallVoidMethod(g_clip_activity, g_clip_mid_text, jm, jt);
+            if (e->ExceptionCheck()) e->ExceptionClear();
+            if (jm) e->DeleteLocalRef(jm);
+            if (jt) e->DeleteLocalRef(jt);
+            if (detach) g_clip_jvm->DetachCurrentThread();
+        },
+        // onGuestClipboardImage(pngBytes)
+        [](const std::string& png) {
+            if (g_clip_activity == nullptr || g_clip_mid_image == nullptr) return;
+            bool detach = false;
+            JNIEnv* e = clip_attach_env(&detach);
+            if (e == nullptr) return;
+            jbyteArray arr = e->NewByteArray(static_cast<jsize>(png.size()));
+            if (arr) {
+                e->SetByteArrayRegion(arr, 0, static_cast<jsize>(png.size()),
+                                      reinterpret_cast<const jbyte*>(png.data()));
+                e->CallVoidMethod(g_clip_activity, g_clip_mid_image, arr);
+                if (e->ExceptionCheck()) e->ExceptionClear();
+                e->DeleteLocalRef(arr);
+            }
+            if (detach) g_clip_jvm->DetachCurrentThread();
+        });
+}
+
+// Tear down the sink + drop the global ref (on compositor stop).
+void clip_uninstall_sink(JNIEnv* env) {
+    alr::wayland::alr_wayland_set_clipboard_sink({}, {}, {});
+    if (g_clip_activity != nullptr) { env->DeleteGlobalRef(g_clip_activity); g_clip_activity = nullptr; }
+    g_clip_mid_offer = g_clip_mid_text = g_clip_mid_image = nullptr;
+}
+
 #endif  // ALR_HAVE_WAYLAND
 
 }  // namespace
@@ -6481,7 +6586,7 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeRenderGpuSurfaceFrames(
 extern "C" JNIEXPORT jstring JNICALL
 Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandCompositorStart(
     JNIEnv* env,
-    jobject /* thiz */,
+    jobject thiz,
     jstring cache_dir,
     jobject surface,
     jint density_dpi,
@@ -6524,8 +6629,12 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandCompositorStart(
         g_wl_presenter.present_list(surfaces, out_w, out_h);
     };
     const std::string status = alr::wayland::alr_start_wayland_compositor(cfg);
+    // Clipboard bridge: install the native->Kotlin up-call sinks now that the
+    // compositor is up, capturing a global ref to MainActivity (released in stop).
+    clip_install_sink(env, thiz);
     return env->NewStringUTF(status.c_str());
 #else
+    (void)thiz;
     (void)env;
     (void)cache_dir;
     (void)surface;
@@ -6561,6 +6670,9 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandCompositorStop(
     jobject /* thiz */) {
 #ifdef ALR_HAVE_WAYLAND
     const std::string status = alr::wayland::alr_stop_wayland_compositor();
+    // Clear the clipboard sinks + drop the MainActivity global ref (the compositor
+    // thread is joined by alr_stop_wayland_compositor, so no up-call can race this).
+    clip_uninstall_sink(env);
     return env->NewStringUTF(status.c_str());
 #else
     return env->NewStringUTF("ALR WAYLAND COMPOSITOR: not-built");
@@ -6647,5 +6759,45 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandInjectScroll(
     alr::wayland::alr_wayland_inject_pointer_axis(value, static_cast<int32_t>(axis));
 #else
     (void)x; (void)y; (void)value; (void)axis;
+#endif
+}
+
+// Android -> guest clipboard push. The Android primary clip changed; pass the
+// mimes the host can satisfy + the actual payloads (so native can answer
+// wl_data_offer.receive without re-entering the JVM). Empty `mimes` clears the
+// Android selection. See docs/design/android-clipboard-bridge.md §5b/§10c.
+extern "C" JNIEXPORT void JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandClipboardSetAndroid(
+    JNIEnv* env,
+    jobject /* thiz */,
+    jobjectArray mimes,
+    jstring utf8Text,
+    jstring htmlText,
+    jbyteArray pngBytes) {
+#ifdef ALR_HAVE_WAYLAND
+    std::vector<std::string> mime_list;
+    if (mimes != nullptr) {
+        const jsize n = env->GetArrayLength(mimes);
+        mime_list.reserve(static_cast<size_t>(n));
+        for (jsize i = 0; i < n; ++i) {
+            auto js = reinterpret_cast<jstring>(env->GetObjectArrayElement(mimes, i));
+            mime_list.push_back(jstring_to_string(env, js));
+            if (js) env->DeleteLocalRef(js);
+        }
+    }
+    const std::string text = jstring_to_string(env, utf8Text);
+    const std::string html = jstring_to_string(env, htmlText);
+    std::string png;
+    if (pngBytes != nullptr) {
+        const jsize len = env->GetArrayLength(pngBytes);
+        if (len > 0) {
+            png.resize(static_cast<size_t>(len));
+            env->GetByteArrayRegion(pngBytes, 0, len,
+                                    reinterpret_cast<jbyte*>(&png[0]));
+        }
+    }
+    alr::wayland::alr_wayland_set_android_selection(mime_list, text, html, png);
+#else
+    (void)env; (void)mimes; (void)utf8Text; (void)htmlText; (void)pngBytes;
 #endif
 }
