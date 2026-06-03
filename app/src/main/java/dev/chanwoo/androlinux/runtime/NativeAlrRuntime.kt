@@ -402,6 +402,16 @@ internal fun InstalledApp.toCatalogApp(): CatalogApp = CatalogApp(
  * heavier GUI stack (GTK3) is already in the base rootfs (it powers GIMP), so galculator's
  * apt closure is essentially just its own leaf — a clean one-package install + launch, the
  * in-app loop's proving app (dpkg configured=true device-proven per project memory).
+ *
+ * CURATION BAR (post Wave-2): every entry must `dpkg --configure` exit-0 on a non-root device
+ * with NO systemd — i.e. its real noble closure must be base-GTK3-provided with no daemon /
+ * dbus-activation / appstream / policykit / accountsservice / libpam-with-postinst /
+ * dconf-service leaf (those postinsts need a running init → the `dpkg --configure -a` exit-73
+ * cascade). mousepad was REMOVED here: its real closure drags perl/libpam/dbus/systemd/dconf
+ * and was device-proven to fail that cascade (installed=false). Proof status per entry:
+ *   DEVICE-PROVEN (installs+configures exit-0 on device): galculator, l3afpad.
+ *   AUDITED (noble closure verified base-GTK3-only, no exit-73 leaf; device-test pending):
+ *     gpicview, xarchiver, sakura.  (htop = proven-class ncurses leaf.)
  */
 object BundledCatalog {
 
@@ -435,29 +445,34 @@ object BundledCatalog {
             installSizeBytes = 1_100_000L,
             source = AppSource.APT,
         ),
-        // mousepad — Xfce 의 가벼운 GTK3 텍스트 편집기. galculator 와 같은 부류(독립형
-        // Xfce 앱, GTK3 base-provided, systemd/dbus-activation/appstream 하드 의존 0).
-        // noble depends 닫힘: dconf-gsettings-backend, libglib2.0-0t64, libgspell-1-2
-        // (→ libenchant-2-2, 데몬 없음), libgtk-3-0t64, libmousepad0 — gnome-calculator
-        // 가 끌던 systemd/dbus/appstream/PAM 유지보수 스크립트(dpkg exit-73 원인)가 전혀
-        // 없어 galculator 처럼 install+configure 가 끝까지 통과한다. appId 는 noble 이
-        // 까는 .desktop basename(org.xfce.mousepad.desktop) 과 일치 — 설치 후
-        // DesktopEntryScanner 가 같은 타일로 재조정. Exec=`mousepad %F`(%F 스캐너 strip),
-        // 바이너리 /usr/bin/mousepad.
+        // sakura — VTE 기반 초경량 GTK3 터미널 에뮬레이터(독립형, 데스크톱 환경 비종속).
+        // noble depends 닫힘: libc6, libglib2.0-0t64, libgtk-3-0t64, libpango-1.0-0,
+        // libvte-2.91-0 — GTK3 코어는 base rootfs(GIMP) 제공이라 새로 까는 건 사실상
+        // libvte-2.91-0(+libvte-2.91-common) leaf 뿐. libvte 가 끄는 유일한 "systemd
+        // 계열" 토큰은 libsystemd0 인데, 이는 journald *클라이언트 라이브러리*(.so)일
+        // 뿐 systemd PID-1/데몬이 아니다 — postinst 는 ldconfig 뿐, 데몬·dbus-activation·
+        // PAM 유지보수 스크립트가 없어 mousepad 가 터졌던 `dpkg --configure -a` exit-73
+        // 캐스케이드(systemd/dbus/libpam postinst 가 동작 중 init 요구)와 무관하고,
+        // libsystemd0 자체는 base 에 이미 깔려 있다. 따라서 galculator/l3afpad 처럼
+        // configure 가 끝까지 통과한다(AUDITED — 아직 device 미검증). appId 는 .desktop
+        // basename(sakura.desktop) 과 일치 → 설치 후 DesktopEntryScanner 가 같은 타일로
+        // 재조정. Exec=`sakura`, 바이너리 /usr/bin/sakura. htop 이 "터미널 안의 ncurses"
+        // 라면 sakura 는 터미널 그 자체 — 실사용 가치 높은 추가.
         CatalogApp(
-            appId = "org.xfce.mousepad",
-            name = "Mousepad",
-            summary = "가벼운 Xfce 텍스트 편집기",
-            entry = LaunchEntry(LaunchEntry.EntryKind.EXEC, "/usr/bin/mousepad"),
-            category = AppCategory.UTILITY,
-            description = "Xfce 의 가벼운 GTK3 텍스트 편집기(독립형, GNOME 플랫폼 비의존). " +
-                "apt 로 설치되어 ALR Wayland 컴포지터 위 창으로 실행됩니다(GDK Wayland " +
-                "백엔드, 소프트웨어 렌더). systemd/dbus-activation/appstream 유지보수 " +
-                "스크립트가 없어 galculator 처럼 dpkg configure 가 끝까지 통과한다. " +
-                "noble 패키지 mousepad → /usr/share/applications/org.xfce.mousepad.desktop.",
-            rootfsDeps = listOf(RootfsDep(RootfsDepKind.APT, "mousepad", 2_400_000L)),
+            appId = "sakura",
+            name = "Sakura",
+            summary = "초경량 VTE 터미널",
+            entry = LaunchEntry(LaunchEntry.EntryKind.EXEC, "/usr/bin/sakura"),
+            category = AppCategory.TERMINAL,
+            description = "VTE 기반의 가벼운 GTK3 터미널 에뮬레이터(독립형, 데스크톱 환경 " +
+                "비종속). apt 로 설치되어 ALR Wayland 컴포지터 위 창으로 실행됩니다(GDK " +
+                "Wayland 백엔드). depends 가 GTK3/pango/libvte 뿐 — libsystemd0 은 " +
+                "journald 클라이언트 .so 일 뿐 systemd 데몬이 아니라, systemd/dbus/" +
+                "appstream 유지보수 스크립트가 없어 galculator 처럼 dpkg configure 가 " +
+                "끝까지 통과한다. noble 패키지 sakura → /usr/share/applications/sakura.desktop.",
+            rootfsDeps = listOf(RootfsDep(RootfsDepKind.APT, "sakura", 300_000L)),
             display = DisplaySpec(DisplaySpec.DisplayMode.WINDOWED),
-            installSizeBytes = 2_400_000L,
+            installSizeBytes = 300_000L,
             source = AppSource.APT,
         ),
         // l3afpad — leafpad 의 GTK3 포크. 카탈로그에서 가장 작은 GUI 닫힘:
@@ -486,9 +501,12 @@ object BundledCatalog {
         // (libgnome-desktop-3, gsettings-desktop-schemas, shared-mime-info, librsvg2-
         // common, webp-pixbuf-loader, peas/gir introspection) 대신, gpicview 닫힘은
         // libcairo2, libgdk-pixbuf-2.0-0, libglib2.0-0t64, libgtk-3-0t64, libjpeg8,
-        // libx11-6 만 — systemd/dbus/appstream/policykit 전무, GNOME 플랫폼 비의존.
-        // appId 는 .desktop basename(gpicview.desktop) 과 일치. Exec=`gpicview %U`(strip),
-        // 바이너리 /usr/bin/gpicview — 푸시한 test.png 를 인자로 연다.
+        // libx11-6 만(libjpeg8 은 libjpeg-turbo8 .so 로 가는 얇은 shim — postinst·데몬
+        // 없음). systemd/dbus/appstream/policykit/accountsservice/dconf-service 전무,
+        // GNOME 플랫폼 비의존 — GTK3 코어는 base(GIMP) 제공이라 새 패키지는 leaf 라이브러리
+        // 뿐이라 galculator 처럼 configure 통과(AUDITED — 닫힘 검증 완료, 아직 device
+        // 미검증). appId 는 .desktop basename(gpicview.desktop) 과 일치. Exec=`gpicview
+        // %U`(strip), 바이너리 /usr/bin/gpicview — 푸시한 test.png 를 인자로 연다.
         CatalogApp(
             appId = "gpicview",
             name = "GPicView",
@@ -506,10 +524,13 @@ object BundledCatalog {
             source = AppSource.APT,
         ),
         // xarchiver — GTK3 아카이브 관리자(독립형, 데스크톱 비종속). noble depends 닫힘:
-        // libc6, libgdk-pixbuf-2.0-0, libglib2.0-0t64, libgtk-3-0t64 만 — systemd/dbus/
-        // appstream/policykit 전무. base GTK3 스택에 이미 다 있어 단일-leaf 설치 →
-        // galculator 동급 configure 통과. appId 는 .desktop basename(xarchiver.desktop)
-        // 과 일치. Exec=`xarchiver %F`(%F strip), 바이너리 /usr/bin/xarchiver.
+        // libc6, libgdk-pixbuf-2.0-0, libglib2.0-0t64, libgtk-3-0t64 만 — 비-GTK leaf 가
+        // 0(닫힘 전체가 base GTK3 스택). systemd/dbus/appstream/policykit/accountsservice/
+        // dconf-service 전무. 새로 까는 패키지가 사실상 xarchiver 자기 leaf 뿐 →
+        // galculator 동급 configure 통과(AUDITED — 닫힘 검증 완료, 아직 device 미검증).
+        // 압축 CLI(tar/zip/unzip)는 Depends 가 아닌 Recommends 라 install 을 막지 않음
+        // (런타임에 필요). appId 는 .desktop basename(xarchiver.desktop) 과 일치.
+        // Exec=`xarchiver %F`(%F strip), 바이너리 /usr/bin/xarchiver.
         CatalogApp(
             appId = "xarchiver",
             name = "Xarchiver",
