@@ -2024,6 +2024,40 @@ class MainActivity : Activity() {
                             val xwMarker = java.io.File("/data/local/tmp/.alr-xwayland")
                             if (xwMarker.isFile) {
                                 val rootfsDirX = java.io.File(java.io.File(filesDir, "rootfs"), rootfsManifest.name)
+                                // X11 socket/lock prep (root cause of the X0-lock EPERM /
+                                // "X0 socket never created"): the guest sees /tmp as
+                                // <rootfs>/tmp via the loader's path mediation, but Xwayland's
+                                // startup needs (a) /tmp writable for the server lock file
+                                // /tmp/.X0-lock — created open(O_CREAT|O_EXCL)+link() — and (b)
+                                // the socket dir /tmp/.X11-unix to EXIST. The base tar ships
+                                // neither .X11-unix (an X-server-only dir) nor a mode that lets a
+                                // non-root euid pass the X server's MkdirIfNeeded ownership check,
+                                // and -nolock is refused for non-root ("the -nolock option can
+                                // only be used by root"). Create both here from the APP side —
+                                // direct, UNMEDIATED filesystem access to the host rootfs path —
+                                // with the canonical sticky 1777 (world-writable, owner-only
+                                // delete) the X server expects, OWNED by the app uid (== the
+                                // guest's euid), so both the lock create/link and the
+                                // .X11-unix/X0 socket bind succeed. Java's File.set* cannot set
+                                // the sticky bit, so chmod via Os. Idempotent + best-effort: a
+                                // failure only logs (the launch still attempts), and this is the
+                                // ONLY Xwayland-launch-specific prep — it does not touch the
+                                // shared loader env.
+                                try {
+                                    val xTmp = java.io.File(rootfsDirX, "tmp")
+                                    val xUnix = java.io.File(xTmp, ".X11-unix")
+                                    xTmp.mkdirs()
+                                    xUnix.mkdirs()
+                                    android.system.Os.chmod(xTmp.absolutePath, 0x3FF /* 01777 */)
+                                    android.system.Os.chmod(xUnix.absolutePath, 0x3FF /* 01777 */)
+                                    android.util.Log.i(
+                                        "alr_loader",
+                                        "xwayland: prepped /tmp(1777)=${xTmp.isDirectory} " +
+                                            "/tmp/.X11-unix(1777)=${xUnix.isDirectory}",
+                                    )
+                                } catch (e: Throwable) {
+                                    android.util.Log.w("alr_loader", "xwayland: /tmp prep EXC: ${e.message}")
+                                }
                                 val xwBin = java.io.File(rootfsDirX, "usr/bin/Xwayland")
                                 // bounded wait for the xwayland overlay to finish extracting
                                 var xwWaited = 0
@@ -2048,12 +2082,19 @@ class MainActivity : Activity() {
                                         android.util.Log.i("alr_loader", "xwayland-server:\n$xwServer")
                                     }.start()
                                     // Wait (bounded) for the X socket to appear, then run the X app.
-                                    // Xwayland :0 binds /tmp/.X11-unix/X0 inside the rootfs (the X
-                                    // app shares it via the same ALR_ROOTFS path mediation).
+                                    // Xwayland :0 binds /tmp/.X11-unix/X0, which the interposer's
+                                    // X11 sun_path transform rewrites to <rootfs>/tmp/.X11-unix/X0
+                                    // (the same rootfs node the X app's connect is rewritten to).
+                                    // NOTE: a bound AF_UNIX socket is a SPECIAL file — File.isFile()
+                                    // is false for it; use exists(). The /tmp/.X0-lock regular file
+                                    // the server writes first is an earlier "Xwayland came up"
+                                    // signal, so accept EITHER (socket node present, or at least the
+                                    // lock landed) before launching the client.
                                     val xSock = java.io.File(rootfsDirX, "tmp/.X11-unix/X0")
+                                    val xLock = java.io.File(rootfsDirX, "tmp/.X0-lock")
                                     var xSockWaited = 0
-                                    while (xSockWaited < 20000 && !xSock.isFile) { Thread.sleep(500); xSockWaited += 500 }
-                                    android.util.Log.i("alr_loader", "xwayland: X0 socket=${xSock.isFile} (waited ${xSockWaited}ms)")
+                                    while (xSockWaited < 20000 && !xSock.exists()) { Thread.sleep(500); xSockWaited += 500 }
+                                    android.util.Log.i("alr_loader", "xwayland: X0 socket=${xSock.exists()} lock=${xLock.isFile} (waited ${xSockWaited}ms)")
                                     // X app program-spec: marker content (newline-argv) or default xcalc.
                                     val xAppSpec = xwMarker.readText().trim().ifEmpty { "/usr/bin/xcalc" }
                                     val xApp = nativeAlrNativeLoaderProbe(
@@ -2073,7 +2114,7 @@ class MainActivity : Activity() {
                                     runOnUiThread {
                                         view.append(
                                             "\nALR XWAYLAND (ROOTFUL X11 app `$xAppSpec` → Xwayland :0 → wl_shm → SurfaceView): " +
-                                                "${gate(xwRendered)} (frames $framesBeforeXw→$framesAfterXw, X0=${gate(xSock.isFile)})",
+                                                "${gate(xwRendered)} (frames $framesBeforeXw→$framesAfterXw, X0=${gate(xSock.exists())}, lock=${gate(xLock.isFile)})",
                                         )
                                         view.append("\n\n--- ALR guest Xwayland X11 app ($xAppSpec) ---\n$xApp")
                                     }

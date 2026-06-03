@@ -1412,6 +1412,63 @@ static int alr_cr_singleton_xform(const struct sockaddr *addr, socklen_t len,
     return 1;
 }
 
+/* X11 AF_UNIX socket path mediation (WS-4 §5 M4, ROOTFUL Xwayland).
+ *
+ * Xwayland :0 binds the X11 socket at the HARDCODED filesystem path
+ * "/tmp/.X11-unix/X0" (os/connection.c, not overridable by env), and X clients
+ * (libxcb _xcb_open_unix) connect to the same "/tmp/.X11-unix/X<n>". bind()/
+ * connect() are NOT path syscalls — neither the seccomp path-trap nor rw() touch
+ * sun_path — so the kernel resolves the LITERAL "/tmp/.X11-unix/X0" against the
+ * BARE Android filesystem (no /tmp there) and the bind ENOENT-fails: the X server
+ * then has no listening socket and the X app cannot connect (the "X0 socket never
+ * created" half of the gap). [The other half — the /tmp/.X0-lock create — is fixed
+ * by pre-creating <rootfs>/tmp mode 1777 from the app side; see MainActivity.]
+ *
+ * Fix: rewrite an X11-unix sun_path to its rootfs location <rootfs>/tmp/.X11-unix/
+ * X<n>, exactly as rw() does for the path syscalls — so the server's bind and the
+ * client's connect both land on the SAME real socket node inside the rootfs (which
+ * the app pre-creates as a 1777 dir). The rootfs prefix + "/tmp/.X11-unix/X0" must
+ * fit sun_path (108); the Android data path is ~70 bytes so it does (we length-
+ * check and pass the original through untouched if it would not, failing safe).
+ * Unlike the chromium SingletonSocket we do NOT use an abstract socket here: the
+ * launch path's readiness probe waits for the real <rootfs>/tmp/.X11-unix/X0 node
+ * to appear, and a filesystem socket keeps the standard X discovery semantics.
+ *
+ * Scope: ONLY a filesystem (non-abstract) sun_path whose prefix is exactly
+ * "/tmp/.X11-unix/". The Wayland socket (XDG_RUNTIME_DIR, an absolute host path
+ * already), abstract sockets, AF_INET, and every other AF_UNIX path are untouched. */
+static int alr_x11_sock_xform(const struct sockaddr *addr, socklen_t len,
+                              struct sockaddr_un *out, socklen_t *out_len) {
+    if (!addr || addr->sa_family != AF_UNIX) return 0;
+    if (g_rootfs_len == 0) return 0;                 /* interposer disabled */
+    if (!g_inited) alr_init();
+    if (len <= (socklen_t)offsetof(struct sockaddr_un, sun_path)) return 0;
+    const struct sockaddr_un *un = (const struct sockaddr_un *)addr;
+    if (un->sun_path[0] == '\0') return 0;           /* abstract -> leave alone */
+    /* prefix match "/tmp/.X11-unix/" (and require at least one more char). */
+    static const char pfx[] = "/tmp/.X11-unix/";
+    const size_t pfxlen = sizeof(pfx) - 1;
+    const size_t cap = (size_t)len - offsetof(struct sockaddr_un, sun_path);
+    size_t plen = 0;
+    while (plen < cap && plen < sizeof(un->sun_path) && un->sun_path[plen] != '\0') ++plen;
+    if (plen <= pfxlen) return 0;
+    for (size_t i = 0; i < pfxlen; ++i) {
+        if (un->sun_path[i] != pfx[i]) return 0;
+    }
+    /* Build <rootfs> + sun_path. Must fit sun_path incl. the NUL. */
+    if (g_rootfs_len + plen + 1 > sizeof(out->sun_path)) return 0;  /* too long -> passthrough */
+    for (size_t i = 0; i < sizeof(out->sun_path); ++i) out->sun_path[i] = 0;
+    out->sun_family = AF_UNIX;
+    size_t w = 0;
+    for (size_t i = 0; i < g_rootfs_len; ++i) out->sun_path[w++] = g_rootfs[i];
+    for (size_t i = 0; i < plen; ++i) out->sun_path[w++] = un->sun_path[i];
+    out->sun_path[w] = '\0';
+    /* Path-bound AF_UNIX addrlen: base + path + the trailing NUL (Linux accepts a
+     * NUL-terminated sun_path with addrlen including the NUL; matches glibc). */
+    *out_len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + w + 1);
+    return 1;
+}
+
 int bind(int fd, const struct sockaddr *addr, socklen_t len) {
     static int (*real)(int, const struct sockaddr *, socklen_t);
     ALR_REAL(real, int (*)(int, const struct sockaddr *, socklen_t), "bind");
@@ -1429,6 +1486,17 @@ int bind(int fd, const struct sockaddr *addr, socklen_t len) {
         /* Abstract bind failed (e.g. name already taken by a stale launch) — fall
          * through to the real bind so chromium sees a truthful errno. */
     }
+    /* ROOTFUL Xwayland: bind the X11 socket at <rootfs>/tmp/.X11-unix/X<n> so it
+     * lands on the rootfs node (the app pre-creates the 1777 dir) instead of the
+     * bare-Android /tmp/.X11-unix that does not exist. */
+    if (alr_x11_sock_xform(addr, len, &xun, &xlen)) {
+        int xr = real(fd, (const struct sockaddr *)&xun, xlen);
+        if (xr == 0) {
+            alr_diag("x11 bind->rootfs", "/tmp/.X11-unix", 0, 0);
+            return 0;
+        }
+        /* fall through to the literal bind so the caller sees a real errno */
+    }
     int r = real(fd, addr, len);
     if (r != 0 && (errno == EACCES || errno == EPERM) &&
         addr && addr->sa_family == AF_NETLINK) {
@@ -1440,14 +1508,18 @@ int bind(int fd, const struct sockaddr *addr, socklen_t len) {
 
 /* connect(): symmetric to bind() above — a second chromium instance probes the
  * SingletonSocket via connect() before binding. Transform the same singleton path
- * to the same abstract name so the probe reaches the first instance's socket. Every
- * other connect (Wayland, X11, AF_INET, …) is passed through byte-identically. */
+ * to the same abstract name so the probe reaches the first instance's socket. X
+ * clients (libxcb) connect to /tmp/.X11-unix/X<n>, rewritten to the same rootfs
+ * node Xwayland bound. Every other connect (Wayland, AF_INET, …) is byte-identical. */
 int connect(int fd, const struct sockaddr *addr, socklen_t len) {
     static int (*real)(int, const struct sockaddr *, socklen_t);
     ALR_REAL(real, int (*)(int, const struct sockaddr *, socklen_t), "connect");
     struct sockaddr_un xun;
     socklen_t xlen;
     if (alr_cr_singleton_xform(addr, len, &xun, &xlen)) {
+        return real(fd, (const struct sockaddr *)&xun, xlen);
+    }
+    if (alr_x11_sock_xform(addr, len, &xun, &xlen)) {
         return real(fd, (const struct sockaddr *)&xun, xlen);
     }
     return real(fd, addr, len);

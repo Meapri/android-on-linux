@@ -105,6 +105,14 @@ class XOverlay:
                    or "" when the binary needs a display/no such flag.
     ok_marker      a substring the binary prints on the probe path (advisory).
     keep_prefixes  data dirs to force-keep even if not DT_NEEDED-reachable.
+    expect_sonames a DT_SONAME name (basename) the flattened overlay MUST ship as a
+                   real-or-alias member because the package's real-file BASENAME
+                   encodes a *different* soname (e.g. libxaw7's libXaw7.so.7.0.0 has
+                   DT_SONAME libXaw.so.7 — every x11-apps binary DT_NEEDEDs the
+                   latter). build_stage_tar re-synthesizes the dropped SONAME alias;
+                   this lists what must be present so a flattener regression that
+                   re-drops it FAILS the build (not silently ships an app that dies
+                   "libXaw.so.7: cannot open shared object file" on device).
     """
 
     name: str
@@ -113,6 +121,7 @@ class XOverlay:
     launch_arg: str
     ok_marker: str
     keep_prefixes: tuple[str, ...] = ()
+    expect_sonames: tuple[str, ...] = ()
     note: str = ""
 
 
@@ -142,6 +151,19 @@ X_OVERLAYS: dict[str, XOverlay] = {
     # These link the X CLIENT libs the BASE already provides (libX11/libXt/libXaw/…)
     # — so this overlay should be tiny (mostly the app binaries + libXaw/libXt/libXmu
     # if the base lacks them). The run path execs e.g. `DISPLAY=:0 xcalc`.
+    #
+    # SONAME audit (readelf -d on every x11-apps binary vs what flattening emits):
+    # the ONLY DT_NEEDED whose flat name would NOT match the linked soname is
+    # libXaw.so.7. libxaw7 ships the real file libXaw7.so.7.0.0 (DT_SONAME
+    # "libXaw.so.7") reached via libXaw.so.7 -> libXaw7.so.7 -> libXaw7.so.7.0.0;
+    # §5-E flattening keys off the FILENAME so it emits libXaw7.so.7 and drops the
+    # libXaw.so.7 link, yet xcalc/xclock/xlogo/xload/xgc/xmag all DT_NEEDED
+    # libXaw.so.7. build_stage_tar now re-synthesizes that alias; expect_sonames
+    # asserts it so a flattener regression re-breaks the BUILD, not the device.
+    # All other x11-apps DT_NEEDED (libXt.so.6, libXmu.so.6, libXft.so.2,
+    # libxkbfile.so.1, libXrender.so.1, libXext.so.6, libSM.so.6, libXi.so.6,
+    # libXmuu.so.1, libxcb-*.so.0) either match their filename soname after flatten
+    # or are already in the base — no extra alias needed.
     "x11app": XOverlay(
         name="x11app",
         leaf_packages=("x11-apps",),
@@ -151,8 +173,10 @@ X_OVERLAYS: dict[str, XOverlay] = {
         keep_prefixes=(
             "/usr/share/X11/app-defaults",  # Xaw widget resources xcalc/xlogo read
         ),
+        expect_sonames=("libXaw.so.7",),
         note="xcalc/xeyes/xlogo/xclock; needs DISPLAY=:0 from Xwayland. Mostly links "
-        "base-provided X client libs, so the overlay is small.",
+        "base-provided X client libs, so the overlay is small. libXaw.so.7 alias is "
+        "re-synthesized by the flattener (libxaw7 real file basename != DT_SONAME).",
     ),
 }
 
@@ -168,6 +192,10 @@ class XOverlayBuild:
     violations: tuple[str, ...]
     conformant: bool
     has_exec: bool = False
+    # DT_SONAME names the recipe REQUIRED (expect_sonames) that are NOT present in
+    # the built tar as a real-or-alias member. Non-empty => the overlay would ship
+    # an app that can't resolve a linked soname on device (e.g. libXaw.so.7) => FAIL.
+    missing_expected: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -175,6 +203,7 @@ class XOverlayBuild:
             self.has_exec
             and not self.violations
             and not self.missing_soname
+            and not self.missing_expected
             and self.conformant
         )
 
@@ -213,6 +242,10 @@ def build_x_overlay(
 
     rep = validate_stage_tar(m["out_tar"], base=base)
     has_exec = overlay_has_exec(m["out_tar"], overlay.exec_path)
+    missing_expected = tuple(
+        s for s in overlay.expect_sonames
+        if not overlay_has_soname(m["out_tar"], s)
+    )
 
     return XOverlayBuild(
         overlay=overlay.name,
@@ -224,6 +257,7 @@ def build_x_overlay(
         violations=tuple(m["violations"]),
         conformant=rep.conformant,
         has_exec=has_exec,
+        missing_expected=missing_expected,
     )
 
 
@@ -240,6 +274,23 @@ def overlay_has_exec(out_tar: str | Path, exec_path: str) -> bool:
     with tarfile.open(out_tar, "r:*") as tar:
         names = set(tar.getnames())
     return want in names
+
+
+def overlay_has_soname(out_tar: str | Path, soname: str) -> bool:
+    """True if ``out_tar`` provides the given DT_SONAME (basename) as a member in
+    ANY directory — either a real flat file or a SONAME-alias symlink. Used to
+    PROVE the overlay can satisfy a linked soname whose package real-file basename
+    differs from the DT_SONAME (the libXaw.so.7 / libxaw7 case), which §5-E
+    flattening would otherwise silently drop. Matched by basename so it is agnostic
+    to the lib directory (/usr/lib/aarch64-linux-gnu vs /lib/...)."""
+    import posixpath
+    import tarfile
+
+    with tarfile.open(out_tar, "r:*") as tar:
+        for name in tar.getnames():
+            if posixpath.basename(name) == soname:
+                return True
+    return False
 
 
 def xwayland_launch_argv(width: int, height: int, display: str = XWAYLAND_DISPLAY) -> list[str]:
@@ -308,6 +359,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"    exec (probe):    {build.exec_path}")
         print(f"    exec in overlay: {'YES' if build.has_exec else 'NO — MISSING'}")
         print(f"    reachable libs:  {len(build.reachable_libs)} {list(build.reachable_libs)}")
+        if ov.expect_sonames:
+            present = [s for s in ov.expect_sonames if s not in build.missing_expected]
+            print(f"    expect sonames:  {list(ov.expect_sonames)} → "
+                  f"present {present}" +
+                  (f"  MISSING {list(build.missing_expected)}" if build.missing_expected else ""))
         if build.missing_soname:
             print(f"    MISSING sonames: {list(build.missing_soname)}")
         print(f"    overlay_guard:   {'OK' if not build.violations else str(len(build.violations)) + ' violation(s)'}")
@@ -353,6 +409,12 @@ def _selftest() -> int:
           X_OVERLAYS["x11app"].leaf_packages == ("x11-apps",))
     check("x11app exec is an x11-apps binary (xcalc)",
           X_OVERLAYS["x11app"].exec_path == "/usr/bin/xcalc")
+    # libXaw.so.7 is the one DT_NEEDED whose flat name != soname; the recipe must
+    # require it so a flattener regression that re-drops the alias FAILS the build.
+    check("x11app requires the libXaw.so.7 SONAME alias (libxaw7 basename mismatch)",
+          "libXaw.so.7" in X_OVERLAYS["x11app"].expect_sonames)
+    check("xwayland requires no extra SONAME alias (its libs' filenames == soname)",
+          X_OVERLAYS["xwayland"].expect_sonames == ())
 
     # --- ROOTFUL launch argv (the load-bearing invocation) -----------------
     argv = xwayland_launch_argv(1200, 1920)
@@ -389,17 +451,40 @@ def _selftest() -> int:
         check("overlay_has_exec reports a genuinely missing binary as False",
               not overlay_has_exec(tar_path, "/usr/bin/Xorg"))
 
+    # --- overlay_has_soname (real-or-alias, dir-agnostic) ------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        tar_path = Path(tmp) / "s.tar"
+        with tarfile.open(tar_path, "w") as t:
+            # a flat real lib + a SONAME-alias symlink (the libXaw shape)
+            payload = b"\x7fELF" + b"flat"
+            ti = tarfile.TarInfo("./usr/lib/aarch64-linux-gnu/libXaw7.so.7")
+            ti.size = len(payload); ti.mode = 0o644
+            t.addfile(ti, io.BytesIO(payload))
+            link = tarfile.TarInfo("./usr/lib/aarch64-linux-gnu/libXaw.so.7")
+            link.type = tarfile.SYMTYPE; link.linkname = "libXaw7.so.7"
+            t.addfile(link)
+        check("overlay_has_soname finds an aliased soname (libXaw.so.7 symlink)",
+              overlay_has_soname(tar_path, "libXaw.so.7"))
+        check("overlay_has_soname finds a real flat soname (libXaw7.so.7)",
+              overlay_has_soname(tar_path, "libXaw7.so.7"))
+        check("overlay_has_soname reports a genuinely absent soname as False",
+              not overlay_has_soname(tar_path, "libXt.so.6"))
+
     # --- XOverlayBuild.ok aggregation --------------------------------------
     good = XOverlayBuild("x", "/tmp/x.tar", "/usr/bin/Xwayland", 5, ("liba",), (), (), True, has_exec=True)
     no_bin = XOverlayBuild("x", "/tmp/x.tar", "/usr/bin/Xwayland", 5, (), (), (), True, has_exec=False)
     bad_guard = XOverlayBuild("x", "/tmp/x.tar", "/usr/bin/Xwayland", 5, (), (), ("BLOCK foo",), True, has_exec=True)
     bad_miss = XOverlayBuild("x", "/tmp/x.tar", "/usr/bin/Xwayland", 5, (), ("libz.so.9",), (), True, has_exec=True)
     bad_conf = XOverlayBuild("x", "/tmp/x.tar", "/usr/bin/Xwayland", 5, (), (), (), False, has_exec=True)
+    bad_expect = XOverlayBuild("x", "/tmp/x.tar", "/usr/bin/xcalc", 5, (), (), (), True,
+                               has_exec=True, missing_expected=("libXaw.so.7",))
     check("XOverlayBuild.ok True when clean + has binary", good.ok)
     check("XOverlayBuild.ok False when the binary is missing", not no_bin.ok)
     check("XOverlayBuild.ok False on guard violation", not bad_guard.ok)
     check("XOverlayBuild.ok False on missing soname", not bad_miss.ok)
     check("XOverlayBuild.ok False when non-conformant", not bad_conf.ok)
+    check("XOverlayBuild.ok False when a required SONAME alias is missing",
+          not bad_expect.ok)
 
     print(f"\nselftest: {'ALL PASS' if failures == 0 else str(failures) + ' FAILED'}")
     return 1 if failures else 0

@@ -130,3 +130,104 @@ def test_builder_selftest_passes():
     from tools.build_xwayland_overlay import _selftest
 
     assert _selftest() == 0
+
+
+# --------------------------------------------------------------------------- #
+# libXaw.so.7 SONAME-alias contract (the gap that broke xcalc on device)
+# --------------------------------------------------------------------------- #
+
+def test_x11app_requires_the_libxaw_soname_alias():
+    """Every x11-apps Xaw client (xcalc/xclock/xlogo/xload/xgc/xmag) DT_NEEDEDs
+    libXaw.so.7, but libxaw7 ships the real file libXaw7.so.7.0.0 (DT_SONAME
+    libXaw.so.7) reached via libXaw.so.7 -> libXaw7.so.7 -> libXaw7.so.7.0.0 —
+    §5-E flattening keys off the FILENAME and would drop the libXaw.so.7 link. The
+    recipe must REQUIRE the alias so a flattener regression fails the build."""
+    assert X_OVERLAYS["x11app"].expect_sonames == ("libXaw.so.7",)
+    # xwayland's own private libs all have filename == DT_SONAME → no alias needed.
+    assert X_OVERLAYS["xwayland"].expect_sonames == ()
+
+
+def test_overlay_has_soname_real_or_alias_dir_agnostic(tmp_path: Path):
+    from tools.build_xwayland_overlay import overlay_has_soname
+
+    tar_path = tmp_path / "s.tar"
+    with tarfile.open(tar_path, "w") as t:
+        payload = b"\x7fELF" + b"flat-real"
+        ti = tarfile.TarInfo("./usr/lib/aarch64-linux-gnu/libXaw7.so.7")
+        ti.size = len(payload)
+        ti.mode = 0o644
+        t.addfile(ti, io.BytesIO(payload))
+        link = tarfile.TarInfo("./usr/lib/aarch64-linux-gnu/libXaw.so.7")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "libXaw7.so.7"
+        t.addfile(link)
+
+    # found as an alias symlink, and as a real flat lib, regardless of dir
+    assert overlay_has_soname(tar_path, "libXaw.so.7")
+    assert overlay_has_soname(tar_path, "libXaw7.so.7")
+    assert not overlay_has_soname(tar_path, "libXt.so.6")
+
+
+def test_missing_required_soname_fails_the_build_gate():
+    # has the binary + conformant + no unresolved DT_NEEDED, but the REQUIRED
+    # libXaw.so.7 alias is absent → ok must be False (would die on device).
+    bad = XOverlayBuild(
+        "x11app", "/tmp/x.tar", "/usr/bin/xcalc", 5, (), (), (), True,
+        has_exec=True, missing_expected=("libXaw.so.7",),
+    )
+    assert not bad.ok
+    good = XOverlayBuild(
+        "x11app", "/tmp/x.tar", "/usr/bin/xcalc", 5, (), (), (), True,
+        has_exec=True, missing_expected=(),
+    )
+    assert good.ok
+
+
+def test_flatten_resynthesizes_libxaw_alias_end_to_end(tmp_path: Path):
+    """INTEGRATION (offline): reproduce libxaw7's on-disk layout, run the SAME
+    flattener build_x_overlay uses (build_stage_tar), and prove the produced tar
+    satisfies the x11app recipe's expect_sonames (libXaw.so.7 resolvable)."""
+    import struct
+
+    from tools.build_stage_tar import build_stage_tar
+    from tools.build_xwayland_overlay import overlay_has_soname
+
+    def make_so(soname: str) -> bytes:
+        strtab = b"\x00" + soname.encode() + b"\x00"
+        ehdr_sz, phent, nph = 64, 56, 2
+        ph_off = ehdr_sz
+        dyn_off = ph_off + nph * phent
+        dyn = struct.pack("<qQ", 14, 1)  # DT_SONAME -> offset 1
+        dyn_final = len(dyn) + 3 * 16
+        strtab_off = dyn_off + dyn_final
+        dyn += struct.pack("<qQ", 5, strtab_off)   # DT_STRTAB
+        dyn += struct.pack("<qQ", 10, len(strtab))  # DT_STRSZ
+        dyn += struct.pack("<qQ", 0, 0)             # DT_NULL
+        total = strtab_off + len(strtab)
+        e_ident = b"\x7fELF" + bytes([2, 1, 1]) + b"\x00" * 9
+        ehdr = e_ident + struct.pack(
+            "<HHIQQQIHHHHHH", 3, 183, 1, 0, ph_off, 0, 0, ehdr_sz, phent, nph, 0, 0, 0
+        )
+        ph_load = struct.pack("<IIQQQQQQ", 1, 5, 0, 0, 0, total, total, 0x1000)
+        ph_dyn = struct.pack("<IIQQQQQQ", 2, 6, dyn_off, dyn_off, dyn_off, len(dyn), len(dyn), 8)
+        blob = bytearray(total)
+        blob[0:ehdr_sz] = ehdr
+        blob[ph_off:ph_off + phent] = ph_load
+        blob[ph_off + phent:ph_off + 2 * phent] = ph_dyn
+        blob[dyn_off:dyn_off + len(dyn)] = dyn
+        blob[strtab_off:strtab_off + len(strtab)] = strtab
+        return bytes(blob)
+
+    src = tmp_path / "src"
+    libdir = src / "usr" / "lib" / "aarch64-linux-gnu"
+    libdir.mkdir(parents=True)
+    (libdir / "libXaw7.so.7.0.0").write_bytes(make_so("libXaw.so.7"))
+    (libdir / "libXaw7.so.7").symlink_to("libXaw7.so.7.0.0")
+    (libdir / "libXaw.so.7").symlink_to("libXaw7.so.7")
+
+    out = tmp_path / "x11app-stage.tar"
+    build_stage_tar(src, out)
+
+    # the recipe expectation is satisfied by the re-synthesized alias
+    for soname in X_OVERLAYS["x11app"].expect_sonames:
+        assert overlay_has_soname(out, soname), soname
