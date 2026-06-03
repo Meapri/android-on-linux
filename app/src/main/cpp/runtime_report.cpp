@@ -2583,6 +2583,14 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
             // Persistent standalone app (ALR Chromium): never time out — no ceiling, no
             // no-progress kill. The user wants the window pinned up; a genuine wedge just
             // blocks the launch Thread while the app + compositor keep running.
+            // NOTE (GIMP launcher path): a persistent GIMP that wedges DURING the plug-in
+            // scan (each plug-in is a fork+exec'd CHILD PROCESS, not a leader thread, that
+            // the single-threaded ptrace supervisor can stall on — supervisor state=D in
+            // wait4) is NOT recovered here, because the stuck tracee is a separate PID, not
+            // a thread of leader_pid, and a no-progress kill would tear down GIMP wholesale
+            // rather than let it fall back. Recovering that is the G1 exec-re-entry track
+            // (plug-in subprocess supervision); the compositor + GIMP render path itself is
+            // unaffected (the splash composites and frames advance before the wedge).
             if (persist_guest) continue;
             const uint32_t now_ev = ev_head.load(std::memory_order_acquire);
             if (now_ev != last_ev) {       // progress -> reset the no-progress timer
@@ -6870,9 +6878,19 @@ void clip_install_sink(JNIEnv* env, jobject activity) {
     if (g_clip_activity != nullptr) { env->DeleteGlobalRef(g_clip_activity); g_clip_activity = nullptr; }
     g_clip_activity = env->NewGlobalRef(activity);
     jclass cls = env->GetObjectClass(activity);
+    // Look up each up-call method, CLEARING any pending exception AFTER EACH lookup.
+    // The launcher path forwards an AlrNative object (it has none of these methods),
+    // so GetMethodID returns null AND leaves a pending NoSuchMethodError. Under CheckJNI
+    // (debug builds) the NEXT GetMethodID then aborts with "called with pending
+    // exception" — so a single trailing ExceptionClear() is too late. Clearing after
+    // each call yields the intended graceful no-op (null methodID) on every Kotlin class
+    // whether or not it declares the clipboard bridge. MainActivity has all three, so it
+    // never raises here regardless.
     g_clip_mid_offer = env->GetMethodID(cls, "onGuestClipboardOffer", "(Ljava/lang/String;)V");
+    if (env->ExceptionCheck()) env->ExceptionClear();
     g_clip_mid_text  = env->GetMethodID(cls, "onGuestClipboardText",
                                         "(Ljava/lang/String;Ljava/lang/String;)V");
+    if (env->ExceptionCheck()) env->ExceptionClear();
     g_clip_mid_image = env->GetMethodID(cls, "onGuestClipboardImage", "([B)V");
     if (env->ExceptionCheck()) env->ExceptionClear();  // tolerate a missing method
     env->DeleteLocalRef(cls);

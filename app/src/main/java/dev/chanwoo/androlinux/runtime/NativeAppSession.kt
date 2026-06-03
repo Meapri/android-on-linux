@@ -261,7 +261,11 @@ class NativeAppSession internal constructor(
     private companion object {
         // Overlay tars a GUI guest may use (superset; only present ones are staged).
         // Mirrors runChromiumStandalone's staging set, minus chromium-only overlays.
-        private val OVERLAY_NAMES = listOf("interpose", "nss", "xkb-gegl", "babl-gegl", "x11", "pulse")
+        // vk-icd ships the guest Vulkan ICD (libvulkan.so.1) the loader binds when a
+        // launch opts into ALR_VK_ICD=1; staged best-effort like the rest (no-op when
+        // its tar is absent), so a normal GUI launch is unaffected.
+        private val OVERLAY_NAMES =
+            listOf("interpose", "nss", "xkb-gegl", "babl-gegl", "x11", "pulse", "vk-icd")
 
         // The loader report's status line, e.g. "alr native loader child exit=0 signal=0".
         private val SIGNAL_RE = Regex("""child exit=(-?\d+) signal=(\d+)""")

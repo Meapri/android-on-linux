@@ -256,11 +256,20 @@ class RunningSurfaceActivity : ComponentActivity() {
         val protocol = intent?.getStringExtra(EXTRA_PROTOCOL)
             ?.let { runCatching { SurfaceProtocol.valueOf(it) }.getOrNull() }
             ?: SurfaceProtocol.WAYLAND
+        // Optional guest env: "KEY=VALUE" entries (first '=' splits; blank/'='-less skipped).
+        val env = intent?.getStringArrayExtra(EXTRA_ENV)
+            ?.mapNotNull { e ->
+                val i = e.indexOf('=')
+                if (i <= 0) null else e.substring(0, i) to e.substring(i + 1)
+            }
+            ?.toMap()
+            .orEmpty()
         return LaunchRequest(
             appId = appId,
             entryPath = entryPath,
             args = args,
             protocol = protocol,
+            env = env,
         )
     }
 
@@ -350,6 +359,11 @@ class RunningSurfaceActivity : ComponentActivity() {
         const val EXTRA_ENTRY_PATH = "dev.chanwoo.androlinux.extra.ENTRY_PATH"
         const val EXTRA_ARGS = "dev.chanwoo.androlinux.extra.ARGS"
         const val EXTRA_PROTOCOL = "dev.chanwoo.androlinux.extra.PROTOCOL"
+        // Optional guest environment: a String[] of "KEY=VALUE" entries, applied to the
+        // guest via LaunchRequest.env (NativeAppSession Os.setenv before the loader exec).
+        // Lets a launch opt into runtime features the loader gates on host env — e.g.
+        // ALR_VK_ICD=1 to bind the guest Vulkan ICD (the alr-vk-enum end-to-end test).
+        const val EXTRA_ENV = "dev.chanwoo.androlinux.extra.ENV"
 
         private const val LABEL_STARTING = "앱을 시작하는 중…"
         private const val LABEL_STOPPING = "종료하는 중…"
