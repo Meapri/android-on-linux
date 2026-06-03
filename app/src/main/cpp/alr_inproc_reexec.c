@@ -618,6 +618,70 @@ ALR_FREESTANDING static void read_auxv(unsigned long* hwcap, unsigned long* hwca
 static char g_interp_buf[FILEBUF_CAP];
 static char g_interp_path[1024];
 
+// Max argv entries the worker pushes onto the synthesized SysV stack (also bounds
+// the shebang-rebuilt vector below). Defined here (was a function-local #define) so
+// the shebang re-target buffers can size against it.
+#define MAX_ARGV 256
+
+// ---- shebang (#!) re-target buffers -----------------------------------------
+// A guest may execve() a `#!`-interpreter SCRIPT (the load-bearing case:
+// authenticated `apt-get update` runs apt's gpgv method, which exec()s
+// /usr/bin/apt-key — a `#!/bin/sh` POSIX script — to verify the InRelease). The
+// kernel's normal binfmt_script handling turns `execve("/usr/bin/apt-key", argv)`
+// into `execve(<interp>, [interp, optarg?, "/usr/bin/apt-key", argv[1..]])`. Under
+// ALR there is NO kernel execve (it is cancelled + redirected here), so WE must do
+// the same rewrite IN-PROCESS: map the INTERPRETER ELF (resolved into the rootfs)
+// and synthesize the interpreter's argv with the script path spliced in. Without
+// this the worker hit the ELF-magic check below on a `#!` file and sys_exit(72)'d,
+// so apt-key never ran and apt reported "Unknown error executing apt-key" → the
+// repo "is not signed". These static .bss buffers hold the parsed shebang line and
+// the rebuilt argv (no malloc mid-guest). Sizes are generous: a shebang line is
+// capped by the kernel at 255 (BINPRM_BUF_SIZE-1); MAX_ARGV already bounds argv.
+#define SHEBANG_LINE_CAP 256
+static char g_shebang_interp[SHEBANG_LINE_CAP];  // the `#!`-named interpreter (guest path)
+static char g_shebang_arg[SHEBANG_LINE_CAP];     // its optional single argument ("" if none)
+static char g_shebang_target_host[1024];         // the script's host path (argv slot)
+static char g_shebang_interp_host[1024];         // <rootfs><interp> — the ELF we re-map to
+static char* g_shebang_argv[MAX_ARGV + 3];       // [interp,(arg,)script,orig argv1..,NULL]
+
+// Parse a `#!` first line from `buf` (length `len`). Mirrors fs/binfmt_script.c
+// and the host-side alr_exec.cpp parse_shebang: skip the leading "#!", trim spaces/
+// tabs, take the first whitespace-delimited token as the interpreter, and (per
+// Linux) treat the WHOLE remainder (leading-trimmed, trailing-trimmed) as a SINGLE
+// argument — the kernel does not word-split shebang args. Writes the guest interp
+// into *interp_out and the (possibly empty) arg into *arg_out (both NUL-terminated,
+// capped at SHEBANG_LINE_CAP-1). Returns 1 if a non-empty interpreter was found.
+ALR_FREESTANDING static int parse_shebang(const char* buf, size_t len,
+                                          char* interp_out, char* arg_out) {
+    interp_out[0] = 0;
+    arg_out[0] = 0;
+    if (len < 2 || buf[0] != '#' || buf[1] != '!') return 0;
+    // Bound the scan to the first newline (or the kernel's 255-byte line cap).
+    size_t end = 2;
+    while (end < len && end < (size_t)(SHEBANG_LINE_CAP - 1) + 2 &&
+           buf[end] != '\n' && buf[end] != '\r') {
+        ++end;
+    }
+    size_t i = 2;
+    while (i < end && (buf[i] == ' ' || buf[i] == '\t')) ++i;  // skip ws after #!
+    // Interpreter token = up to the next whitespace.
+    size_t k = 0;
+    while (i < end && buf[i] != ' ' && buf[i] != '\t' &&
+           k < (size_t)(SHEBANG_LINE_CAP - 1)) {
+        interp_out[k++] = buf[i++];
+    }
+    interp_out[k] = 0;
+    if (k == 0) return 0;  // "#!" with no interpreter — not a usable script
+    // Skip whitespace before the (single) optional argument.
+    while (i < end && (buf[i] == ' ' || buf[i] == '\t')) ++i;
+    size_t a = 0;
+    while (i < end && a < (size_t)(SHEBANG_LINE_CAP - 1)) arg_out[a++] = buf[i++];
+    // Right-trim trailing whitespace from the argument (e.g. "#!/bin/sh  ").
+    while (a > 0 && (arg_out[a - 1] == ' ' || arg_out[a - 1] == '\t')) --a;
+    arg_out[a] = 0;
+    return 1;
+}
+
 // ===========================================================================
 //  alr_inproc_reexec_worker — the C worker. Entered from the naked asm shim with
 //  the entry ABI already unpacked into the SysV arg regs:
@@ -658,6 +722,76 @@ void alr_inproc_reexec_worker(const char* target, char** argv,
     size_t tlen = 0;
     char* tbuf = (char*)map_file(target, &tlen);
     if (tbuf == MAP_FAILED) { diag("ALR-INPROC: target open/read fail\n"); sys_exit(EX_OPEN_TARGET); }
+
+    // ---- shebang (#!) re-target: map the INTERPRETER, splice the script path --
+    // If the target is a `#!`-script (not an ELF) — e.g. apt's gpgv method exec()s
+    // /usr/bin/apt-key, a `#!/bin/sh` POSIX script — emulate the kernel's
+    // binfmt_script: resolve the named interpreter into the rootfs, REPLACE the map
+    // target with that interpreter ELF, and rebuild argv as
+    //   [interp, optarg?, <script host path>, orig argv[1..]]
+    // exactly as the kernel would (orig argv[0] is dropped; the script path becomes
+    // argv[1]/[2]). We pass the script's HOST path (already rootfs-resolved in
+    // `target`) as the argv slot so the interpreter's open() of it needs no further
+    // mediation. Only ONE level of shebang is unwrapped here (matches the Linux
+    // single-pass binfmt_script: an interpreter that is itself a script is rare and
+    // would re-enter this trampoline on its own exec anyway). After the swap we fall
+    // through to the normal ELF validate/map path below with target=interp.
+    if (tlen >= 2 && tbuf[0] == '#' && tbuf[1] == '!') {
+        if (!parse_shebang(tbuf, tlen, g_shebang_interp, g_shebang_arg)) {
+            diag("ALR-INPROC: malformed shebang\n"); sys_exit(EX_ELF_TARGET);
+        }
+        diag("ALR-INPROC: shebang interp="); diag(g_shebang_interp);
+        if (g_shebang_arg[0]) { diag(" arg="); diag(g_shebang_arg); }
+        diag("\n");
+        // Snapshot the script's host path (currently in `target`) for the argv slot.
+        {
+            size_t tn = s_len(target);
+            if (tn + 1 > sizeof(g_shebang_target_host)) {
+                diag("ALR-INPROC: shebang script path too long\n");
+                sys_exit(EX_INTERP_PATH);
+            }
+            s_cpy(g_shebang_target_host, target);
+        }
+        // Resolve the interpreter into the rootfs: <rootfs><interp> (interp begins
+        // with '/'). Use a DEDICATED buffer (NOT g_interp_path) because the
+        // dynamic-interp block below rewrites g_interp_path for the ld.so — `target`
+        // must keep pointing at a STABLE interpreter-path string (it is later read
+        // for AT_EXECFN), so it cannot alias a buffer that gets clobbered.
+        {
+            size_t rl = s_len(rootfs);
+            size_t il = s_len(g_shebang_interp);
+            if (rl + il + 1 > sizeof(g_shebang_interp_host)) {
+                diag("ALR-INPROC: shebang interp path too long\n");
+                sys_exit(EX_INTERP_PATH);
+            }
+            s_cpy(g_shebang_interp_host, rootfs);
+            s_cpy(g_shebang_interp_host + rl, g_shebang_interp);
+        }
+        diag("ALR-INPROC: shebang interp host="); diag(g_shebang_interp_host); diag("\n");
+        // Rebuild argv = [interp, optarg?, script_host, orig argv[1..], NULL].
+        size_t na = 0;
+        g_shebang_argv[na++] = g_shebang_interp;          // argv[0] = interpreter
+        if (g_shebang_arg[0]) g_shebang_argv[na++] = g_shebang_arg;
+        g_shebang_argv[na++] = g_shebang_target_host;     // the script to run
+        // Append the guest's ORIGINAL argv[1..] (drop its argv[0], like the kernel).
+        if (argv && argv[0]) {
+            for (char** a = argv + 1; *a && na < (size_t)(MAX_ARGV + 2); ++a) {
+                g_shebang_argv[na++] = *a;
+            }
+        }
+        g_shebang_argv[na] = 0;  // NULL-terminate
+        // Swap the map target + argv to the interpreter and re-map the interp file.
+        sys3(SYS_munmap, (long)tbuf, (long)tlen, 0);       // drop the script mapping
+        target = g_shebang_interp_host;                    // now map the interpreter
+        argv = g_shebang_argv;                             // interpreter's argv
+        tlen = 0;
+        tbuf = (char*)map_file(target, &tlen);
+        if (tbuf == MAP_FAILED) {
+            diag("ALR-INPROC: shebang interp open/read fail\n");
+            sys_exit(EX_OPEN_INTERP);
+        }
+    }
+
     if (tlen < sizeof(Elf64_Ehdr) ||
         tbuf[0] != 0x7f || tbuf[1] != 'E' ||
         tbuf[2] != 'L'  || tbuf[3] != 'F') {
@@ -735,8 +869,8 @@ void alr_inproc_reexec_worker(const char* target, char** argv,
     }
     uintptr_t at_execfn = top;
 
-    // Push argv strings (high -> low), preserving the guest's argv[0].
-    #define MAX_ARGV 256
+    // Push argv strings (high -> low), preserving the guest's argv[0]. MAX_ARGV is
+    // defined at file scope (the shebang re-target buffers size against it).
     uintptr_t argv_ptrs[MAX_ARGV];
     unsigned long g_argc = 0;
     for (char** a = argv; a && *a && g_argc < MAX_ARGV; ++a) ++g_argc;

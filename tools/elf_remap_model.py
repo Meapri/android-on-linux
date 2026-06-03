@@ -518,3 +518,102 @@ def fixture_static_pie_relative_irelative() -> ElfImage:
             Reloc(0xF810, R_AARCH64_IRELATIVE, 0x1500),  # real ifunc resolver
         ),
     )
+
+
+# --------------------------------------------------------------------------
+# Shebang (#!) re-target model — the in-process binfmt_script emulation.
+#
+# WHY: the in-process re-map trampoline (alr_inproc_reexec.c) used to bail on any
+# non-ELF target (sys_exit(72) on the ELF-magic check), so a guest that exec()s a
+# `#!`-interpreter SCRIPT died. The load-bearing case is authenticated `apt-get
+# update`: noble apt's gpgv method exec()s /usr/bin/apt-key — a `#!/bin/sh` script
+# — to verify the InRelease, so apt-key never ran ("Unknown error executing
+# apt-key" → "The repository is not signed"). The trampoline now emulates the
+# kernel's fs/binfmt_script: parse `#!INTERP [ARG]`, map the rootfs-resolved
+# INTERPRETER ELF, and rebuild argv = [interp, optarg?, script, orig argv[1..]].
+#
+# This is a PURE host model of that parse + re-target (it does NOT run guest code),
+# mirroring the C in alr_inproc_reexec.c:parse_shebang + the worker's interp-path
+# resolve + argv splice, so the decision is host-regression-guarded device-lessly.
+# --------------------------------------------------------------------------
+SHEBANG_LINE_CAP = 256  # mirrors the C cap (kernel BINPRM_BUF_SIZE-1 = 255)
+
+
+def parse_shebang_line(first_bytes: bytes) -> tuple[str, str] | None:
+    """Parse a `#!` first line exactly as alr_inproc_reexec.c:parse_shebang (which
+    mirrors fs/binfmt_script.c + alr_exec.cpp:parse_shebang): skip "#!", trim
+    leading/trailing whitespace, the first whitespace-delimited token is the
+    interpreter, and the WHOLE (trimmed) remainder is a SINGLE argument (the kernel
+    does not word-split). Returns (interp, arg) — arg "" if none — or None if there
+    is no usable interpreter (`#!` only, or not a shebang). Honours the 255-byte cap.
+    """
+    if len(first_bytes) < 2 or first_bytes[0:2] != b"#!":
+        return None
+    # Bound to the first newline OR the kernel's 255-byte line cap (matches the C).
+    line = first_bytes[2 : 2 + (SHEBANG_LINE_CAP - 1)]
+    nl = min([i for i in (line.find(b"\n"), line.find(b"\r")) if i >= 0], default=-1)
+    if nl >= 0:
+        line = line[:nl]
+    text = line.decode("utf-8", "replace")
+    text = text.lstrip(" \t")
+    if not text:
+        return None
+    sp = next((i for i, c in enumerate(text) if c in " \t"), -1)
+    if sp < 0:
+        interp, arg = text, ""
+    else:
+        interp = text[:sp]
+        arg = text[sp:].lstrip(" \t").rstrip(" \t")
+    interp = interp[: SHEBANG_LINE_CAP - 1]
+    arg = arg[: SHEBANG_LINE_CAP - 1]
+    if not interp:
+        return None
+    return interp, arg
+
+
+@dataclass
+class ShebangRetarget:
+    is_shebang: bool
+    interp_guest: str = ""          # the `#!`-named interpreter (guest path, e.g. /bin/sh)
+    interp_host: str = ""           # <rootfs><interp> — the ELF the trampoline maps
+    argv: tuple[str, ...] = ()      # rebuilt argv for the interpreter
+    error: str = ""                 # non-empty => the trampoline would sys_exit (EX_*)
+
+
+def model_shebang_retarget(
+    target_host: str,
+    first_bytes: bytes,
+    orig_argv: tuple[str, ...],
+    rootfs: str,
+) -> ShebangRetarget:
+    """Model the trampoline's shebang re-target for a target whose mapped file
+    begins `first_bytes`. `target_host` is the script's already-rootfs-resolved host
+    path (the supervisor seeded it in x19); `orig_argv` is the guest's original argv
+    (x20); `rootfs` is x22. Mirrors the C exactly:
+
+      * non-`#!` -> is_shebang False (the worker falls through to the ELF path).
+      * `#!` with no interpreter -> error (the C sys_exit(EX_ELF_TARGET)=72).
+      * else: interp_host = <rootfs><interp>; argv = [interp, optarg?, target_host,
+        orig_argv[1..]] (orig argv[0] dropped, exactly like the kernel). The script
+        slot is the HOST path so the interpreter's open() needs no further mediation.
+    """
+    parsed = parse_shebang_line(first_bytes)
+    if parsed is None:
+        # Either not a shebang (ELF/other) or a malformed "#!". Distinguish: a real
+        # ELF is the normal fall-through; a "#!"-prefixed-but-unparsable is the error.
+        if len(first_bytes) >= 2 and first_bytes[0:2] == b"#!":
+            return ShebangRetarget(is_shebang=True, error="malformed shebang")
+        return ShebangRetarget(is_shebang=False)
+    interp, arg = parsed
+    interp_host = rootfs.rstrip("/") + interp if interp.startswith("/") else rootfs + "/" + interp
+    new_argv: list[str] = [interp]
+    if arg:
+        new_argv.append(arg)
+    new_argv.append(target_host)
+    new_argv.extend(orig_argv[1:])  # drop the guest's argv[0], like binfmt_script
+    return ShebangRetarget(
+        is_shebang=True,
+        interp_guest=interp,
+        interp_host=interp_host,
+        argv=tuple(new_argv),
+    )
