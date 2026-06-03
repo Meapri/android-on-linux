@@ -11,8 +11,17 @@ Contract:
   * the pinned IPs are members of the CDN's published anycast ranges (durable);
   * /etc/hosts pins host -> each anycast IP (so glibc resolves it with no DNS);
   * the deb822 .sources name the HOSTNAME (never a bare IP) so HTTPS SNI/cert match;
-  * apt.conf keeps signature checking ON (signed Release = why plain HTTP is safe);
+  * apt is isolated to the ALR ports stanza via Dir::Etc (ignores base sources),
+    and the base cloud-init ubuntu.sources is overwritten with a neutralizer;
+  * by default the stanza is Trusted: yes + AllowUnauthenticated (DEMO GPG skip —
+    the device apt-key is broken; real GPG is a follow-up); `trusted=False`
+    restores Signed-By keyring verification (the original integrity-on behavior);
   * the packed overlay is §5-E ./-rooted and stage_tar_spec conformant.
+
+These mirror the device evidence that drove the overlay's final shape: with this
+overlay `apt-get update` reaches exit 0 with no E: errors on a DNS-blocked device
+(the only residual is a NATIVE realpath edge on the in-rootfs dpkg status, dodged
+via `--status-path` pointing at a status copy outside the rootfs).
 """
 
 from __future__ import annotations
@@ -122,8 +131,18 @@ def test_sources_name_hostname_never_ip_http():
         assert ip not in body  # the URI must use the hostname, not a literal IP
     assert "Suites: noble noble-updates noble-security" in body
     assert "Types: deb" in body
-    # signature checking is kept (a keyring is named)
+    # default (device demo) is Trusted: yes (apt-key is broken on device); the
+    # signed-keyring path is opt-in via trusted=False (see below).
+    assert "Trusted: yes" in body
+    assert "Signed-By:" not in body
+
+
+def test_sources_trusted_false_restores_signed_by():
+    m = MIRRORS["ports"]
+    body = build_sources_body(m, scheme="http", trusted=False)
+    # the original integrity-on behavior: GPG-signed Release via the archive keyring
     assert "Signed-By:" in body and "ubuntu-archive-keyring.gpg" in body
+    assert "Trusted: yes" not in body
 
 
 def test_sources_https_uses_hostname_for_sni():
@@ -134,7 +153,8 @@ def test_sources_https_uses_hostname_for_sni():
 
 def test_debian_sources_shape():
     m = MIRRORS["debian"]
-    body = build_sources_body(m, scheme="http")
+    # check the keyring on the trusted=False (signed) variant
+    body = build_sources_body(m, scheme="http", trusted=False)
     assert "URIs: http://deb.debian.org/debian" in body
     assert "debian-archive-keyring.gpg" in body
     # Debian serves -security from a separate host, so the stanza omits it here.
@@ -151,13 +171,38 @@ def test_bad_scheme_rejected():
 # apt.conf keeps integrity ON
 # --------------------------------------------------------------------------- #
 
-def test_apt_conf_keeps_signature_checking():
+def test_apt_conf_isolates_sources_and_demo_trusts():
+    # round-trip trimming retained
     assert 'Acquire::Languages "none";' in APT_CONF_BODY
     assert 'Acquire::ForceIPv4 "true";' in APT_CONF_BODY
-    # the whole point: plain HTTP is safe BECAUSE the signed Release is verified,
-    # so we must NOT disable auth.
-    assert "AllowInsecure" not in APT_CONF_BODY
-    assert "AllowUnauthenticated" not in APT_CONF_BODY
+    # (1) Dir::Etc isolation: apt reads ONLY the ALR ports stanza, ignoring the base
+    # cloud-init ubuntu.sources + github-cli/tailscale (device-proven necessary).
+    assert 'Dir::Etc::sourcelist "/dev/null";' in APT_CONF_BODY
+    assert "Dir::Etc::sourceparts" in APT_CONF_BODY and "sources.list.alr.d" in APT_CONF_BODY
+    # (2) default trusted: AllowUnauthenticated (device apt-key is broken).
+    assert 'APT::Get::AllowUnauthenticated "true";' in APT_CONF_BODY
+    # (3) status pin to the absolute in-rootfs DB path (default).
+    assert "Dir::State::status" in APT_CONF_BODY and bam.DEFAULT_ROOTFS_ABS in APT_CONF_BODY
+    # (4) device-env hygiene: the PackageKit/c-n-f Post-Invoke hook lists are
+    # #cleared (not blanked — assigning "" only appends an empty entry), run as root.
+    assert "#clear APT::Update::Post-Invoke-Success;" in APT_CONF_BODY
+    assert 'APT::Sandbox::User "root";' in APT_CONF_BODY
+
+
+def test_apt_conf_trusted_false_drops_allow_unauth():
+    body = bam.build_apt_conf_body(trusted=False)
+    assert "AllowUnauthenticated" not in body
+    # isolation + hygiene still apply regardless of trust
+    assert 'Dir::Etc::sourcelist "/dev/null";' in body
+    assert "#clear APT::Update::Post-Invoke-Success;" in body
+
+
+def test_apt_conf_status_path_overrides_to_outside_rootfs():
+    # the realpath-edge workaround: point Dir::State::status at a DB copy that is
+    # NOT under the rootfs (so the path interposer leaves realpath alone).
+    body = bam.build_apt_conf_body(status_path="/data/local/tmp/alr-dpkg-status")
+    assert 'Dir::State::status "/data/local/tmp/alr-dpkg-status";' in body
+    assert f'Dir::State::status "{bam.DEFAULT_ROOTFS_ABS}/var/lib/dpkg/status";' not in body
 
 
 # --------------------------------------------------------------------------- #
@@ -173,15 +218,24 @@ def test_full_pack_is_conformant_and_complete(tmp_path):
         bodies = {n: t.extractfile(m).read() for n, m in names.items() if m.isfile()}
 
     assert "./" + HOSTS_PATH in names
+    # the AUTHORITATIVE stanza apt actually reads (Dir::Etc::sourceparts -> here)
+    assert "./etc/apt/sources.list.alr.d/alr-ports.sources" in names
+    # the conventional-dir copy is still shipped (humans / direct tools)
     assert "./etc/apt/sources.list.d/alr-ports.sources" in names
+    # the base cloud-init ubuntu.sources is OVERWRITTEN with a neutralizer
+    assert "./etc/apt/sources.list.d/ubuntu.sources" in names
     assert "./" + APT_CONF_PATH in names
     assert all(n.startswith("./") for n in names)
 
     assert b"172.66.152.176\tports.ubuntu.com" in bodies["./" + HOSTS_PATH]
     assert (b"http://ports.ubuntu.com/ubuntu-ports"
-            in bodies["./etc/apt/sources.list.d/alr-ports.sources"])
+            in bodies["./etc/apt/sources.list.alr.d/alr-ports.sources"])
+    assert b"Trusted: yes" in bodies["./etc/apt/sources.list.alr.d/alr-ports.sources"]
+    # the neutralized ubuntu.sources carries no live repo stanza
+    assert b"Types: deb" not in bodies["./etc/apt/sources.list.d/ubuntu.sources"]
 
-    assert res.file_count == 3
+    # hosts + 2x alr sources (alr.d + list.d) + ubuntu.sources + apt.conf = 5 files
+    assert res.file_count == 5
     assert res.base_uri == "http://ports.ubuntu.com/ubuntu-ports"
 
     rep = validate_stage_tar(str(out))
