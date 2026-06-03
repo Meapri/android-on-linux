@@ -176,10 +176,15 @@ typedef struct { Elf64_Addr r_offset; Elf64_Xword r_info; Elf64_Sxword r_addend;
 #define SYS_exit_group  94
 #define SYS_lseek       62
 #define SYS_munmap      215
+#define SYS_fcntl       25
+#define SYS_getdents64  61
 
 #define O_RDONLY 0
+#define O_DIRECTORY 0x4000   // aarch64/asm-generic: open a directory (for /proc/self/fd)
 #define SEEK_END 2
 #define AT_FDCWD (-100)
+#define F_GETFD     1        // fcntl: get the fd flags (returns FD_CLOEXEC bit)
+#define FD_CLOEXEC  1        // close-on-exec flag
 #define PROT_NONE  0
 #define PROT_READ  1
 #define PROT_WRITE 2
@@ -682,6 +687,86 @@ ALR_FREESTANDING static int parse_shebang(const char* buf, size_t len,
     return 1;
 }
 
+// ---- execve FD_CLOEXEC semantics emulation (the load-bearing fd-table fix) ---
+// A REAL execve() closes every fd whose FD_CLOEXEC bit is set; the surviving fds
+// (those the caller deliberately left inheritable) become the new image's fd
+// table. The in-process re-map does NO execve, so without this sweep EVERY
+// CLOEXEC fd the caller marked for closing stays open in the re-mapped guest —
+// breaking any fd-inheritance protocol that relies on execve to prune the table.
+// Two device-root-caused failures both reduce to this single gap:
+//   (1) authenticated `apt-get update`: apt's ExecGPGV/ExecFork mark all fds >=3
+//       FD_CLOEXEC (close_range(3,~0U,CLOSE_RANGE_CLOEXEC)) then dup2 the gpgv
+//       status pipe's WRITE end onto fd 3 (--status-fd 3) and clear CLOEXEC ONLY
+//       on that one. After a real execve, fd 3 is the SOLE remaining write end, so
+//       when gpgv finishes the pipe hits EOF and apt parses the GOODSIG/VALIDSIG.
+//       Under the no-execve re-map the ORIGINAL pre-dup write end (and any earlier
+//       re-mapped link in apt->apt-key->gpgv) stays open as an extra write end →
+//       apt's read of the status pipe never sees EOF → the GOODSIG is never
+//       finalized → "the repository is not signed".
+//   (2) ROOTFUL Xwayland: the X server fork()+execs /usr/bin/xkbcomp to compile
+//       its keymap, feeding the description via a pipe and reading the compiled
+//       XKM back. The server marks its sockets/fds CLOEXEC so xkbcomp does not
+//       inherit them; without the sweep xkbcomp inherits stray write ends and the
+//       compiled-keymap read never reaches EOF → "XKB: Failed to compile keymap"
+//       → Xwayland dies before binding X0.
+// We emulate the kernel exactly: enumerate the OPEN fds via /proc/self/fd
+// (getdents64 — bounded to fds that actually exist, no RLIMIT_NOFILE scan) and,
+// for each, fcntl(F_GETFD); if FD_CLOEXEC is set, close it. /proc/self/fd lists
+// the dir's own readdir fd too — we skip it so the close() does not perturb the
+// iteration. Fallback (proc unavailable): a linear fcntl scan to a generous cap.
+// Run ONCE, right before the jump to ld.so, AFTER the worker has closed all of
+// its own transient fds (target/interp maps, auxv) — so it never closes a working
+// fd, mirroring execve's "at the exec boundary" timing.
+#define ALR_FD_LINEAR_CAP 4096   // fallback scan ceiling (well past any real table)
+ALR_FREESTANDING static int fd_is_cloexec(long fd) {
+    long fl = sys3(SYS_fcntl, fd, F_GETFD, 0);
+    return (fl >= 0) && (fl & FD_CLOEXEC);
+}
+ALR_FREESTANDING static unsigned long close_cloexec_fds(void) {
+    unsigned long closed = 0;
+    // Primary: enumerate only the open fds via /proc/self/fd.
+    long dfd = sys4(SYS_openat, AT_FDCWD, "/proc/self/fd",
+                    O_RDONLY | O_DIRECTORY, 0);
+    if (dfd >= 0) {
+        // linux_dirent64: u64 d_ino; s64 d_off; u16 d_reclen; u8 d_type; char name[].
+        // name starts at offset 19 (8+8+2+1). Parse minimally — we only need d_reclen
+        // (offset 16) and the NUL-terminated decimal name.
+        char dbuf[2048];
+        for (;;) {
+            long n = sys3(SYS_getdents64, dfd, dbuf, sizeof(dbuf));
+            if (n <= 0) break;  // 0 = end, <0 = error (treat as done)
+            long off = 0;
+            while (off < n) {
+                unsigned short reclen =
+                    (unsigned short)((unsigned char)dbuf[off + 16] |
+                                     ((unsigned char)dbuf[off + 17] << 8));
+                if (reclen == 0) break;  // malformed — stop to avoid a tight loop
+                const char* name = dbuf + off + 19;
+                // Parse the decimal fd name ("." / ".." parse to 0 with leftover '.').
+                long fd = 0;
+                int ok = (name[0] >= '0' && name[0] <= '9');
+                for (const char* p = name; *p; ++p) {
+                    if (*p < '0' || *p > '9') { ok = 0; break; }
+                    fd = fd * 10 + (*p - '0');
+                }
+                if (ok && fd != dfd && fd_is_cloexec(fd)) {
+                    if (sys1(SYS_close, fd) == 0) ++closed;
+                }
+                off += reclen;
+            }
+        }
+        sys1(SYS_close, dfd);
+        return closed;
+    }
+    // Fallback: linear fcntl scan (proc not mounted / openat failed).
+    for (long fd = 0; fd < ALR_FD_LINEAR_CAP; ++fd) {
+        if (fd_is_cloexec(fd)) {
+            if (sys1(SYS_close, fd) == 0) ++closed;
+        }
+    }
+    return closed;
+}
+
 // ===========================================================================
 //  alr_inproc_reexec_worker — the C worker. Entered from the naked asm shim with
 //  the entry ABI already unpacked into the SysV arg regs:
@@ -961,6 +1046,18 @@ void alr_inproc_reexec_worker(const char* target, char** argv,
                                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     void* tcb = (tcb_region == MAP_FAILED) ? (void*)0 : (void*)((char*)tcb_region + 8192);
     diag_hex("ALR-INPROC: tcb@", (unsigned long)tcb);
+
+    // ---- execve FD_CLOEXEC emulation (the fd-table fix) -----------------------
+    // A real execve closes every FD_CLOEXEC fd at this exact boundary; we did NOT
+    // execve, so do it ourselves now — right before the jump, after every transient
+    // worker fd (target/interp maps, auxv) is already closed and before the guest
+    // image runs. This is what lets apt's gpgv --status-fd 3 pipe reach EOF (GOODSIG
+    // accepted) and the X server's xkbcomp keymap pipe reach EOF (keymap compiles),
+    // because the caller's CLOEXEC-marked extra pipe ends finally close. The guest's
+    // intentionally-inherited fds (NOT CLOEXEC: fd 3, stdio, the dup2'd status fd)
+    // are untouched. Runs unconditionally (a guest with no CLOEXEC fds closes none).
+    unsigned long cloexec_closed = close_cloexec_fds();
+    diag_hex("ALR-INPROC: cloexec_closed=", cloexec_closed);
 
     enter_guest((void*)start, (void*)jump_entry, tcb);
     sys_exit(99);  // unreachable
