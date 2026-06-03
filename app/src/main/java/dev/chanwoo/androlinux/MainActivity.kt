@@ -1248,26 +1248,48 @@ class MainActivity : Activity() {
                 } else false
             }
             // Production input path: forward real touches on the SurfaceView to the
-            // focused Wayland client (as wl_touch + wl_pointer) so GUI apps are
-            // interactive once a real toolkit window is up.
+            // focused Wayland client as multi-contact wl_touch (NOT a synthetic mouse).
+            // Each MotionEvent forwards ALL of its contacts, then one frame closes the
+            // atomic set; single-finger pointer emulation for pointer-only clients is
+            // decided compositor-side. This is the "touch feels like a mouse" fix:
+            //  - MOVE batches every current pointer (index 0..pointerCount-1), so a
+            //    two-finger drag moves BOTH fingers (the old code only moved index 0);
+            //  - DOWN/UP/POINTER_DOWN/POINTER_UP use actionIndex for BOTH the id AND the
+            //    coordinate (the old code sent index-0's x/y with the wrong finger's id);
+            //  - ACTION_CANCEL maps to a real wl_touch.cancel, not a lift.
             setOnTouchListener { v, ev ->
-                val phase = when (ev.actionMasked) {
+                when (ev.actionMasked) {
+                    android.view.MotionEvent.ACTION_CANCEL -> {
+                        nativeWaylandInjectTouchCancel()
+                    }
+                    android.view.MotionEvent.ACTION_MOVE -> {
+                        // One MOVE callback batches movement for ALL current contacts.
+                        for (i in 0 until ev.pointerCount) {
+                            nativeWaylandInjectTouch(ev.getPointerId(i), ev.getX(i), ev.getY(i), 1)
+                        }
+                        nativeWaylandInjectTouchFrame()
+                    }
                     android.view.MotionEvent.ACTION_DOWN,
-                    android.view.MotionEvent.ACTION_POINTER_DOWN -> 0
+                    android.view.MotionEvent.ACTION_POINTER_DOWN -> {
+                        val i = ev.actionIndex
+                        nativeWaylandInjectTouch(ev.getPointerId(i), ev.getX(i), ev.getY(i), 0)
+                        nativeWaylandInjectTouchFrame()
+                        if (ev.actionMasked == android.view.MotionEvent.ACTION_DOWN) {
+                            // The FIRST contact (re)claims key focus so hardware keys
+                            // reach the guest. Do NOT auto-raise the soft keyboard here —
+                            // it would steal focus and cover the lower half of the screen
+                            // on every tap (e.g. swallowing menu-item clicks). The IME is
+                            // raised only on demand (long-press) via showSoftKeyboard().
+                            v.requestFocus()
+                            v.performClick()
+                        }
+                    }
                     android.view.MotionEvent.ACTION_UP,
-                    android.view.MotionEvent.ACTION_POINTER_UP,
-                    android.view.MotionEvent.ACTION_CANCEL -> 2
-                    else -> 1
-                }
-                nativeWaylandInjectTouch(ev.getPointerId(ev.actionIndex), ev.x, ev.y, phase)
-                if (phase == 0) {
-                    // Tapping the GUI (re)claims key focus so hardware keys reach the
-                    // guest. Do NOT auto-raise the soft keyboard here — it would steal
-                    // focus and cover the lower half of the screen on every tap (e.g.
-                    // swallowing menu-item clicks). The IME is raised only on demand
-                    // (long-press) via showSoftKeyboard().
-                    v.requestFocus()
-                    v.performClick()
+                    android.view.MotionEvent.ACTION_POINTER_UP -> {
+                        val i = ev.actionIndex
+                        nativeWaylandInjectTouch(ev.getPointerId(i), ev.getX(i), ev.getY(i), 2)
+                        nativeWaylandInjectTouchFrame()
+                    }
                 }
                 true
             }
@@ -2802,6 +2824,10 @@ class MainActivity : Activity() {
     private external fun nativeWaylandInjectSelfTest(x: Float, y: Float): String
 
     private external fun nativeWaylandInjectTouch(id: Int, x: Float, y: Float, phase: Int)
+    // Close the atomic set of touch changes for one MotionEvent (wl_touch.frame).
+    private external fun nativeWaylandInjectTouchFrame()
+    // Drive wl_touch.cancel from ACTION_CANCEL (gesture stolen by the system).
+    private external fun nativeWaylandInjectTouchCancel()
 
     private external fun nativeWaylandInjectKey(evdevKey: Int, pressed: Int)
     private external fun nativeWaylandInjectScroll(x: Float, y: Float, value: Double, axis: Int)
