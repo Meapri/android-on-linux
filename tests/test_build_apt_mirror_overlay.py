@@ -233,7 +233,7 @@ def test_apt_conf_default_is_demo_trust():
 
 
 def test_apt_conf_authenticated_pins_apt_key_and_gpgv_absolutely():
-    """GAP-1 fix: noble apt 2.7.14's gpgv method ALWAYS shells out to apt-key,
+    """GAP-1 fix: noble apt 2.8.3's gpgv method ALWAYS shells out to apt-key,
     which then PATH-resolves gpgv. The guest PATH isn't guaranteed, so authenticated
     mode pins BOTH the apt-key binary (Dir::Bin::apt-key) and its verifier
     (Apt::Key::gpgvcommand) to absolute rootfs paths — eliminating the

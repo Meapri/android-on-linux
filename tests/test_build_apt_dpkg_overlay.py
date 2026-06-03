@@ -46,10 +46,10 @@ from tools.stage_tar_spec import validate_stage_tar
 # A synthetic noble-like Packages index covering the closure brain. Sizes are the
 # real noble compressed sizes so total-download accounting is exercised too.
 INDEX = {
-    "apt": {"Version": "2.7.14", "Architecture": "arm64", "Size": "1336188",
+    "apt": {"Version": "2.8.3", "Architecture": "arm64", "Size": "1336188",
             "Depends": "libapt-pkg6.0t64, gpgv, dpkg (>= 1.17.2)"},
-    "apt-utils": {"Version": "2.7.14", "Architecture": "arm64", "Size": "205248",
-                  "Depends": "apt (= 2.7.14), libapt-pkg6.0t64"},
+    "apt-utils": {"Version": "2.8.3", "Architecture": "arm64", "Size": "205248",
+                  "Depends": "apt (= 2.8.3), libapt-pkg6.0t64"},
     "dpkg": {"Version": "1.22.6", "Architecture": "arm64", "Size": "1265468",
              "Depends": "tar, libzstd1"},
     "tar": {"Version": "1.35", "Architecture": "arm64", "Size": "247906"},
@@ -59,11 +59,12 @@ INDEX = {
     "zstd": {"Version": "1.5.5", "Architecture": "arm64", "Size": "574810",
              "Depends": "libzstd1"},
     "coreutils": {"Version": "9.4", "Architecture": "arm64", "Size": "1362772"},
+    "sed": {"Version": "4.9", "Architecture": "arm64", "Size": "171910"},
     "bash": {"Version": "5.2", "Architecture": "arm64", "Size": "780262"},
     "dash": {"Version": "0.5.12", "Architecture": "arm64", "Size": "90376"},
     "gpgv": {"Version": "2.4.4", "Architecture": "arm64", "Size": "149882",
              "Depends": "libgcrypt20"},
-    "libapt-pkg6.0t64": {"Version": "2.7.14", "Architecture": "arm64", "Size": "934734",
+    "libapt-pkg6.0t64": {"Version": "2.8.3", "Architecture": "arm64", "Size": "934734",
                          "Depends": "libzstd1, libgcrypt20"},
     "libgcrypt20": {"Version": "1.10", "Architecture": "arm64", "Size": "471954"},
     "libzstd1": {"Version": "1.5.5", "Architecture": "arm64", "Size": "271224"},
@@ -172,7 +173,7 @@ def test_self_contained_set_covers_load_bearing_frontends():
 # --------------------------------------------------------------------------- #
 
 def test_self_contained_set_ships_the_whole_apt_key_verify_path():
-    """noble apt 2.7.14 verifies an InRelease by exec'ing apt-key → gpgv, and
+    """noble apt 2.8.3 verifies an InRelease by exec'ing apt-key → gpgv, and
     apt-key shells out to several coreutils for its temp gpg home. The slim base
     ships NONE of these, so --self-contained must stage the WHOLE happy path or
     authenticated `apt-get update` dies "Unknown error executing apt-key"."""
@@ -184,6 +185,9 @@ def test_self_contained_set_ships_the_whole_apt_key_verify_path():
     assert "usr/bin/apt-key" in flat
     assert "usr/lib/apt/methods/gpgv" in flat
     assert "usr/bin/gpgv" in flat
+    # sed: apt-key's escape_shell pipes through it (non-fatal on the verify path,
+    # but essential:yes + needed by general maint scripts); the slim base dropped it.
+    assert "usr/bin/sed" in flat
 
 
 def test_apt_key_verify_deps_include_the_required_coreutils():

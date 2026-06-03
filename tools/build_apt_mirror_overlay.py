@@ -77,13 +77,16 @@ AUTHENTICATED (``--authenticated`` opt-in), how it is wired:
     OpenPGP keyring) and sets ``Signed-By: <that path>`` on the deb822 stanza.
     ``AllowUnauthenticated`` is OFF in this mode.
   * HOW noble apt verifies it (the device-diagnosed crux of GAP 1).
-    ``ports``'s base is **noble**, whose apt is **2.7.14**. In that apt the
+    The shipped base's apt is **2.8.3** (host-verified from the libapt-pkg SONAME
+    version string in ``rootfs/tiny-rootfs.tar``). In that apt the
     ``gpgv`` *method* (``apt-pkg/contrib/gpgv.cc`` ``ExecGPGV``) does **NOT** run
     ``gpgv`` directly — even with a per-source ``Signed-By`` it ALWAYS exec()s
     ``Dir::Bin::apt-key`` (default ``/usr/bin/apt-key``), passing ``--keyring
-    <Signed-By>`` (host-verified: the device method binary's strings carry
-    "Unknown error executing apt-key"; the 2.7.14 source does
-    ``Args.push_back(aptkey)`` unconditionally). The ``apt-key verify`` *script*
+    <Signed-By>`` (host-verified TWO ways: the rootfs method binary's strings carry
+    both the direct-gpgv path AND "Unknown error executing apt-key"; and the apt
+    2.8.3 source — salsa ``apt-pkg/contrib/gpgv.cc`` ``ExecGPGV`` — does
+    ``Args.push_back(aptkey)`` then ``execvp(Args[0], …)`` unconditionally, with NO
+    Signed-By short-circuit). The ``apt-key verify`` *script*
     then (a) resolves its verifier from ``Apt::Key::gpgvcommand`` or a bare-name
     ``gpgv`` PATH lookup and runs it against the keyring, and (b) shells out to a
     handful of **coreutils** (``mktemp``/``chmod``/``touch``/``rm``/``cat``/
@@ -360,7 +363,7 @@ SOURCES_PATH_TMPL = "etc/apt/sources.list.d/alr-{key}.sources"
 APT_CONF_PATH = "etc/apt/apt.conf.d/99alr-mirror-ip"
 
 # Absolute rootfs paths of the two binaries apt's signature verification execs.
-# noble apt 2.7.14's `methods/gpgv` ALWAYS shells out to `Dir::Bin::apt-key`, and
+# noble apt 2.8.3's `methods/gpgv` ALWAYS shells out to `Dir::Bin::apt-key`, and
 # that apt-key script resolves its verifier from `Apt::Key::gpgvcommand` (else a
 # bare-name PATH lookup). In-guest PATH is not guaranteed, so we PIN both to their
 # absolute rootfs paths. The binaries are staged by build_apt_dpkg_overlay
@@ -465,12 +468,14 @@ def build_apt_conf_body(
        the minimal rootfs lacks → ``W: No sandbox user '_apt'``); ``APT::Sandbox::
        User "root"`` keeps apt as the fakeroot uid=0 instead of warning/erroring.
 
-    5. **Verifier path pins (AUTHENTICATED mode — gpgv + apt-key).** noble apt is
-       2.7.14, whose ``methods/gpgv`` (``apt-pkg/contrib/gpgv.cc`` ``ExecGPGV``)
+    5. **Verifier path pins (AUTHENTICATED mode — gpgv + apt-key).** the shipped
+       base's apt is 2.8.3, whose ``methods/gpgv`` (``apt-pkg/contrib/gpgv.cc``
+       ``ExecGPGV``)
        ALWAYS exec()s ``Dir::Bin::apt-key`` to check an ``InRelease`` — it never
        calls ``gpgv`` directly, even with a per-source ``Signed-By`` (host-verified
-       from the device binary's strings + the 2.7.14 source: ``ExecGPGV`` does
-       ``Args.push_back(aptkey)`` unconditionally and passes ``--keyring
+       from the rootfs binary's strings + the 2.8.3 source: ``ExecGPGV`` does
+       ``Args.push_back(aptkey)`` then ``execvp(Args[0], …)`` unconditionally and
+       passes ``--keyring
        <Signed-By>``). The ``apt-key verify`` script then resolves its verifier from
        ``Apt::Key::gpgvcommand`` (falling back to a **bare-name PATH** lookup of
        ``gpgv``). In the guest, neither ``apt-key`` nor ``gpgv`` is guaranteed on
@@ -503,7 +508,7 @@ def build_apt_conf_body(
         "//     those hooks exec gdbus/dbus that this headless rootfs lacks, which otherwise",
         "//     fails apt-get update AFTER a clean fetch. (5) AUTHENTICATED only: pin",
         "//     Dir::Bin::apt-key + Apt::Key::gpgvcommand to absolute rootfs paths (noble apt",
-        "//     2.7.14 always shells out to apt-key, which then PATH-looks-up gpgv).",
+        "//     2.8.3 always shells out to apt-key, which then PATH-looks-up gpgv).",
         'Acquire::Languages "none";',
         'Acquire::ForceIPv4 "true";',
         # (4) Device-environment hygiene — always (independent of trust / rootfs).
@@ -1425,7 +1430,7 @@ def _selftest() -> int:
     check("apt.conf runtime default does NOT pin apt-key/gpgv (demo skips verify)",
           f'Dir::Bin::apt-key "{APT_KEY_BIN_PATH}";' not in _conf_default)
     # (5) authenticated mode pins the apt-key + gpgv verifier paths absolutely
-    # (noble apt 2.7.14 always shells to apt-key, which PATH-resolves gpgv).
+    # (noble apt 2.8.3 always shells to apt-key, which PATH-resolves gpgv).
     check("apt.conf (authenticated) pins Dir::Bin::apt-key to the absolute rootfs path",
           f'Dir::Bin::apt-key "{APT_KEY_BIN_PATH}";' in APT_CONF_BODY)
     check("apt.conf (authenticated) pins Apt::Key::gpgvcommand to the absolute gpgv",
