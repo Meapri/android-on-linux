@@ -747,6 +747,21 @@ inline VkResult vk_real_create_device2(
                      vphys, qci.size(),
                      created_counts.count(0) ? created_counts[0] : 0u,
                      dev_ext.size(), el.c_str(), feat_store.size(), (int)r);
+        // WAVE-7: also report (1) every extension ANGLE ENABLED that Mali does NOT expose —
+        // i.e. one we silently DROPPED, the prime suspect for a render device ANGLE needs but
+        // we can't faithfully build; and (2) every feature sType ANGLE chained that our host
+        // allowlist DROPPED (never forwarded). Together with the ICD-side dump this pins the
+        // -3 to a specific missing extension or unforwarded feature rather than a bare result.
+        for (const auto& e : ext_store) {
+            if (e.empty() || e == "VK_KHR_swapchain") continue;
+            if (!vk_real_dev_ext_present(phys, e.c_str()))
+                std::fprintf(stderr, "[alr-vk-host]   DROPPED-ext (Mali lacks): %s\n", e.c_str());
+        }
+        for (size_t i = 0; i < feat_bytes.size() && i < feat_types.size(); ++i) {
+            if (!vk_passthrough_feature_stype_allowed(feat_types[i]))
+                std::fprintf(stderr, "[alr-vk-host]   DROPPED-feat sType=%u (not in host allowlist)\n",
+                             feat_types[i]);
+        }
         std::fflush(stderr);
     }
     if (r == VK_SUCCESS) {

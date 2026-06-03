@@ -560,6 +560,28 @@ static VkResult VKAPI_CALL alr_vkCreateDevice(VkPhysicalDevice physicalDevice,
         if (sz) { feat_count++; need += 4u + 4u + sz; }
     }
 
+    /* WAVE-7 DEVICE-CREATE DIAG: dump the EXACT VkDeviceCreateInfo ANGLE passes — every
+     * enabled device extension name, and every pNext sType (flagged FWD if our allowlist
+     * marshals it to the host, or DROP if it is filtered out here before the wire). This is
+     * the ground truth for the host_result=-3 wall: it shows precisely which extensions /
+     * feature structs ANGLE's REAL render device requires, so a -3 can be attributed to a
+     * specific extension Mali lacks or a feature struct that never reached the host. Gated on
+     * ALR_ICD_DIAG (zero cost otherwise). */
+    if (alr_icd_diag_on()) {
+        for (uint32_t i = 0; i < ext_count; ++i) {
+            const char *nm = pCreateInfo->ppEnabledExtensionNames
+                                 ? pCreateInfo->ppEnabledExtensionNames[i] : NULL;
+            ALR_ICD_DIAG("vkCreateDevice ext[%u]=%s", i, nm ? nm : "(null)");
+        }
+        for (const VkBaseInStructure *p = pCreateInfo
+                 ? (const VkBaseInStructure *)pCreateInfo->pNext : NULL;
+             p; p = p->pNext) {
+            uint32_t sz = alr_icd_feature_struct_size((uint32_t)p->sType);
+            ALR_ICD_DIAG("vkCreateDevice pNext sType=%u %s", (uint32_t)p->sType,
+                         sz ? "FWD" : "DROP(not in feature allowlist)");
+        }
+    }
+
     uint8_t *req = (uint8_t *)malloc(need);
     if (!req) { free(dev); return VK_ERROR_OUT_OF_HOST_MEMORY; }
     {
