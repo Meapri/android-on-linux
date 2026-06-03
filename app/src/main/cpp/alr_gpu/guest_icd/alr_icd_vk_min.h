@@ -113,6 +113,23 @@ typedef enum VkStructureType {
     VK_STRUCTURE_TYPE_MAX_ENUM = 0x7FFFFFFF
 } VkStructureType;
 
+/* FULL DEVICE PASSTHROUGH: a base header for walking a pNext chain (every Vulkan struct
+ * begins with { sType, pNext }). We never deref past these two words for an UNKNOWN struct
+ * — we only ship structs whose sType is in our size table (alr_icd_feature_struct_size). */
+typedef struct VkBaseInStructure {
+    VkStructureType            sType;
+    const struct VkBaseInStructure* pNext;
+} VkBaseInStructure;
+
+/* sType values for the device-feature structs ANGLE's RendererVk may chain off
+ * VkDeviceCreateInfo.pNext (official Vulkan constants). The size table below maps each to
+ * its struct byte length so the guest can ship the WHOLE struct verbatim over the wire; the
+ * host re-validates the sType against its own allowlist before chaining it to real Mali. */
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2_VAL 1000059000
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES_VAL 49
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES_VAL 51
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES_VAL 53
+
 /* Selected VK-M4 enum values the guest app may set (passed opaquely to the ICD). */
 #define VK_SHADER_STAGE_VERTEX_BIT 0x00000001u
 #define VK_SHADER_STAGE_FRAGMENT_BIT 0x00000010u
@@ -427,6 +444,30 @@ typedef struct VkPhysicalDeviceSparseImageFormatInfo2 {
     VkImageUsageFlags  usage;
     VkImageTiling      tiling;
 } VkPhysicalDeviceSparseImageFormatInfo2;
+
+/* FULL DEVICE PASSTHROUGH: the byte size of a device-feature struct the guest may forward
+ * over the wire, by sType. Returns 0 for an unknown sType (the guest then DROPS that pNext
+ * struct — the feature simply stays disabled on the real device, the conservative answer).
+ * Sizes are the official 64-bit-ABI struct sizes ({sType u32, pad u32, pNext ptr}=16-byte
+ * header + N×VkBool32, rounded up to 8-byte alignment). VkPhysicalDeviceFeatures2 uses the
+ * guest's own exact struct size. Note: since the ICD advertises ZERO optional features in
+ * vkGetPhysicalDeviceFeatures2, a conformant client (ANGLE) enables none, so in practice the
+ * only struct on the wire is an all-zero VkPhysicalDeviceFeatures2 — but we size the common
+ * core-version feature structs too so a client that chains them is handled, not truncated. */
+static inline uint32_t alr_icd_feature_struct_size(uint32_t s_type) {
+    switch (s_type) {
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2_VAL:
+            return (uint32_t)sizeof(VkPhysicalDeviceFeatures2);  /* exact, guest-defined */
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES_VAL:
+            return 16 + 12 * 4;   /* 12 VkBool32 */
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES_VAL:
+            return 16 + 47 * 4;   /* 47 VkBool32 */
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES_VAL:
+            return 16 + 15 * 4;   /* 15 VkBool32 */
+        default:
+            return 0;             /* unknown: drop (feature stays off) */
+    }
+}
 
 /* The "2" sType values (official Vulkan constants). */
 #define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 1000059000

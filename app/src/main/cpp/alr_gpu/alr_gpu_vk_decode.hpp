@@ -30,6 +30,7 @@
 #define ALR_GPU_ALR_GPU_VK_DECODE_HPP
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <string>
@@ -292,6 +293,12 @@ struct VkDecodeState {
         VkPhysicalDevice phys = VK_NULL_HANDLE;
         VkDevice dev = VK_NULL_HANDLE;
         uint32_t gfx_family = 0;
+        // FULL DEVICE PASSTHROUGH: the queue families+counts this device was ACTUALLY
+        // created with (family -> queue_count). For the coarse CREATE_DEVICE path this is
+        // { gfx_family -> 1 }; for CREATE_DEVICE2 it mirrors the client's queue-create
+        // list. GET_DEVICE_QUEUE2 consults this so it never asks the driver for a
+        // (family,index) the device wasn't built with (the GetDeviceQueue null-deref).
+        std::map<uint32_t, uint32_t> queue_counts;
     };
     std::map<uint32_t, RealDevice> real_dev;       // vdev -> logical device
     std::map<uint32_t, VkQueue> real_queue;        // vqueue -> queue
@@ -520,6 +527,7 @@ inline VkResult vk_real_create_device(VkDecodeState& st, uint32_t vphys, uint32_
         rd.phys = phys;
         rd.dev = dev;
         rd.gfx_family = family;
+        rd.queue_counts[family] = 1;  // the single queue this coarse path created
         st.real_dev[vdev] = rd;
         gfx_family_out = family;
     }
@@ -532,6 +540,230 @@ inline void vk_real_get_queue(VkDecodeState& st, uint32_t vdev, uint32_t queue_i
     if (it == st.real_dev.end()) return;
     VkQueue q = VK_NULL_HANDLE;
     vkGetDeviceQueue(it->second.dev, it->second.gfx_family, queue_index, &q);
+    if (q != VK_NULL_HANDLE) st.real_queue[vqueue] = q;
+}
+
+// ---- FULL DEVICE PASSTHROUGH: the allowlist of pNext feature sTypes we forward to the
+// real Mali vkCreateDevice. Each is a self-contained { sType, pNext, <bools/limits> }
+// struct ANGLE may chain off VkDeviceCreateInfo.pNext (typically a single
+// VkPhysicalDeviceFeatures2 plus a handful of core-promoted feature structs). We forward
+// only KNOWN structs (so a malformed/unknown sType from the wire can never make the host
+// driver walk a bogus pNext), reconstructing each into a fixed local buffer and relinking
+// the chain. An unknown sType on the wire is DROPPED (the feature simply stays disabled —
+// the conservative, conformant outcome), never blindly chained. ----
+inline bool vk_passthrough_feature_stype_allowed(uint32_t s_type) {
+    switch (s_type) {
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2:
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES:
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES:
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES:
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES:
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES:
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES:
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES:
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES:
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES:
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROTECTED_MEMORY_FEATURES:
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES:
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES:
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES:
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES:
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES:
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES:
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES:
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SEPARATE_DEPTH_STENCIL_LAYOUTS_FEATURES:
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES:
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES:
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES:
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT:
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT:
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT:
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT:
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES_EXT:
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT:
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT:
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// FULL DEVICE PASSTHROUGH: create a real Mali VkDevice from the CLIENT's actual
+// VkDeviceCreateInfo (queue families+counts, enabled device extensions, allowlisted pNext
+// feature chain decoded from the wire). `qcis` is (family,count) pairs; `exts` the enabled
+// device-extension names; `feat_bytes`/`feat_types` the allowlisted feature structs (each
+// the WHOLE struct incl. its sType/pNext header, relinked here). On success fills
+// st.real_dev[vdev] (incl. queue_counts) and reports the first graphics family used.
+inline VkResult vk_real_create_device2(
+    VkDecodeState& st, uint32_t vphys, uint32_t vdev,
+    const std::vector<std::pair<uint32_t, uint32_t>>& qcis,
+    const std::vector<std::string>& exts,
+    const std::vector<std::vector<uint8_t>>& feat_bytes,
+    const std::vector<uint32_t>& feat_types, uint32_t& gfx_family_out) {
+    auto it = st.real_phys.find(vphys);
+    if (it == st.real_phys.end()) {
+        std::fprintf(stderr, "[alr-vk-host] create_device2 FAIL: vphys=%u not in real_phys "
+                             "(map size=%zu)\n", vphys, st.real_phys.size());
+        std::fflush(stderr);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    VkPhysicalDevice phys = it->second;
+
+    // The device's available queue families (so we never request a count beyond what the
+    // family supports, and so we can pick the graphics family to report back).
+    uint32_t nqf = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(phys, &nqf, nullptr);
+    std::vector<VkQueueFamilyProperties> qfprops(nqf ? nqf : 1);
+    if (nqf) vkGetPhysicalDeviceQueueFamilyProperties(phys, &nqf, qfprops.data());
+
+    // Build the queue-create list from the client's request, clamped to what each family
+    // actually supports. If the client asked for nothing (defensive), fall back to one
+    // queue on the first graphics family — the coarse path's behavior.
+    static const float kPrios[64] = {
+        1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+        1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1};
+    std::vector<VkDeviceQueueCreateInfo> qci;
+    std::map<uint32_t, uint32_t> created_counts;
+    uint32_t first_gfx = UINT32_MAX;
+    for (const auto& fc : qcis) {
+        uint32_t fam = fc.first, want = fc.second ? fc.second : 1;
+        if (nqf && fam >= nqf) continue;  // out-of-range family: skip (never request it)
+        uint32_t avail = (nqf && fam < nqf) ? qfprops[fam].queueCount : want;
+        uint32_t cnt = want < avail ? want : avail;
+        if (cnt == 0) cnt = 1;
+        if (cnt > 64) cnt = 64;
+        VkDeviceQueueCreateInfo q{};
+        q.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        q.queueFamilyIndex = fam;
+        q.queueCount = cnt;
+        q.pQueuePriorities = kPrios;
+        qci.push_back(q);
+        created_counts[fam] = cnt;
+        if (first_gfx == UINT32_MAX && (!nqf || (qfprops[fam].queueFlags & VK_QUEUE_GRAPHICS_BIT)))
+            first_gfx = fam;
+    }
+    if (qci.empty()) {
+        uint32_t fam = 0;
+        if (!vk_real_gfx_family(phys, fam)) return VK_ERROR_INITIALIZATION_FAILED;
+        VkDeviceQueueCreateInfo q{};
+        q.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        q.queueFamilyIndex = fam;
+        q.queueCount = 1;
+        q.pQueuePriorities = kPrios;
+        qci.push_back(q);
+        created_counts[fam] = 1;
+        first_gfx = fam;
+    }
+    if (first_gfx == UINT32_MAX) first_gfx = qci.front().queueFamilyIndex;
+
+    // Intersect the client's enabled extensions with what Mali actually exposes (never
+    // pass an extension the driver doesn't have — vkCreateDevice would reject the whole
+    // create). ALSO ensure the AHB external-memory pair the host's own present path needs
+    // is enabled even if the client didn't ask (our swapchain import depends on it), so the
+    // passthrough device stays compatible with the AHB present rung.
+    std::vector<const char*> dev_ext;
+    auto add_ext_if_present = [&](const char* name) {
+        if (vk_real_dev_ext_present(phys, name)) {
+            for (const char* e : dev_ext) if (std::strcmp(e, name) == 0) return;
+            dev_ext.push_back(name);
+        }
+    };
+    // Keep the c_str storage alive for the duration of the create.
+    std::vector<std::string> ext_store = exts;
+    for (const auto& e : ext_store) {
+        if (e.empty()) continue;
+        // VK_KHR_swapchain is a real WSI extension Mali exposes, but our ICD's swapchain is
+        // a host-side AHB rotation (no on-screen VkSurface), so enabling the driver's real
+        // swapchain is unnecessary AND could pull in surface deps; the host present path
+        // does NOT use the driver swapchain. Drop it (the guest ICD answers swapchain ops).
+        if (e == "VK_KHR_swapchain") continue;
+        if (vk_real_dev_ext_present(phys, e.c_str())) {
+            bool dup = false;
+            for (const char* p : dev_ext) if (e == p) { dup = true; break; }
+            if (!dup) dev_ext.push_back(e.c_str());
+        }
+    }
+    add_ext_if_present(kAlrVkAhbExt);
+    add_ext_if_present("VK_EXT_queue_family_foreign");
+
+    // Rebuild the allowlisted feature pNext chain from the wire bytes into stable local
+    // storage, relinking each struct's pNext to the next. Every struct begins with
+    // { VkStructureType sType; void* pNext; } so we can splice pNext after copying.
+    // VkPhysicalDeviceFeatures2 (if present) is chained the same way; vkCreateDevice reads
+    // .features from it. We do NOT also set dci.pEnabledFeatures (mutually exclusive with a
+    // Features2 in pNext); if no Features2 came over the wire, pEnabledFeatures stays null
+    // (all-core, the conservative default).
+    std::vector<std::vector<uint8_t>> feat_store;  // owns the reconstructed structs
+    feat_store.reserve(feat_bytes.size());
+    struct Hdr { VkStructureType sType; void* pNext; };
+    for (size_t i = 0; i < feat_bytes.size(); ++i) {
+        if (i >= feat_types.size()) break;
+        if (!vk_passthrough_feature_stype_allowed(feat_types[i])) continue;
+        if (feat_bytes[i].size() < sizeof(Hdr)) continue;  // too small to be a real struct
+        feat_store.push_back(feat_bytes[i]);
+    }
+    void* chain_head = nullptr;
+    for (size_t i = feat_store.size(); i-- > 0;) {
+        Hdr h{};
+        std::memcpy(&h, feat_store[i].data(), sizeof(Hdr));
+        h.pNext = chain_head;  // relink: this struct -> the previously-linked one
+        std::memcpy(feat_store[i].data(), &h, sizeof(Hdr));
+        chain_head = feat_store[i].data();
+    }
+
+    VkDeviceCreateInfo dci{};
+    dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    dci.pNext = chain_head;  // the allowlisted Features2 + feature-struct chain (may be null)
+    dci.queueCreateInfoCount = static_cast<uint32_t>(qci.size());
+    dci.pQueueCreateInfos = qci.data();
+    dci.enabledExtensionCount = static_cast<uint32_t>(dev_ext.size());
+    dci.ppEnabledExtensionNames = dev_ext.empty() ? nullptr : dev_ext.data();
+    VkDevice dev = VK_NULL_HANDLE;
+    VkResult r = vkCreateDevice(phys, &dci, nullptr, &dev);
+    if (r != VK_SUCCESS) {
+        // Diagnose a real-Mali create rejection (the forwarded ext/feature/queue set Mali
+        // refused) so a device run pins WHY the full-passthrough device failed rather than
+        // a bare VkResult on the wire. Quiet on success (no per-create spam).
+        std::string el;
+        for (const char* e : dev_ext) { el += e; el += ' '; }
+        std::fprintf(stderr, "[alr-vk-host] create_device2 vphys=%u qci=%zu(fam0_cnt=%u) "
+                             "ext=%zu[%s] feat=%zu -> VkResult=%d\n",
+                     vphys, qci.size(),
+                     created_counts.count(0) ? created_counts[0] : 0u,
+                     dev_ext.size(), el.c_str(), feat_store.size(), (int)r);
+        std::fflush(stderr);
+    }
+    if (r == VK_SUCCESS) {
+        VkDecodeState::RealDevice rd;
+        rd.phys = phys;
+        rd.dev = dev;
+        rd.gfx_family = first_gfx;
+        rd.queue_counts = created_counts;
+        st.real_dev[vdev] = rd;
+        gfx_family_out = first_gfx;
+    }
+    return r;
+}
+
+// FULL DEVICE PASSTHROUGH: queue-family-aware get-device-queue. Binds vqueue to the real
+// queue at (family,index) — but ONLY if the device was created with a queue there, so the
+// driver's GetDeviceQueue can never null-deref on an un-created (family,index). If the
+// requested family/index wasn't created, we fall back to the device's recorded gfx_family
+// index 0 (a valid queue) so the client still gets a usable queue rather than a crash.
+inline void vk_real_get_queue2(VkDecodeState& st, uint32_t vdev, uint32_t queue_family_index,
+                               uint32_t queue_index, uint32_t vqueue) {
+    auto it = st.real_dev.find(vdev);
+    if (it == st.real_dev.end()) return;
+    uint32_t fam = queue_family_index, idx = queue_index;
+    auto qc = it->second.queue_counts.find(fam);
+    if (qc == it->second.queue_counts.end() || idx >= qc->second) {
+        // Not a queue this device was built with — use the known-good graphics queue 0.
+        fam = it->second.gfx_family;
+        idx = 0;
+    }
+    VkQueue q = VK_NULL_HANDLE;
+    vkGetDeviceQueue(it->second.dev, fam, idx, &q);
     if (q != VK_NULL_HANDLE) st.real_queue[vqueue] = q;
 }
 
@@ -1773,6 +2005,16 @@ struct VkProvider {
                          uint32_t* gfx_family_out) = nullptr;
     void (*get_queue)(void* ctx, uint32_t vdev, uint32_t queue_index,
                       uint32_t vqueue) = nullptr;
+    // FULL DEVICE PASSTHROUGH seams (synthetic/wire mode; null = host real-Mali path).
+    // create_device2 forwards the client's actual queue list / extensions / feature chain.
+    int (*create_device2)(void* ctx, uint32_t vphys, uint32_t vdev,
+                          const std::vector<std::pair<uint32_t, uint32_t>>& qcis,
+                          const std::vector<std::string>& exts,
+                          const std::vector<std::vector<uint8_t>>& feat_bytes,
+                          const std::vector<uint32_t>& feat_types,
+                          uint32_t* gfx_family_out) = nullptr;
+    void (*get_queue2)(void* ctx, uint32_t vdev, uint32_t queue_family_index,
+                       uint32_t queue_index, uint32_t vqueue) = nullptr;
     int (*create_pool)(void* ctx, uint32_t vdev, uint32_t vpool) = nullptr;
     int (*alloc_cmd)(void* ctx, uint32_t vdev, uint32_t vpool, uint32_t vcmd) = nullptr;
     // Replay the clear+submit; fill px[4] (RGBA 0..255); return AlrVkRenderResult.
@@ -1956,6 +2198,86 @@ inline bool decode_vk_batch(const uint8_t* data, size_t len, VkDecodeState& st,
 #endif
                 if (provider && provider->get_queue)
                     provider->get_queue(provider->ctx, vdev, queue_index, vqueue);
+                st.queues[vqueue] = true;  // client-side virtual id, no reply needed
+                st.decoded++;
+                break;
+            }
+
+            // ---- FULL DEVICE PASSTHROUGH ops ----
+            case ALR_VK_OP_CREATE_DEVICE2: {
+                uint32_t vinst = 0, vphys = 0, vdev = 0;
+                if (!r.u32(vinst) || !r.u32(vphys) || !r.u32(vdev)) { st.ok = false; break; }
+                // queue-create list
+                uint32_t qci_count = 0;
+                if (!r.u32(qci_count)) { st.ok = false; break; }
+                if (qci_count > 64) { st.ok = false; break; }  // sane cap (matches kPrios)
+                std::vector<std::pair<uint32_t, uint32_t>> qcis;
+                qcis.reserve(qci_count);
+                for (uint32_t i = 0; i < qci_count; ++i) {
+                    uint32_t fam = 0, cnt = 0;
+                    if (!r.u32(fam) || !r.u32(cnt)) { st.ok = false; break; }
+                    qcis.emplace_back(fam, cnt);
+                }
+                if (!st.ok) break;
+                // enabled device extensions
+                uint32_t ext_count = 0;
+                if (!r.u32(ext_count)) { st.ok = false; break; }
+                if (ext_count > 256) { st.ok = false; break; }
+                std::vector<std::string> exts;
+                exts.reserve(ext_count);
+                for (uint32_t i = 0; i < ext_count; ++i) {
+                    const uint8_t* d = nullptr; uint32_t n = 0;
+                    if (!r.blob(d, n)) { st.ok = false; break; }
+                    if (n > 256) { st.ok = false; break; }  // VK_MAX_EXTENSION_NAME_SIZE bound
+                    exts.emplace_back(reinterpret_cast<const char*>(d), n);
+                }
+                if (!st.ok) break;
+                // allowlisted pNext feature structs
+                uint32_t feat_count = 0;
+                if (!r.u32(feat_count)) { st.ok = false; break; }
+                if (feat_count > 64) { st.ok = false; break; }
+                std::vector<uint32_t> feat_types;
+                std::vector<std::vector<uint8_t>> feat_bytes;
+                feat_types.reserve(feat_count);
+                feat_bytes.reserve(feat_count);
+                for (uint32_t i = 0; i < feat_count; ++i) {
+                    uint32_t stype = 0; const uint8_t* d = nullptr; uint32_t n = 0;
+                    if (!r.u32(stype) || !r.blob(d, n)) { st.ok = false; break; }
+                    if (n > 1024) { st.ok = false; break; }  // a feature struct is small
+                    feat_types.push_back(stype);
+                    feat_bytes.emplace_back(d, d + n);
+                }
+                if (!st.ok) break;
+
+                int res = -1;
+                uint32_t gfx_family = 0;
+#ifdef ALR_VK_DECODE_REAL
+                if (!provider)
+                    res = static_cast<int>(vk_real_create_device2(
+                        st, vphys, vdev, qcis, exts, feat_bytes, feat_types, gfx_family));
+#endif
+                if (provider && provider->create_device2)
+                    res = provider->create_device2(provider->ctx, vphys, vdev, qcis, exts,
+                                                   feat_bytes, feat_types, &gfx_family);
+                if (res == 0) st.devices[vdev] = true;
+                reply.u8(static_cast<uint8_t>(ALR_VK_REPLY_DEVICE));
+                reply.u32(vdev);
+                reply.i32(res);
+                reply.u32(gfx_family);
+                st.decoded++;
+                break;
+            }
+
+            case ALR_VK_OP_GET_DEVICE_QUEUE2: {
+                uint32_t vdev = 0, fam = 0, queue_index = 0, vqueue = 0;
+                if (!r.u32(vdev) || !r.u32(fam) || !r.u32(queue_index) || !r.u32(vqueue)) {
+                    st.ok = false; break;
+                }
+#ifdef ALR_VK_DECODE_REAL
+                if (!provider) vk_real_get_queue2(st, vdev, fam, queue_index, vqueue);
+#endif
+                if (provider && provider->get_queue2)
+                    provider->get_queue2(provider->ctx, vdev, fam, queue_index, vqueue);
                 st.queues[vqueue] = true;  // client-side virtual id, no reply needed
                 st.decoded++;
                 break;
