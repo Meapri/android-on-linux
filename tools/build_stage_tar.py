@@ -55,6 +55,14 @@ class BuildResult:
     file_count: int
     flattened: tuple[str, ...]      # directory-scoped soname keys flattened
     dropped_symlinks: int
+    # SONAME-alias symlinks synthesized when a flattened real library's embedded
+    # DT_SONAME differs from its FILENAME-derived flat name (e.g. libxaw7 ships the
+    # real file ``libXaw7.so.7.0.0`` whose DT_SONAME is ``libXaw.so.7`` — consumers
+    # link the DT_SONAME, but flattening emits the filename name ``libXaw7.so.7``).
+    # Each entry is the rootfs-relative alias path (``…/libXaw.so.7``); the alias is
+    # a relative symlink to the flat file in the same directory. Empty for the common
+    # case where every real lib's filename matches its DT_SONAME (byte-identical out).
+    soname_aliases: tuple[str, ...] = ()
 
 
 # --------------------------------------------------------------------------- #
@@ -233,10 +241,16 @@ def build_stage_tar(
             rel == pref or rel.startswith(pref + "/") for pref in include_prefixes
         )
 
+    # Lazy: the ELF reader may post-date this import site (matches deb_closure).
+    # Used to recover a flattened lib's TRUE DT_SONAME so we can re-synthesize the
+    # SONAME-alias symlink that flattening drops when filename != DT_SONAME.
+    from tools.elf_needed import read_elf_dynamic
+
     so_groups, plain_files, dev_symlinks, extra_dropped_dev = _classify(src_root)
 
     sidecar: dict[str, str] = {}
     flattened: list[str] = []
+    soname_aliases: list[str] = []
     dropped_symlinks = 0
     file_count = 0
 
@@ -286,6 +300,42 @@ def build_stage_tar(
             file_count += 1
             flattened.append(key)
 
+            # SONAME-alias: a few Debian libraries ship a real file whose BASENAME
+            # encodes a different soname than the binary's embedded DT_SONAME — the
+            # canonical case is libxaw7's ``libXaw7.so.7.0.0`` (DT_SONAME
+            # ``libXaw.so.7``), reached on disk via ``libXaw.so.7 -> libXaw7.so.7 ->
+            # libXaw7.so.7.0.0``. parse_solib keys off the FILENAME, so flattening
+            # emits ``libXaw7.so.7`` and DROPS the ``libXaw.so.7`` link (step 2's
+            # symlink purge) — yet every consumer DT_NEEDEDs ``libXaw.so.7`` (e.g.
+            # xcalc), so the guest dies "libXaw.so.7: cannot open shared object
+            # file". Recover the real DT_SONAME from the chosen ELF; when it differs
+            # from the flat name, re-create the alias as a RELATIVE symlink to the
+            # flat file in the same directory (idempotent, base does the same via its
+            # own SONAME link). No-op when filename == DT_SONAME (the overwhelming
+            # majority), so existing overlays are byte-identical.
+            try:
+                dt_soname = read_elf_dynamic(chosen_full).soname
+            except OSError:
+                dt_soname = None
+            if dt_soname and dt_soname != soname and "/" not in dt_soname:
+                alias_rel = f"{directory}/{dt_soname}" if directory else dt_soname
+                # Suppress ONLY when a *real* library already provides the DT_SONAME
+                # name in this directory (its own flat file would be emitted, so an
+                # alias would collide). A symlink-ONLY group for the DT_SONAME (e.g.
+                # libxaw7's ``libXaw.so.7 -> libXaw7.so.7`` link, which _classify
+                # buckets into its own dangling group) is exactly what we are
+                # re-synthesizing — it must NOT suppress the alias.
+                real_provider = any(
+                    (g.real_versioned or g.real_flat)
+                    and (f"{g.directory}/{g.soname}" if g.directory else g.soname)
+                    == alias_rel
+                    for g in so_groups.values()
+                )
+                if included(alias_rel) and not real_provider:
+                    _add_symlink(tar, alias_rel, soname)
+                    file_count += 1
+                    soname_aliases.append(alias_rel)
+
             # sidecar: prefer an explicit version override for this soname.
             override = versions.get(soname) if versions else None
             sidecar[soname_rel] = override if override else _fmt_version(chosen_version)
@@ -311,6 +361,7 @@ def build_stage_tar(
         file_count=file_count,
         flattened=tuple(sorted(flattened)),
         dropped_symlinks=dropped_symlinks,
+        soname_aliases=tuple(sorted(soname_aliases)),
     )
 
 
