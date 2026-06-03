@@ -245,6 +245,8 @@ def test_closure_shape_offline_against_a_synthetic_index():
                  "Filename": "pool/main/libz/zstd.deb"},
         "coreutils": {"Package": "coreutils", "Depends": "libc6", "Size": "1362772",
                       "Filename": "pool/main/c/coreutils/coreutils.deb"},
+        "sed": {"Package": "sed", "Depends": "libc6", "Size": "171910",
+                "Filename": "pool/main/s/sed/sed.deb"},
         "bash": {"Package": "bash", "Depends": "libc6", "Size": "780262",
                  "Filename": "pool/main/b/bash/bash.deb"},
         "dash": {"Package": "dash", "Depends": "libc6", "Size": "90376",
