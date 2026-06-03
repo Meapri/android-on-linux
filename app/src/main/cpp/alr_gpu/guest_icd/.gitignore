@@ -1,0 +1,3 @@
+# build-icd.sh artifacts (the ICD .so + client are regenerated, not tracked — mirrors
+# the GLES guest_shim/out/ convention).
+out/

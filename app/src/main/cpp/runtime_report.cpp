@@ -110,6 +110,13 @@
 // ALR_VK_DECODE_REAL pulls <vulkan/vulkan.h> (NDK) + selects run_vk_marshal_mali_probe().
 #define ALR_VK_DECODE_REAL 1
 #include "alr_gpu/alr_gpu_vk_marshal_probe.hpp"
+// alr_gpu_vk_host_service.hpp: the app-process HALF of the guest Vulkan ICD path — a
+// servicer thread that drains the guest ICD's request ring, replays each Vulkan batch
+// on the REAL vendor Mali libvulkan (decode_vk_batch, ALR_VK_DECODE_REAL), and writes
+// the reply ring the ICD consumes. alr_loader_attach_vk_ring()/vk_ring_guest_env() are
+// the loader wiring (gated on ALR_VK_ICD=1); run_vk_icd_servicer_probe() is the host
+// self-test. The guest half is alr_gpu/guest_icd/ (SONAME libvulkan.so.1).
+#include "alr_gpu/alr_gpu_vk_host_service.hpp"
 // alr_jit_probe.hpp: V8-style iterative W^X (RW<->RX) executable-memory cycle probe —
 // decides whether Chromium (V8/SwiftShader JIT) can run WITHOUT --jitless on this
 // untrusted_app domain. Pure anonymous mmap/mprotect; no memfd-exec (that's EACCES).
@@ -1553,12 +1560,22 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         const char* ga = ::getenv("ALR_GPU_ACCEL");
         if (ga && ga[0] == '1') gpu_accel_requested = true;
     }
+    // VK-M3 (guest Vulkan ICD): a SEPARATE, narrow opt-in (ALR_VK_ICD=1) puts our
+    // libvulkan.so.1 (alr_gpu/guest_icd/) first on the guest library path and attaches
+    // the VK request/reply rings (further down). Kept distinct from gpu_accel_requested
+    // so a GLES-only guest never accidentally binds the (ENUM-rung) Vulkan ICD, and a
+    // Vulkan guest never needs the GLES shim. Either gate prepends /usr/lib/androlinux.
+    bool vk_icd_requested = false;
+    {
+        const char* vi = ::getenv("ALR_VK_ICD");
+        if (vi && vi[0] == '1') vk_icd_requested = true;
+    }
     // CP-2: a GLES guest (glmark2) dlopens the GPU shim libEGL.so.1/libGLESv2.so.2 from
     // /usr/lib/androlinux — it MUST resolve ahead of any rootfs/vendor GL lib, so prepend
     // that dir. Gated on accel-request so the general path never risks shim-shadowing a
     // real libEGL (non-GPU guests don't dlopen those sonames anyway).
     const std::string ld_shim =
-        gpu_accel_requested
+        (gpu_accel_requested || vk_icd_requested)
             ? (config.rootfs_dir + "/usr/lib/androlinux:") : std::string();
     guest_env.push_back("LD_LIBRARY_PATH=" + ld_shim +
                         config.rootfs_dir + "/lib/aarch64-linux-gnu:" +
@@ -1807,6 +1824,31 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
             for (const auto& kv : alr::gpu::gpu_ring_guest_env(gpu_ring))
                 guest_env.push_back(kv);
         }
+    }
+    // VK-M3: attach the guest Vulkan ICD's request/reply rings + start the host
+    // servicer (owns NDK libvulkan, replays each batch on real Mali) when the guest
+    // opted into the ICD (ALR_VK_ICD=1). The ICD (libvulkan.so.1) inherits the memfd
+    // fds and reads ALR_VK_RING_FD/BYTES + ALR_VK_REPLY_FD/BYTES from the env we push.
+    // Attach failure → no env pushed; the ICD then reports 0 devices (ring-less) rather
+    // than crashing. VK_LOADER_DEBUG is forwarded for the device test (harmless to the
+    // direct-SONAME path; lights up a real Vulkan loader if one is ever present).
+    alr::gpu::VkRing vk_ring{};
+    bool vk_ring_attached = false;
+    if (vk_icd_requested) {
+        if (alr::gpu::alr_loader_attach_vk_ring(vk_ring)) {
+            vk_ring_attached = true;
+            for (const auto& kv : alr::gpu::vk_ring_guest_env(vk_ring))
+                guest_env.push_back(kv);
+        }
+        // Forward VK_LOADER_DEBUG (e.g. =all) into the guest so a device run can trace
+        // ICD discovery; only set if the host has it, so the default run is quiet.
+        if (const char* vld = ::getenv("VK_LOADER_DEBUG"))
+            guest_env.push_back(std::string("VK_LOADER_DEBUG=") + vld);
+        // If a future build takes the LOADER route (real Khronos loader + our ICD
+        // manifest) instead of the direct-SONAME route, point the loader at the manifest
+        // the vk-icd overlay stages. Harmless for the direct route (no loader reads it).
+        guest_env.push_back("VK_ICD_FILENAMES=" + config.rootfs_dir +
+                            "/usr/lib/androlinux/alr_icd.json");
     }
     const auto t_exec_start = std::chrono::steady_clock::now();  // WS-1 M2: native-exec wall-clock (fork→reap)
     const pid_t pid = ::fork();
@@ -4266,6 +4308,8 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
 
     // WS-1 ↔ WS-2 (CP-0): guest reaped → stop the Mali executor + free ring/doorbell.
     if (gpu_ring_attached) alr::gpu::alr_loader_detach_gpu_ring();
+    // VK-M3: guest reaped → stop the Vulkan ICD servicer + free its request/reply rings.
+    if (vk_ring_attached) alr::gpu::alr_loader_detach_vk_ring();
     return out.str();
 }
 
@@ -7265,6 +7309,21 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeAlrGpuVkDrawProbe(
     jobject /* thiz */) {
     const auto report = alr::gpu::run_vk_draw_mali_probe();
     __android_log_print(ANDROID_LOG_INFO, "alr_loader", "vk-draw:\n%s", report.c_str());
+    return env->NewStringUTF(report.c_str());
+}
+
+// VK-M3 (guest Vulkan ICD): HOST-side self-test of the ICD's servicer + dual-ring
+// transport — a host producer speaks the SAME wire the guest libvulkan.so.1 ICD emits
+// (create-instance/enumerate/props), the servicer thread replays it on real Mali +
+// writes the reply ring, and the reply is decoded to assert "Mali-G615 MC2" surfaced.
+// This is the host gate for the servicer half (the forked-guest ICD end-to-end is the
+// alr-vk-enum device test). Gating line: "ALR VK ICD SERVICE: PASS".
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeAlrGpuVkIcdServiceProbe(
+    JNIEnv* env,
+    jobject /* thiz */) {
+    const auto report = alr::gpu::run_vk_icd_servicer_probe();
+    __android_log_print(ANDROID_LOG_INFO, "alr_loader", "vk-icd-service:\n%s", report.c_str());
     return env->NewStringUTF(report.c_str());
 }
 
