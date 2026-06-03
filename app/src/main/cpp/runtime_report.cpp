@@ -1808,6 +1808,35 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
             guest_env.push_back(std::string("ALR_INTERPOSE_DIAG=") + idiag);
         }
     }
+    // [DIAG-ANGLE] One-shot: when ALR_INTERPOSE_DIAG is armed, dump the COMPLETE
+    // guest_env vector (every entry, in order) to the report so a device run can SEE
+    // exactly what ld.so receives (LD_PRELOAD position/value, LD_LIBRARY_PATH, and
+    // whether anything past kMaxEnv would be truncated). Also re-open() the LD_PRELOAD
+    // interposer path here in the PARENT (same abs path ld.so will open) and record
+    // the open result + errno, so a preload that ld.so silently refuses (ENOENT/EACCES)
+    // is caught directly rather than inferred from a missing ctor log.
+    {
+        const char* idg2 = ::getenv("ALR_INTERPOSE_DIAG");
+        if (idg2 != nullptr && idg2[0] != '0' && idg2[0] != '\0') {
+            out << "\nalr native loader [DIAG-ANGLE] guest_env count=" << guest_env.size()
+                << " (kMaxEnv=" << 64 << ")";
+            for (std::size_t i = 0; i < guest_env.size(); ++i) {
+                const std::string& e = guest_env[i];
+                if (e.rfind("LD_PRELOAD=", 0) == 0 || e.rfind("LD_LIBRARY_PATH=", 0) == 0 ||
+                    e.rfind("ALR_ANGLE", 0) == 0 || e.rfind("ALR_PCGATE", 0) == 0 ||
+                    e.rfind("ALR_ROOTFS=", 0) == 0 || e.rfind("ALR_DISABLE_INTERPOSE", 0) == 0 ||
+                    i >= 60) {
+                    out << "\nalr native loader [DIAG-ANGLE] env[" << i << "]=" << e;
+                }
+            }
+            std::string pre_chk =
+                config.rootfs_dir + "/usr/lib/androlinux/libalr_interpose.so";
+            const int pfd = ::open(pre_chk.c_str(), O_RDONLY | O_CLOEXEC);
+            out << "\nalr native loader [DIAG-ANGLE] preload_open(" << pre_chk
+                << ") fd=" << pfd << " errno=" << (pfd < 0 ? errno : 0);
+            if (pfd >= 0) ::close(pfd);
+        }
+    }
     // Record both arms in the report so each run is self-identifying for A/B.
     out << "\nalr native loader pcgate=" << (pcgate_on ? "on" : "off")
         << " interpose=" << (interpose_off ? "off" : "on");

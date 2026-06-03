@@ -32,6 +32,22 @@ import java.net.SocketTimeoutException
 import kotlin.concurrent.thread
 
 class MainActivity : Activity() {
+    companion object {
+        // GPU Part B staging lock. The .alr-angle onCreate thread and
+        // launchAngleGlesProbe BOTH stage the vk-loader / vk-icd overlays (they ship
+        // libvulkan.so.1 + libalr_mali_icd.so + alr_icd.json into /usr/lib/androlinux).
+        // Their `!marker.isFile` check is a check-then-act, so on a cold start both
+        // threads passed it and extracted the SAME overlay CONCURRENTLY, racing on the
+        // shared sibling temp file and leaving a 0-byte libvulkan.so.1 — so ANGLE's
+        // Vulkan loader was empty and eglInitialize died with "Internal Vulkan error
+        // -3". Serializing every GPU-overlay extract behind this one JVM-wide monitor
+        // makes the two stagers mutually exclusive (the second sees the marker and
+        // no-ops), which — together with the per-extraction-unique .alrpart temp in
+        // RootfsInstaller — guarantees a complete loader on disk before ANGLE runs.
+        @JvmStatic
+        val gpuOverlayStageLock = Any()
+    }
+
     // --- Android soft-keyboard IME <-> guest zwp_text_input_v3 state ---------
     // Driven by the compositor's onGuestImeState upcall (a guest text field
     // enabled/disabled text input). imeWanted gates onCheckIsTextEditor so the IME
@@ -392,11 +408,18 @@ class MainActivity : Activity() {
                 // libvulkan.so symlink, so nothing shadows the loader).
                 val vkLoaderTar = java.io.File("/data/local/tmp/vk-loader-stage.tar")
                 val vkLoaderMarker = java.io.File(rootfsStatus.rootfsDir, ".vk-loader-staged-${vkLoaderTar.length()}")
+                // Serialize against launchAngleGlesProbe's stageOverlay("vk-loader") so the
+                // two never extract libvulkan.so.1 concurrently (the 0-byte-loader race).
+                // Double-checked: re-test the marker INSIDE the lock so the loser no-ops.
                 if (vkLoaderTar.isFile && !vkLoaderMarker.isFile) {
-                    val ovr = RootfsInstaller(this@MainActivity).extractOverlayTar(vkLoaderTar, rootfsStatus.rootfsDir)
-                    vkLoaderMarker.writeText("staged\n")
-                    android.util.Log.i("alr_loader", "vk-loader-stage: overlay done (extracted=${ovr.extracted} skipped=${ovr.skipped.size})")
-                    if (ovr.skipped.isNotEmpty()) android.util.Log.w("alr_loader", "vk-loader-stage: guard skipped:\n${ovr.skipped.joinToString("\n")}")
+                    synchronized(gpuOverlayStageLock) {
+                        if (!vkLoaderMarker.isFile) {
+                            val ovr = RootfsInstaller(this@MainActivity).extractOverlayTar(vkLoaderTar, rootfsStatus.rootfsDir)
+                            vkLoaderMarker.writeText("staged\n")
+                            android.util.Log.i("alr_loader", "vk-loader-stage: overlay done (extracted=${ovr.extracted} skipped=${ovr.skipped.size})")
+                            if (ovr.skipped.isNotEmpty()) android.util.Log.w("alr_loader", "vk-loader-stage: guard skipped:\n${ovr.skipped.joinToString("\n")}")
+                        }
+                    }
                 }
             } catch (e: Throwable) {
                 android.util.Log.e("alr_loader", "angle-stage EXC: ${android.util.Log.getStackTraceString(e)}")
@@ -3363,21 +3386,120 @@ class MainActivity : Activity() {
                 // Both only auto-stage on the cronly path; the ANGLE proof runs in the normal
                 // flow, so stage BOTH here (marker-guarded, idempotent). The vk-loader overlay
                 // also rides the .alr-angle staging thread above; double-staging is a no-op.
+                // Shares the .$name-staged-<len> marker AND the gpuOverlayStageLock with the
+                // .alr-angle onCreate stager, so vk-loader/vk-icd extract exactly once across
+                // both threads (double-checked) — never the concurrent 0-byte-loader race.
                 fun stageOverlay(name: String) {
                     try {
                         val tar = java.io.File("/data/local/tmp/$name-stage.tar")
                         val mk = java.io.File(rootfsDir, ".$name-staged-${tar.length()}")
                         if (tar.isFile && !mk.isFile) {
-                            val ovr = RootfsInstaller(this@MainActivity).extractOverlayTar(tar, rootfsDir)
-                            mk.writeText("staged\n")
-                            android.util.Log.i("alr_loader", "angle-gles: $name staged (extracted=${ovr.extracted} skipped=${ovr.skipped.size})")
+                            synchronized(gpuOverlayStageLock) {
+                                if (!mk.isFile) {
+                                    val ovr = RootfsInstaller(this@MainActivity).extractOverlayTar(tar, rootfsDir)
+                                    mk.writeText("staged\n")
+                                    android.util.Log.i("alr_loader", "angle-gles: $name staged (extracted=${ovr.extracted} skipped=${ovr.skipped.size})")
+                                }
+                            }
                         }
                     } catch (e: Throwable) {
                         android.util.Log.e("alr_loader", "angle-gles: $name stage EXC: ${android.util.Log.getStackTraceString(e)}")
                     }
                 }
+                // SELF-HEAL a device already poisoned by the pre-fix 0-byte-loader race:
+                // if libvulkan.so.1 (or the ICD) is present but EMPTY, the stale
+                // ".$name-staged-<len>" marker would otherwise make stageOverlay no-op
+                // forever. Drop the marker (under the lock) so the race-free stageOverlay
+                // re-extracts a complete file. A correct prior stage (>0 bytes) is untouched.
+                run {
+                    synchronized(gpuOverlayStageLock) {
+                        fun reStageIfEmpty(name: String, lib: java.io.File) {
+                            if (lib.isFile && lib.length() == 0L) {
+                                val tar = java.io.File("/data/local/tmp/$name-stage.tar")
+                                val mk = java.io.File(rootfsDir, ".$name-staged-${tar.length()}")
+                                mk.delete()
+                                android.util.Log.w("alr_loader", "angle-gles: $name 0-byte ${lib.name} detected → cleared marker for re-stage")
+                            }
+                        }
+                        reStageIfEmpty("vk-loader", java.io.File(rootfsDir, "usr/lib/androlinux/libvulkan.so.1"))
+                        reStageIfEmpty("vk-icd", java.io.File(rootfsDir, "usr/lib/androlinux/libalr_mali_icd.so"))
+                    }
+                }
                 stageOverlay("vk-icd")
                 stageOverlay("vk-loader")
+                // GPU Part B — ICD DISCOVERY without depending on interposer mediation.
+                // Root cause (device-proven): ANGLE's libGLESv2 dlopen()s the BARE soname
+                // "libvulkan.so.1", and ld.so resolves it from /usr/lib/androlinux-angle
+                // FIRST (it leads LD_LIBRARY_PATH under ALR_ANGLE) — but the angle overlay
+                // ships NO libvulkan there, so ANGLE never reaches our Khronos loader. AND
+                // even when it does, the loader reads alr_icd.json whose library_path is an
+                // ABSOLUTE GUEST path (/usr/lib/androlinux/libalr_mali_icd.so) that only
+                // resolves through the interposer's path rewrite — but ANGLE's libGLESv2
+                // ctor calls setenv/unsetenv, which reallocates `environ` BEFORE the
+                // LD_PRELOAD interposer ctor runs, so the interposer reads no ALR_ROOTFS,
+                // self-disables (g_rootfs_len==0), and its dlopen/path rewrites never fire
+                // → the loader's dlopen of the absolute ICD path hits the HOST root → no
+                // driver → ANGLE "Internal Vulkan error -3".
+                //
+                // FIX (no interposer dependency, no host tar rebuild): place a COMPLETE,
+                // self-consistent Vulkan stack in the dir ANGLE searches first, with an ICD
+                // manifest whose library_path is the BARE FILENAME so the Khronos loader
+                // resolves the ICD through LD_LIBRARY_PATH (androlinux-angle/androlinux are
+                // on it) instead of an absolute guest path. Runs every launch AFTER staging
+                // (so a re-extract can't revert it); idempotent (size/content compare).
+                run {
+                    try {
+                        val shared = java.io.File(rootfsDir, "usr/lib/androlinux")
+                        val angleDir = java.io.File(rootfsDir, "usr/lib/androlinux-angle")
+                        val srcLoader = java.io.File(shared, "libvulkan.so.1")
+                        val srcIcd = java.io.File(shared, "libalr_mali_icd.so")
+                        // The Khronos ICD manifest with a SEARCH-PATH-RELATIVE library_path
+                        // (bare filename). The loader treats a separator-free library_path as
+                        // a soname to dlopen via the OS search path — which finds our ICD in
+                        // androlinux-angle/androlinux without any guest-absolute rewrite.
+                        val relManifest =
+                            "{\"file_format_version\":\"1.0.1\"," +
+                                "\"ICD\":{\"library_path\":\"libalr_mali_icd.so\"," +
+                                "\"api_version\":\"1.3.0\"}}\n"
+                        fun writeManifest(f: java.io.File) {
+                            if (!f.isFile || f.readText() != relManifest) {
+                                f.parentFile?.mkdirs()
+                                f.writeText(relManifest)
+                                f.setReadable(true, false)
+                            }
+                        }
+                        fun mirror(src: java.io.File, dst: java.io.File) {
+                            if (src.isFile && src.length() > 0L &&
+                                (!dst.isFile || dst.length() != src.length())) {
+                                dst.parentFile?.mkdirs()
+                                val tmp = java.io.File(dst.parentFile, ".${dst.name}.mirror.${System.nanoTime()}")
+                                src.copyTo(tmp, overwrite = true)
+                                tmp.setReadable(true, false)
+                                tmp.setExecutable(true, false)
+                                try { android.system.Os.rename(tmp.absolutePath, dst.absolutePath) }
+                                catch (e: android.system.ErrnoException) { tmp.renameTo(dst) }
+                                if (tmp.exists()) tmp.delete()
+                            }
+                        }
+                        if (srcLoader.isFile && srcLoader.length() > 0L && srcIcd.isFile && srcIcd.length() > 0L) {
+                            // 1) Normalize the manifest the loader reads via VK_DRIVER_FILES
+                            //    (the shared-dir one) to the bare-filename form.
+                            writeManifest(java.io.File(shared, "alr_icd.json"))
+                            // 2) Mirror loader + ICD + manifest into androlinux-angle (where
+                            //    ANGLE's dlopen("libvulkan.so.1") looks first), so ANGLE binds
+                            //    OUR loader directly and the loader finds OUR ICD by soname.
+                            angleDir.mkdirs()
+                            mirror(srcLoader, java.io.File(angleDir, "libvulkan.so.1"))
+                            mirror(srcIcd, java.io.File(angleDir, "libalr_mali_icd.so"))
+                            writeManifest(java.io.File(angleDir, "alr_icd.json"))
+                            android.util.Log.i("alr_loader", "angle-gles: VK stack normalized into androlinux + androlinux-angle (bare-soname ICD manifest)")
+                        } else {
+                            android.util.Log.w("alr_loader", "angle-gles: VK stack normalize SKIP (loader=${srcLoader.length()}B icd=${srcIcd.length()}B)")
+                        }
+                    } catch (e: Throwable) {
+                        android.util.Log.e("alr_loader", "angle-gles: VK stack normalize EXC: ${android.util.Log.getStackTraceString(e)}")
+                    }
+                }
                 // Wait (bounded) for the angle overlay to finish staging into
                 // /usr/lib/androlinux-angle (its marker is written by the angle-stage thread)
                 // AND for the cube binary it ships to land, so we never race the extract.
@@ -3393,14 +3515,18 @@ class MainActivity : Activity() {
                 // dlopen("libvulkan.so.1") → loader → ICD chain needs both on disk first.
                 val loaderLib = java.io.File(rootfsDir, "usr/lib/androlinux/libvulkan.so.1")
                 val icdLib = java.io.File(rootfsDir, "usr/lib/androlinux/libalr_mali_icd.so")
+                // Require the loader + ICD to be NON-EMPTY (length>0), not merely present:
+                // the 0-byte-loader race left a zero-length libvulkan.so.1 that "exists" but
+                // can never dlopen, so isFile alone would falsely green-light ANGLE.
+                fun ready(f: java.io.File) = f.isFile && f.length() > 0L
                 var waited = 0
-                while (waited < 40000 && !(angleMarker.isFile && angleGles.isFile && loaderLib.isFile && icdLib.isFile && (vkBin.isFile || cubeBin.isFile))) {
+                while (waited < 40000 && !(angleMarker.isFile && ready(angleGles) && ready(loaderLib) && ready(icdLib) && (vkBin.isFile || cubeBin.isFile))) {
                     Thread.sleep(500); waited += 500
                 }
-                if (!(angleGles.isFile && loaderLib.isFile && icdLib.isFile && (vkBin.isFile || cubeBin.isFile))) {
+                if (!(ready(angleGles) && ready(loaderLib) && ready(icdLib) && (vkBin.isFile || cubeBin.isFile))) {
                     android.util.Log.w(
                         "alr_loader",
-                        "angle-gles: skipped (vk=${vkBin.isFile} cube=${cubeBin.isFile} angleGLES=${angleGles.isFile} loader=${loaderLib.isFile} icd=${icdLib.isFile} waited=${waited}ms)",
+                        "angle-gles: skipped (vk=${vkBin.isFile} cube=${cubeBin.isFile} angleGLES=${angleGles.isFile} loader=${loaderLib.isFile}/${loaderLib.length()}B icd=${icdLib.isFile}/${icdLib.length()}B waited=${waited}ms)",
                     )
                     return@Thread
                 }

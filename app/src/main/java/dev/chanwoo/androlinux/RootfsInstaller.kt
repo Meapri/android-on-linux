@@ -217,7 +217,22 @@ class RootfsInstaller(private val context: Context) {
                 // atomic: a concurrent open sees either the whole old inode or the whole
                 // new one, never a partial write. The temp carries the same final perms so
                 // the swapped-in file is immediately correct (no post-rename perm window).
-                val tmp = File(target.parentFile, ".${target.name}.alrpart")
+                // PER-EXTRACTION-UNIQUE temp name. The old shared ".${name}.alrpart"
+                // path collided when two stager Threads extracted the SAME overlay
+                // concurrently (e.g. the .alr-angle onCreate thread AND
+                // launchAngleGlesProbe both staging vk-loader-stage.tar): both opened
+                // the same .alrpart, and the interleaved write/setPerm/rename/finally-
+                // delete left a 0-byte libvulkan.so.1 (device-confirmed: the Khronos
+                // Vulkan-Loader extracted to 0 bytes, so ANGLE's dlopen of it could
+                // never load → "Internal Vulkan error -3", FileNotFoundException
+                // ".libvulkan.so.1.alrpart: ENOENT" in the loser thread). A tid+nanotime
+                // suffix makes each writer's temp private, so the only shared step is the
+                // atomic rename(2) onto the final path (last-writer-wins is fine: each
+                // candidate is a COMPLETE copy of the identical overlay payload).
+                val tmp = File(
+                    target.parentFile,
+                    ".${target.name}.alrpart.${Thread.currentThread().id}.${System.nanoTime()}",
+                )
                 try {
                     tmp.outputStream().use { output -> tar.copyTo(output) }
                     tmp.setReadable(true, true)
