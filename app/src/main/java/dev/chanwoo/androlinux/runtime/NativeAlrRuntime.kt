@@ -435,6 +435,60 @@ object BundledCatalog {
             installSizeBytes = 1_100_000L,
             source = AppSource.APT,
         ),
+        // gedit — GNOME 의 가벼운 GTK3 텍스트 편집기. galculator 와 같은 부류(GTK3 base-
+        // provided, software-rendered, systemd 하드 의존 없음) — `apt-get install gedit` 후
+        // ALR Wayland 컴포지터 위 창으로 실행. appId 는 noble 이 까는 .desktop basename
+        // (org.gnome.gedit.desktop) 과 일치해야 설치 후 DesktopEntryScanner 가 같은 타일로
+        // 재조정한다. Exec=`gedit %U`(%U 는 스캐너가 strip), 바이너리 /usr/bin/gedit.
+        CatalogApp(
+            appId = "org.gnome.gedit",
+            name = "gedit",
+            summary = "GNOME 텍스트 편집기",
+            entry = LaunchEntry(LaunchEntry.EntryKind.EXEC, "/usr/bin/gedit"),
+            category = AppCategory.UTILITY,
+            description = "GNOME 의 가벼운 GTK3 텍스트 편집기. apt 로 설치되어 ALR Wayland " +
+                "컴포지터 위 창으로 실행됩니다(GDK Wayland 백엔드, 소프트웨어 렌더). " +
+                "noble 패키지 gedit → /usr/share/applications/org.gnome.gedit.desktop.",
+            rootfsDeps = listOf(RootfsDep(RootfsDepKind.APT, "gedit", 8_000_000L)),
+            display = DisplaySpec(DisplaySpec.DisplayMode.WINDOWED),
+            installSizeBytes = 8_000_000L,
+            source = AppSource.APT,
+        ),
+        // gnome-calculator — GNOME 의 GTK3 계산기. galculator 와 동급(GTK3 base, software-
+        // rendered). appId 는 noble .desktop basename(org.gnome.Calculator.desktop, 대문자 C)
+        // 과 일치 — 이게 설치 후 surfacing 키. Exec=`gnome-calculator`, 바이너리
+        // /usr/bin/gnome-calculator(추가로 /usr/bin/gcalccmd CLI 도 깔리나 .desktop 은 GUI).
+        CatalogApp(
+            appId = "org.gnome.Calculator",
+            name = "GNOME 계산기",
+            summary = "GNOME GTK 계산기",
+            entry = LaunchEntry(LaunchEntry.EntryKind.EXEC, "/usr/bin/gnome-calculator"),
+            category = AppCategory.UTILITY,
+            description = "GNOME 의 GTK3 계산기. apt 로 설치되어 ALR Wayland 컴포지터 위 " +
+                "창으로 실행됩니다(GDK Wayland 백엔드, 소프트웨어 렌더). noble 패키지 " +
+                "gnome-calculator → /usr/share/applications/org.gnome.Calculator.desktop.",
+            rootfsDeps = listOf(RootfsDep(RootfsDepKind.APT, "gnome-calculator", 6_000_000L)),
+            display = DisplaySpec(DisplaySpec.DisplayMode.WINDOWED),
+            installSizeBytes = 6_000_000L,
+            source = AppSource.APT,
+        ),
+        // eog — Eye of GNOME 이미지 뷰어(GTK3). galculator 와 동급(GTK3 base, software-
+        // rendered). appId 는 noble .desktop basename(org.gnome.eog.desktop) 과 일치.
+        // Exec=`eog %U`(%U strip), 바이너리 /usr/bin/eog — 푸시한 test.png 를 인자로 연다.
+        CatalogApp(
+            appId = "org.gnome.eog",
+            name = "Eye of GNOME",
+            summary = "GNOME 이미지 뷰어",
+            entry = LaunchEntry(LaunchEntry.EntryKind.EXEC, "/usr/bin/eog"),
+            category = AppCategory.GRAPHICS,
+            description = "Eye of GNOME — GTK3 이미지 뷰어. apt 로 설치되어 ALR Wayland " +
+                "컴포지터 위 창으로 실행됩니다(GDK Wayland 백엔드, 소프트웨어 렌더). " +
+                "noble 패키지 eog → /usr/share/applications/org.gnome.eog.desktop.",
+            rootfsDeps = listOf(RootfsDep(RootfsDepKind.APT, "eog", 7_000_000L)),
+            display = DisplaySpec(DisplaySpec.DisplayMode.WINDOWED),
+            installSizeBytes = 7_000_000L,
+            source = AppSource.APT,
+        ),
     )
 
     private val aptRefByAppId: Map<String, String> =
