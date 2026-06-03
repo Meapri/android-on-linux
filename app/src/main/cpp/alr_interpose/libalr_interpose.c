@@ -127,6 +127,8 @@
 #include <sys/socket.h> /* struct sockaddr, AF_NETLINK, socklen_t (bind workaround) */
 #include <sys/un.h>     /* struct sockaddr_un (chromium ProcessSingleton transform) */
 #include <sys/stat.h>   /* struct stat[64], struct statx, statx flags */
+#include <sys/statvfs.h> /* struct statvfs (statvfs/statvfs64 free-space wrappers) */
+#include <sys/vfs.h>     /* struct statfs (statfs/statfs64 free-space wrappers) */
 
 /* PCGATE additions: raw UAPI seccomp/BPF + openat2, plus the SIGSYS-catching
  * availability probe. We deliberately use raw __NR_/SECCOMP_RET_ numbers (not
@@ -212,6 +214,15 @@ static int a_eq(const char *p, const char *q) {
  * net still mediates). Sized generously for any plausible Android data path. */
 static char   g_rootfs[1024];
 static size_t g_rootfs_len = 0;
+/* Canonical (symlink-resolved) ALIAS of g_rootfs. ALR_ROOTFS is the per-user
+ * Android form "/data/user/0/<pkg>/…"; "/data/user/0" is a symlink to
+ * "/data/data". After glibc realpath() canonicalizes an already-rootfs path it
+ * follows that symlink, so the guest then open()s the "/data/data/<pkg>/…" form.
+ * That form is NOT a string-prefix of g_rootfs, so without this alias rw() would
+ * wrongly re-map it to "<rootfs>/data/data/…" (ENOENT). We compute the alias once
+ * (pure string swap) and treat a path under EITHER form as already-host. */
+static char   g_rootfs_canon[1024];
+static size_t g_rootfs_canon_len = 0;
 static int    g_inited = 0;
 
 /* ALR_GUEST_EXE: the GUEST-visible path of the running program (e.g.
@@ -240,8 +251,31 @@ static void alr_init(void) {
         g_rootfs[n] = '\0';
         /* A rootfs of exactly "/" is a no-op prefix; treat as disabled. */
         g_rootfs_len = (n == 1 && g_rootfs[0] == '/') ? 0 : n;
+        /* Derive the canonical /data/data alias (see g_rootfs_canon). Pure string
+         * swap of the documented Android per-user data symlink; no syscall. */
+        g_rootfs_canon_len = 0;
+        {
+            static const char kPerUser[] = "/data/user/0/";
+            static const char kCanon[]   = "/data/data/";
+            const size_t pu = sizeof(kPerUser) - 1;   /* 13 */
+            const size_t ca = sizeof(kCanon) - 1;     /* 11 */
+            int match = (g_rootfs_len > pu);
+            for (size_t i = 0; match && i < pu; ++i)
+                if (g_rootfs[i] != kPerUser[i]) match = 0;
+            if (match) {
+                const size_t rest = g_rootfs_len - pu;     /* chars after the prefix */
+                if (ca + rest < sizeof(g_rootfs_canon)) {
+                    size_t i = 0;
+                    for (; i < ca; ++i) g_rootfs_canon[i] = kCanon[i];
+                    for (size_t j = 0; j < rest; ++j) g_rootfs_canon[ca + j] = g_rootfs[pu + j];
+                    g_rootfs_canon[ca + rest] = '\0';
+                    g_rootfs_canon_len = ca + rest;
+                }
+            }
+        }
     } else {
         g_rootfs_len = 0;
+        g_rootfs_canon_len = 0;
     }
 
     const char *e = getenv("ALR_GUEST_EXE");
@@ -257,6 +291,23 @@ static void alr_init(void) {
 }
 
 /*
+ * Reentrancy guard for the compositional libc wrappers (realpath/canonicalize_
+ * file_name) that resolve a path component-by-component INTERNALLY via lstat/
+ * readlink. Those internal stats re-enter our stat/readlink wrappers; if rw()
+ * rewrote them too, an intermediate component like "/data" (lstat'd on the way
+ * to canonicalizing "<rootfs>/var/lib/dpkg/status") would be mis-mapped to the
+ * nonexistent "<rootfs>/data" and the whole realpath would fail ENOENT even
+ * though the target file exists. That was the device-observed
+ *   E: flAbsPath on <rootfs>/var/lib/dpkg/status failed - realpath (2: ...)
+ * (apt-get install computing the dpkg status abspath). When this thread-local
+ * counter is non-zero, rw() is a no-op pass-through, so the wrapped realpath
+ * sees the REAL host tree (where /, /data, …, <rootfs>/var/lib/dpkg/status all
+ * exist) and canonicalizes correctly. The wrapper rewrites the INPUT once up
+ * front, then sets this so glibc's internal walk is un-mediated. Thread-local =>
+ * no cross-thread effect; the brief window is just the realpath() call. */
+static __thread int g_rw_suppress = 0;
+
+/*
  * rw(): the single rewrite helper.
  * Returns p unchanged, or a pointer into buf holding "<rootfs><p>".
  * buf must hold at least g_rootfs_len + strlen(p) + 1 bytes; if it is too
@@ -264,6 +315,7 @@ static void alr_init(void) {
  */
 static const char *rw(const char *p, char *buf, size_t buflen) {
     if (!p || p[0] != '/') return p;            /* NULL or relative -> passthrough */
+    if (g_rw_suppress) return p;                /* inside realpath() -> no-op (see guard) */
     if (!g_inited) alr_init();
     if (g_rootfs_len == 0) return p;            /* interposer disabled */
 
@@ -272,8 +324,12 @@ static const char *rw(const char *p, char *buf, size_t buflen) {
         return p;
 
     /* Idempotency: a path already under the rootfs is left as-is (matches the
-     * supervisor's already_host guard; prevents <rootfs><rootfs>/...). */
+     * supervisor's already_host guard; prevents <rootfs><rootfs>/...). Accept the
+     * canonical /data/data alias too — glibc realpath resolves an already-rootfs
+     * path through the /data/user/0->/data/data symlink, so the guest then opens
+     * the /data/data form, which is equally "already host" (see g_rootfs_canon). */
     if (a_under(p, g_rootfs)) return p;
+    if (g_rootfs_canon_len && a_under(p, g_rootfs_canon)) return p;
 
     size_t plen = a_len(p);
     if (g_rootfs_len + plen + 1 > buflen) return p;   /* too long -> fail safe */
@@ -819,7 +875,8 @@ static int alr_open_emit(int dirfd, const char *path, int flags, mode_t mode) {
     if (g_openat2_ok && g_rootfs_fd >= 0 &&
         path && path[0] == '/' &&
         !a_under(path, "/proc") && !a_under(path, "/sys") && !a_under(path, "/dev") &&
-        !a_under(path, g_rootfs)) {
+        !a_under(path, g_rootfs) &&
+        !(g_rootfs_canon_len && a_under(path, g_rootfs_canon))) {
         struct open_how how;
         how.flags = (uint64_t)(unsigned)flags;
 #ifdef O_TMPFILE
@@ -1095,6 +1152,52 @@ int statx(int dirfd, const char *path, int flags, unsigned int mask,
     char b[ALR_PBUF];
     const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
     return real(dirfd, p, flags, mask, buf);
+}
+
+/* =================================================================== */
+/* statfs / statvfs family — filesystem free-space queries             */
+/* =================================================================== */
+/*
+ * apt-get install does statvfs("/var/cache/apt/archives/") to check there is
+ * room for the .deb downloads BEFORE fetching; dpkg/glibc also statfs() paths.
+ * These take an ABSOLUTE path that must be rewritten into the rootfs. They are
+ * NOT in the seccomp-traced set (the supervisor only traps the 9 open/stat/exec
+ * syscalls), so an un-wrapped statfs would hit the LITERAL Android path and fail
+ * ENOENT — the device-observed apt `Couldn't determine free space in
+ * /var/cache/apt/archives/ - statvfs (2: No such file or directory)`. We rewrite
+ * the path and forward to the REAL libc entry (RTLD_NEXT); the result (block
+ * counts of the underlying Android filesystem the rootfs lives on) is exactly
+ * what apt needs to size its free-space check. rw() handles the /data/data alias
+ * + idempotency just like the stat wrappers. PCGATE-independent (no trampoline
+ * needed: statfs is un-traced, so the real libc call from a rewritten path is
+ * already correct and trusted). */
+int statvfs(const char *path, struct statvfs *buf) {
+    static int (*real)(const char *, struct statvfs *);
+    ALR_REAL(real, int (*)(const char *, struct statvfs *), "statvfs");
+    char b[ALR_PBUF];
+    const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
+    return real(p, buf);
+}
+int statvfs64(const char *path, struct statvfs64 *buf) {
+    static int (*real)(const char *, struct statvfs64 *);
+    ALR_REAL(real, int (*)(const char *, struct statvfs64 *), "statvfs64");
+    char b[ALR_PBUF];
+    const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
+    return real(p, buf);
+}
+int statfs(const char *path, struct statfs *buf) {
+    static int (*real)(const char *, struct statfs *);
+    ALR_REAL(real, int (*)(const char *, struct statfs *), "statfs");
+    char b[ALR_PBUF];
+    const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
+    return real(p, buf);
+}
+int statfs64(const char *path, struct statfs64 *buf) {
+    static int (*real)(const char *, struct statfs64 *);
+    ALR_REAL(real, int (*)(const char *, struct statfs64 *), "statfs64");
+    char b[ALR_PBUF];
+    const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
+    return real(p, buf);
 }
 
 /* =================================================================== */
@@ -1944,29 +2047,48 @@ gid_t getegid(void) {
 /* path canonicalization                                               */
 /* =================================================================== */
 
-/* realpath(path, resolved): we rewrite the *input* path. The resolved output
- * will then be a rootfs host path, which is correct for a subsequent open()
- * (already-host paths are left alone by both us and the seccomp net). */
+/* realpath(path, resolved): we rewrite the *input* path ONCE to its rootfs host
+ * form, then resolve with rw() SUPPRESSED (g_rw_suppress) so glibc's internal,
+ * component-by-component lstat/readlink walk sees the REAL host tree. Without the
+ * suppression an intermediate component (e.g. "/data" on the way to canonicalizing
+ * "<rootfs>/var/lib/dpkg/status") would be re-mapped to the nonexistent
+ * "<rootfs>/data" and realpath would fail ENOENT even though the target exists —
+ * the device-observed apt-get install `flAbsPath … status … realpath (2: …)`. The
+ * resolved output is a rootfs host path, correct for a subsequent open() (already-
+ * host paths are left alone by both us and the seccomp net). */
 char *realpath(const char *path, char *resolved) {
     static char *(*real)(const char *, char *);
     ALR_REAL(real, char *(*)(const char *, char *), "realpath");
     char b[ALR_PBUF];
-    return real(rw(path, b, sizeof b), resolved);
+    const char *in = rw(path, b, sizeof b);
+    g_rw_suppress++;
+    char *r = real(in, resolved);
+    g_rw_suppress--;
+    return r;
 }
 char *canonicalize_file_name(const char *path) {
     static char *(*real)(const char *);
     ALR_REAL(real, char *(*)(const char *), "canonicalize_file_name");
     char b[ALR_PBUF];
-    return real(rw(path, b, sizeof b));
+    const char *in = rw(path, b, sizeof b);
+    g_rw_suppress++;
+    char *r = real(in);
+    g_rw_suppress--;
+    return r;
 }
 /* FORTIFY (_FORTIFY_SOURCE) variant of realpath: glibc adds a resolved-buffer
  * size arg for its __chk guard. We rewrite the input path and forward to the
- * real __realpath_chk so its overflow guard still fires identically. */
+ * real __realpath_chk so its overflow guard still fires identically (rw()
+ * suppressed during the resolve — same reason as plain realpath above). */
 char *__realpath_chk(const char *path, char *resolved, size_t resolvedlen) {
     static char *(*real)(const char *, char *, size_t);
     ALR_REAL(real, char *(*)(const char *, char *, size_t), "__realpath_chk");
     char b[ALR_PBUF];
-    return real(rw(path, b, sizeof b), resolved, resolvedlen);
+    const char *in = rw(path, b, sizeof b);
+    g_rw_suppress++;
+    char *r = real(in, resolved, resolvedlen);
+    g_rw_suppress--;
+    return r;
 }
 
 /* =================================================================== */

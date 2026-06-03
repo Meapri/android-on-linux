@@ -2457,6 +2457,29 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     // input => same output, so the rewrite is provably unchanged.
     std::unordered_map<std::string, std::string> xlate_cache;
     constexpr std::size_t kXlateCacheCap = 256;
+    // Canonical (symlink-resolved) ALIAS of the rootfs dir, for the already-host /
+    // ancestor guards below. On Android, ALR_ROOTFS is given in the per-user form
+    // "/data/user/0/<pkg>/…", but "/data/user/0" is a symlink to "/data/data". When
+    // glibc's realpath()/canonicalize_file_name() resolves an already-host rootfs
+    // path (apt-get install computes flAbsPath(Dir::State::status)), it follows that
+    // symlink and the remaining component walk happens under the CANONICAL
+    // "/data/data/<pkg>/…" form. Those direct lstat/readlink syscalls (glibc bypasses
+    // the LD_PRELOAD libc wrappers via its GLIBC_PRIVATE internals) reach this
+    // supervisor with the /data/data/… prefix, which neither already_host nor the
+    // ancestor guard would recognize against the /data/user/0/… config form — so the
+    // supervisor would mis-rewrite them into "<rootfs>/data/data/…" (ENOENT) and the
+    // whole realpath fails. We derive the alias by the documented Android path-form
+    // equivalence (pure string swap, NO syscall — installing seccomp on the
+    // supervisor's own realpath could deadlock the self-tracer), then the guards
+    // accept EITHER form. Empty when the config path is not in the per-user form.
+    std::string rootfs_canon;
+    {
+        static const char kPerUser[] = "/data/user/0/";
+        const std::string& rd = config.rootfs_dir;
+        if (rd.compare(0, sizeof(kPerUser) - 1, kPerUser) == 0) {
+            rootfs_canon = "/data/data/" + rd.substr(sizeof(kPerUser) - 1);
+        }
+    }
     // === ADR-003-v3 §2.2/§4: parent-side stall WATCHDOG (chromium-deadlock bound +
     // diagnostic). The per-guest alarm() is armed in the CHILD (alr_enter_guest path),
     // but a thread that is ptrace-stopped / PTRACE_LISTEN-parked cannot service SIGALRM
@@ -2757,8 +2780,39 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                             // LD_PRELOAD interposer) — else we'd produce
                             // <rootfs><rootfs>/… and the open would fail.
                             const bool already_host =
-                                under(gp, config.rootfs_dir.c_str());
-                            if (gp[0] == '/' && !sysdir && !already_host) {
+                                under(gp, config.rootfs_dir.c_str()) ||
+                                (!rootfs_canon.empty() &&
+                                 under(gp, rootfs_canon.c_str()));
+                            // ANCESTOR guard (apt-get install realpath fix): a path that
+                            // is a proper prefix of the rootfs host dir — "/data",
+                            // "/data/user", … up to the rootfs itself — is a REAL Android
+                            // directory that leads INTO the rootfs and must stay native.
+                            // glibc's realpath()/canonicalize_file_name() resolve an
+                            // already-host rootfs path by lstat'ing each ancestor prefix
+                            // from "/" upward via DIRECT syscalls (they bypass the
+                            // LD_PRELOAD libc wrappers), so those prefix stats reach this
+                            // handler. Without this guard "/data" would be rewritten to the
+                            // nonexistent "<rootfs>/data" and the whole realpath fails
+                            // ENOENT — the device-observed apt `flAbsPath … status …
+                            // realpath (2: No such file or directory)`. A prefix is an
+                            // ancestor iff rootfs_dir starts with gp AND the next rootfs
+                            // char is '/' (so "/data" matches "/data/user/…" but "/dat"
+                            // does not). gp=="/" is already excluded (it would translate to
+                            // the rootfs root, harmless, but realpath never stats "/" here).
+                            auto is_ancestor_of = [](const char* p,
+                                                     const std::string& root) {
+                                const std::size_t pn = ::strlen(p);
+                                if (pn == 0 || pn > root.size()) return false;
+                                if (::strncmp(root.c_str(), p, pn) != 0) return false;
+                                return root[pn] == '/' || root[pn] == '\0';
+                            };
+                            // Ancestor of EITHER the config form or its canonical
+                            // /data/data alias (realpath walks both; see rootfs_canon).
+                            const bool ancestor =
+                                is_ancestor_of(gp, config.rootfs_dir) ||
+                                (!rootfs_canon.empty() &&
+                                 is_ancestor_of(gp, rootfs_canon));
+                            if (gp[0] == '/' && !sysdir && !already_host && !ancestor) {
                                 // translate_rootfs_path is pure in (rootfs_dir, cwd,
                                 // path); rootfs_dir and cwd are fixed for the run, so
                                 // a repeated guest path yields an identical host path.
