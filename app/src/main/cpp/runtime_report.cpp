@@ -7102,10 +7102,12 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeAlrGpuBoundaryProbe(
     return env->NewStringUTF(report.c_str());
 }
 
-extern "C" JNIEXPORT jstring JNICALL
-Java_dev_chanwoo_androlinux_MainActivity_nativeAlrNativeLoaderProbe(
+// Shared body for nativeAlrNativeLoaderProbe — class-neutral so BOTH the
+// MainActivity probe harness AND the runtime/AlrNative facade (product launcher)
+// drive the exact same native loader entry. Behavior is identical to the original
+// MainActivity export (the export below now just forwards here unchanged).
+static jstring alr_jni_native_loader_probe(
     JNIEnv* env,
-    jobject /* thiz */,
     jstring package_name,
     jstring native_library_dir,
     jstring app_files_dir,
@@ -7122,6 +7124,36 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeAlrNativeLoaderProbe(
     };
     const auto report = build_native_loader_probe(input);
     return env->NewStringUTF(report.c_str());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeAlrNativeLoaderProbe(
+    JNIEnv* env,
+    jobject /* thiz */,
+    jstring package_name,
+    jstring native_library_dir,
+    jstring app_files_dir,
+    jstring app_cache_dir,
+    jstring rootfs_name,
+    jstring program) {
+    return alr_jni_native_loader_probe(env, package_name, native_library_dir,
+                                       app_files_dir, app_cache_dir, rootfs_name, program);
+}
+
+// runtime/AlrNative facade export (product launcher path) — same helper, different
+// JNI class name. NativeAppSession.launch() calls this to exec the guest binary.
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_chanwoo_androlinux_runtime_AlrNative_nativeAlrNativeLoaderProbe(
+    JNIEnv* env,
+    jobject /* thiz */,
+    jstring package_name,
+    jstring native_library_dir,
+    jstring app_files_dir,
+    jstring app_cache_dir,
+    jstring rootfs_name,
+    jstring program) {
+    return alr_jni_native_loader_probe(env, package_name, native_library_dir,
+                                       app_files_dir, app_cache_dir, rootfs_name, program);
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -7333,8 +7365,14 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeRenderGpuSurfaceFrames(
 // client buffers onto the given SurfaceView via EGL/GLES. The guest connects to
 // the AF_UNIX socket under <cacheDir>/alr-xdg (the loader injects
 // WAYLAND_DISPLAY/XDG_RUNTIME_DIR into the guest env to match).
-extern "C" JNIEXPORT jstring JNICALL
-Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandCompositorStart(
+// Shared body for nativeWaylandCompositorStart — class-neutral. `thiz` is forwarded
+// ONLY to clip_install_sink (which GetObjectClass()-resolves the guest-clipboard
+// up-call methods on it). MainActivity passes its own jobject (full clipboard
+// bridge); the runtime/AlrNative facade passes its jobject, whose class lacks those
+// methods, so the up-calls gracefully no-op (guarded by null jmethodID) — the
+// compositor itself behaves identically. Body is otherwise byte-for-byte the
+// original MainActivity export.
+static jstring alr_jni_wayland_compositor_start(
     JNIEnv* env,
     jobject thiz,
     jstring cache_dir,
@@ -7398,6 +7436,39 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandCompositorStart(
 #endif
 }
 
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandCompositorStart(
+    JNIEnv* env,
+    jobject thiz,
+    jstring cache_dir,
+    jobject surface,
+    jint density_dpi,
+    jfloat xdpi,
+    jfloat ydpi,
+    jint out_width_px,
+    jint out_height_px,
+    jint refresh_mhz) {
+    return alr_jni_wayland_compositor_start(env, thiz, cache_dir, surface, density_dpi,
+                                            xdpi, ydpi, out_width_px, out_height_px, refresh_mhz);
+}
+
+// runtime/AlrNative facade export (product launcher path) — same compositor helper.
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_chanwoo_androlinux_runtime_AlrNative_nativeWaylandCompositorStart(
+    JNIEnv* env,
+    jobject thiz,
+    jstring cache_dir,
+    jobject surface,
+    jint density_dpi,
+    jfloat xdpi,
+    jfloat ydpi,
+    jint out_width_px,
+    jint out_height_px,
+    jint refresh_mhz) {
+    return alr_jni_wayland_compositor_start(env, thiz, cache_dir, surface, density_dpi,
+                                            xdpi, ydpi, out_width_px, out_height_px, refresh_mhz);
+}
+
 // Dynamic surface resize / rotation / multi-window. Called from SurfaceHolder.
 // surfaceChanged on the Android UI thread with the NEW surface and its pixel size.
 // Two coupled steps:
@@ -7408,10 +7479,10 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandCompositorStart(
 //   2. Re-size the Wayland output so wl_output + every mapped xdg_toplevel are
 //      reconfigured to (w,h) and chromium/GTK re-lay-out (no bar overlap, correct
 //      orientation). Pass the content-area pixel size from the SurfaceView.
-extern "C" JNIEXPORT jstring JNICALL
-Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandCompositorResize(
+// Shared body for nativeWaylandCompositorResize — class-neutral (no thiz use).
+// Byte-for-byte the original MainActivity export body; both exports forward here.
+static jstring alr_jni_wayland_compositor_resize(
     JNIEnv* env,
-    jobject /* thiz */,
     jobject surface,
     jint width_px,
     jint height_px,
@@ -7440,6 +7511,37 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandCompositorResize(
     (void)density_dpi; (void)xdpi; (void)ydpi; (void)refresh_mhz;
     return env->NewStringUTF("ALR WAYLAND COMPOSITOR RESIZE: not-built");
 #endif
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandCompositorResize(
+    JNIEnv* env,
+    jobject /* thiz */,
+    jobject surface,
+    jint width_px,
+    jint height_px,
+    jint density_dpi,
+    jfloat xdpi,
+    jfloat ydpi,
+    jint refresh_mhz) {
+    return alr_jni_wayland_compositor_resize(env, surface, width_px, height_px,
+                                             density_dpi, xdpi, ydpi, refresh_mhz);
+}
+
+// runtime/AlrNative facade export (product launcher path) — same resize helper.
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_chanwoo_androlinux_runtime_AlrNative_nativeWaylandCompositorResize(
+    JNIEnv* env,
+    jobject /* thiz */,
+    jobject surface,
+    jint width_px,
+    jint height_px,
+    jint density_dpi,
+    jfloat xdpi,
+    jfloat ydpi,
+    jint refresh_mhz) {
+    return alr_jni_wayland_compositor_resize(env, surface, width_px, height_px,
+                                             density_dpi, xdpi, ydpi, refresh_mhz);
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -7575,6 +7677,91 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandInjectScroll(
     alr::wayland::alr_wayland_inject_pointer_axis(value, static_cast<int32_t>(axis));
 #else
     (void)x; (void)y; (void)value; (void)axis;
+#endif
+}
+
+// ===========================================================================
+// runtime/AlrNative input-inject facade (product launcher path). The compositor's
+// inject API is process-global state (no per-class thiz), so these forward to the
+// SAME alr::wayland:: calls as the MainActivity exports above — the focused guest
+// client receives identical wl_touch / wl_keyboard events. RunningSurfaceActivity's
+// SurfaceView routes touch here exactly as runChromiumStandalone routes to the
+// MainActivity exports.
+// ===========================================================================
+extern "C" JNIEXPORT void JNICALL
+Java_dev_chanwoo_androlinux_runtime_AlrNative_nativeWaylandInjectTouch(
+    JNIEnv* /* env */,
+    jobject /* thiz */,
+    jint id,
+    jfloat x,
+    jfloat y,
+    jint phase) {
+#ifdef ALR_HAVE_WAYLAND
+    alr::wayland::alr_wayland_inject_touch_point(id, x, y, phase);
+#else
+    (void)id; (void)x; (void)y; (void)phase;
+#endif
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_dev_chanwoo_androlinux_runtime_AlrNative_nativeWaylandInjectTouchFrame(
+    JNIEnv* /* env */,
+    jobject /* thiz */) {
+#ifdef ALR_HAVE_WAYLAND
+    alr::wayland::alr_wayland_inject_touch_frame();
+#endif
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_dev_chanwoo_androlinux_runtime_AlrNative_nativeWaylandInjectTouchCancel(
+    JNIEnv* /* env */,
+    jobject /* thiz */) {
+#ifdef ALR_HAVE_WAYLAND
+    alr::wayland::alr_wayland_inject_touch_cancel();
+#endif
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_dev_chanwoo_androlinux_runtime_AlrNative_nativeWaylandInjectKey(
+    JNIEnv* /* env */,
+    jobject /* thiz */,
+    jint evdevKey,
+    jint pressed) {
+#ifdef ALR_HAVE_WAYLAND
+    alr::wayland::alr_wayland_inject_key(static_cast<uint32_t>(evdevKey),
+                                         static_cast<uint32_t>(pressed));
+#else
+    (void)evdevKey; (void)pressed;
+#endif
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_dev_chanwoo_androlinux_runtime_AlrNative_nativeWaylandInjectScroll(
+    JNIEnv* /* env */,
+    jobject /* thiz */,
+    jfloat x,
+    jfloat y,
+    jdouble value,
+    jint axis) {
+#ifdef ALR_HAVE_WAYLAND
+    alr::wayland::alr_wayland_inject_pointer_motion(x, y);
+    alr::wayland::alr_wayland_inject_pointer_axis(value, static_cast<int32_t>(axis));
+#else
+    (void)x; (void)y; (void)value; (void)axis;
+#endif
+}
+
+// Compositor stop facade (product launcher teardown) — same global compositor.
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_chanwoo_androlinux_runtime_AlrNative_nativeWaylandCompositorStop(
+    JNIEnv* env,
+    jobject /* thiz */) {
+#ifdef ALR_HAVE_WAYLAND
+    const std::string status = alr::wayland::alr_stop_wayland_compositor();
+    clip_uninstall_sink(env);
+    return env->NewStringUTF(status.c_str());
+#else
+    return env->NewStringUTF("ALR WAYLAND COMPOSITOR: not-built");
 #endif
 }
 

@@ -57,6 +57,7 @@ import dev.chanwoo.androlinux.runtime.AlrRuntime
 import dev.chanwoo.androlinux.runtime.AlrRuntimeHolder
 import dev.chanwoo.androlinux.runtime.AppSession
 import dev.chanwoo.androlinux.runtime.LaunchRequest
+import dev.chanwoo.androlinux.runtime.NativeAppSession
 import dev.chanwoo.androlinux.runtime.SessionState
 import dev.chanwoo.androlinux.runtime.StopReason
 import dev.chanwoo.androlinux.runtime.SurfaceProtocol
@@ -228,8 +229,11 @@ class RunningSurfaceActivity : ComponentActivity() {
         }
 
         override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-            // v1: 표면 크기 변경은 컴포지터가 device surface 로 클램프(별도 처리 없음).
             lastHolder = holder
+            // Real runtime: reconfigure the live compositor output to the new content-area
+            // size (rotation / multi-window) so the guest re-lays-out instead of going
+            // black. FakeAlrRuntime has no such method → no-op via the safe cast.
+            (session as? NativeAppSession)?.onSurfaceChanged(holder, width, height)
         }
 
         override fun surfaceDestroyed(holder: SurfaceHolder) {
@@ -283,6 +287,13 @@ class RunningSurfaceActivity : ComponentActivity() {
 
         surfaceView = SurfaceView(this).apply {
             layoutParams = FrameLayout.LayoutParams(MATCH, MATCH)
+            // Route touch into the focused Wayland client (scroll/click/draw). Real runtime
+            // only; FakeAlrRuntime sessions ignore it via the safe cast. Mirrors
+            // runChromiumStandalone's SurfaceView touch forwarding.
+            setOnTouchListener { _, ev ->
+                (session as? NativeAppSession)?.injectTouch(ev)
+                true
+            }
         }
         root.addView(surfaceView)
 
