@@ -70,6 +70,23 @@ struct SyntheticMaliProvider {
     static void destroy_instance(void* ctx, uint32_t /*vinst*/) {
         static_cast<SyntheticMaliProvider*>(ctx)->instance_created = false;
     }
+    // ANGLE-init rung: answer an image-format query like a real GPU would for the common
+    // render/sampled tuples. R8G8B8A8_UNORM (37) optimal COLOR_ATTACHMENT/SAMPLED is
+    // "supported" with a generous max extent; everything else is reported supported too
+    // (the synthetic device is permissive — the REAL Mali path returns the true verdict).
+    static bool image_format_props(void* /*ctx*/, uint32_t /*vphys*/, uint32_t /*format*/,
+                                   uint32_t /*type*/, uint32_t /*tiling*/, uint32_t /*usage*/,
+                                   uint32_t /*flags*/, VkImageFmtProps& out) {
+        out.vk_result = 0;  // VK_SUCCESS
+        out.max_extent_w = 16384;
+        out.max_extent_h = 16384;
+        out.max_extent_d = 1;
+        out.max_mip_levels = 15;
+        out.max_array_layers = 2048;
+        out.sample_counts = 0x1 | 0x4;  // VK_SAMPLE_COUNT_1_BIT | _4_BIT
+        out.max_resource_size = static_cast<uint64_t>(1) << 31;  // 2 GiB
+        return true;
+    }
     // ---- VK-M2 body seams: the synthetic device behaves like a real one for the wire
     // round trip. create/queue/pool/cmd succeed; clear_submit "renders" by returning the
     // requested clear color as the center pixel (0..1 -> 0..255), so the round trip can
@@ -166,6 +183,7 @@ struct SyntheticMaliProvider {
         p.create_instance = &create_instance;
         p.enumerate = &enumerate;
         p.props = &props;
+        p.image_format_props = &image_format_props;
         p.destroy_instance = &destroy_instance;
         p.create_device = &create_device;
         p.get_queue = &get_queue;

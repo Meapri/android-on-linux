@@ -60,6 +60,19 @@ enum AlrVkOp {
     // comes back in the reply blob, keyed by `vphys`.
     ALR_VK_OP_GET_PHYSICAL_DEVICE_PROPERTIES = 202,  // u32 vinst, u32 vphys
 
+    // ---- ANGLE-init rung: vkGetPhysicalDeviceImageFormatProperties forward. ----
+    // ANGLE's RendererVk + the Khronos loader query a physical device's image-format
+    // capabilities (vkGetPhysicalDeviceImageFormatProperties) for a (format, type, tiling,
+    // usage, flags) tuple BEFORE creating any image/swapchain. Unlike the v1 props above
+    // (cached once at enumerate), this is parameterized, so it round-trips per query: the
+    // host calls the REAL Mali vkGetPhysicalDeviceImageFormatProperties for `vphys` with
+    // the tuple and returns the VkImageFormatProperties (max extent/mip/array/sample +
+    // maxResourceSize) + the VkResult in ALR_VK_REPLY_IMAGE_FORMAT_PROPS. A
+    // VK_ERROR_FORMAT_NOT_SUPPORTED is a VALID answer (the format is simply unsupported),
+    // carried back as the result so the guest mirrors Mali's verdict exactly.
+    ALR_VK_OP_GET_PHYS_IMAGE_FORMAT_PROPS = 203,
+    //   u32 vinst, u32 vphys, u32 format, u32 type, u32 tiling, u32 usage, u32 flags
+
     // destroy the instance `vinst` (releases the host's real VkInstance + virtual maps).
     ALR_VK_OP_DESTROY_INSTANCE = 209,  // u32 vinst
 
@@ -240,13 +253,27 @@ enum AlrVkReply {
     // and the center pixel of the presented image (so a headless self-test asserts the
     // guest shader's color even with no display). `presented` is 1 if the AHB was
     // actually handed to the compositor sink (0 if no sink wired — still a valid render).
-    ALR_VK_REPLY_PRESENT = 228
+    ALR_VK_REPLY_PRESENT = 228,
     //   u32 vswapchain
     //   u32 image_index
     //   i32 submit_result        (VkResult; 0 == VK_SUCCESS)
     //   i32 render_result        (AlrVkRenderResult; 0 == drew + read back)
     //   u8  presented            (1 if routed to the compositor sink)
     //   u8  px_r, px_g, px_b, px_a   (center pixel of the presented image, 0..255)
+
+    // result of GET_PHYS_IMAGE_FORMAT_PROPS: the VkResult of the real Mali
+    // vkGetPhysicalDeviceImageFormatProperties (0 == supported; a negative
+    // VK_ERROR_FORMAT_NOT_SUPPORTED is a valid "this format/usage is unsupported" verdict)
+    // + the VkImageFormatProperties fields Mali returned. The guest fills the caller's
+    // VkImageFormatProperties from these (or returns the error result on a non-zero code).
+    ALR_VK_REPLY_IMAGE_FORMAT_PROPS = 229
+    //   u32 vphys
+    //   i32 vk_result
+    //   u32 max_extent_w, u32 max_extent_h, u32 max_extent_d
+    //   u32 max_mip_levels
+    //   u32 max_array_layers
+    //   u32 sample_counts        (VkSampleCountFlags)
+    //   u64 max_resource_size
 };
 
 // Host-side render-path outcome carried in ALR_VK_REPLY_SUBMIT::render_result. 0 means
@@ -301,6 +328,7 @@ static inline void alr_vk_enc_raw(AlrVkEncoder *e, const void *p, size_t n) {
 }
 static inline void alr_vk_enc_u8(AlrVkEncoder *e, uint8_t v)  { alr_vk_enc_raw(e, &v, 1); }
 static inline void alr_vk_enc_u32(AlrVkEncoder *e, uint32_t v){ alr_vk_enc_raw(e, &v, 4); }
+static inline void alr_vk_enc_u64(AlrVkEncoder *e, uint64_t v){ alr_vk_enc_raw(e, &v, 8); }
 static inline void alr_vk_enc_i32(AlrVkEncoder *e, int32_t v) { alr_vk_enc_raw(e, &v, 4); }
 static inline void alr_vk_enc_f32(AlrVkEncoder *e, float v)   { alr_vk_enc_raw(e, &v, 4); }
 static inline void alr_vk_enc_blob(AlrVkEncoder *e, const void *p, uint32_t n) {
@@ -330,6 +358,22 @@ static inline void alr_vk_enc_get_phys_props(AlrVkEncoder *e, uint32_t vinst,
     alr_vk_enc_u8(e, (uint8_t)ALR_VK_OP_GET_PHYSICAL_DEVICE_PROPERTIES);
     alr_vk_enc_u32(e, vinst);
     alr_vk_enc_u32(e, vphys);
+}
+/* ANGLE-init rung: query real Mali image-format capabilities for a (format,type,tiling,
+ * usage,flags) tuple on virtual device `vphys`. The data comes back in
+ * ALR_VK_REPLY_IMAGE_FORMAT_PROPS. */
+static inline void alr_vk_enc_get_phys_image_format_props(AlrVkEncoder *e, uint32_t vinst,
+                                                          uint32_t vphys, uint32_t format,
+                                                          uint32_t type, uint32_t tiling,
+                                                          uint32_t usage, uint32_t flags) {
+    alr_vk_enc_u8(e, (uint8_t)ALR_VK_OP_GET_PHYS_IMAGE_FORMAT_PROPS);
+    alr_vk_enc_u32(e, vinst);
+    alr_vk_enc_u32(e, vphys);
+    alr_vk_enc_u32(e, format);
+    alr_vk_enc_u32(e, type);
+    alr_vk_enc_u32(e, tiling);
+    alr_vk_enc_u32(e, usage);
+    alr_vk_enc_u32(e, flags);
 }
 static inline void alr_vk_enc_destroy_instance(AlrVkEncoder *e, uint32_t vinst) {
     alr_vk_enc_u8(e, (uint8_t)ALR_VK_OP_DESTROY_INSTANCE);

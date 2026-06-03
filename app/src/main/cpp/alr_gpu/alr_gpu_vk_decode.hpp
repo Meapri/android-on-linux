@@ -56,6 +56,7 @@ public:
     VkReader(const uint8_t* p, size_t n) : p_(p), n_(n) {}
     bool u8(uint8_t& v) { return take(&v, 1); }
     bool u32(uint32_t& v) { return take(&v, 4); }
+    bool u64(uint64_t& v) { return take(&v, 8); }
     bool i32(int32_t& v) { return take(&v, 4); }
     bool f32(float& v) { return take(&v, 4); }
     bool blob(const uint8_t*& data, uint32_t& len) {
@@ -87,6 +88,7 @@ class VkReplyEncoder {
 public:
     void u8(uint8_t v) { buf_.push_back(v); }
     void u32(uint32_t v) { raw(&v, 4); }
+    void u64(uint64_t v) { raw(&v, 8); }
     void i32(int32_t v) { raw(&v, 4); }
     void f32(float v) { raw(&v, 4); }
     void blob(const void* p, uint32_t n) {
@@ -119,6 +121,21 @@ struct VkPhysProps {
         uint32_t count = 0;
     };
     std::vector<QF> queue_families;
+};
+
+// One image-format query's result, in the host's own struct (decoupled from <vulkan.h>
+// so the wire test can construct/compare it without a Vulkan SDK). Mirrors the fields of
+// VkImageFormatProperties + the VkResult the real Mali driver returned (a negative
+// vk_result means the format/usage tuple is unsupported — a valid answer).
+struct VkImageFmtProps {
+    int32_t  vk_result = 0;       // 0 == VK_SUCCESS; <0 == VK_ERROR_FORMAT_NOT_SUPPORTED etc.
+    uint32_t max_extent_w = 0;
+    uint32_t max_extent_h = 0;
+    uint32_t max_extent_d = 0;
+    uint32_t max_mip_levels = 0;
+    uint32_t max_array_layers = 0;
+    uint32_t sample_counts = 0;   // VkSampleCountFlags
+    uint64_t max_resource_size = 0;
 };
 
 // The clear a CMD_BEGIN_CLEAR recorded into a virtual command buffer, plus the geometry
@@ -394,6 +411,33 @@ inline void vk_real_destroy_instance(VkDecodeState& st, uint32_t vinst) {
         st.real_inst.erase(it);
     }
     st.instances.erase(vinst);
+}
+
+// ANGLE-init rung: query the REAL Mali vkGetPhysicalDeviceImageFormatProperties for the
+// physical device behind virtual `vphys` and fill `out`. Returns true if `vphys` was a
+// known device (out.vk_result then carries Mali's verdict — VK_SUCCESS or, validly,
+// VK_ERROR_FORMAT_NOT_SUPPORTED); false if the virtual id was unknown to the host.
+inline bool vk_real_image_format_props(VkDecodeState& st, uint32_t vphys, uint32_t format,
+                                       uint32_t type, uint32_t tiling, uint32_t usage,
+                                       uint32_t flags, VkImageFmtProps& out) {
+    auto it = st.real_phys.find(vphys);
+    if (it == st.real_phys.end()) return false;
+    VkImageFormatProperties props{};
+    VkResult r = vkGetPhysicalDeviceImageFormatProperties(
+        it->second, static_cast<VkFormat>(format), static_cast<VkImageType>(type),
+        static_cast<VkImageTiling>(tiling), static_cast<VkImageUsageFlags>(usage),
+        static_cast<VkImageCreateFlags>(flags), &props);
+    out.vk_result = static_cast<int32_t>(r);
+    if (r == VK_SUCCESS) {
+        out.max_extent_w = props.maxExtent.width;
+        out.max_extent_h = props.maxExtent.height;
+        out.max_extent_d = props.maxExtent.depth;
+        out.max_mip_levels = props.maxMipLevels;
+        out.max_array_layers = props.maxArrayLayers;
+        out.sample_counts = static_cast<uint32_t>(props.sampleCounts);
+        out.max_resource_size = static_cast<uint64_t>(props.maxResourceSize);
+    }
+    return true;
 }
 
 // ---- VK-M2 body, real Mali path: device + queue + command-buffer + clear-submit. ----
@@ -1716,6 +1760,12 @@ struct VkProvider {
     uint32_t (*enumerate)(void* ctx, uint32_t vinst, uint32_t vphys_base) = nullptr;
     // For props: fill `out` for vphys; return true if the id was known.
     bool (*props)(void* ctx, uint32_t vphys, VkPhysProps& out) = nullptr;
+    // ANGLE-init rung: image-format query. Fill `out` (incl. out.vk_result = Mali's
+    // verdict) for the (format,type,tiling,usage,flags) tuple on vphys; return true if the
+    // id was known. Null = the host answers it directly via the real Mali path.
+    bool (*image_format_props)(void* ctx, uint32_t vphys, uint32_t format, uint32_t type,
+                               uint32_t tiling, uint32_t usage, uint32_t flags,
+                               VkImageFmtProps& out) = nullptr;
     void (*destroy_instance)(void* ctx, uint32_t vinst) = nullptr;
     // ---- VK-M2 body seams (synthetic = wire mode; null callbacks are no-ops). ----
     // Create a logical device on vphys; return VkResult (0 == success), set gfx_family.
@@ -1823,6 +1873,43 @@ inline bool decode_vk_batch(const uint8_t* data, size_t len, VkDecodeState& st,
                 }
                 // If the id was unknown the host emits no props record; the guest sees
                 // the absence (a missing vphys in the reply) as "props unavailable".
+                st.decoded++;
+                break;
+            }
+
+            case ALR_VK_OP_GET_PHYS_IMAGE_FORMAT_PROPS: {
+                uint32_t vinst = 0, vphys = 0, format = 0, type = 0, tiling = 0, usage = 0,
+                         flags = 0;
+                if (!r.u32(vinst) || !r.u32(vphys) || !r.u32(format) || !r.u32(type) ||
+                    !r.u32(tiling) || !r.u32(usage) || !r.u32(flags)) {
+                    st.ok = false;
+                    break;
+                }
+                (void)vinst;
+                VkImageFmtProps ifp{};
+                // Default to "unknown vphys" => report FORMAT_NOT_SUPPORTED (a conformant,
+                // non-crashing answer if the host can't resolve the device).
+                ifp.vk_result = -11;  // VK_ERROR_FORMAT_NOT_SUPPORTED
+                bool known = false;
+#ifdef ALR_VK_DECODE_REAL
+                if (!provider)
+                    known = vk_real_image_format_props(st, vphys, format, type, tiling,
+                                                       usage, flags, ifp);
+#endif
+                if (provider && provider->image_format_props)
+                    known = provider->image_format_props(provider->ctx, vphys, format, type,
+                                                         tiling, usage, flags, ifp);
+                (void)known;
+                reply.u8(static_cast<uint8_t>(ALR_VK_REPLY_IMAGE_FORMAT_PROPS));
+                reply.u32(vphys);
+                reply.i32(ifp.vk_result);
+                reply.u32(ifp.max_extent_w);
+                reply.u32(ifp.max_extent_h);
+                reply.u32(ifp.max_extent_d);
+                reply.u32(ifp.max_mip_levels);
+                reply.u32(ifp.max_array_layers);
+                reply.u32(ifp.sample_counts);
+                reply.u64(ifp.max_resource_size);
                 st.decoded++;
                 break;
             }
@@ -2211,6 +2298,18 @@ struct VkReplyPresent {
     uint8_t presented = 0;      // 1 if routed to the compositor sink
     uint8_t px[4] = {0, 0, 0, 0};
 };
+// ---- ANGLE-init rung reply record ----
+struct VkReplyImageFormatProps {
+    uint32_t vphys = 0;
+    int32_t result = 0;  // VkResult (0 == supported; <0 == FORMAT_NOT_SUPPORTED etc.)
+    uint32_t max_extent_w = 0;
+    uint32_t max_extent_h = 0;
+    uint32_t max_extent_d = 0;
+    uint32_t max_mip_levels = 0;
+    uint32_t max_array_layers = 0;
+    uint32_t sample_counts = 0;
+    uint64_t max_resource_size = 0;
+};
 struct VkDecodedReply {
     std::vector<VkReplyInstance> instances;
     std::vector<VkReplyPhysCount> enumerations;
@@ -2221,6 +2320,7 @@ struct VkDecodedReply {
     std::vector<VkReplySwapchain> swapchains;  // VK-M4
     std::vector<VkReplyAcquire> acquires;      // VK-M4
     std::vector<VkReplyPresent> presents;      // VK-M4
+    std::vector<VkReplyImageFormatProps> image_format_props;  // ANGLE-init rung
     bool ok = true;
 };
 
@@ -2328,6 +2428,18 @@ inline bool decode_vk_reply(const uint8_t* data, size_t len, VkDecodedReply& out
                     return false;
                 }
                 out.presents.push_back(pr);
+                break;
+            }
+            case ALR_VK_REPLY_IMAGE_FORMAT_PROPS: {
+                VkReplyImageFormatProps ip{};
+                if (!r.u32(ip.vphys) || !r.i32(ip.result) || !r.u32(ip.max_extent_w) ||
+                    !r.u32(ip.max_extent_h) || !r.u32(ip.max_extent_d) ||
+                    !r.u32(ip.max_mip_levels) || !r.u32(ip.max_array_layers) ||
+                    !r.u32(ip.sample_counts) || !r.u64(ip.max_resource_size)) {
+                    out.ok = false;
+                    return false;
+                }
+                out.image_format_props.push_back(ip);
                 break;
             }
             default:

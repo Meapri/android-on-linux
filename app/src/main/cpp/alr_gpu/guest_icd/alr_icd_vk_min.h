@@ -342,6 +342,106 @@ typedef struct VkFormatProperties {
     VkFlags bufferFeatures;
 } VkFormatProperties;
 
+/* ---- vkGetPhysicalDeviceImageFormatProperties ABI (a REQUIRED loader entrypoint; also
+ * an ANGLE format-capability query). VkImageType/Tiling are int-sized enums; the query
+ * takes (format, type, tiling, usage, flags) and fills VkImageFormatProperties. ---- */
+typedef int32_t VkImageType;
+typedef int32_t VkImageTiling;
+typedef uint32_t VkImageCreateFlags;
+typedef struct VkExtent3D { uint32_t width; uint32_t height; uint32_t depth; } VkExtent3D;
+typedef struct VkImageFormatProperties {
+    VkExtent3D    maxExtent;
+    uint32_t      maxMipLevels;
+    uint32_t      maxArrayLayers;
+    VkSampleCountFlags sampleCounts;
+    VkDeviceSize  maxResourceSize;
+} VkImageFormatProperties;
+
+/* ---- Core 1.1 "2" query structs (sType-tagged, pNext-chained). ANGLE's RendererVk
+ * uses vkGetPhysicalDeviceProperties2 (in ChoosePhysicalDevice) + the Features2 /
+ * QueueFamilyProperties2 / MemoryProperties2 / FormatProperties2 family. We mirror each
+ * as { sType, pNext, <v1 struct value> } — byte/ABI-identical to the official header —
+ * and the ICD fills the embedded v1 value (which is the real-Mali data it already
+ * marshalled) while walking past any pNext the caller chained. The "2" sType values are
+ * the official Vulkan constants. ---- */
+typedef struct VkPhysicalDeviceProperties2 {
+    VkStructureType            sType;
+    void*                      pNext;
+    VkPhysicalDeviceProperties properties;
+} VkPhysicalDeviceProperties2;
+typedef struct VkPhysicalDeviceFeatures2 {
+    VkStructureType          sType;
+    void*                    pNext;
+    VkPhysicalDeviceFeatures features;
+} VkPhysicalDeviceFeatures2;
+typedef struct VkQueueFamilyProperties2 {
+    VkStructureType         sType;
+    void*                   pNext;
+    VkQueueFamilyProperties queueFamilyProperties;
+} VkQueueFamilyProperties2;
+typedef struct VkPhysicalDeviceMemoryProperties2 {
+    VkStructureType                  sType;
+    void*                            pNext;
+    VkPhysicalDeviceMemoryProperties memoryProperties;
+} VkPhysicalDeviceMemoryProperties2;
+typedef struct VkFormatProperties2 {
+    VkStructureType    sType;
+    void*              pNext;
+    VkFormatProperties formatProperties;
+} VkFormatProperties2;
+/* The image-format "2" pair: an INPUT info struct (format/type/tiling/usage/flags) and an
+ * OUTPUT struct embedding VkImageFormatProperties. */
+typedef struct VkPhysicalDeviceImageFormatInfo2 {
+    VkStructureType    sType;
+    const void*        pNext;
+    VkFormat           format;
+    VkImageType        type;
+    VkImageTiling      tiling;
+    VkImageUsageFlags  usage;
+    VkImageCreateFlags flags;
+} VkPhysicalDeviceImageFormatInfo2;
+typedef struct VkImageFormatProperties2 {
+    VkStructureType         sType;
+    void*                   pNext;
+    VkImageFormatProperties imageFormatProperties;
+} VkImageFormatProperties2;
+/* Sparse image-format query (a REQUIRED loader entrypoint). We report ZERO properties
+ * (no sparse support) — a conformant answer ANGLE tolerates — so only the count form +
+ * the struct SIZE matter for ABI. */
+typedef struct VkSparseImageFormatProperties {
+    VkFlags    aspectMask;        /* VkImageAspectFlags */
+    VkExtent3D imageGranularity;
+    VkFlags    flags;             /* VkSparseImageFormatFlags */
+} VkSparseImageFormatProperties;
+typedef struct VkSparseImageFormatProperties2 {
+    VkStructureType               sType;
+    void*                         pNext;
+    VkSparseImageFormatProperties properties;
+} VkSparseImageFormatProperties2;
+typedef struct VkPhysicalDeviceSparseImageFormatInfo2 {
+    VkStructureType    sType;
+    const void*        pNext;
+    VkFormat           format;
+    VkImageType        type;
+    VkSampleCountFlags samples;   /* VkSampleCountFlagBits */
+    VkImageUsageFlags  usage;
+    VkImageTiling      tiling;
+} VkPhysicalDeviceSparseImageFormatInfo2;
+
+/* The "2" sType values (official Vulkan constants). */
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 1000059000
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 1000059001
+#define VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2 1000059002
+#define VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2 1000059003
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2 1000059004
+#define VK_STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2 1000059005
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2 1000059006
+#define VK_STRUCTURE_TYPE_SPARSE_IMAGE_FORMAT_PROPERTIES_2 1000059007
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SPARSE_IMAGE_FORMAT_INFO_2 1000059008
+/* VK_ERROR_FORMAT_NOT_SUPPORTED is a VALID image-format verdict (the format/usage tuple
+ * is simply unsupported), distinct from an init failure. */
+#define VK_ERROR_FORMAT_NOT_SUPPORTED (-11)
+
 /* Common VkMemoryPropertyFlagBits (only the ones a minimal allocator reports). */
 #define VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT     0x00000001
 #define VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT     0x00000002
@@ -359,6 +459,16 @@ typedef void (VKAPI_PTR *PFN_vkGetPhysicalDeviceQueueFamilyProperties)(VkPhysica
 typedef VkResult (VKAPI_PTR *PFN_vkCreateDevice)(VkPhysicalDevice, const VkDeviceCreateInfo*, const VkAllocationCallbacks*, VkDevice*);
 typedef void (VKAPI_PTR *PFN_vkDestroyDevice)(VkDevice, const VkAllocationCallbacks*);
 typedef void (VKAPI_PTR *PFN_vkGetDeviceQueue)(VkDevice, uint32_t, uint32_t, VkQueue*);
+/* ---- ANGLE-init rung PFNs: the REQUIRED image/sparse-format queries + the core-1.1
+ * "2" physical-device query family ANGLE's RendererVk::initialize uses. ---- */
+typedef VkResult (VKAPI_PTR *PFN_vkGetPhysicalDeviceImageFormatProperties)(VkPhysicalDevice, VkFormat, VkImageType, VkImageTiling, VkImageUsageFlags, VkImageCreateFlags, VkImageFormatProperties*);
+typedef void (VKAPI_PTR *PFN_vkGetPhysicalDeviceSparseImageFormatProperties)(VkPhysicalDevice, VkFormat, VkImageType, VkSampleCountFlags, VkImageUsageFlags, VkImageTiling, uint32_t*, VkSparseImageFormatProperties*);
+typedef void (VKAPI_PTR *PFN_vkGetPhysicalDeviceProperties2)(VkPhysicalDevice, VkPhysicalDeviceProperties2*);
+typedef void (VKAPI_PTR *PFN_vkGetPhysicalDeviceFeatures2)(VkPhysicalDevice, VkPhysicalDeviceFeatures2*);
+typedef void (VKAPI_PTR *PFN_vkGetPhysicalDeviceQueueFamilyProperties2)(VkPhysicalDevice, uint32_t*, VkQueueFamilyProperties2*);
+typedef void (VKAPI_PTR *PFN_vkGetPhysicalDeviceMemoryProperties2)(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties2*);
+typedef void (VKAPI_PTR *PFN_vkGetPhysicalDeviceFormatProperties2)(VkPhysicalDevice, VkFormat, VkFormatProperties2*);
+typedef VkResult (VKAPI_PTR *PFN_vkGetPhysicalDeviceImageFormatProperties2)(VkPhysicalDevice, const VkPhysicalDeviceImageFormatInfo2*, VkImageFormatProperties2*);
 /* ---- VK-M4 (PRESENT rung) PFNs ---- */
 typedef VkResult (VKAPI_PTR *PFN_vkCreateCommandPool)(VkDevice, const VkCommandPoolCreateInfo*, const VkAllocationCallbacks*, VkCommandPool*);
 typedef void (VKAPI_PTR *PFN_vkDestroyCommandPool)(VkDevice, VkCommandPool, const VkAllocationCallbacks*);
@@ -387,6 +497,16 @@ VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceQueueFamilyProperties(VkPhysicalDe
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCreateInfo, const VkAllocationCallbacks *pAllocator, VkDevice *pDevice);
 VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice device, const VkAllocationCallbacks *pAllocator);
 VKAPI_ATTR void VKAPI_CALL vkGetDeviceQueue(VkDevice device, uint32_t queueFamilyIndex, uint32_t queueIndex, VkQueue *pQueue);
+/* ---- ANGLE-init rung public prototypes (REQUIRED image/sparse format queries + the
+ * core-1.1 "2" physical-device query family) ---- */
+VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatProperties(VkPhysicalDevice physicalDevice, VkFormat format, VkImageType type, VkImageTiling tiling, VkImageUsageFlags usage, VkImageCreateFlags flags, VkImageFormatProperties *pImageFormatProperties);
+VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceSparseImageFormatProperties(VkPhysicalDevice physicalDevice, VkFormat format, VkImageType type, VkSampleCountFlags samples, VkImageUsageFlags usage, VkImageTiling tiling, uint32_t *pPropertyCount, VkSparseImageFormatProperties *pProperties);
+VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties2 *pProperties);
+VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures2 *pFeatures);
+VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice physicalDevice, uint32_t *pQueueFamilyPropertyCount, VkQueueFamilyProperties2 *pQueueFamilyProperties);
+VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceMemoryProperties2(VkPhysicalDevice physicalDevice, VkPhysicalDeviceMemoryProperties2 *pMemoryProperties);
+VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice, VkFormat format, VkFormatProperties2 *pFormatProperties);
+VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice, const VkPhysicalDeviceImageFormatInfo2 *pImageFormatInfo, VkImageFormatProperties2 *pImageFormatProperties);
 /* ---- VK-M4 (PRESENT rung) public prototypes ---- */
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateCommandPool(VkDevice device, const VkCommandPoolCreateInfo *pCreateInfo, const VkAllocationCallbacks *pAllocator, VkCommandPool *pCommandPool);
 VKAPI_ATTR void VKAPI_CALL vkDestroyCommandPool(VkDevice device, VkCommandPool commandPool, const VkAllocationCallbacks *pAllocator);

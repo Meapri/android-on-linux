@@ -937,6 +937,15 @@ static VkResult VKAPI_CALL alr_vkEnumerateDeviceExtensionProperties(
                               pPropertyCount, pProperties);
 }
 
+/* Deprecated (device layers are gone since Vulkan 1.0.13) but the loader still queries it
+ * via the instance dispatch table; report ZERO layers — the conformant modern answer. */
+static VkResult VKAPI_CALL alr_vkEnumerateDeviceLayerProperties(
+    VkPhysicalDevice physicalDevice, uint32_t *pPropertyCount, VkLayerProperties *pProperties) {
+    (void)physicalDevice; (void)pProperties;
+    if (pPropertyCount) *pPropertyCount = 0;
+    return VK_SUCCESS;
+}
+
 static void VKAPI_CALL alr_vkGetPhysicalDeviceFeatures(
     VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures *pFeatures) {
     (void)physicalDevice;
@@ -982,6 +991,200 @@ static void VKAPI_CALL alr_vkGetPhysicalDeviceFormatProperties(
 }
 
 /* ============================================================================
+ * ANGLE-init rung, batch 2: the REQUIRED-by-the-loader image/sparse-format queries +
+ * the core-1.1 "2" physical-device query family ANGLE's RendererVk::initialize calls.
+ *
+ * WHY THIS BATCH UNBLOCKS -9 (VK_ERROR_INCOMPATIBLE_DRIVER): the Khronos Vulkan-Loader's
+ * loader_icd_init_entries() resolves a FIXED set of physical-device entry points through
+ * our vk_icdGetInstanceProcAddr at ICD-scan time; if ANY required one is NULL it logs
+ * "Unable to load <fn> from ICD" and REJECTS the ICD (-9). vkGetPhysicalDeviceImage
+ * FormatProperties + vkGetPhysicalDeviceSparseImageFormatProperties were the two missing
+ * REQUIRED entries (the others were already exported). Adding them to alr_lookup() makes
+ * the loader accept us; the "2" family then satisfies ANGLE's own RendererVk queries.
+ *
+ * FORWARDING MODEL:
+ *  - ImageFormatProperties: parameterized, so it ROUND-TRIPS to the REAL Mali
+ *    vkGetPhysicalDeviceImageFormatProperties over the ring (op GET_PHYS_IMAGE_FORMAT_PROPS
+ *    -> host servicer -> real Mali -> reply). Mali's verdict (incl. a valid
+ *    VK_ERROR_FORMAT_NOT_SUPPORTED) flows back verbatim, so the guest mirrors the hardware.
+ *  - Properties2 / Features2 / QueueFamilyProperties2 / MemoryProperties2 /
+ *    FormatProperties2: the v2 struct is { sType, pNext, <v1 value> }, and the v1 value IS
+ *    the real-Mali data we already marshalled (props cache) or already answer (features/
+ *    memory/format). So these reuse the v1 entry points to fill the embedded v1 member and
+ *    leave any chained pNext untouched (ANGLE tolerates a cleared ID/driver-props chain —
+ *    it only WARNs on the driver name). This keeps the wire minimal while the data stays
+ *    real-Mali-truthful where it matters (the device props/queues come from Mali).
+ *  - SparseImageFormatProperties(2): report ZERO properties (no sparse support) — a
+ *    conformant answer ANGLE's basic render path tolerates (it does not require sparse).
+ * ============================================================================ */
+
+/* Scan a reply stream for the ONE ALR_VK_REPLY_IMAGE_FORMAT_PROPS record, filling the
+ * out params. Returns 1 if found. A dedicated reader (the ENUM-rung alr_icd_parse_reply
+ * only knows props records; this record has its own fixed payload). */
+static int alr_icd_scan_image_format_reply(const uint8_t *data, uint32_t len,
+                                           int32_t *out_result, uint32_t *out_w,
+                                           uint32_t *out_h, uint32_t *out_d,
+                                           uint32_t *out_mips, uint32_t *out_layers,
+                                           uint32_t *out_samples, uint64_t *out_maxsz) {
+    AlrRd r; uint8_t op;
+    r.p = data; r.n = len; r.pos = 0;
+    for (;;) {
+        if (!rd_u8(&r, &op)) break;
+        if (op == ALR_VK_REPLY_END) break;
+        if (op == ALR_VK_REPLY_IMAGE_FORMAT_PROPS) {
+            uint32_t vphys, w, h, d, mips, layers, samples; int32_t res;
+            uint8_t maxsz_b[8]; uint64_t maxsz;
+            if (!rd_u32(&r, &vphys) || !rd_i32(&r, &res) || !rd_u32(&r, &w) ||
+                !rd_u32(&r, &h) || !rd_u32(&r, &d) || !rd_u32(&r, &mips) ||
+                !rd_u32(&r, &layers) || !rd_u32(&r, &samples)) return 0;
+            /* u64 max_resource_size (no rd_u64 helper; read 8 bytes LE). */
+            if (r.pos + 8 > r.n) return 0;
+            memcpy(maxsz_b, r.p + r.pos, 8); r.pos += 8;
+            memcpy(&maxsz, maxsz_b, 8);
+            if (out_result) *out_result = res;
+            if (out_w) *out_w = w;
+            if (out_h) *out_h = h;
+            if (out_d) *out_d = d;
+            if (out_mips) *out_mips = mips;
+            if (out_layers) *out_layers = layers;
+            if (out_samples) *out_samples = samples;
+            if (out_maxsz) *out_maxsz = maxsz;
+            return 1;
+        }
+        /* Any other record here is unexpected for this single-op batch; bail. */
+        return 0;
+    }
+    return 0;
+}
+
+static VkResult VKAPI_CALL alr_vkGetPhysicalDeviceImageFormatProperties(
+    VkPhysicalDevice physicalDevice, VkFormat format, VkImageType type, VkImageTiling tiling,
+    VkImageUsageFlags usage, VkImageCreateFlags flags,
+    VkImageFormatProperties *pImageFormatProperties) {
+    AlrIcdPhysicalDevice *pd = (AlrIcdPhysicalDevice *)physicalDevice;
+    int32_t res = (int32_t)VK_ERROR_FORMAT_NOT_SUPPORTED;
+    uint32_t w = 0, h = 0, d = 0, mips = 0, layers = 0, samples = 0;
+    uint64_t maxsz = 0;
+    if (!pd || !pImageFormatProperties) return VK_ERROR_INITIALIZATION_FAILED;
+    memset(pImageFormatProperties, 0, sizeof(*pImageFormatProperties));
+    ALR_ICD_DIAG("vkGetPhysicalDeviceImageFormatProperties fmt=%d type=%d tiling=%d "
+                 "usage=0x%x (ring_ok=%d)", (int)format, (int)type, (int)tiling,
+                 (unsigned)usage, alr_icd_ring_ok());
+    if (alr_icd_ring_ok()) {
+        uint8_t req[64]; AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH]; uint32_t rlen;
+        alr_vk_enc_init(&e, req, sizeof(req));
+        alr_vk_enc_get_phys_image_format_props(&e, pd->inst->vinst, pd->vphys,
+                                               (uint32_t)format, (uint32_t)type,
+                                               (uint32_t)tiling, (uint32_t)usage,
+                                               (uint32_t)flags);
+        alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
+        if (!e.overflow) {
+            rlen = alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
+            if (rlen)
+                (void)alr_icd_scan_image_format_reply(reply, rlen, &res, &w, &h, &d, &mips,
+                                                      &layers, &samples, &maxsz);
+        }
+    } else {
+        /* Ring-less: report a generous "supported" answer so a no-host guest still
+         * progresses (the same conservative-permissive stance the v1 props take). */
+        res = (int32_t)VK_SUCCESS;
+        w = 16384; h = 16384; d = 1; mips = 15; layers = 2048;
+        samples = 0x1; maxsz = (uint64_t)1 << 31;
+    }
+    if (res != 0) return (VkResult)res;  /* propagate Mali's verdict (e.g. NOT_SUPPORTED) */
+    pImageFormatProperties->maxExtent.width = w;
+    pImageFormatProperties->maxExtent.height = h;
+    pImageFormatProperties->maxExtent.depth = d;
+    pImageFormatProperties->maxMipLevels = mips;
+    pImageFormatProperties->maxArrayLayers = layers;
+    pImageFormatProperties->sampleCounts = samples;
+    pImageFormatProperties->maxResourceSize = (VkDeviceSize)maxsz;
+    return VK_SUCCESS;
+}
+
+static void VKAPI_CALL alr_vkGetPhysicalDeviceSparseImageFormatProperties(
+    VkPhysicalDevice physicalDevice, VkFormat format, VkImageType type,
+    VkSampleCountFlags samples, VkImageUsageFlags usage, VkImageTiling tiling,
+    uint32_t *pPropertyCount, VkSparseImageFormatProperties *pProperties) {
+    (void)physicalDevice; (void)format; (void)type; (void)samples; (void)usage;
+    (void)tiling; (void)pProperties;
+    /* No sparse-residency support: report ZERO properties (a conformant answer; ANGLE's
+     * basic render path does not require sparse). The two-call form just yields count=0. */
+    if (pPropertyCount) *pPropertyCount = 0;
+    ALR_ICD_DIAG("vkGetPhysicalDeviceSparseImageFormatProperties -> 0 (no sparse)");
+}
+
+/* ---- the core-1.1 "2" family: fill the embedded v1 struct from the v1 entry points,
+ * leaving any chained pNext untouched (ANGLE tolerates a cleared chain). ---- */
+static void VKAPI_CALL alr_vkGetPhysicalDeviceProperties2(
+    VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties2 *pProperties) {
+    if (!pProperties) return;
+    /* Do NOT memset the whole struct: the caller chained pNext structs (ANGLE attaches
+     * VkPhysicalDeviceIDProperties + DriverProperties) that we must not stomp. Only fill
+     * the embedded v1 .properties (the real-Mali data, via the v1 entry point). */
+    alr_vkGetPhysicalDeviceProperties(physicalDevice, &pProperties->properties);
+    ALR_ICD_DIAG("vkGetPhysicalDeviceProperties2 (pNext=%p) name=%s",
+                 (void *)pProperties->pNext, pProperties->properties.deviceName);
+}
+
+static void VKAPI_CALL alr_vkGetPhysicalDeviceFeatures2(
+    VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures2 *pFeatures) {
+    if (!pFeatures) return;
+    alr_vkGetPhysicalDeviceFeatures(physicalDevice, &pFeatures->features);
+    ALR_ICD_DIAG("vkGetPhysicalDeviceFeatures2 (pNext=%p)", (void *)pFeatures->pNext);
+}
+
+static void VKAPI_CALL alr_vkGetPhysicalDeviceQueueFamilyProperties2(
+    VkPhysicalDevice physicalDevice, uint32_t *pQueueFamilyPropertyCount,
+    VkQueueFamilyProperties2 *pQueueFamilyProperties) {
+    if (!pQueueFamilyPropertyCount) return;
+    if (pQueueFamilyProperties == NULL) {
+        /* Count form: delegate to the v1 query with a NULL fill array. */
+        alr_vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice,
+                                                     pQueueFamilyPropertyCount, NULL);
+        return;
+    }
+    /* Fill form: gather the v1 array, then copy each into the embedded v1 member of the
+     * "2" structs (leaving each element's pNext chain untouched). */
+    uint32_t n = *pQueueFamilyPropertyCount, i;
+    VkQueueFamilyProperties tmp[16];
+    if (n > 16) n = 16;
+    uint32_t got = n;
+    alr_vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &got, tmp);
+    for (i = 0; i < got; ++i) pQueueFamilyProperties[i].queueFamilyProperties = tmp[i];
+    *pQueueFamilyPropertyCount = got;
+}
+
+static void VKAPI_CALL alr_vkGetPhysicalDeviceMemoryProperties2(
+    VkPhysicalDevice physicalDevice, VkPhysicalDeviceMemoryProperties2 *pMemoryProperties) {
+    if (!pMemoryProperties) return;
+    alr_vkGetPhysicalDeviceMemoryProperties(physicalDevice,
+                                            &pMemoryProperties->memoryProperties);
+}
+
+static void VKAPI_CALL alr_vkGetPhysicalDeviceFormatProperties2(
+    VkPhysicalDevice physicalDevice, VkFormat format,
+    VkFormatProperties2 *pFormatProperties) {
+    if (!pFormatProperties) return;
+    alr_vkGetPhysicalDeviceFormatProperties(physicalDevice, format,
+                                            &pFormatProperties->formatProperties);
+}
+
+static VkResult VKAPI_CALL alr_vkGetPhysicalDeviceImageFormatProperties2(
+    VkPhysicalDevice physicalDevice, const VkPhysicalDeviceImageFormatInfo2 *pImageFormatInfo,
+    VkImageFormatProperties2 *pImageFormatProperties) {
+    if (!pImageFormatInfo || !pImageFormatProperties)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    /* Forward to the v1 path (which round-trips to real Mali), filling the embedded v1
+     * member. Any pNext (e.g. VkSamplerYcbcrConversionImageFormatProperties) is left
+     * as the caller initialized it — a conformant default for the bring-up. */
+    return alr_vkGetPhysicalDeviceImageFormatProperties(
+        physicalDevice, pImageFormatInfo->format, pImageFormatInfo->type,
+        pImageFormatInfo->tiling, pImageFormatInfo->usage, pImageFormatInfo->flags,
+        &pImageFormatProperties->imageFormatProperties);
+}
+
+/* ============================================================================
  * Dispatch — vkGetInstanceProcAddr / vkGetDeviceProcAddr. The app/loader resolves
  * every entry point through these. We return our ENUM-rung implementations and
  * vkGetInstanceProcAddr / vkGetDeviceProcAddr themselves (a global GIPA also resolves
@@ -1005,9 +1208,30 @@ static PFN_vkVoidFunction alr_lookup(const char *pName) {
         ALR_ENTRY("vkEnumerateInstanceExtensionProperties", alr_vkEnumerateInstanceExtensionProperties),
         ALR_ENTRY("vkEnumerateInstanceLayerProperties", alr_vkEnumerateInstanceLayerProperties),
         ALR_ENTRY("vkEnumerateDeviceExtensionProperties", alr_vkEnumerateDeviceExtensionProperties),
+        ALR_ENTRY("vkEnumerateDeviceLayerProperties", alr_vkEnumerateDeviceLayerProperties),
         ALR_ENTRY("vkGetPhysicalDeviceFeatures", alr_vkGetPhysicalDeviceFeatures),
         ALR_ENTRY("vkGetPhysicalDeviceMemoryProperties", alr_vkGetPhysicalDeviceMemoryProperties),
         ALR_ENTRY("vkGetPhysicalDeviceFormatProperties", alr_vkGetPhysicalDeviceFormatProperties),
+        /* The two REQUIRED-by-the-Khronos-loader physical-device entry points whose
+         * absence made loader_icd_init_entries reject us with -9 (the precise fix). */
+        ALR_ENTRY("vkGetPhysicalDeviceImageFormatProperties", alr_vkGetPhysicalDeviceImageFormatProperties),
+        ALR_ENTRY("vkGetPhysicalDeviceSparseImageFormatProperties", alr_vkGetPhysicalDeviceSparseImageFormatProperties),
+        /* The core-1.1 "2" query family ANGLE's RendererVk::initialize calls (Properties2
+         * is used in ChoosePhysicalDevice; the rest in the device bring-up). */
+        ALR_ENTRY("vkGetPhysicalDeviceProperties2", alr_vkGetPhysicalDeviceProperties2),
+        ALR_ENTRY("vkGetPhysicalDeviceFeatures2", alr_vkGetPhysicalDeviceFeatures2),
+        ALR_ENTRY("vkGetPhysicalDeviceQueueFamilyProperties2", alr_vkGetPhysicalDeviceQueueFamilyProperties2),
+        ALR_ENTRY("vkGetPhysicalDeviceMemoryProperties2", alr_vkGetPhysicalDeviceMemoryProperties2),
+        ALR_ENTRY("vkGetPhysicalDeviceFormatProperties2", alr_vkGetPhysicalDeviceFormatProperties2),
+        ALR_ENTRY("vkGetPhysicalDeviceImageFormatProperties2", alr_vkGetPhysicalDeviceImageFormatProperties2),
+        /* The KHR aliases (ANGLE may resolve the VK_KHR_get_physical_device_properties2
+         * names when it enables that instance extension instead of relying on core 1.1). */
+        ALR_ENTRY("vkGetPhysicalDeviceProperties2KHR", alr_vkGetPhysicalDeviceProperties2),
+        ALR_ENTRY("vkGetPhysicalDeviceFeatures2KHR", alr_vkGetPhysicalDeviceFeatures2),
+        ALR_ENTRY("vkGetPhysicalDeviceQueueFamilyProperties2KHR", alr_vkGetPhysicalDeviceQueueFamilyProperties2),
+        ALR_ENTRY("vkGetPhysicalDeviceMemoryProperties2KHR", alr_vkGetPhysicalDeviceMemoryProperties2),
+        ALR_ENTRY("vkGetPhysicalDeviceFormatProperties2KHR", alr_vkGetPhysicalDeviceFormatProperties2),
+        ALR_ENTRY("vkGetPhysicalDeviceImageFormatProperties2KHR", alr_vkGetPhysicalDeviceImageFormatProperties2),
         ALR_ENTRY("vkCreateDevice", alr_vkCreateDevice),
         ALR_ENTRY("vkDestroyDevice", alr_vkDestroyDevice),
         ALR_ENTRY("vkGetDeviceQueue", alr_vkGetDeviceQueue),
@@ -1071,11 +1295,49 @@ PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInstance instance, con
     return alr_vkGetInstanceProcAddr(instance, pName);
 }
 
-/* vk_icdGetPhysicalDeviceProcAddr (interface v4+): our phys-device functions resolve
- * through the normal GIPA, so just forward. */
+/* vk_icdGetPhysicalDeviceProcAddr (interface v4+): the Khronos loader calls this to find
+ * functions whose FIRST parameter is a VkPhysicalDevice, and a non-NULL return makes the
+ * loader build a physical-device trampoline+terminator for that name. The contract (LunarG
+ * LoaderDriverInterface) is that it must return NULL for any function that does NOT take a
+ * VkPhysicalDevice first (global/instance/device-level), so we restrict to the
+ * physical-device family rather than forwarding the whole table — returning ours for, say,
+ * a VkDevice-first function (vkCreateSwapchainKHR) would mis-route it as a phys-device call.
+ * The loader still resolves the non-phys functions through vk_icdGetInstanceProcAddr. */
+static int alr_is_phys_device_fn(const char *n) {
+    static const char *const phys_fns[] = {
+        "vkGetPhysicalDeviceProperties",
+        "vkGetPhysicalDeviceQueueFamilyProperties",
+        "vkGetPhysicalDeviceFeatures",
+        "vkGetPhysicalDeviceMemoryProperties",
+        "vkGetPhysicalDeviceFormatProperties",
+        "vkGetPhysicalDeviceImageFormatProperties",
+        "vkGetPhysicalDeviceSparseImageFormatProperties",
+        "vkGetPhysicalDeviceProperties2",
+        "vkGetPhysicalDeviceFeatures2",
+        "vkGetPhysicalDeviceQueueFamilyProperties2",
+        "vkGetPhysicalDeviceMemoryProperties2",
+        "vkGetPhysicalDeviceFormatProperties2",
+        "vkGetPhysicalDeviceImageFormatProperties2",
+        "vkGetPhysicalDeviceProperties2KHR",
+        "vkGetPhysicalDeviceFeatures2KHR",
+        "vkGetPhysicalDeviceQueueFamilyProperties2KHR",
+        "vkGetPhysicalDeviceMemoryProperties2KHR",
+        "vkGetPhysicalDeviceFormatProperties2KHR",
+        "vkGetPhysicalDeviceImageFormatProperties2KHR",
+        "vkEnumerateDeviceExtensionProperties",
+        "vkEnumerateDeviceLayerProperties",
+        "vkCreateDevice",  /* takes VkPhysicalDevice first */
+    };
+    size_t i;
+    if (!n) return 0;
+    for (i = 0; i < sizeof(phys_fns) / sizeof(phys_fns[0]); ++i)
+        if (strcmp(phys_fns[i], n) == 0) return 1;
+    return 0;
+}
 __attribute__((visibility("default")))
 PFN_vkVoidFunction VKAPI_CALL vk_icdGetPhysicalDeviceProcAddr(VkInstance instance, const char *pName) {
     (void)instance;
+    if (!alr_is_phys_device_fn(pName)) return NULL;
     return alr_lookup(pName);
 }
 
@@ -1141,6 +1403,12 @@ VkResult VKAPI_CALL vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physic
                                                      pPropertyCount, pProperties);
 }
 __attribute__((visibility("default")))
+VkResult VKAPI_CALL vkEnumerateDeviceLayerProperties(VkPhysicalDevice physicalDevice,
+                                                     uint32_t *pPropertyCount,
+                                                     VkLayerProperties *pProperties) {
+    return alr_vkEnumerateDeviceLayerProperties(physicalDevice, pPropertyCount, pProperties);
+}
+__attribute__((visibility("default")))
 void VKAPI_CALL vkGetPhysicalDeviceFeatures(VkPhysicalDevice physicalDevice,
                                             VkPhysicalDeviceFeatures *pFeatures) {
     alr_vkGetPhysicalDeviceFeatures(physicalDevice, pFeatures);
@@ -1155,6 +1423,61 @@ void VKAPI_CALL vkGetPhysicalDeviceFormatProperties(VkPhysicalDevice physicalDev
                                                     VkFormat format,
                                                     VkFormatProperties *pFormatProperties) {
     alr_vkGetPhysicalDeviceFormatProperties(physicalDevice, format, pFormatProperties);
+}
+/* ---- ANGLE-init rung public symbols (the REQUIRED image/sparse format queries + the
+ * core-1.1 "2" family). The direct-SONAME path (an app/ANGLE that dlsyms these by name)
+ * binds straight to ours; the loader route resolves them via vk_icdGetInstanceProcAddr. */
+__attribute__((visibility("default")))
+VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatProperties(
+    VkPhysicalDevice physicalDevice, VkFormat format, VkImageType type, VkImageTiling tiling,
+    VkImageUsageFlags usage, VkImageCreateFlags flags,
+    VkImageFormatProperties *pImageFormatProperties) {
+    return alr_vkGetPhysicalDeviceImageFormatProperties(physicalDevice, format, type, tiling,
+                                                        usage, flags, pImageFormatProperties);
+}
+__attribute__((visibility("default")))
+void VKAPI_CALL vkGetPhysicalDeviceSparseImageFormatProperties(
+    VkPhysicalDevice physicalDevice, VkFormat format, VkImageType type,
+    VkSampleCountFlags samples, VkImageUsageFlags usage, VkImageTiling tiling,
+    uint32_t *pPropertyCount, VkSparseImageFormatProperties *pProperties) {
+    alr_vkGetPhysicalDeviceSparseImageFormatProperties(physicalDevice, format, type, samples,
+                                                       usage, tiling, pPropertyCount,
+                                                       pProperties);
+}
+__attribute__((visibility("default")))
+void VKAPI_CALL vkGetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
+                                               VkPhysicalDeviceProperties2 *pProperties) {
+    alr_vkGetPhysicalDeviceProperties2(physicalDevice, pProperties);
+}
+__attribute__((visibility("default")))
+void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice,
+                                             VkPhysicalDeviceFeatures2 *pFeatures) {
+    alr_vkGetPhysicalDeviceFeatures2(physicalDevice, pFeatures);
+}
+__attribute__((visibility("default")))
+void VKAPI_CALL vkGetPhysicalDeviceQueueFamilyProperties2(
+    VkPhysicalDevice physicalDevice, uint32_t *pQueueFamilyPropertyCount,
+    VkQueueFamilyProperties2 *pQueueFamilyProperties) {
+    alr_vkGetPhysicalDeviceQueueFamilyProperties2(physicalDevice, pQueueFamilyPropertyCount,
+                                                  pQueueFamilyProperties);
+}
+__attribute__((visibility("default")))
+void VKAPI_CALL vkGetPhysicalDeviceMemoryProperties2(
+    VkPhysicalDevice physicalDevice, VkPhysicalDeviceMemoryProperties2 *pMemoryProperties) {
+    alr_vkGetPhysicalDeviceMemoryProperties2(physicalDevice, pMemoryProperties);
+}
+__attribute__((visibility("default")))
+void VKAPI_CALL vkGetPhysicalDeviceFormatProperties2(
+    VkPhysicalDevice physicalDevice, VkFormat format,
+    VkFormatProperties2 *pFormatProperties) {
+    alr_vkGetPhysicalDeviceFormatProperties2(physicalDevice, format, pFormatProperties);
+}
+__attribute__((visibility("default")))
+VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatProperties2(
+    VkPhysicalDevice physicalDevice, const VkPhysicalDeviceImageFormatInfo2 *pImageFormatInfo,
+    VkImageFormatProperties2 *pImageFormatProperties) {
+    return alr_vkGetPhysicalDeviceImageFormatProperties2(physicalDevice, pImageFormatInfo,
+                                                         pImageFormatProperties);
 }
 __attribute__((visibility("default")))
 VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physicalDevice,

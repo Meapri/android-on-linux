@@ -305,9 +305,53 @@ int main() {
         check(syn.present_count == 1, "synthetic device presented exactly once");
     }
 
+    // 15) ANGLE-init rung: vkGetPhysicalDeviceImageFormatProperties forward. The new op
+    //     round-trips a (format,type,tiling,usage,flags) tuple to the host, which (here,
+    //     synthetically; on device, real Mali) returns a VkImageFormatProperties + result.
+    //     This is the op the ICD's image-format entry point marshals — the entry point whose
+    //     ABSENCE made the Khronos loader reject the ICD with -9. Asserts the reply record
+    //     decodes with the synthetic device's supported verdict + max extent.
+    {
+        SyntheticMaliProvider syn;
+        VkProvider prov = syn.as_provider();
+        VkDecodeState st;
+        // First create instance + enumerate so vphys 100 is a known device id.
+        std::vector<uint8_t> a(256);
+        AlrVkEncoder e; alr_vk_enc_init(&e, a.data(), (uint32_t)a.size());
+        alr_vk_enc_create_instance(&e, 1, kAlrVkApi13);
+        alr_vk_enc_enumerate_phys(&e, 1, 100);
+        // R8G8B8A8_UNORM (37), 2D (0), OPTIMAL (0), COLOR_ATTACHMENT (0x10), no flags.
+        alr_vk_enc_get_phys_image_format_props(&e, 1, 100, 37, 0, 0, 0x10u, 0);
+        alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
+        VkReplyEncoder reply;
+        check(decode_vk_batch(a.data(), e.len, st, reply, &prov), "image-format batch decodes");
+        VkDecodedReply dr;
+        check(decode_vk_reply(reply.bytes().data(), reply.bytes().size(), dr),
+              "image-format reply decodes");
+        check(dr.image_format_props.size() == 1, "one image-format-props reply record");
+        if (dr.image_format_props.size() == 1) {
+            const auto& ip = dr.image_format_props[0];
+            check(ip.vphys == 100, "image-format vphys round-trips");
+            check(ip.result == 0, "image-format result is VK_SUCCESS (supported)");
+            check(ip.max_extent_w >= 1 && ip.max_extent_h >= 1, "image-format max extent set");
+            check(ip.max_resource_size > 0, "image-format max resource size set");
+        }
+    }
+
+    // 16) ANGLE-init rung: a truncated GET_PHYS_IMAGE_FORMAT_PROPS (opcode + partial
+    //     operands) must fail-stop, not over-read.
+    {
+        uint8_t bad[5] = {(uint8_t)ALR_VK_OP_GET_PHYS_IMAGE_FORMAT_PROPS, 1, 0, 0, 0};  // vinst only
+        VkDecodeState st;
+        VkReplyEncoder reply;
+        const bool ok = decode_vk_batch(bad, sizeof(bad), st, reply, nullptr);
+        check(!ok, "truncated image-format op fails cleanly");
+    }
+
     if (failures == 0) {
         printf("native_vk_marshal_test: ALL PASS (vk enumerate/props + clear-submit + "
-               "DRAW(pipeline/vbuf/vkCmdDraw) + PRESENT(guest SPIR-V/swapchain) marshalling)\n");
+               "DRAW(pipeline/vbuf/vkCmdDraw) + PRESENT(guest SPIR-V/swapchain) + "
+               "ANGLE-init image-format marshalling)\n");
         return 0;
     }
     printf("native_vk_marshal_test: %d FAILURE(S)\n", failures);
