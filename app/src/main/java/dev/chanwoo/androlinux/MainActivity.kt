@@ -3037,4 +3037,11 @@ class MainActivity : Activity() {
         surface: android.view.Surface,
         encodedFrames: String,
     ): String
+
+    // USB host bridge diagnostics (docs/design/android-usb-host.md §5): reports
+    // whether the ALR USB bridge AF_UNIX socket (<cacheDir>/alr-usb/usbd.sock,
+    // also exported to the guest as ALR_USB_SOCK) is present + connectable. Pure
+    // observability; the bridge itself is the Kotlin dev.chanwoo.androlinux.usb.
+    // UsbHostBridge started where the guest launch env is assembled.
+    private external fun nativeUsbBridgeStatus(appCacheDir: String): String
 }

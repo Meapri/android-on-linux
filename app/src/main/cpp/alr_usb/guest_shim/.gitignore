@@ -1,0 +1,3 @@
+# Build artifacts from build-usb-shim.sh (the standalone libusb-1.0.so.0 + .o).
+# Source-only repo; the shim is rebuilt on demand and overlaid into the rootfs.
+out/

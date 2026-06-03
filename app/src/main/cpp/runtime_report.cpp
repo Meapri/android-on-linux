@@ -11,6 +11,7 @@
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/un.h>
@@ -1606,6 +1607,22 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     // the wrong directory. With this, DIR_MODULE resolves under the rootfs and normal
     // path mediation maps the asset open. Only used when guest_rel is absolute.
     guest_env.push_back("ALR_GUEST_EXE=" + guest_rel);
+    // ALR_USB_SOCK: the AF_UNIX socket the guest's libusb shim
+    // (alr_usb/guest_shim/libusb-1.0.so.0) connects to in order to forward
+    // libusb_* calls to the Android-side UsbHostBridge (Kotlin) which performs
+    // the real UsbManager/UsbDeviceConnection transfers. Path mirrors the
+    // Wayland socket: <cacheDir>/alr-usb/usbd.sock. The bridge is started by the
+    // owner (MainActivity/RunningSurfaceActivity) before launch; this only EXPORTS
+    // the env var so an unmodified libusb guest finds it. Harmless if the bridge
+    // is absent — the shim self-disables (LIBUSB_ERROR_OTHER from libusb_init) and
+    // a non-USB guest never connects. Design: docs/design/android-usb-host.md §3.
+    {
+        const std::string usb_sock =
+            (input.app_cache_dir.empty() ? std::string("/data/local/tmp")
+                                         : input.app_cache_dir) +
+            "/alr-usb/usbd.sock";
+        guest_env.push_back("ALR_USB_SOCK=" + usb_sock);
+    }
     // Two A/B gates, both read from the HOST (app) environment and decided here in
     // the parent. They are hoisted to function scope (not an inner block) so the
     // report lines below — including the path-mediation traps/rewrites line — can
@@ -6810,4 +6827,48 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandImeRegisterStateCallback(
 #else
     (void)env; (void)thiz;
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// nativeUsbBridgeStatus — pure diagnostics (docs/design/android-usb-host.md §5).
+// Reports whether the ALR USB host bridge's AF_UNIX socket exists at
+// <cacheDir>/alr-usb/usbd.sock (the path also exported to the guest as
+// ALR_USB_SOCK above) and whether it is currently connectable. This is the same
+// convention as nativeWaylandCompositorStatus: read-only observability for the
+// report screen; it neither starts nor owns the bridge (the bridge is pure
+// Kotlin — all USB host access is Java-only on Android). No transfers happen
+// here. APPEND-ONLY: added at the end of the JNI block by the USB owner.
+// ---------------------------------------------------------------------------
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeUsbBridgeStatus(
+    JNIEnv* env,
+    jobject /* thiz */,
+    jstring app_cache_dir) {
+    const std::string cache = jstring_to_string(env, app_cache_dir);
+    const std::string sock_path =
+        (cache.empty() ? std::string("/data/local/tmp") : cache) + "/alr-usb/usbd.sock";
+
+    std::string out = "alr usb bridge sock=" + sock_path;
+
+    struct stat st {};
+    const bool exists = (::stat(sock_path.c_str(), &st) == 0);
+    out += exists ? "\nalr usb bridge socket_present=yes"
+                  : "\nalr usb bridge socket_present=no";
+
+    bool connectable = false;
+    if (exists) {
+        const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd >= 0) {
+            struct sockaddr_un sa {};
+            sa.sun_family = AF_UNIX;
+            // truncate-safe copy into the fixed sun_path buffer
+            ::strncpy(sa.sun_path, sock_path.c_str(), sizeof(sa.sun_path) - 1);
+            connectable = (::connect(fd, reinterpret_cast<struct sockaddr*>(&sa),
+                                     sizeof(sa)) == 0);
+            ::close(fd);
+        }
+    }
+    out += connectable ? "\nalr usb bridge connectable=yes\nSTATUS: up"
+                       : "\nalr usb bridge connectable=no\nSTATUS: down";
+    return env->NewStringUTF(out.c_str());
 }
