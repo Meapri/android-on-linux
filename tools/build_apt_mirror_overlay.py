@@ -36,7 +36,8 @@ Both ``ports.ubuntu.com`` (Ubuntu arm64 = ``ubuntu-ports``) and
 is GPG-signed and every ``Packages`` index and ``.deb`` is checksum-pinned by that
 signed Release. So **HTTP is the simpler, more robust offline transport** — no
 cert, no clock-skew failures, no SNI subtleties — while integrity is still
-guaranteed by apt's signature chain. We therefore default the sources to
+guaranteed by apt's signature chain (see "Authenticated by default" below). We
+therefore default the sources to
 ``http://`` (``--scheme http``). HTTPS is offered (``--scheme https``) for
 environments that require transport encryption; it works via the ``/etc/hosts``
 pin because the URL still carries the hostname (SNI/cert match — host-proven), but
@@ -47,6 +48,38 @@ it is strictly heavier than HTTP here.
      curl --resolve ports.ubuntu.com:443:172.66.152.176 https://…/InRelease    -> 200, ssl_verify=0
      curl                              https://172.66.152.176/…/InRelease       -> TLS handshake FAIL
    i.e. hostname-via-/etc/hosts works over both; raw-IP HTTPS fails the cert.)
+
+Authenticated by default — gpgv + Signed-By keyring (NOT apt-key)
+----------------------------------------------------------------
+Integrity is only real if apt **verifies the signature** on that ``InRelease``.
+The overlay therefore ships an honest, authenticated path by default:
+
+  * It stages the **Ubuntu archive signing key** into the rootfs at
+    ``/usr/share/keyrings/ubuntu-archive-keyring.gpg`` (a dearmored binary
+    OpenPGP keyring) and sets ``Signed-By: <that path>`` on the deb822 stanza.
+    apt then runs ``/usr/lib/apt/methods/gpgv`` → the ``gpgv`` binary against the
+    pinned keyring — the modern keyring path that does **NOT** touch ``apt-key``
+    (whose ``apt-key`` shell-out is what dies "Unknown error executing apt-key"
+    on the device). ``AllowUnauthenticated`` is OFF in this mode.
+  * The key bytes are the **exact** ones the base rootfs already ships in
+    ``etc/apt/trusted.gpg.d/`` — the **Ubuntu Archive Automatic Signing Key
+    (2018)**, fingerprint ``F6ECB3762474EDA9D21B7022871920D1991BC93C`` (plus the
+    2012 CD Image key, harmless to include). That 2018 key is the one that signs
+    the noble ``InRelease`` on ports.ubuntu.com (host-proven: the InRelease
+    signature's Issuer Fingerprint == ``F6EC…C93C``). ``ports.ubuntu.com`` uses
+    the **same** Ubuntu archive key as ``archive.ubuntu.com`` — there is no
+    separate "ports" key — so this keyring is correct for the arm64 archive.
+    Bytes are embedded here (base64) for a deterministic offline build, with
+    their sha256 asserted in the selftest; ``--keyring-from-rootfs <tar|dir>``
+    re-extracts them from a live base rootfs instead, and ``--demo-trust`` falls
+    back to the old unauthenticated ``Trusted: yes`` shim.
+  * DEVICE PREREQ: gpgv must actually be present. The base rootfs ships the apt
+    ``gpgv`` *method* but **not** the ``/usr/bin/gpgv`` *binary*; the apt+dpkg
+    closure overlay (``tools/build_apt_dpkg_overlay.py``, ``gpgv`` in
+    DEFAULT_TARGETS / SELF_CONTAINED_BINS) supplies it. Stage that overlay too,
+    or ``apt-get update`` fails closed ("Could not execute 'gpgv'"). This is the
+    honest trade: authenticated mode refuses everything if the verifier is
+    missing, which is exactly what a security boundary should do.
 
 Mirror choice & IP stability (the crux)
 ---------------------------------------
@@ -87,14 +120,18 @@ Honest scope
 HOST-ONLY. This builds + validates the overlay host-side and (with
 ``--verify-fetch``) proves on the *host* that apt's index + a pool ``.deb`` are
 reachable through the pinned IP via the hostname (curl ``--resolve`` == exactly
-what ``/etc/hosts`` does for apt). The real in-app ``apt update`` is the
-integration/device gate (the integration session stages the tar). The
-socket-passthrough claim is read from the seccomp source, not a device run.
+what ``/etc/hosts`` does for apt) and that the noble ``InRelease`` is clearsigned
+by the staged key's fingerprint. The real in-app ``apt update`` (and the
+gpgv-verifies-the-signature confirmation) is the integration/device gate (the
+integration session stages the tar). The socket-passthrough claim is read from
+the seccomp source, not a device run.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import io
 import json
 import socket
@@ -103,6 +140,122 @@ import tarfile
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# --------------------------------------------------------------------------- #
+# Ubuntu archive signing keyring (authenticated mode)
+# --------------------------------------------------------------------------- #
+# apt verifies an InRelease against a keyring named by ``Signed-By:`` using gpgv
+# (NOT apt-key). We stage the Ubuntu archive key into the rootfs and point the
+# stanza at it. The bytes below are the EXACT keyring the base rootfs already
+# ships at etc/apt/trusted.gpg.d/ubuntu-keyring-2018-archive.gpg (+ the 2012
+# cdimage key), embedded here so the build is offline+deterministic. They are
+# REUSE, not fabricated: --keyring-from-rootfs re-extracts them from a live base
+# rootfs and they must byte-match. The 2018 key (fpr F6EC…C93C) is what signs the
+# noble InRelease on ports.ubuntu.com (host-proven). ports uses the SAME archive
+# key as archive.ubuntu.com — there is no separate ports key.
+#
+# Where the keyring lands in the rootfs. /usr/share/keyrings/ is the canonical
+# location the ``ubuntu-keyring`` package installs and the path
+# ``Signed-By:`` already referenced — but the base rootfs does NOT actually ship
+# it there (it ships the same key under etc/apt/trusted.gpg.d/ instead), so the
+# overlay MUST stage the file or Signed-By dangles. We stage it here.
+ARCHIVE_KEYRING_PATH = "usr/share/keyrings/ubuntu-archive-keyring.gpg"
+
+# Ubuntu Archive Automatic Signing Key (2018) — signs the noble Release/InRelease.
+UBUNTU_ARCHIVE_KEY_2018_FPR = "F6ECB3762474EDA9D21B7022871920D1991BC93C"
+_KEY_2018_SHA256 = "5ebbeeb474034b1fa7e50abbe6f136e177fc826219e01f314b3623f7b3097e96"
+_KEY_2018_B64 = (
+    "mQINBFufwdoBEADv/Gxytx/LcSXYuM0MwKojbBye81s0G1nEx+lz6VAUpIUZnbkqdXBHC+dwrGS/"
+    "CeeLuAjPRLU8AoxE/jjvZVp8xFGEWHYdklqXGZ/gJfP5d3fIUBtZHZEJl8B8m9pMHf/AQQdsC+Yz"
+    "izSG5t5Mhnotw044LXtdEEkx2t6Jz0OGrh+5IoxqX7pZiq6Cv19BohaUioKMdp7ES6RYfN7ol6HS"
+    "LFlrMXtVfh/ijpN9j3ZhVGVeRC8kKHQsJ5PkIbmvxBiUh7SJmfZUx0IQhNMaDHXfdZAGNtnhzzNR"
+    "eb1FqNLSVkrS/PnsAQzMhG1BDm2VOSF64jebKXffFqM5LXRQTeqTLsjUbbrqR6s/GCO8UF7jfUj6"
+    "I7taLygmsHO/JD4jpKRC0gbpUBfaiJyLvuepx3kWoqL3sN0LhlMI80+fA7GTvoOx4tpqVlzlE6Ta"
+    "jYu+jfW3QpOFS5ewEMdL26hzxsZg/geZvTbArcP+OsJKRmhv4kNo6AydyHQ/3ZV/f3X9mT3/SPLb"
+    "Jaumkgp3Yzd6t5PeBu+ZQk/mN5WNNuaihNEV7llb1ZhvY0Fxu9BVd/BNl0rzuxp3rIinB2TX2SCg"
+    "7wE5xXkwXuQ/2eTDE0v0HlGntkuZjGowDZkxHZQSxZVOzdZCRVaX/WEFLpKa2AQpw5RJrQ4oZ/Of"
+    "ifXyJzP27o03wQARAQABtEJVYnVudHUgQXJjaGl2ZSBBdXRvbWF0aWMgU2lnbmluZyBLZXkgKDIw"
+    "MTgpIDxmdHBtYXN0ZXJAdWJ1bnR1LmNvbT6JAjgEEwEKACIFAlufwdoCGwMGCwkIBwMCBhUIAgkK"
+    "CwQWAgMBAh4BAheAAAoJEIcZINGZG8k8LHMQAKS2cnxz/5WaoCOWArf5g6UHbeOCgc5DBm0hCuFD"
+    "ZWWv427aGei3CPuLw0DGLCXZdyc5dqE8mvjMlOmmAKKlj1uGg3TYCbQWjWPeMnBPZbkFgkZoXJ7/"
+    "6CB7bWRht1sHzpt1LTZ+SYDwOwJ68QRp7DRaZl9Y6QiUbeuhq2DUcTofVbBxbhrckN4ZteLvm+/n"
+    "G9m/ciopc66LwRdkxqfJ32Cyq+1TS5VaIJDG7DWziG+Kbu6qCDM4QNlg3LH7p14CrRxAbc4lvohR"
+    "gsV4eQqsIcdFkuVY5HPPj2K8TqpY6STe8Gh0aprG1RV8ZKay3KSMpnyV1fAKn4fM9byiLzQAovC0"
+    "LZ9MMMsrAS/45AvC3IEKSShjLFn1X1dRCiO6/7jmZEoZtAp53hkf8SMBsi78hVNrBumZwfIdBA1v"
+    "22+LY4xQK8q4XCoRcA9G+pvzU9YVW7cRnDZZGl0uwOw7z9PkQBF5KFKjWDz4fCk+K6+YtGpovGKe"
+    "kGBb8I7EA6UpvPgqA/QdI0t1IBP0N06RQcs1fUaAQEtz6DGy5zkRhR4pGSZn+dFET7PdAjEK84y7"
+    "BdY4t+U1jcSIvBj0F2B7LwRL7xGpSpIKi/ekAXLs117bvFHaCvmUYN7JVp1GMmVFxhIdx6CFm3fx"
+    "G8QjNb5tere/YqK+uOgcXny1UlwtCUzlrSaP"
+)
+# Ubuntu CD Image Automatic Signing Key (2012) — signs CD images, not the apt
+# archive; bundled for parity with the stock ubuntu-archive-keyring (harmless).
+UBUNTU_CDIMAGE_KEY_2012_FPR = "843938DF228D22F7B3742BC0D94AA3F0EFE21092"
+_KEY_2012_SHA256 = "192b3782ba2e00e05b6521371fbe67847efad3fdd1cfb87621882d833c8703fa"
+_KEY_2012_B64 = (
+    "mQINBE+tjmgBEAC7pKK78t89DW7mvMoSgiScLfPNF8/TSF380is0hFRL3dOmcXEfNsX26jtv8bdv"
+    "vtkElB1fPwOntmqSAsrLOuURVQ6GSxH7IDU5QFfaTIsudtLR5YTlC3ZuOTOb1HWEK26fDRXuIWjh"
+    "FDXJH3KLv+rSrq0+x7ZtH++CHq5XJWk7VUh/wWcGxZefs7+1HTivymhjXCOwQvqblzZ5MAec9i4Q"
+    "IXxkqX1HY7ryxGVdjj9lApOnoU5EcSYr08cm7xQEgrdDLAZFQxDYBLDuV6E6jKEfAfwZINSEe4Oc"
+    "m82vtCF5K0HiwhFU09ky2yogbMuTTi2f8ibN8SbbhZDJlDPd2ZkkpsKNfIALmOiPhHGvXGmtg6Fd"
+    "zRUOSGirSm8tcakpS+d0/IElbD453sksxg6s3cTs7Q+PudaccyQ0BqatMnzmfxCVOotT65kVnmz2"
+    "P+4Q0gRSQ/Zi9Inz+OrzWxtn6/Tdw+FMUwvBccxW1r88k6uVLz23jW/8jOuwnUp4JKmZta/U2UZK"
+    "TyPyrvTYhp/zK332BEnxiRY4ZfQjA4Iwlw00l4pYBDLLc6TFJtLbDv859UCisXa8MtWYWrlM3YfG"
+    "Fs9k1WemML8u79g2DK8g3VPkD94Q5anqufEGm74K/keOmss8cQoBX9VPFMpS1mFCT+2UdGP0UvMl"
+    "ADct0aFnAwtb9QARAQABtEFVYnVudHUgQ0QgSW1hZ2UgQXV0b21hdGljIFNpZ25pbmcgS2V5ICgy"
+    "MDEyKSA8Y2RpbWFnZUB1YnVudHUuY29tPokCNwQTAQoAIQUCT62OaAIbAwULCQgHAwUVCgkICwUW"
+    "AgMBAAIeAQIXgAAKCRDZSqPw7+IQkkhAEACJjZZXuAabMrC49Z52HywVZipJgoV5ufMi2LQYMkyG"
+    "KVQQ/E74lUjccMmbQ4j00ihTYB+F/i29AxfavJnlSpWgmwjPO4YY5jvooUiXQmVHX10oM1w3+Y9w"
+    "ScmeUY3IhTtwiFaBJr6TZ7RvOTg/pbQ0GvzxNlkSobuqFCZ023mcl2Y7OkY1PZgxiLafD6Rx2O/g"
+    "clQPs4YfHo8bKRA4o10702nE8YE+dixIgAQw67Txhq5idNxsWpudKq9J1fLgnEz7i9AJUOf12sg9"
+    "X7ZvpXZ3QvMV5iOvLA4DRLv9HIxyz70XqeakS+uzfKXuCMzhdUTIb/tNACNB37+reIqdPsyUF3tx"
+    "VyWaL1jMkRsv617yKAiYvPNwMDRvrbKiJ4Icnd4tPzmqz5HBFUyULns3JzJNjpgKCvLGhVq+lVsd"
+    "pMlpQxEG5/bhzJgB1jrIbkcOSfnQ1y0Gv9CItel+1q0BHMn0dPVWaNfKYFGsz4igW+uj//C09/gt"
+    "GMm78PQfjqEoR2j/Tam/tmucxSK331yfm5ag2CQYGC3bswfII+4EanX9dN/RG3/2dsSyYruWpTIQ"
+    "G6Xa7+AZtYBDEXNYovgdJtXWyUtW0X7R6vIjh1HYer3dR6ivJ+q/bWGY45zHeNBNU33hlnlxEENi"
+    "f3RZ/j/w3SjGrtSQK69maNR6onq492e+6w=="
+)
+
+# Where the base rootfs actually ships the two keys (used by --keyring-from-rootfs).
+_ROOTFS_KEY_MEMBERS = (
+    "etc/apt/trusted.gpg.d/ubuntu-keyring-2018-archive.gpg",
+    "etc/apt/trusted.gpg.d/ubuntu-keyring-2012-cdimage.gpg",
+)
+
+
+def archive_keyring_bytes() -> bytes:
+    """The dearmored Ubuntu archive keyring (2018 archive key + 2012 cdimage key),
+    concatenated — exactly the bytes the base rootfs ships. A binary OpenPGP
+    keyring is just the concatenation of its key packets, so gpgv reads both."""
+    blob = base64.b64decode(_KEY_2018_B64) + base64.b64decode(_KEY_2012_B64)
+    return blob
+
+
+def keyring_from_rootfs(base: str | Path) -> bytes:
+    """Re-extract the archive keyring from a live base rootfs (tar OR dir) and
+    return the same concatenated-keyring bytes. Lets the integration session
+    rebuild the overlay from the canonical source instead of the embedded copy;
+    selftest asserts this equals :func:`archive_keyring_bytes`."""
+    base = Path(base)
+    parts: list[bytes] = []
+    if base.is_dir():
+        for rel in _ROOTFS_KEY_MEMBERS:
+            p = base / rel
+            if not p.is_file():
+                raise FileNotFoundError(f"{base}: missing rootfs key {rel}")
+            parts.append(p.read_bytes())
+    else:
+        with tarfile.open(base, "r:*") as t:
+            members = {m.name.lstrip("./").lstrip("/"): m for m in t.getmembers()}
+            for rel in _ROOTFS_KEY_MEMBERS:
+                m = members.get(rel)
+                if m is None:
+                    raise FileNotFoundError(f"{base}: missing rootfs key {rel}")
+                fh = t.extractfile(m)
+                if fh is None:
+                    raise FileNotFoundError(f"{base}: {rel} is not a regular file")
+                parts.append(fh.read())
+    return b"".join(parts)
+
 
 # --------------------------------------------------------------------------- #
 # Mirror catalog — host + suite + stable anycast bootstrap IPs
@@ -196,7 +349,7 @@ UBUNTU_SOURCES_NEUTRALIZED = (
 def build_apt_conf_body(
     *,
     rootfs_abs: str | None = DEFAULT_ROOTFS_ABS,
-    trusted: bool = True,
+    trusted: bool = False,
     status_path: str | None = None,
 ) -> str:
     """The apt.conf drop-in for the DNS-less, single-mirror apt path.
@@ -213,13 +366,15 @@ def build_apt_conf_body(
        scopes the source set. (sourceparts must be a directory that EXISTS; we ship
        it. We give the ABSOLUTE rootfs path so apt's own canonicalization of the
        dir doesn't depend on the path interposer.)
-    2. **Signature trust (Trusted/AllowUnauthenticated).** On-device, apt's
-       ``apt-key`` shells out and dies "Unknown error executing apt-key" → every
-       InRelease is "not signed" → ``apt-get update`` exits 100. ``Trusted: yes``
-       on the stanza (set in the sources body) skips the GPG check for THIS repo;
-       ``APT::Get::AllowUnauthenticated`` here is the belt-and-suspenders global.
-       DEMO-grade: real GPG (ubuntu-archive-keyring + working gpgv) is a follow-up
-       DEVICE-REQ. Only enabled when ``trusted`` is True.
+    2. **Signature trust (AUTHENTICATED default).** By default this is
+       authenticated: the sources stanza carries ``Signed-By: <staged keyring>``
+       and apt verifies the Release with gpgv — so NO ``AllowUnauthenticated``
+       knob is emitted (apt fails closed on a bad/missing signature, as it
+       should). The DEMO fallback (``--demo-trust`` → ``trusted=True``) instead
+       skips verification: it emits ``APT::Get::AllowUnauthenticated`` as the
+       belt-and-suspenders global to the stanza's ``Trusted: yes``. That demo
+       path matches the device's broken ``apt-key`` ("Unknown error executing
+       apt-key") but is UNAUTHENTICATED — only use it where gpgv is unavailable.
     3. **dpkg status realpath (Dir::State::status).** apt does
        ``flAbsPath(Dir::State::status)`` = ``realpath("/var/lib/dpkg/status")``
        early; on device that fails ``realpath (2: No such file or directory)`` even
@@ -247,9 +402,9 @@ def build_apt_conf_body(
     lines = [
         "// ALR apt mirror-IP overlay (DoH fallback): robust single-mirror apt without DNS.",
         "// (1) Dir::Etc isolates apt to the ports stanza in sources.list.alr.d (ignores the",
-        "//     base cloud-init ubuntu.sources + github-cli/tailscale). (2) Trusted/Allow-",
-        "//     Unauthenticated = DEMO signature skip (device apt-key is broken; real GPG is a",
-        "//     follow-up). (3) Dir::State::status pins the dpkg DB to its absolute rootfs path.",
+        "//     base cloud-init ubuntu.sources + github-cli/tailscale). (2) Signature: AUTHENTICATED",
+        "//     by default (stanza Signed-By + gpgv verify); the unauthenticated skip is opt-in",
+        "//     via --demo-trust. (3) Dir::State::status pins the dpkg DB to its absolute rootfs path.",
         "//     (4) Blank the PackageKit/c-n-f Post-Invoke hooks + run as root (no _apt user):",
         "//     those hooks exec gdbus/dbus that this headless rootfs lacks, which otherwise",
         "//     fails apt-get update AFTER a clean fetch.",
@@ -349,7 +504,7 @@ def build_sources_body(
     scheme: str = DEFAULT_SCHEME,
     suite: str | None = None,
     components: tuple[str, ...] | None = None,
-    trusted: bool = True,
+    trusted: bool = False,
 ) -> str:
     """A deb822 ``.sources`` stanza naming the **hostname** (not a bare IP).
 
@@ -357,14 +512,18 @@ def build_sources_body(
     Naming the hostname (resolved offline via /etc/hosts) is what lets HTTPS keep
     a valid SNI + cert; over HTTP it is simply the clean canonical URI.
 
-    ``trusted`` (default True for the device demo) emits ``Trusted: yes``, which
-    tells apt to SKIP signature verification for this repo. This is required today
-    because the device's ``apt-key`` is broken ("Unknown error executing apt-key"
-    → every InRelease "not signed" → ``apt-get update`` exit 100); host-curl
-    already proves transport+integrity-by-checksum, and a real GPG path
-    (ubuntu-archive-keyring + a working gpgv) is the follow-up DEVICE-REQ. Pass
-    ``trusted=False`` to keep ``Signed-By`` GPG verification on (the original
-    behavior) once that lands.
+    AUTHENTICATED by default (``trusted=False``): emits ``Signed-By: <keyring>``
+    so apt verifies the Release signature with gpgv against the archive keyring
+    this overlay stages at ``/<ARCHIVE_KEYRING_PATH>`` (the modern keyring path —
+    NOT apt-key). For Ubuntu that keyring is the 2018 archive key (fpr
+    ``F6EC…C93C``) which signs the noble InRelease (host-proven).
+
+    ``trusted=True`` is the DEMO fallback (``--demo-trust``): emits
+    ``Trusted: yes`` to SKIP signature verification, for the case where gpgv is
+    unavailable on the device (the base ships the apt gpgv *method* but not the
+    ``/usr/bin/gpgv`` binary unless the apt+dpkg overlay is also staged). This
+    matches the device's broken ``apt-key`` workaround but is UNAUTHENTICATED —
+    any MITM on the HTTP mirror could inject packages. Prefer the default.
     """
     suite = suite or mirror.suite
     comps = components or mirror.components
@@ -374,17 +533,21 @@ def build_sources_body(
     # `<suite>`+`<suite>-updates`; Ubuntu serves `-security` from the same host.
     if mirror.host.endswith("debian.org"):
         suites = f"{suite} {suite}-updates"
+        # Debian's stock keyring path (the base/closure must provide it; for the
+        # Ubuntu default path we STAGE the keyring, see ARCHIVE_KEYRING_PATH).
         keyring = "/usr/share/keyrings/debian-archive-keyring.gpg"
     else:
         suites = f"{suite} {suite}-updates {suite}-security"
-        keyring = "/usr/share/keyrings/ubuntu-archive-keyring.gpg"
+        # The keyring THIS overlay stages (Ubuntu archive key). Leading "/" =
+        # rootfs-absolute, matching where _add_file writes ARCHIVE_KEYRING_PATH.
+        keyring = "/" + ARCHIVE_KEYRING_PATH
     trust_line = (
         "Trusted: yes\n" if trusted else f"Signed-By: {keyring}\n"
     )
     trust_note = (
-        "# Trusted: yes = DEMO signature skip (device apt-key broken); real GPG is a follow-up.\n"
+        "# Trusted: yes = DEMO signature SKIP (--demo-trust; UNAUTHENTICATED, MITM-able).\n"
         if trusted
-        else "# Integrity = GPG-signed Release via the archive keyring.\n"
+        else "# Integrity = gpgv-verified GPG-signed Release via the staged archive keyring.\n"
     )
     return (
         f"# ALR apt mirror-IP overlay (DoH fallback) — {mirror.key} via {scheme.upper()}.\n"
@@ -455,8 +618,10 @@ class AptMirrorOverlayResult:
     base_uri: str
     members: tuple[str, ...] = ()
     file_count: int = 0
-    trusted: bool = True
+    trusted: bool = False
     rootfs_abs: str | None = None
+    keyring_path: str | None = None       # staged keyring (authenticated mode), else None
+    keyring_fpr: str | None = None        # archive signing-key fingerprint
 
     def as_dict(self) -> dict:
         return {
@@ -468,8 +633,11 @@ class AptMirrorOverlayResult:
             "base_uri": self.base_uri,
             "members": list(self.members),
             "file_count": self.file_count,
-            "trusted": self.trusted,
+            "authenticated": not self.trusted,
+            "trusted_demo_skip": self.trusted,
             "rootfs_abs": self.rootfs_abs,
+            "keyring_path": self.keyring_path,
+            "keyring_fpr": self.keyring_fpr,
         }
 
 
@@ -482,9 +650,10 @@ def build_apt_mirror_overlay(
     components: tuple[str, ...] | None = None,
     bootstrap_ips: tuple[str, ...] | None = None,
     extra_hosts: tuple[tuple[str, tuple[str, ...]], ...] = (),
-    trusted: bool = True,
+    trusted: bool = False,
     rootfs_abs: str | None = DEFAULT_ROOTFS_ABS,
     status_path: str | None = None,
+    keyring_bytes: bytes | None = None,
 ) -> AptMirrorOverlayResult:
     """Pack the §5-E ``apt-mirror-stage.tar`` (OFFLINE — no network).
 
@@ -493,20 +662,26 @@ def build_apt_mirror_overlay(
       * ``/etc/hosts`` — mirror host -> anycast IP pin (no-DNS resolution).
       * ``/etc/apt/sources.list.alr.d/alr-<key>.sources`` — the ONLY stanza apt
         reads (apt.conf repoints Dir::Etc::sourceparts here). Carries
-        ``Trusted: yes`` when ``trusted``.
+        ``Signed-By`` (authenticated, default) or ``Trusted: yes`` (--demo-trust).
       * ``/etc/apt/sources.list.d/alr-<key>.sources`` — same stanza, kept for
         humans / any tool that reads the conventional dir directly. (Inert for the
         ``apt-get update`` path since Dir::Etc::sourceparts points elsewhere.)
       * ``/etc/apt/sources.list.d/ubuntu.sources`` — OVERWRITES the base cloud-init
         file with a neutralizer comment (kills the unpinned clouds.ports host +
         noble-backports). Overlay extraction atomically replaces non-library files.
-      * ``/etc/apt/apt.conf.d/99alr-mirror-ip`` — Dir::Etc isolation + (when
-        ``trusted``) AllowUnauthenticated + Dir::State::status absolute-path pin.
+      * ``/usr/share/keyrings/ubuntu-archive-keyring.gpg`` — the Ubuntu archive
+        signing key (authenticated mode only, Ubuntu mirrors). ``Signed-By`` points
+        here so gpgv can verify the Release. NOT staged in --demo-trust mode or for
+        the Debian mirror (which relies on its own base/closure keyring path).
+      * ``/etc/apt/apt.conf.d/99alr-mirror-ip`` — Dir::Etc isolation + (only in
+        ``--demo-trust``) AllowUnauthenticated + Dir::State::status absolute-path pin.
 
     ``bootstrap_ips`` overrides the catalog pins. ``rootfs_abs`` is the on-device
     rootfs path baked into the absolute Dir::Etc::sourceparts / Dir::State::status
     (None => relative sourceparts + no status pin). ``trusted`` toggles the DEMO
-    signature skip (see ``build_sources_body`` / ``build_apt_conf_body``).
+    signature skip (default False = authenticated; see ``build_sources_body`` /
+    ``build_apt_conf_body``). ``keyring_bytes`` overrides the embedded archive
+    keyring (e.g. re-extracted via :func:`keyring_from_rootfs`).
     """
     m = resolve_mirror(mirror)
     if bootstrap_ips:
@@ -527,14 +702,26 @@ def build_apt_mirror_overlay(
     sources_path = SOURCES_PATH_TMPL.format(key=m.key)
     alr_sources_path = ALR_SOURCES_PATH_TMPL.format(key=m.key)
 
+    # Stage the Ubuntu archive keyring in authenticated mode (Ubuntu mirrors only;
+    # Debian's Signed-By names the stock debian-archive-keyring path the base owns).
+    stage_keyring = (not trusted) and (not m.host.endswith("debian.org"))
+    keyring_path = None
+    keyring_fpr = None
+    if stage_keyring:
+        keyring_path = "/" + ARCHIVE_KEYRING_PATH
+        keyring_fpr = UBUNTU_ARCHIVE_KEY_2018_FPR
+
     members: list[str] = []
     with tarfile.open(out_tar, "w") as tar:
-        for d in (
+        dirs = [
             "etc", "etc/apt",
             "etc/apt/sources.list.d",
             ALR_SOURCES_DIR,
             "etc/apt/apt.conf.d",
-        ):
+        ]
+        if stage_keyring:
+            dirs += ["usr", "usr/share", "usr/share/keyrings"]
+        for d in dirs:
             _add_dir(tar, d)
             members.append("./" + d)
         _add_file(tar, HOSTS_PATH, hosts_body)
@@ -548,6 +735,11 @@ def build_apt_mirror_overlay(
         # Overwrite the base cloud-init ubuntu.sources with a neutralizer.
         _add_file(tar, UBUNTU_SOURCES_PATH, UBUNTU_SOURCES_NEUTRALIZED.encode())
         members.append("./" + UBUNTU_SOURCES_PATH)
+        # The archive keyring the Signed-By stanza points at (authenticated mode).
+        if stage_keyring:
+            kr = keyring_bytes if keyring_bytes is not None else archive_keyring_bytes()
+            _add_file(tar, ARCHIVE_KEYRING_PATH, kr)
+            members.append("./" + ARCHIVE_KEYRING_PATH)
         _add_file(tar, APT_CONF_PATH, apt_conf_body)
         members.append("./" + APT_CONF_PATH)
 
@@ -565,6 +757,8 @@ def build_apt_mirror_overlay(
         file_count=file_count,
         trusted=trusted,
         rootfs_abs=rootfs_abs,
+        keyring_path=keyring_path,
+        keyring_fpr=keyring_fpr,
     )
 
 
@@ -620,11 +814,121 @@ def _open_pinned(url: str, host: str, ip: str, *, timeout: float = 30.0) -> tupl
         sock.close()
 
 
+def _fetch_full(url: str, host: str, ip: str, *, timeout: float = 30.0, cap: int = 600_000) -> bytes:
+    """Fetch the FULL body of a small text resource (InRelease) through a pinned IP
+    while presenting ``host`` for Host/SNI. Returns the decoded body bytes (no
+    chunked-encoding handling needed: the archive serves InRelease with a fixed
+    Content-Length over plain HTTP)."""
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url)
+    scheme = parts.scheme
+    port = parts.port or (443 if scheme == "https" else 80)
+    path = parts.path or "/"
+    if scheme == "https":
+        ctx = ssl.create_default_context()
+        sock = ctx.wrap_socket(socket.create_connection((ip, port), timeout=timeout),
+                               server_hostname=host)
+    else:
+        sock = socket.create_connection((ip, port), timeout=timeout)
+    try:
+        sock.sendall(
+            (f"GET {path} HTTP/1.1\r\nHost: {host}\r\n"
+             "User-Agent: Debian APT-HTTP/1.3 (ALR apt-mirror-overlay verify)\r\n"
+             "Connection: close\r\n\r\n").encode()
+        )
+        buf = b""
+        while len(buf) < cap:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        sock.close()
+    return buf.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in buf else b""
+
+
+def inrelease_issuer_fprs(body: bytes) -> set[str]:
+    """Parse a clearsigned ``InRelease`` and return the set of issuer
+    fingerprints + 64-bit key IDs found in its OpenPGP signature packet.
+
+    This does NOT verify the signature (no gpg on the build host) — it confirms
+    the document is clearsigned by the key we stage (the fpr matches), so the
+    on-device gpgv has the right key to succeed against. Returns an empty set if
+    the body is not clearsigned / has no parseable issuer."""
+    import re as _re
+    import struct as _struct
+
+    m = _re.search(
+        rb"-----BEGIN PGP SIGNATURE-----\r?\n(.*?)\r?\n-----END PGP SIGNATURE-----",
+        body, _re.S,
+    )
+    if not m:
+        return set()
+    armored = m.group(1)
+    b64_lines = [
+        ln for ln in armored.split(b"\n")
+        if ln and not ln.startswith(b"=") and b":" not in ln
+    ]
+    try:
+        sig = base64.b64decode(b"".join(b64_lines))
+    except Exception:
+        return set()
+    if not sig:
+        return set()
+    # First packet = signature (tag 2); read its length (old or new format).
+    tag = sig[0]
+    i = 1
+    if tag & 0x40:  # new format
+        l = sig[i]
+        if l < 192:
+            length = l; i += 1
+        elif l < 224:
+            length = ((l - 192) << 8) + sig[i + 1] + 192; i += 2
+        else:
+            length = _struct.unpack(">I", sig[i + 1:i + 5])[0]; i += 5
+    else:  # old format
+        ltype = tag & 0x03
+        if ltype == 0:
+            length = sig[i]; i += 1
+        elif ltype == 1:
+            length = _struct.unpack(">H", sig[i:i + 2])[0]; i += 2
+        elif ltype == 2:
+            length = _struct.unpack(">I", sig[i:i + 4])[0]; i += 4
+        else:
+            length = len(sig) - i
+    body_pkt = sig[i:i + length]
+    out: set[str] = set()
+    if not body_pkt or body_pkt[0] != 4:  # only v4 sigs carry subpackets
+        return out
+    p = 4  # ver, sigtype, pkalgo, hashalgo
+    for _region in range(2):  # hashed, then unhashed subpacket areas
+        if p + 2 > len(body_pkt):
+            break
+        sublen = _struct.unpack(">H", body_pkt[p:p + 2])[0]; p += 2
+        end = p + sublen
+        while p < end and p < len(body_pkt):
+            sl = body_pkt[p]; p += 1
+            if sl == 0 or p >= len(body_pkt):
+                break
+            stype = body_pkt[p]
+            val = body_pkt[p + 1:p + sl]
+            if stype == 16 and len(val) == 8:        # Issuer key ID
+                out.add(val.hex().upper())
+            elif stype == 33 and len(val) >= 21:     # Issuer Fingerprint (ver byte + 20)
+                out.add(val[1:].hex().upper())
+            p += sl
+    return out
+
+
 def verify_fetch(
-    mirror: Mirror, scheme: str, *, suite: str | None = None
+    mirror: Mirror, scheme: str, *, suite: str | None = None, check_key: str | None = None
 ) -> list[dict]:
     """Prove (on the host) that apt's index is reachable through the pinned IP via
-    the hostname — for EACH bootstrap IP. Returns one result dict per IP."""
+    the hostname — for EACH bootstrap IP. Returns one result dict per IP. When
+    ``check_key`` (a fingerprint) is given, also fetch the InRelease in full and
+    confirm it is clearsigned by that key (so the staged keyring is the right one
+    for the on-device gpgv)."""
     suite = suite or mirror.suite
     idx = f"{mirror.base_uri(scheme)}/dists/{suite}/InRelease"
     results: list[dict] = []
@@ -635,6 +939,14 @@ def verify_fetch(
             rec["status"] = status
             rec["bytes"] = n
             rec["ok"] = status == 200 and n > 0
+            if rec["ok"] and check_key:
+                body = _fetch_full(idx, mirror.host, ip)
+                fprs = inrelease_issuer_fprs(body)
+                want = check_key.upper()
+                signed = any(f == want or want.endswith(f) for f in fprs)
+                rec["clearsigned_by"] = sorted(fprs)
+                rec["signed_by_expected_key"] = signed
+                rec["ok"] = rec["ok"] and signed
         except Exception as exc:  # noqa: BLE001 — report any transport/TLS failure
             rec["error"] = f"{type(exc).__name__}: {exc}"
             rec["ok"] = False
@@ -674,7 +986,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="resolve + print the mirror host's current IPs (NETWORK) and exit")
     parser.add_argument("--verify-fetch", action="store_true",
                         help="prove on the HOST that the index is reachable through each "
-                        "pinned IP via the hostname (curl --resolve equivalent; NETWORK)")
+                        "pinned IP via the hostname (curl --resolve equivalent; NETWORK). In "
+                        "authenticated mode also confirms the InRelease is clearsigned by the "
+                        "staged archive key's fingerprint")
     parser.add_argument("--rootfs-abs", default=DEFAULT_ROOTFS_ABS,
                         help="on-device rootfs absolute path baked into the apt.conf "
                         f"Dir::Etc::sourceparts + Dir::State::status (default {DEFAULT_ROOTFS_ABS!r}); "
@@ -685,11 +999,25 @@ def main(argv: list[str] | None = None) -> int:
                         "/data/local/tmp/alr-dpkg-status) to dodge the on-device realpath edge "
                         "that fails flAbsPath for in-rootfs paths — WORKAROUND, needs that file "
                         "staged as a separate device asset")
+    # Signature mode. DEFAULT = authenticated (Signed-By + staged keyring + gpgv).
+    # --demo-trust falls back to the UNAUTHENTICATED Trusted:yes shim; --no-trusted
+    # is kept as a back-compat alias for "authenticated" (it always meant GPG-on).
+    parser.add_argument("--demo-trust", dest="trusted", action="store_true",
+                        help="UNAUTHENTICATED demo fallback: Trusted:yes + AllowUnauthenticated "
+                        "(skips signature verification). Use ONLY where gpgv is unavailable on "
+                        "the device — any MITM on the HTTP mirror could inject packages. The "
+                        "default is authenticated (Signed-By staged keyring + gpgv)")
     parser.add_argument("--no-trusted", dest="trusted", action="store_false",
-                        help="keep apt GPG signature verification ON (Signed-By keyring); "
-                        "default is Trusted:yes + AllowUnauthenticated (DEMO skip, since the "
-                        "device apt-key is broken — real GPG is a follow-up DEVICE-REQ)")
-    parser.set_defaults(trusted=True)
+                        help="(back-compat alias for the authenticated default) keep apt GPG "
+                        "signature verification ON via the staged Signed-By keyring")
+    parser.set_defaults(trusted=False)
+    parser.add_argument("--keyring-from-rootfs", metavar="TAR|DIR",
+                        help="re-extract the Ubuntu archive keyring from a live base rootfs "
+                        "(tar or dir) instead of the embedded copy; must byte-match the "
+                        "embedded 2018+2012 keys")
+    parser.add_argument("--print-keyring-fpr", action="store_true",
+                        help="print the staged archive keyring's signing-key fingerprint(s) "
+                        "+ sha256 and exit")
     parser.add_argument("--list", "--dry-run", action="store_true", dest="dry_run",
                         help="print the planned overlay members + bodies WITHOUT packing")
     parser.add_argument("--json", action="store_true", help="machine-readable output")
@@ -699,6 +1027,31 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.selftest:
         return _selftest()
+
+    if args.print_keyring_fpr:
+        kr = archive_keyring_bytes()
+        info = {
+            "keyring_path": "/" + ARCHIVE_KEYRING_PATH,
+            "bytes": len(kr),
+            "sha256": hashlib.sha256(kr).hexdigest(),
+            "signing_keys": [
+                {"name": "Ubuntu Archive Automatic Signing Key (2018)",
+                 "fingerprint": UBUNTU_ARCHIVE_KEY_2018_FPR,
+                 "role": "signs noble Release/InRelease on ports.ubuntu.com"},
+                {"name": "Ubuntu CD Image Automatic Signing Key (2012)",
+                 "fingerprint": UBUNTU_CDIMAGE_KEY_2012_FPR,
+                 "role": "CD images (bundled for parity; not used by apt-get update)"},
+            ],
+        }
+        if args.json:
+            print(json.dumps(info, indent=2))
+        else:
+            print(f"staged keyring: /{ARCHIVE_KEYRING_PATH} "
+                  f"({info['bytes']} bytes, sha256 {info['sha256']})")
+            for k in info["signing_keys"]:
+                print(f"  {k['fingerprint']}  {k['name']}")
+                print(f"      -> {k['role']}")
+        return 0
 
     # custom mirror (host + IPs) short-circuits the catalog
     if args.mirror_host or args.mirror_ips:
@@ -716,6 +1069,19 @@ def main(argv: list[str] | None = None) -> int:
         )
     else:
         m = resolve_mirror(args.mirror)
+
+    # Optionally re-extract the archive keyring from a live base rootfs (else the
+    # embedded copy is used). Validate it byte-matches so a wrong/corrupt rootfs
+    # can't silently stage a bad key that would make apt refuse everything.
+    keyring_bytes = None
+    if args.keyring_from_rootfs:
+        keyring_bytes = keyring_from_rootfs(args.keyring_from_rootfs)
+        if keyring_bytes != archive_keyring_bytes():
+            parser.error(
+                f"--keyring-from-rootfs {args.keyring_from_rootfs}: extracted keyring "
+                "does not byte-match the known Ubuntu archive keyring (2018+2012). "
+                "Refusing to stage an unverified key."
+            )
 
     if args.print_current_ips:
         ips = resolve_current_ips(m.host)
@@ -735,16 +1101,29 @@ def main(argv: list[str] | None = None) -> int:
             m = Mirror(**{**m.__dict__, "bootstrap": tuple(fresh)})
 
     if args.verify_fetch:
-        res = verify_fetch(m, args.scheme, suite=args.suite)
+        # In authenticated mode (and for an Ubuntu mirror) also confirm the
+        # InRelease is clearsigned by the key we stage.
+        check_key = None
+        if not args.trusted and not m.host.endswith("debian.org"):
+            check_key = UBUNTU_ARCHIVE_KEY_2018_FPR
+        res = verify_fetch(m, args.scheme, suite=args.suite, check_key=check_key)
         if args.json:
-            print(json.dumps({"host": m.host, "scheme": args.scheme, "results": res}, indent=2))
+            print(json.dumps({"host": m.host, "scheme": args.scheme,
+                              "check_key": check_key, "results": res}, indent=2))
         else:
-            print(f"verify-fetch {m.host} via {args.scheme} (hostname pinned to each IP):")
+            print(f"verify-fetch {m.host} via {args.scheme} (hostname pinned to each IP"
+                  + (f"; expect signer {check_key})" if check_key else ")") + ":")
             for r in res:
                 if r.get("ok"):
-                    print(f"  [OK]   {r['ip']} -> HTTP {r['status']}, {r['bytes']}+ bytes  ({r['url']})")
+                    sig = ""
+                    if check_key:
+                        sig = "  signed-by-2018-key=OK"
+                    print(f"  [OK]   {r['ip']} -> HTTP {r['status']}, {r['bytes']}+ bytes{sig}  ({r['url']})")
                 else:
-                    print(f"  [FAIL] {r['ip']} -> {r.get('error') or ('HTTP ' + str(r.get('status')))}")
+                    why = r.get("error")
+                    if not why and check_key and r.get("signed_by_expected_key") is False:
+                        why = f"InRelease NOT signed by {check_key} (saw {r.get('clearsigned_by')})"
+                    print(f"  [FAIL] {r['ip']} -> {why or ('HTTP ' + str(r.get('status')))}")
         return 0 if all(r.get("ok") for r in res) else 1
 
     if args.dry_run:
@@ -759,14 +1138,21 @@ def main(argv: list[str] | None = None) -> int:
         )
         sources_path = SOURCES_PATH_TMPL.format(key=m.key)
         alr_sources_path = ALR_SOURCES_PATH_TMPL.format(key=m.key)
-        planned = sorted([
+        stage_keyring = (not args.trusted) and (not m.host.endswith("debian.org"))
+        planned = [
             "./" + HOSTS_PATH, "./" + alr_sources_path, "./" + sources_path,
             "./" + UBUNTU_SOURCES_PATH, "./" + APT_CONF_PATH,
-        ])
+        ]
+        if stage_keyring:
+            planned.append("./" + ARCHIVE_KEYRING_PATH)
+        planned = sorted(planned)
         if args.json:
             print(json.dumps({
                 "mirror": m.key, "host": m.host, "scheme": args.scheme,
-                "trusted": args.trusted, "rootfs_abs": rootfs_abs,
+                "authenticated": not args.trusted, "trusted_demo_skip": args.trusted,
+                "rootfs_abs": rootfs_abs,
+                "keyring_path": ("/" + ARCHIVE_KEYRING_PATH) if stage_keyring else None,
+                "keyring_fpr": UBUNTU_ARCHIVE_KEY_2018_FPR if stage_keyring else None,
                 "bootstrap_ips": list(m.bootstrap), "base_uri": m.base_uri(args.scheme),
                 "planned_members": planned,
                 "hosts_body": hosts_body, "sources_body": sources_body,
@@ -775,9 +1161,11 @@ def main(argv: list[str] | None = None) -> int:
             }, indent=2))
         else:
             print(f"apt mirror-IP overlay plan ({m.key} via {args.scheme}, "
-                  f"trusted={args.trusted}, rootfs_abs={rootfs_abs}):")
+                  f"authenticated={not args.trusted}, rootfs_abs={rootfs_abs}):")
             print(f"  base URI: {m.base_uri(args.scheme)}")
             print(f"  pinned IPs: {', '.join(m.bootstrap)} ({m.cdn} {', '.join(m.cdn_ranges)})")
+            if stage_keyring:
+                print(f"  staged keyring: /{ARCHIVE_KEYRING_PATH} (fpr {UBUNTU_ARCHIVE_KEY_2018_FPR})")
             print("  planned members:")
             for x in planned:
                 print(f"    {x}")
@@ -789,13 +1177,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.out:
         parser.error("--out is required for a full build (or use --list / --verify-fetch / "
-                     "--print-current-ips / --selftest)")
+                     "--print-current-ips / --print-keyring-fpr / --selftest)")
 
     res = build_apt_mirror_overlay(
         args.out, mirror=m, scheme=args.scheme, suite=args.suite,
         components=tuple(args.components) if args.components else None,
         bootstrap_ips=tuple(m.bootstrap),
         trusted=args.trusted, rootfs_abs=rootfs_abs, status_path=args.status_path,
+        keyring_bytes=keyring_bytes,
     )
     if args.json:
         print(json.dumps(res.as_dict(), indent=2))
@@ -804,7 +1193,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  mirror: {res.mirror} ({res.host}) via {res.scheme}")
         print(f"  base URI: {res.base_uri}")
         print(f"  pinned IPs: {', '.join(res.bootstrap_ips)}")
-        print(f"  trusted (DEMO GPG skip): {res.trusted}")
+        if res.trusted:
+            print("  signature: DEMO-TRUST (UNAUTHENTICATED — Trusted:yes + AllowUnauthenticated)")
+        else:
+            print(f"  signature: AUTHENTICATED (Signed-By gpgv keyring)")
+            if res.keyring_path:
+                print(f"    staged keyring: {res.keyring_path} (fpr {res.keyring_fpr})")
+                print("    DEVICE PREREQ: stage the apt+dpkg overlay too (it provides /usr/bin/gpgv)")
         print(f"  rootfs_abs (status/sourceparts pin): {res.rootfs_abs}")
         print(f"  files in overlay: {res.file_count}")
         print("  members:")
@@ -853,7 +1248,7 @@ def _selftest() -> int:
     check("hosts comment names the CDN (Cloudflare)", "Cloudflare" in hb)
 
     # --- sources name the HOSTNAME (not a bare IP) so SNI/cert match -------- #
-    # Default is trusted=True (the device demo): Trusted: yes, NO Signed-By.
+    # Default is AUTHENTICATED (trusted=False): Signed-By staged keyring, NO Trusted.
     sb_http = build_sources_body(ports, scheme="http")
     check("http sources URI names the hostname (not an IP)",
           "URIs: http://ports.ubuntu.com/ubuntu-ports" in sb_http)
@@ -861,36 +1256,37 @@ def _selftest() -> int:
           "172.66.152.176" not in sb_http and "104.20.28.246" not in sb_http)
     check("sources include noble + -updates + -security suites",
           "Suites: noble noble-updates noble-security" in sb_http)
-    check("default sources carry Trusted: yes (DEMO GPG skip)",
-          "Trusted: yes" in sb_http)
-    check("trusted sources DROP Signed-By (apt-key is broken on device)",
-          "Signed-By:" not in sb_http)
+    check("DEFAULT sources are AUTHENTICATED: Signed-By the staged archive keyring",
+          f"Signed-By: /{ARCHIVE_KEYRING_PATH}" in sb_http)
+    check("default sources DROP Trusted: yes (no unauthenticated skip)",
+          "Trusted: yes" not in sb_http)
     check("sources are deb822 (Types: deb)", sb_http.startswith("#") and "Types: deb" in sb_http)
-    # --no-trusted restores Signed-By GPG verification (the original behavior).
-    sb_signed = build_sources_body(ports, scheme="http", trusted=False)
-    check("trusted=False restores Signed-By archive keyring",
-          "Signed-By:" in sb_signed and "ubuntu-archive-keyring.gpg" in sb_signed)
-    check("trusted=False drops Trusted: yes", "Trusted: yes" not in sb_signed)
+    # --demo-trust (trusted=True) falls back to the UNAUTHENTICATED Trusted:yes shim.
+    sb_demo = build_sources_body(ports, scheme="http", trusted=True)
+    check("demo-trust sources carry Trusted: yes (UNAUTHENTICATED skip)",
+          "Trusted: yes" in sb_demo)
+    check("demo-trust sources drop Signed-By", "Signed-By:" not in sb_demo)
     sb_https = build_sources_body(ports, scheme="https")
     check("https sources URI names the hostname (SNI/cert match)",
           "URIs: https://ports.ubuntu.com/ubuntu-ports" in sb_https)
 
-    # debian sources differ (no -security suffix the same way; Fastly host)
-    sb_deb = build_sources_body(deb, scheme="http", trusted=False)
+    # debian sources differ (no -security suffix the same way; Fastly host). The
+    # Debian Signed-By names the stock debian keyring (we don't stage that one).
+    sb_deb = build_sources_body(deb, scheme="http")
     check("debian sources name deb.debian.org",
           "URIs: http://deb.debian.org/debian" in sb_deb)
-    check("debian sources use the debian keyring (trusted=False)",
+    check("debian sources use the debian keyring path",
           "debian-archive-keyring.gpg" in sb_deb)
 
-    # --- apt.conf: Dir::Etc isolation + DEMO trust + status pin ------------- #
+    # --- apt.conf: Dir::Etc isolation + AUTHENTICATED default + status pin --- #
     check("apt.conf sets Languages none", 'Acquire::Languages "none";' in APT_CONF_BODY)
     check("apt.conf forces IPv4", 'Acquire::ForceIPv4 "true";' in APT_CONF_BODY)
     check("apt.conf isolates sourcelist to /dev/null (ignore base sources.list)",
           'Dir::Etc::sourcelist "/dev/null";' in APT_CONF_BODY)
     check("apt.conf repoints sourceparts at sources.list.alr.d",
           "sources.list.alr.d" in APT_CONF_BODY and "Dir::Etc::sourceparts" in APT_CONF_BODY)
-    check("apt.conf (default trusted) sets AllowUnauthenticated",
-          'APT::Get::AllowUnauthenticated "true";' in APT_CONF_BODY)
+    check("apt.conf (authenticated default) does NOT set AllowUnauthenticated",
+          'APT::Get::AllowUnauthenticated' not in APT_CONF_BODY)
     check("apt.conf default bakes the device rootfs status pin (Dir::State::status)",
           "Dir::State::status" in APT_CONF_BODY and DEFAULT_ROOTFS_ABS in APT_CONF_BODY)
     check("apt.conf #clears the PackageKit Post-Invoke-Success hook list",
@@ -899,10 +1295,10 @@ def _selftest() -> int:
           "#clear APT::Update::Post-Invoke;" in APT_CONF_BODY)
     check("apt.conf runs as root (no _apt sandbox user on the rootfs)",
           'APT::Sandbox::User "root";' in APT_CONF_BODY)
-    # trusted=False conf drops AllowUnauthenticated; absent rootfs drops status pin.
-    conf_signed = build_apt_conf_body(trusted=False)
-    check("apt.conf trusted=False drops AllowUnauthenticated",
-          "AllowUnauthenticated" not in conf_signed)
+    # --demo-trust (trusted=True) ADDS AllowUnauthenticated back.
+    conf_demo = build_apt_conf_body(trusted=True)
+    check("apt.conf demo-trust sets AllowUnauthenticated",
+          'APT::Get::AllowUnauthenticated "true";' in conf_demo)
     conf_norootfs = build_apt_conf_body(rootfs_abs=None)
     check("apt.conf rootfs_abs=None drops the absolute status pin directive",
           'Dir::State::status "' not in conf_norootfs)
@@ -941,28 +1337,96 @@ def _selftest() -> int:
               "./etc/apt/sources.list.d/ubuntu.sources" in names)
         check("overlay ships ./etc/apt/apt.conf.d/99alr-mirror-ip",
               "./etc/apt/apt.conf.d/99alr-mirror-ip" in names)
+        check("overlay STAGES the archive keyring ./usr/share/keyrings/ubuntu-archive-keyring.gpg",
+              "./" + ARCHIVE_KEYRING_PATH in names)
         check("all members ./-rooted", all(n.startswith("./") for n in names))
         check("packed hosts pins the mirror IP",
               b"172.66.152.176\tports.ubuntu.com" in bodies["./etc/hosts"])
-        check("packed authoritative sources name the hostname + Trusted: yes",
+        check("packed authoritative sources name the hostname + Signed-By (authenticated)",
               b"http://ports.ubuntu.com/ubuntu-ports" in
               bodies["./etc/apt/sources.list.alr.d/alr-ports.sources"]
-              and b"Trusted: yes" in
+              and b"Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg" in
+              bodies["./etc/apt/sources.list.alr.d/alr-ports.sources"]
+              and b"Trusted: yes" not in
               bodies["./etc/apt/sources.list.alr.d/alr-ports.sources"])
         check("packed ubuntu.sources is neutralized (no live URIs)",
               b"Types: deb" not in bodies["./etc/apt/sources.list.d/ubuntu.sources"])
         check("packed apt.conf carries the absolute status pin",
               DEFAULT_ROOTFS_ABS.encode() in bodies["./etc/apt/apt.conf.d/99alr-mirror-ip"])
-        check("result.file_count == 5", res.file_count == 5)
-        check("result reports trusted + rootfs_abs",
-              res.trusted is True and res.rootfs_abs == DEFAULT_ROOTFS_ABS)
+        check("packed apt.conf (authenticated) has NO AllowUnauthenticated directive",
+              b"AllowUnauthenticated" not in bodies["./etc/apt/apt.conf.d/99alr-mirror-ip"])
+        # staged keyring byte-matches the embedded archive keyring (2018+2012)
+        check("packed keyring == embedded archive keyring bytes",
+              bodies["./" + ARCHIVE_KEYRING_PATH] == archive_keyring_bytes())
+        check("packed keyring starts with an OpenPGP public-key packet (0x99/0x98)",
+              bodies["./" + ARCHIVE_KEYRING_PATH][:1] in (b"\x99", b"\x98"))
+        check("result.file_count == 6 (hosts + 2 sources + ubuntu.sources + apt.conf + keyring)",
+              res.file_count == 6)
+        check("result is authenticated (trusted False) + reports keyring + rootfs_abs",
+              res.trusted is False and res.rootfs_abs == DEFAULT_ROOTFS_ABS
+              and res.keyring_path == "/" + ARCHIVE_KEYRING_PATH
+              and res.keyring_fpr == UBUNTU_ARCHIVE_KEY_2018_FPR)
         check("result base_uri is the hostname URI",
               res.base_uri == "http://ports.ubuntu.com/ubuntu-ports")
 
         from tools.stage_tar_spec import validate_stage_tar
         rep = validate_stage_tar(str(out))
-        check("overlay is stage_tar_spec conformant", rep.conformant)
-        check("overlay has no stage_tar warnings", rep.warnings == [])
+        check("authenticated overlay is stage_tar_spec conformant", rep.conformant)
+        check("authenticated overlay has no stage_tar warnings", rep.warnings == [])
+
+    # --- archive keyring identity (the bytes we stage are the RIGHT key) ----- #
+    kr = archive_keyring_bytes()
+    check("embedded keyring sha256 == base rootfs 2018 key + 2012 key concat",
+          hashlib.sha256(kr).hexdigest() ==
+          hashlib.sha256(base64.b64decode(_KEY_2018_B64)
+                         + base64.b64decode(_KEY_2012_B64)).hexdigest())
+    check("embedded 2018 archive key sha256 matches base rootfs",
+          hashlib.sha256(base64.b64decode(_KEY_2018_B64)).hexdigest() == _KEY_2018_SHA256)
+    check("embedded 2012 cdimage key sha256 matches base rootfs",
+          hashlib.sha256(base64.b64decode(_KEY_2012_B64)).hexdigest() == _KEY_2012_SHA256)
+    fprs_2018 = _pgp_primary_fprs(base64.b64decode(_KEY_2018_B64))
+    check("embedded 2018 key fingerprint == F6EC…C93C (Ubuntu Archive 2018 signing key)",
+          UBUNTU_ARCHIVE_KEY_2018_FPR in fprs_2018)
+    fprs_2012 = _pgp_primary_fprs(base64.b64decode(_KEY_2012_B64))
+    check("embedded 2012 key fingerprint == Ubuntu CD Image 2012 key",
+          UBUNTU_CDIMAGE_KEY_2012_FPR in fprs_2012)
+
+    # --- --demo-trust pack: NO keyring, Trusted:yes, file_count 5 ------------- #
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "demo.tar"
+        rd = build_apt_mirror_overlay(out, mirror="ports", scheme="http", trusted=True)
+        with tarfile.open(out) as t:
+            dnames = {m.name for m in t.getmembers()}
+            dsrc = t.extractfile("./etc/apt/sources.list.alr.d/alr-ports.sources").read()
+        check("demo-trust does NOT stage the keyring",
+              "./" + ARCHIVE_KEYRING_PATH not in dnames)
+        check("demo-trust sources carry Trusted: yes", b"Trusted: yes" in dsrc)
+        check("demo-trust sources drop Signed-By", b"Signed-By:" not in dsrc)
+        check("demo-trust file_count == 5 (no keyring)", rd.file_count == 5)
+        check("demo-trust result is trusted + no keyring_path",
+              rd.trusted is True and rd.keyring_path is None)
+        rep_d = validate_stage_tar(str(out))
+        check("demo-trust overlay is stage_tar_spec conformant", rep_d.conformant)
+
+    # --- keyring_from_rootfs round-trips against the live base rootfs --------- #
+    _rootfs = Path(__file__).resolve().parent.parent / "rootfs" / "tiny-rootfs.tar"
+    if _rootfs.is_file():
+        extracted = keyring_from_rootfs(_rootfs)
+        check("keyring_from_rootfs(tiny-rootfs.tar) byte-matches the embedded keyring",
+              extracted == archive_keyring_bytes())
+    else:
+        check("keyring_from_rootfs skipped (no rootfs/tiny-rootfs.tar handy)", True)
+
+    # --- debian mirror: authenticated but keyring NOT staged (base owns it) -- #
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "debian.tar"
+        rdeb = build_apt_mirror_overlay(out, mirror="debian", scheme="http")
+        with tarfile.open(out) as t:
+            dnames = {m.name for m in t.getmembers()}
+        check("debian authenticated mode does NOT stage an Ubuntu keyring",
+              "./" + ARCHIVE_KEYRING_PATH not in dnames)
+        check("debian result has no keyring_path (uses base debian keyring)",
+              rdeb.keyring_path is None and rdeb.trusted is False)
 
     # --- custom mirror + bootstrap override --------------------------------- #
     with tempfile.TemporaryDirectory() as tmp:
@@ -1000,6 +1464,50 @@ def _ip_in_any(ip: str, cidrs: tuple[str, ...]) -> bool:
 
     a = ipaddress.ip_address(ip)
     return any(a in ipaddress.ip_network(c) for c in cidrs)
+
+
+def _pgp_primary_fprs(blob: bytes) -> set[str]:
+    """Return the v4 fingerprints of the primary public-key packets in a binary
+    OpenPGP keyring blob (SHA-1 over 0x99 || 2-byte-len || packet body). Used by
+    the selftest to prove the embedded key bytes ARE the expected archive key."""
+    import struct as _struct
+
+    out: set[str] = set()
+    i, n = 0, len(blob)
+    while i < n:
+        tag = blob[i]
+        if not (tag & 0x80):
+            break
+        if tag & 0x40:  # new format
+            ptag = tag & 0x3f
+            i += 1
+            l = blob[i]
+            if l < 192:
+                length = l; i += 1
+            elif l < 224:
+                length = ((l - 192) << 8) + blob[i + 1] + 192; i += 2
+            elif l == 255:
+                length = _struct.unpack(">I", blob[i + 1:i + 5])[0]; i += 5
+            else:
+                length = 1 << (l & 0x1f); i += 1
+        else:  # old format
+            ptag = (tag >> 2) & 0x0f
+            ltype = tag & 0x03
+            i += 1
+            if ltype == 0:
+                length = blob[i]; i += 1
+            elif ltype == 1:
+                length = _struct.unpack(">H", blob[i:i + 2])[0]; i += 2
+            elif ltype == 2:
+                length = _struct.unpack(">I", blob[i:i + 4])[0]; i += 4
+            else:
+                length = n - i
+        body = blob[i:i + length]
+        if ptag == 6 and body and body[0] == 4:  # primary public key, v4
+            pref = b"\x99" + _struct.pack(">H", len(body)) + body
+            out.add(hashlib.sha1(pref).hexdigest().upper())
+        i += length
+    return out
 
 
 if __name__ == "__main__":
