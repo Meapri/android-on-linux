@@ -52,6 +52,13 @@
 #include "alr_gpu/alr_gpu_ring.hpp"        // ring_init, RingProducer/RingConsumer
 #include "alr_gpu/alr_gpu_vk_decode.hpp"   // decode_vk_batch, VkDecodeState, VkReplyEncoder
 #include "alr_gpu/alr_gpu_vk_proto.hpp"    // AlrVkEncoder + wire
+// The codegen output for the 300.. entrypoint band (CreateCommandPool/AllocateMemory/
+// MapMemory/Create{Buffer,Image,ImageView}/Bind*/Get*Reqs/Destroy*). #including it here
+// self-registers its dispatcher into decode_vk_batch's generated-op seam (so the servicer
+// replays generated ops on real Mali) AND brings in the MAP_SHARED arena the same-process
+// vkMapMemory uses. The hand-written 200..229 ops are untouched.
+#include "alr_gpu/generated/alr_gpu_vk_gen_decode.hpp"  // decode_vk_gen_op + registrar
+#include "alr_gpu/generated/alr_gpu_vk_arena.hpp"       // alr_vk_arena_create (host side)
 
 namespace alr::gpu {
 
@@ -223,6 +230,12 @@ struct VkRing {
     int rep_fd = -1;          // inheritable memfd of the REPLY region
     uint32_t rep_bytes = 0;   // reply data-region size
     int doorbell_fd = -1;     // inheritable eventfd the guest signals on submit (-1 = none)
+    // The same-process MAP_SHARED arena for HOST_VISIBLE device memory (the zero-copy
+    // vkMapMemory keystone — alr_gpu/generated/alr_gpu_vk_arena.hpp). The host creates it
+    // here; the guest inherits arena_fd + maps it MAP_SHARED so a guest vkMapMemory pointer
+    // aliases the real VkDeviceMemory. -1 = no arena (the generated mem path then degrades).
+    int arena_fd = -1;        // inheritable memfd of the arena region
+    uint64_t arena_bytes = 0; // arena size
 };
 
 namespace vkdetail {
@@ -261,6 +274,8 @@ struct VkRingHolder {
     int req_fd = -1;
     int rep_fd = -1;
     int doorbell_fd = -1;
+    int arena_fd = -1;          // same-process arena memfd (zero-copy vkMapMemory)
+    uint64_t arena_bytes = 0;
     bool attached = false;
 };
 
@@ -292,6 +307,16 @@ inline std::vector<std::string> vk_ring_guest_env(const VkRing& r) {
         std::snprintf(buf, sizeof(buf), "ALR_VK_RING_DOORBELL_FD=%d", r.doorbell_fd);
         env.emplace_back(buf);
     }
+    // Advertise the same-process arena (zero-copy vkMapMemory) if it was created. The
+    // guest ICD's alr_icd_gen_glue.h maps ALR_VK_ARENA_FD MAP_SHARED. Keys MUST equal
+    // alr_gpu/guest_icd/alr_icd_env.h (ALR_VK_ENV_ARENA_FD / ALR_VK_ENV_ARENA_BYTES).
+    if (r.arena_fd >= 0 && r.arena_bytes > 0) {
+        std::snprintf(buf, sizeof(buf), "ALR_VK_ARENA_FD=%d", r.arena_fd);
+        env.emplace_back(buf);
+        std::snprintf(buf, sizeof(buf), "ALR_VK_ARENA_BYTES=%llu",
+                      static_cast<unsigned long long>(r.arena_bytes));
+        env.emplace_back(buf);
+    }
     return env;
 }
 
@@ -317,6 +342,8 @@ inline bool alr_loader_attach_vk_ring(VkRing& out, uint32_t ring_bytes = (1u << 
         out.rep_bytes = static_cast<uint32_t>(
             ring_valid(h.rep_region) ? static_cast<RingHeader*>(h.rep_region)->ring_bytes : 0u);
         out.doorbell_fd = h.doorbell_fd;
+        out.arena_fd = h.arena_fd;
+        out.arena_bytes = h.arena_bytes;
         return h.svc && h.svc->error().empty();
     }
 
@@ -342,10 +369,24 @@ inline bool alr_loader_attach_vk_ring(VkRing& out, uint32_t ring_bytes = (1u << 
         return false;
     }
 
+    // Create the same-process MAP_SHARED arena (the zero-copy vkMapMemory keystone). The
+    // guest inherits arena_fd + maps it MAP_SHARED. Best-effort: if arena creation fails
+    // (or this is a non-Linux host with no memfd), the generated memory path degrades to
+    // no-arena (vkMapMemory then fails for memory the host couldn't arena-back) rather than
+    // failing the whole VK ring bring-up. FD_CLOEXEC must be cleared by the loader on the
+    // returned arena_fd (same as the ring fds) so it survives exec into the guest.
+    int arena_fd = -1;
+    uint64_t arena_bytes = 0;
+    if (alr_vk_arena_create()) {
+        arena_fd = alr_vk_arena_fd();
+        arena_bytes = alr_vk_arena_size();
+    }
+
     h.svc = std::move(svc);
     h.req_region = req_region; h.req_region_sz = req_sz;
     h.rep_region = rep_region; h.rep_region_sz = rep_sz;
     h.req_fd = req_fd; h.rep_fd = rep_fd; h.doorbell_fd = bell_fd;
+    h.arena_fd = arena_fd; h.arena_bytes = arena_bytes;
     h.attached = true;
 
     out.req_fd = req_fd;
@@ -353,6 +394,8 @@ inline bool alr_loader_attach_vk_ring(VkRing& out, uint32_t ring_bytes = (1u << 
     out.rep_fd = rep_fd;
     out.rep_bytes = ring_bytes;
     out.doorbell_fd = bell_fd;
+    out.arena_fd = arena_fd;
+    out.arena_bytes = arena_bytes;
     return true;
 }
 

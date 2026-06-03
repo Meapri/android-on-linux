@@ -61,4 +61,14 @@
 #define ALR_VK_ENV_REPLY_BYTES      "ALR_VK_REPLY_BYTES"
 #define ALR_VK_ENV_RING_DOORBELL_FD "ALR_VK_RING_DOORBELL_FD"
 
+/* The same-process MAP_SHARED ARENA for HOST_VISIBLE device memory (the zero-copy
+ * vkMapMemory keystone — see alr_gpu/generated/alr_gpu_vk_arena.hpp). The host creates
+ * the arena memfd before fork and advertises it here; the guest ICD maps the SAME memfd
+ * MAP_SHARED so a guest write through a vkMapMemory pointer lands directly in the memory
+ * the host's real VkDeviceMemory aliases (host-pointer import). If absent, the generated
+ * memory entrypoints fall back to no-arena (vkMapMemory then fails for memory the host
+ * could not arena-back — the conformant degradation, like the ring-less path). */
+#define ALR_VK_ENV_ARENA_FD         "ALR_VK_ARENA_FD"
+#define ALR_VK_ENV_ARENA_BYTES      "ALR_VK_ARENA_BYTES"
+
 #endif /* ALR_ICD_ENV_H */

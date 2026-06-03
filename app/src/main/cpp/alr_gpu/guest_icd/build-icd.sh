@@ -21,11 +21,16 @@ OUT="${OUT:-$HERE/out}"
 # producer port (alr_gpu_ring_c.h) lives in the sibling guest_shim/ dir — include both.
 ALR_GPU_DIR="$(cd "$HERE/.." && pwd)"
 GUEST_SHIM_DIR="$ALR_GPU_DIR/guest_shim"
+# The C++ source root (app/src/main/cpp): the GENERATED headers (alr_gpu/generated/*)
+# include each other via the "alr_gpu/..." path the host build uses, so the ICD needs
+# this root on its include path too.
+CPP_ROOT="$(cd "$ALR_GPU_DIR/.." && pwd)"
 TARGET="aarch64-linux-gnu.2.34"
 CC=(zig cc -target "$TARGET")
-# The ICD TU is pure C; the .hpp wire header is C-clean (extern "C" guarded).
+# The ICD TU is pure C; the .hpp wire header is C-clean (extern "C" guarded). The
+# generated proto header is C-clean too (extern "C" + plain enums/static-inline encoders).
 CFLAGS=(-std=c11 -O2 -fPIC -Wall -Wextra -fvisibility=default
-        -I"$HERE" -I"$ALR_GPU_DIR" -I"$GUEST_SHIM_DIR")
+        -I"$HERE" -I"$ALR_GPU_DIR" -I"$GUEST_SHIM_DIR" -I"$CPP_ROOT")
 
 mkdir -p "$OUT"
 echo "== zig version =="

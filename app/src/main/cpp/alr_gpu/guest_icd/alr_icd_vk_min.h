@@ -94,6 +94,7 @@ typedef enum VkResult {
     VK_ERROR_OUT_OF_DEVICE_MEMORY = -2,
     VK_ERROR_INITIALIZATION_FAILED = -3,
     VK_ERROR_DEVICE_LOST = -4,
+    VK_ERROR_MEMORY_MAP_FAILED = -5,   /* used by the generated vkMapMemory */
     VK_ERROR_INCOMPATIBLE_DRIVER = -9,
     VK_RESULT_MAX_ENUM = 0x7FFFFFFF
 } VkResult;
@@ -468,6 +469,108 @@ static inline uint32_t alr_icd_feature_struct_size(uint32_t s_type) {
             return 0;             /* unknown: drop (feature stays off) */
     }
 }
+
+/* ========================================================================
+ * GENERATED render-batch ABI (device memory / buffer / image / image view).
+ * The codegen entrypoints (alr_gpu/generated/alr_gpu_vk_gen_icd.inc) take these
+ * types. Every layout below is byte/ABI-identical to <vulkan/vulkan_core.h>
+ * (verified against vk.xml v1.3.275 == NDK r27). Non-dispatchable handles are
+ * uint64_t (VK_DEFINE_NON_DISPATCHABLE_HANDLE) exactly like VkImage above; the
+ * ICD only ever carries the guest's virtual id in them, never derefs them.
+ * ======================================================================== */
+typedef uint64_t VkBuffer;          /* non-dispatchable (== official ABI) */
+typedef uint64_t VkImageView;       /* non-dispatchable */
+typedef uint64_t VkDeviceMemory;    /* non-dispatchable */
+
+typedef VkFlags VkBufferCreateFlags;
+typedef VkFlags VkBufferUsageFlags;
+typedef VkFlags VkMemoryMapFlags;
+typedef VkFlags VkImageViewCreateFlags;
+typedef int32_t VkImageViewType;     /* int-sized enum; passed opaquely */
+typedef int32_t VkComponentSwizzle;  /* int-sized enum; passed opaquely */
+
+/* VkMemoryAllocateInfo { sType, pNext, allocationSize(u64), memoryTypeIndex(u32) }. */
+typedef struct VkMemoryAllocateInfo {
+    VkStructureType sType;
+    const void     *pNext;
+    VkDeviceSize    allocationSize;
+    uint32_t        memoryTypeIndex;
+} VkMemoryAllocateInfo;
+
+/* VkMappedMemoryRange { sType, pNext, memory, offset(u64), size(u64) }. */
+typedef struct VkMappedMemoryRange {
+    VkStructureType sType;
+    const void     *pNext;
+    VkDeviceMemory  memory;
+    VkDeviceSize    offset;
+    VkDeviceSize    size;
+} VkMappedMemoryRange;
+
+/* VkMemoryRequirements { size(u64), alignment(u64), memoryTypeBits(u32) }. */
+typedef struct VkMemoryRequirements {
+    VkDeviceSize size;
+    VkDeviceSize alignment;
+    uint32_t     memoryTypeBits;
+} VkMemoryRequirements;
+
+/* VkBufferCreateInfo (the POD prefix the codegen ships; pQueueFamilyIndices is part of
+ * the ABI struct but the generated forwarder uses EXCLUSIVE sharing — see the tool). */
+typedef struct VkBufferCreateInfo {
+    VkStructureType     sType;
+    const void         *pNext;
+    VkBufferCreateFlags flags;
+    VkDeviceSize        size;
+    VkBufferUsageFlags  usage;
+    VkSharingMode       sharingMode;
+    uint32_t            queueFamilyIndexCount;
+    const uint32_t     *pQueueFamilyIndices;
+} VkBufferCreateInfo;
+
+/* VkImageCreateInfo — full ABI layout (matches the official header field-for-field). */
+typedef struct VkImageCreateInfo {
+    VkStructureType    sType;
+    const void        *pNext;
+    VkImageCreateFlags flags;
+    VkImageType        imageType;
+    VkFormat           format;
+    VkExtent3D         extent;
+    uint32_t           mipLevels;
+    uint32_t           arrayLayers;
+    VkSampleCountFlags samples;       /* VkSampleCountFlagBits, int-sized */
+    VkImageTiling      tiling;
+    VkImageUsageFlags  usage;
+    VkSharingMode      sharingMode;
+    uint32_t           queueFamilyIndexCount;
+    const uint32_t    *pQueueFamilyIndices;
+    VkImageLayout      initialLayout;
+} VkImageCreateInfo;
+
+typedef struct VkComponentMapping {
+    VkComponentSwizzle r;
+    VkComponentSwizzle g;
+    VkComponentSwizzle b;
+    VkComponentSwizzle a;
+} VkComponentMapping;
+
+typedef struct VkImageSubresourceRange {
+    VkFlags  aspectMask;          /* VkImageAspectFlags */
+    uint32_t baseMipLevel;
+    uint32_t levelCount;
+    uint32_t baseArrayLayer;
+    uint32_t layerCount;
+} VkImageSubresourceRange;
+
+/* VkImageViewCreateInfo — full ABI layout. */
+typedef struct VkImageViewCreateInfo {
+    VkStructureType         sType;
+    const void             *pNext;
+    VkImageViewCreateFlags  flags;
+    VkImage                 image;
+    VkImageViewType         viewType;
+    VkFormat                format;
+    VkComponentMapping      components;
+    VkImageSubresourceRange subresourceRange;
+} VkImageViewCreateInfo;
 
 /* The "2" sType values (official Vulkan constants). */
 #define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 1000059000

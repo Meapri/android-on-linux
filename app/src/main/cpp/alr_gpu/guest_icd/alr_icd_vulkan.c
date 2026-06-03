@@ -34,6 +34,11 @@
 #include "alr_icd_vk_min.h"
 #include "alr_icd_runtime.h"  /* alr_icd_roundtrip / alr_icd_ring_ok */
 #include "alr_gpu_vk_proto.hpp"  /* AlrVkEncoder + AlrVkOp/AlrVkReply wire (C-clean) */
+#include "alr_icd_gen_glue.h"  /* AlrVkReader + the same-process arena glue (gen support) */
+/* The GENERATED passthrough wire (the 300.. escape band): per-entrypoint encoders for the
+ * memory + buffer + image + image-view render batch. Produced by
+ * tools/gen_vk_passthrough.py; C-clean (extern "C"). */
+#include "alr_gpu/generated/alr_gpu_vk_gen_proto.hpp"
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -123,6 +128,13 @@ static uint32_t g_next_vpool   = 3000;
 static uint32_t g_next_vcmd    = 4000;
 static uint32_t g_next_vshader = 5000;
 static uint32_t g_next_vswap   = 6000;
+/* GENERATED render-batch virtual-id pools (alr_gpu/generated/, the 300.. escape band):
+ * buffers/images/image-views/device-memory. Disjoint high ranges so a stray id is
+ * diagnosable. Referenced by the generated ICD entrypoints (alr_gpu_vk_gen_icd.inc). */
+static uint32_t g_next_vbuf    = 7000000;
+static uint32_t g_next_vimg    = 8000000;
+static uint32_t g_next_vview   = 8500000;
+static uint32_t g_next_vmem    = 9000000;
 /* The vcmd of the most recent coarse draw-record (alrVkCmdDrawTriangleModules). The
  * single-surface bring-up records then presents, so QUEUE_PRESENT (which keys the host's
  * recorded draw by vcmd) uses this. A multi-surface breadth rung carries vcmd explicitly
@@ -1248,6 +1260,20 @@ static VkResult VKAPI_CALL alr_vkGetPhysicalDeviceImageFormatProperties2(
 }
 
 /* ============================================================================
+ * GENERATED passthrough entrypoints (the 300.. escape band). Defining ALR_ICD_GEN_DEFINE
+ * emits (a) the reply scanners (alr_gpu_vk_gen_icd_runtime.inc) and (b) the per-entrypoint
+ * VKAPI_CALL functions (alr_gpu_vk_gen_icd.inc). They reuse this TU's AlrIcdDevice, the
+ * alr_alloc id allocator, the g_next_v counters, alr_icd_ring_ok, alr_icd_roundtrip, the
+ * glue's AlrVkReader + arena helpers, and the generated encoders. Must precede alr_lookup
+ * (its table references these functions). The table rows are spliced below via
+ * ALR_ICD_GEN_TABLE.
+ * ============================================================================ */
+#define ALR_ICD_GEN_DEFINE 1
+#include "alr_gpu/generated/alr_gpu_vk_gen_icd_runtime.inc"
+#include "alr_gpu/generated/alr_gpu_vk_gen_icd.inc"
+#undef ALR_ICD_GEN_DEFINE
+
+/* ============================================================================
  * Dispatch — vkGetInstanceProcAddr / vkGetDeviceProcAddr. The app/loader resolves
  * every entry point through these. We return our ENUM-rung implementations and
  * vkGetInstanceProcAddr / vkGetDeviceProcAddr themselves (a global GIPA also resolves
@@ -1310,6 +1336,12 @@ static PFN_vkVoidFunction alr_lookup(const char *pName) {
         ALR_ENTRY("vkAcquireNextImageKHR", alr_vkAcquireNextImageKHR),
         ALR_ENTRY("vkQueuePresentKHR", alr_vkQueuePresentKHR),
         ALR_ENTRY("alrVkCmdDrawTriangleModules", alrVkCmdDrawTriangleModules),
+        /* ---- GENERATED render-batch entrypoints (the 300.. escape band): device memory
+         * (same-process arena), buffers, images, image views + their reqs/bind/destroy.
+         * The ALR_ENTRY rows are emitted by the codegen (tools/gen_vk_passthrough.py). ---- */
+#define ALR_ICD_GEN_TABLE 1
+#include "alr_gpu/generated/alr_gpu_vk_gen_icd.inc"
+#undef ALR_ICD_GEN_TABLE
     };
     size_t i;
     if (!pName) return NULL;
