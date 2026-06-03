@@ -1929,7 +1929,7 @@ class MainActivity : Activity() {
         // adb-push'd to /data/local/tmp; the base rootfs already ships the GTK/X/font
         // stack. No GPU shim / toolkit / GIMP overlays here (lean).
         Thread {
-            for (name in listOf("interpose", "nss", "chromium-net", "xkb-gegl", "chromium-gui")) {
+            for (name in listOf("interpose", "nss", "chromium-net", "xkb-gegl", "content-shell")) {
                 try {
                     val tar = File("/data/local/tmp/$name-stage.tar")
                     val marker = File(rootfsDir, ".$name-staged-${tar.length()}")
@@ -1974,13 +1974,13 @@ class MainActivity : Activity() {
                         // staging thread writes LAST (".chromium-gui-staged-<size>") AND on a
                         // late-tar dependency file, so launch only proceeds with the overlay
                         // fully in place.
-                        val chromiumBin = File(rootfsDir, "usr/lib/chromium/chromium")
-                        val crGuiTar = File("/data/local/tmp/chromium-gui-stage.tar")
-                        val crGuiMarker = File(rootfsDir, ".chromium-gui-staged-${crGuiTar.length()}")
+                        val chromiumBin = File(rootfsDir, "usr/lib/chromium/chromium-shell")
+                        val csTar = File("/data/local/tmp/content-shell-stage.tar")
+                        val csMarker = File(rootfsDir, ".content-shell-staged-${csTar.length()}")
                         val openh264 = File(rootfsDir, "usr/lib/aarch64-linux-gnu/libopenh264.so.7")
                         var waited = 0
                         while (waited < 180000 &&
-                            !(chromiumBin.isFile && crGuiMarker.isFile && openh264.isFile)
+                            !(chromiumBin.isFile && csMarker.isFile && openh264.isFile)
                         ) { Thread.sleep(500); waited += 500 }
                         try {
                             val demoSrc = File("/data/local/tmp/alr-demo.html")
@@ -2036,7 +2036,13 @@ class MainActivity : Activity() {
                             //   --disable-setuid-sandbox / --disable-namespace-sandbox /
                             //   --disable-gpu-sandbox : no SUID helper, no userns clone, no GPU
                             //       sandbox — none can work inside an untrusted_app domain.
-                            "/usr/lib/chromium/chromium\n--ozone-platform=wayland" +
+                            // content_shell (chromium-shell): a TRUE single-process embedder
+                            // (layout-test shell) — unlike full chromium it does NOT fork the
+                            // zygote_host / crashpad child that argc=10 storm came from, so the
+                            // "No usable sandbox" child-crash loop is sidestepped at the source.
+                            // Keep every sandbox layer off (content_shell still links the bpf
+                            // sandbox) + --single-process so the loader maps ONE address space.
+                            "/usr/lib/chromium/chromium-shell\n--ozone-platform=wayland" +
                                 "\n--no-sandbox\n--disable-seccomp-filter-sandbox" +
                                 "\n--disable-setuid-sandbox\n--disable-namespace-sandbox" +
                                 "\n--disable-gpu-sandbox" +
@@ -2045,8 +2051,8 @@ class MainActivity : Activity() {
                                 "\n--disable-dev-shm-usage\n--user-data-dir=/tmp/cr4-profile" +
                                 "\n--no-first-run\n--no-default-browser-check" +
                                 "\n--disable-crash-reporter\n--disable-breakpad" +
-                                "\n--start-maximized" +
-                                "\n--window-size=1200,1920\n--enable-logging=stderr\n--v=1" +
+                                "\n--content-shell-hide-toolbar\n--ozone-override-screen-size=1200,1920" +
+                                "\n--enable-logging=stderr\n--v=1" +
                                 "\nfile:///root/demo.html",
                         )
                         android.util.Log.i("alr_loader", "cronly chromium exited:\n$out")
