@@ -2171,9 +2171,26 @@ class MainActivity : Activity() {
             nativeWaylandInjectTouch(ev.getPointerId(ev.actionIndex), ev.x, ev.y, phase)
             true
         }
-        setContentView(surfaceView)
-        // Standalone Chromium: keep the Android status bar + nav bar (soft keys) visible
-        // (normal-app frame), NOT immersive — chromium renders inside the inset content.
+        // Strictly inset the SurfaceView INSIDE the system bars: fitsSystemWindows on the
+        // container consumes the status-bar + nav-bar insets as padding, so the SurfaceView
+        // (hence its surface = the compositor output) is exactly the content area between
+        // the bars. chromium then NEVER paints under the Android bars (normal-app frame);
+        // its surfaceFrame/surfaceChanged report the inset size, which drives the compositor
+        // output + chromium --window-size. (Bar height changes on rotation re-fire
+        // surfaceChanged → nativeWaylandCompositorResize.)
+        setContentView(
+            android.widget.FrameLayout(this).apply {
+                fitsSystemWindows = true
+                addView(
+                    surfaceView,
+                    android.widget.FrameLayout.LayoutParams(
+                        android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                        android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                    ),
+                )
+            },
+        )
+        // Show the Android status bar + nav bar (soft keys) — normal-app frame, NOT immersive.
         showSystemBars()
         surfaceView.post { surfaceView.requestFocus() }
     }
