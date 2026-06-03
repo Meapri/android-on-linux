@@ -85,6 +85,7 @@
 
 #ifdef ALR_HAVE_WAYLAND
 #include "alr_wayland/alr_compositor.hpp"
+#include "alr_wayland/alr_text_input.hpp"  // Android IME <-> guest text-input bridge
 #endif
 
 // GPU-native app track (Phase 4): host-side GLES command-stream decoder + probes.
@@ -6669,5 +6670,137 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandInjectScroll(
     alr::wayland::alr_wayland_inject_pointer_axis(value, static_cast<int32_t>(axis));
 #else
     (void)x; (void)y; (void)value; (void)axis;
+#endif
+}
+
+// ===========================================================================
+// Android soft-keyboard IME <-> guest zwp_text_input_v3 (design: docs/design/
+// android-ime-text-input.md). Mirrors the inject bridges above: Android's
+// AlrInputConnection forwards committed/composing text + deletions here; this
+// file relays them into the compositor (alr_text_input.hpp), which sends
+// zwp_text_input_v3.commit_string/preedit_string/delete_surrounding_text to the
+// focused guest. The reverse direction (guest enables a text field) upcalls via
+// onGuestImeState so MainActivity raises/hides the soft keyboard.
+// ===========================================================================
+#ifdef ALR_HAVE_WAYLAND
+namespace {
+// State-callback plumbing. Cached once in nativeWaylandImeRegisterStateCallback and
+// used by ime_state_trampoline, which is invoked ON THE COMPOSITOR THREAD: it must
+// AttachCurrentThread before touching JNI, then call MainActivity.onGuestImeState
+// (the Kotlin side hops to the UI looper itself via runOnUiThread).
+JavaVM*   g_ime_jvm = nullptr;
+jobject   g_ime_activity = nullptr;   // global ref to the MainActivity
+jmethodID g_ime_on_state = nullptr;   // onGuestImeState(ZIIIIIII? -> see signature)
+
+void ime_state_trampoline(const alr::wayland::AlrImeState& st, void* /*ud*/) {
+    if (!g_ime_jvm || !g_ime_activity || !g_ime_on_state) return;
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    jint rc = g_ime_jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+    if (rc == JNI_EDETACHED) {
+        if (g_ime_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK || env == nullptr)
+            return;
+        attached = true;
+    } else if (rc != JNI_OK || env == nullptr) {
+        return;
+    }
+    env->CallVoidMethod(g_ime_activity, g_ime_on_state,
+                        static_cast<jboolean>(st.enabled ? JNI_TRUE : JNI_FALSE),
+                        static_cast<jint>(st.content_purpose),
+                        static_cast<jint>(st.content_hint),
+                        static_cast<jint>(st.cursor_x), static_cast<jint>(st.cursor_y),
+                        static_cast<jint>(st.cursor_w), static_cast<jint>(st.cursor_h));
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (attached) g_ime_jvm->DetachCurrentThread();
+}
+}  // namespace
+#endif  // ALR_HAVE_WAYLAND
+
+// Commit text from the soft keyboard. text is passed as a UTF-8 ByteArray (NOT a
+// jstring) on purpose: GetStringUTFChars yields *modified* UTF-8 (CESU-8) which
+// corrupts astral-plane code points (emoji -> surrogate pairs). The Kotlin side does
+// text.toByteArray(UTF_8); here we read the real bytes verbatim.
+extern "C" JNIEXPORT void JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandImeCommitText(
+    JNIEnv* env, jobject /* thiz */, jbyteArray utf8) {
+#ifdef ALR_HAVE_WAYLAND
+    if (!utf8) return;
+    const jsize len = env->GetArrayLength(utf8);
+    if (len <= 0) { alr::wayland::alr_ime_commit_text("", 0); return; }
+    jbyte* bytes = env->GetByteArrayElements(utf8, nullptr);
+    if (!bytes) return;
+    alr::wayland::alr_ime_commit_text(reinterpret_cast<const char*>(bytes),
+                                      static_cast<int32_t>(len));
+    env->ReleaseByteArrayElements(utf8, bytes, JNI_ABORT);  // read-only, no copy-back
+#else
+    (void)env; (void)utf8;
+#endif
+}
+
+// Composing (pre-edit) text from a CJK/glide IME. Same UTF-8 ByteArray route.
+// cursorByte is the preedit cursor as a UTF-8 BYTE offset.
+extern "C" JNIEXPORT void JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandImePreedit(
+    JNIEnv* env, jobject /* thiz */, jbyteArray utf8, jint cursorByte) {
+#ifdef ALR_HAVE_WAYLAND
+    const jsize len = utf8 ? env->GetArrayLength(utf8) : 0;
+    // Empty (or null) ByteArray => clear the composing run (finishComposingText).
+    jbyte* bytes = (utf8 && len > 0) ? env->GetByteArrayElements(utf8, nullptr) : nullptr;
+    alr::wayland::alr_ime_preedit(bytes ? reinterpret_cast<const char*>(bytes) : "",
+                                  bytes ? static_cast<int32_t>(len) : 0,
+                                  static_cast<int32_t>(cursorByte));
+    if (bytes) env->ReleaseByteArrayElements(utf8, bytes, JNI_ABORT);
+#else
+    (void)env; (void)utf8; (void)cursorByte;
+#endif
+}
+
+// deleteSurroundingText -> zwp_text_input_v3.delete_surrounding_text. The Kotlin side
+// converts char counts to UTF-8 byte counts before calling.
+extern "C" JNIEXPORT void JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandImeDeleteSurrounding(
+    JNIEnv* /* env */, jobject /* thiz */, jint beforeBytes, jint afterBytes) {
+#ifdef ALR_HAVE_WAYLAND
+    alr::wayland::alr_ime_delete_surrounding(
+        static_cast<uint32_t>(beforeBytes < 0 ? 0 : beforeBytes),
+        static_cast<uint32_t>(afterBytes < 0 ? 0 : afterBytes));
+#else
+    (void)beforeBytes; (void)afterBytes;
+#endif
+}
+
+// Whether the focused guest has an enabled zwp_text_input_v3 (InputConnection uses
+// this to choose commit_string vs key synthesis).
+extern "C" JNIEXPORT jboolean JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandImeFocusHasTextInput(
+    JNIEnv* /* env */, jobject /* thiz */) {
+#ifdef ALR_HAVE_WAYLAND
+    return alr::wayland::alr_ime_focus_has_text_input() ? JNI_TRUE : JNI_FALSE;
+#else
+    return JNI_FALSE;
+#endif
+}
+
+// Register the guest-IME-state upcall. Called once after the compositor starts. Caches
+// the JavaVM + a global ref to the MainActivity + the onGuestImeState methodID, then
+// installs ime_state_trampoline as the compositor's AlrImeStateFn.
+extern "C" JNIEXPORT void JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandImeRegisterStateCallback(
+    JNIEnv* env, jobject thiz) {
+#ifdef ALR_HAVE_WAYLAND
+    if (env->GetJavaVM(&g_ime_jvm) != JNI_OK || !g_ime_jvm) return;
+    if (g_ime_activity) { env->DeleteGlobalRef(g_ime_activity); g_ime_activity = nullptr; }
+    g_ime_activity = env->NewGlobalRef(thiz);
+    jclass cls = env->GetObjectClass(thiz);
+    if (cls) {
+        // void onGuestImeState(boolean enabled, int purpose, int hint,
+        //                      int curX, int curY, int curW, int curH)
+        g_ime_on_state = env->GetMethodID(cls, "onGuestImeState", "(ZIIIIII)V");
+        env->DeleteLocalRef(cls);
+    }
+    if (g_ime_activity && g_ime_on_state)
+        alr::wayland::alr_ime_set_state_callback(&ime_state_trampoline, nullptr);
+#else
+    (void)env; (void)thiz;
 #endif
 }

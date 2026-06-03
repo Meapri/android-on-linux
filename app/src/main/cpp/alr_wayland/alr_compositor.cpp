@@ -24,6 +24,7 @@
 
 #include "alr_wayland/alr_compositor.hpp"
 #include "alr_wayland/alr_present_source.hpp"  // §5-C GPU present contract
+#include "alr_wayland/alr_text_input.hpp"      // Android IME <-> guest text-input boundary
 #include "alr_wayland/alr_xkb_keymap_us.h"     // embedded self-contained XKB keymap
 
 #include <android/log.h>
@@ -57,6 +58,7 @@ extern "C" {
 // Generated server glue (checked in under third_party/wayland_generated).
 #include "wayland-server-protocol.h"
 #include "xdg-shell-server-protocol.h"
+#include "text-input-unstable-v3-server-protocol.h"  // zwp_text_input_v3 (IME)
 }
 
 #define ALR_WL_TAG "alr_wayland"
@@ -133,6 +135,19 @@ struct SurfaceState {
     uint64_t sub_parent_key = 0;
     int32_t sub_x = 0;
     int32_t sub_y = 0;
+
+    // --- zwp_text_input_v3 per-surface state (IME / soft-keyboard) ---------
+    // Double-buffered: the pending_* fields collect enable/disable/content_type/
+    // cursor_rectangle changes; .commit atomically copies them into the current
+    // ti_* fields and fires the Android IME-show/hide upcall. State lives on the
+    // FOCUSED surface so it travels with the window and is cleared on unmap.
+    bool     ti_enabled = false;
+    bool     ti_pending_enabled = false;
+    uint32_t ti_purpose = 0,  ti_hint = 0;            // current (applied)
+    uint32_t ti_pending_purpose = 0, ti_pending_hint = 0;
+    int32_t  ti_cur_x = -1, ti_cur_y = -1, ti_cur_w = -1, ti_cur_h = -1;        // current
+    int32_t  ti_pending_cur_x = -1, ti_pending_cur_y = -1,
+             ti_pending_cur_w = -1, ti_pending_cur_h = -1;                       // pending
 };
 
 }  // namespace
@@ -221,6 +236,7 @@ private:
     static void bind_xdg_wm_base(struct wl_client*, void*, uint32_t, uint32_t);
     static void bind_subcompositor(struct wl_client*, void*, uint32_t, uint32_t);
     static void bind_data_device_manager(struct wl_client*, void*, uint32_t, uint32_t);
+    static void bind_text_input_manager(struct wl_client*, void*, uint32_t, uint32_t);
 
     CompositorConfig config_;
     std::string status_;
@@ -232,6 +248,7 @@ private:
     struct wl_global* g_xdg_wm_base_ = nullptr;
     struct wl_global* g_subcompositor_ = nullptr;
     struct wl_global* g_data_device_manager_ = nullptr;
+    struct wl_global* g_text_input_manager_ = nullptr;  // zwp_text_input_manager_v3
 
     int epoll_fd_ = -1;
     int wakeup_fd_ = -1;
@@ -262,7 +279,12 @@ Compositor* instance() {
 // compositor thread (wl_resource sends must happen there). ----
 enum class InjectKind : uint8_t {
     PointerMotion, PointerButton, PointerAxis,
-    TouchDown, TouchMotion, TouchUp, TouchFrame, TouchCancel, Key,
+    TouchDown, TouchMotion, TouchUp, TouchFrame, TouchCancel,
+    // zwp_text_input_v3 (Android soft-keyboard IME). Enqueued from the UI thread
+    // via alr_ime_*; drained on the compositor thread into the focused client's
+    // text-input objects (commit_string / preedit_string / delete_surrounding_text
+    // each followed by a done — see drain_input_queue).
+    ImeCommit, ImePreedit, ImeDelete, Key,
 };
 struct InjectEvent {
     InjectKind kind;
@@ -273,6 +295,12 @@ struct InjectEvent {
     int32_t axis = 0;       // 0=vertical, 1=horizontal
     double axis_value = 0;
     uint32_t time_ms = 0;
+    // IME payload (ImeCommit/ImePreedit/ImeDelete): `text` is real UTF-8;
+    // before_bytes/after_bytes are the delete_surrounding_text byte counts;
+    // preedit_cursor is the preedit cursor BYTE offset (ImePreedit).
+    std::string text;
+    uint32_t before_bytes = 0, after_bytes = 0;
+    int32_t preedit_cursor = 0;
 };
 std::mutex g_inject_mutex;
 std::vector<InjectEvent> g_inject_queue;  // guarded by g_inject_mutex
@@ -329,6 +357,28 @@ inline void clear_momentary_mods() { g_mods_depressed = 0; }
 std::vector<struct wl_resource*> g_pointers;
 std::vector<struct wl_resource*> g_keyboards;
 std::vector<struct wl_resource*> g_touches;
+// zwp_text_input_v3 objects (one per client; chromium/GTK/Qt each create one).
+// enter/leave/commit_string/preedit_string/done are sent to the text-inputs whose
+// client owns the focused surface. Entries are dropped in ti_resource_destroy.
+std::vector<struct wl_resource*> g_text_inputs;
+// IME-state upcall to Android (alr_text_input.hpp): invoked ON THE COMPOSITOR
+// THREAD from the text_input_commit handler / focus transitions. The JNI side
+// (runtime_report.cpp) must AttachCurrentThread + hop to the UI looper itself.
+AlrImeStateFn g_ime_state_cb = nullptr;
+void*         g_ime_state_ud = nullptr;
+// Per-zwp_text_input_v3-object commit-request counter. The protocol REQUIRES the
+// done.serial to equal the number of commit requests already issued on THAT object
+// (else GTK ignores the batch), so it is tracked per resource, not globally.
+struct TextInputState { uint32_t commit_serial = 0; };
+// Forward decls: the IME focus helper is DEFINED in the zwp_text_input_v3 block
+// (far below, near the data_device_manager glue) but CALLED from the keyboard-focus
+// transitions above it (focus_follow_to_toplevel / toplevel_destroy / the lazy key
+// enter). ti_set_focus sends zwp_text_input_v3.leave(old)+enter(new) to the focused
+// client's text-inputs and, when focus leaves an enabled field, upcalls an IME hide.
+void ti_set_focus(struct wl_resource* new_surface, struct wl_resource* old_surface);
+// Fire the Android IME show/hide upcall for the focused surface. enabled_override<0
+// => use the focused surface's ti_enabled; 0/1 => force hide/show.
+void ti_emit_state(int enabled_override);
 struct wl_resource* g_focus_surface = nullptr;
 bool g_pointer_entered = false;
 bool g_keyboard_entered = false;
@@ -530,7 +580,11 @@ void surface_commit(struct wl_client*, struct wl_resource* resource) {
                                     g_focus_surface);
                         }
                         clear_momentary_mods();  // fresh mods for the new toplevel/dialog
+                        struct wl_resource* prev_focus = g_focus_surface;
                         g_focus_surface = s->surface;
+                        // Move zwp_text_input_v3 focus to the freshly-mapped toplevel and
+                        // hide a soft keyboard that was up over the previous window.
+                        ti_set_focus(g_focus_surface, prev_focus);
                         g_pointer_entered = false;
                         g_keyboard_entered = false;
                     } else if (s->is_popup) {
@@ -653,9 +707,14 @@ void surface_resource_destroy(struct wl_resource* resource) {
         // to a destroyed surface (a use-after-free when a client exits — common
         // once multiple toplevels/popups come and go, e.g. GTK dialogs/menus).
         if (g_focus_surface == s->surface) {
+            // If the dying focus surface had an enabled text input, hide the soft
+            // keyboard (no zwp_text_input_v3.leave: the surface is being destroyed, so
+            // sending to it would be a UAF — the client is tearing down anyway).
+            const bool had_ime = s->ti_enabled;
             g_focus_surface = nullptr;
             g_pointer_entered = false;
             g_keyboard_entered = false;
+            if (had_ime) ti_emit_state(/*enabled_override=*/0);
         }
         // Same UAF guard for the pointer/touch target (which may be a popup, i.e.
         // NOT g_focus_surface): never leave it pointing at a freed wl_surface.
@@ -1173,7 +1232,9 @@ void focus_follow_to_toplevel(SurfaceState* tgt) {
                                    g_focus_surface);
     }
     clear_momentary_mods();      // don't leak held Shift/Ctrl/Alt into the new focus
+    struct wl_resource* prev_focus = g_focus_surface;
     g_focus_surface = tgt->surface;
+    ti_set_focus(g_focus_surface, prev_focus);  // move zwp_text_input_v3 focus + hide IME if needed
     g_keyboard_entered = false;  // force a fresh wl_keyboard.enter on the next key
     zorder_raise(tgt);           // most-recently-activated window is on top
     g_scene_dirty = true;        // repaint: the raised window draws above the others
@@ -1268,10 +1329,14 @@ void toplevel_destroy(struct wl_client*, struct wl_resource* resource) {
         zorder_remove(s);
         if (g_focus_surface == s->surface) {
             clear_momentary_mods();  // destroyed toplevel: don't leak held mods onward
+            struct wl_resource* prev_focus = g_focus_surface;
             g_focus_surface = nullptr;
             g_pointer_entered = false;
             g_keyboard_entered = false;
             if (SurfaceState* nt = zorder_top()) g_focus_surface = nt->surface;
+            // Move text-input focus off the gone window (its wl_surface is still alive
+            // here) onto the new top toplevel (or null); hide the IME if it was up.
+            ti_set_focus(g_focus_surface, prev_focus);
         }
         // The xdg_toplevel ROLE is gone but s->surface is still ALIVE here (GTK can
         // destroy the role and reuse the wl_surface). If this surface was the pointer
@@ -1782,6 +1847,176 @@ void ddm_release(struct wl_client*, struct wl_resource* r) { wl_resource_destroy
 const struct wl_data_device_manager_interface kDataDeviceManagerImpl = {
     ddm_create_data_source, ddm_get_data_device, ddm_release};
 
+// =================== zwp_text_input_v3 (Android soft-keyboard IME) ===================
+// Models wl_data_device_manager above: a manager global hands out per-seat
+// zwp_text_input_v3 objects. Each object collects double-buffered enable/disable/
+// content_type/cursor_rectangle requests; .commit applies them to the FOCUSED
+// SurfaceState, sends .done(serial) where serial == that object's commit count
+// (protocol requirement — GTK ignores a batch whose serial != its commit count),
+// and upcalls Android (g_ime_state_cb) to raise/hide the soft keyboard.
+//
+// The return text channel (commit_string / preedit_string / delete_surrounding_text
+// + done) is driven from Android via the alr_ime_* functions (alr_text_input.hpp),
+// enqueued on g_inject_queue and emitted in drain_input_queue.
+
+// The SurfaceState that currently holds keyboard focus (where text-input state
+// lives), or null. Single source of truth used by both the commit handler and the
+// alr_ime_* drains so they agree on "the focused text field".
+SurfaceState* ti_focused_state() { return surface_state_for_wl(g_focus_surface); }
+
+// True iff `ti` belongs to the same client as the focused surface — only those
+// text-inputs receive enter/leave/commit_string/done.
+bool ti_owns_focus(struct wl_resource* ti) {
+    if (!ti || !g_focus_surface) return false;
+    return wl_resource_get_client(ti) == wl_resource_get_client(g_focus_surface);
+}
+
+// Build the AlrImeState for the focused surface and fire the Android upcall (runs
+// on the compositor thread). `enabled_override<0` => use the focused surface's
+// ti_enabled; otherwise force enabled(1)/disabled(0) (used by focus-leave to
+// synthesize a hide). Cursor rect is surface-local logical px from the guest; we
+// pass it through as-is (Android side may scale/ignore — the design allows v1 to
+// skip cursor placement). No-op if no callback registered.
+void ti_emit_state(int enabled_override) {
+    if (!g_ime_state_cb) return;
+    SurfaceState* s = ti_focused_state();
+    AlrImeState st{};
+    if (enabled_override >= 0) {
+        st.enabled = (enabled_override != 0);
+    } else {
+        st.enabled = (s && s->ti_enabled);
+    }
+    if (s && st.enabled) {
+        st.content_purpose = s->ti_purpose;
+        st.content_hint = s->ti_hint;
+        st.cursor_x = s->ti_cur_x;
+        st.cursor_y = s->ti_cur_y;
+        st.cursor_w = s->ti_cur_w;
+        st.cursor_h = s->ti_cur_h;
+    }
+    g_ime_state_cb(st, g_ime_state_ud);
+}
+
+// Move text-input focus from old_surface to new_surface (already-validated wl_surface
+// resources, either may be null). Sends zwp_text_input_v3.leave to the OLD surface's
+// text-inputs and enter to the NEW surface's text-inputs (per protocol: leave before
+// enter). When focus leaves a surface that had an ENABLED text input and the new
+// surface is not (yet) an enabled field, synthesize an IME-hide upcall so the soft
+// keyboard does not linger over the newly-focused window. Called from the three
+// keyboard-focus transitions. g_focus_surface must already be updated to new_surface
+// by the caller before this runs (so ti_owns_focus keys off the new focus for enter).
+void ti_set_focus(struct wl_resource* new_surface, struct wl_resource* old_surface) {
+    if (new_surface == old_surface) return;
+    bool left_enabled_field = false;
+    if (old_surface) {
+        struct wl_client* oc = wl_resource_get_client(old_surface);
+        if (SurfaceState* os = surface_state_for_wl(old_surface)) {
+            left_enabled_field = os->ti_enabled;
+            // The text-input enable state is per-surface; clear it as focus leaves so a
+            // stale enable doesn't re-raise the keyboard if the surface is refocused
+            // before the client re-commits enable.
+            os->ti_enabled = os->ti_pending_enabled = false;
+        }
+        for (struct wl_resource* ti : g_text_inputs)
+            if (wl_resource_get_client(ti) == oc)
+                zwp_text_input_v3_send_leave(ti, old_surface);
+    }
+    if (new_surface) {
+        struct wl_client* nc = wl_resource_get_client(new_surface);
+        for (struct wl_resource* ti : g_text_inputs)
+            if (wl_resource_get_client(ti) == nc)
+                zwp_text_input_v3_send_enter(ti, new_surface);
+    }
+    // If we left an enabled field, hide the IME (the new surface starts disabled; it
+    // re-raises via its own enable+commit if it focuses a text entry).
+    if (left_enabled_field) ti_emit_state(/*enabled_override=*/0);
+}
+
+void ti_destroy(struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); }
+void ti_enable(struct wl_client*, struct wl_resource* r) {
+    auto* st = static_cast<TextInputState*>(wl_resource_get_user_data(r));
+    (void)st;
+    // enable resets the pending state per the protocol (the prior content_type /
+    // cursor_rectangle from a previous enable are not carried over until re-set).
+    if (SurfaceState* s = ti_focused_state()) {
+        s->ti_pending_enabled = true;
+        s->ti_pending_purpose = 0;
+        s->ti_pending_hint = 0;
+        s->ti_pending_cur_x = s->ti_pending_cur_y = -1;
+        s->ti_pending_cur_w = s->ti_pending_cur_h = -1;
+    }
+}
+void ti_disable(struct wl_client*, struct wl_resource* r) {
+    (void)r;
+    if (SurfaceState* s = ti_focused_state()) s->ti_pending_enabled = false;
+}
+void ti_set_surrounding_text(struct wl_client*, struct wl_resource*,
+                             const char* /*text*/, int32_t /*cursor*/, int32_t /*anchor*/) {
+    // Stored for a future upgrade (feed Android InputConnection getTextBeforeCursor);
+    // v1 ignores it (the InputConnection is a non-full editor, see the design §3.1).
+}
+void ti_set_text_change_cause(struct wl_client*, struct wl_resource*, uint32_t /*cause*/) {}
+void ti_set_content_type(struct wl_client*, struct wl_resource*,
+                         uint32_t hint, uint32_t purpose) {
+    if (SurfaceState* s = ti_focused_state()) {
+        s->ti_pending_hint = hint;
+        s->ti_pending_purpose = purpose;
+    }
+}
+void ti_set_cursor_rectangle(struct wl_client*, struct wl_resource*,
+                             int32_t x, int32_t y, int32_t w, int32_t h) {
+    if (SurfaceState* s = ti_focused_state()) {
+        s->ti_pending_cur_x = x; s->ti_pending_cur_y = y;
+        s->ti_pending_cur_w = w; s->ti_pending_cur_h = h;
+    }
+}
+void ti_commit(struct wl_client*, struct wl_resource* r) {
+    auto* st = static_cast<TextInputState*>(wl_resource_get_user_data(r));
+    // Apply pending -> current on the focused surface.
+    SurfaceState* s = ti_focused_state();
+    if (s) {
+        s->ti_enabled = s->ti_pending_enabled;
+        s->ti_purpose = s->ti_pending_purpose;
+        s->ti_hint = s->ti_pending_hint;
+        s->ti_cur_x = s->ti_pending_cur_x; s->ti_cur_y = s->ti_pending_cur_y;
+        s->ti_cur_w = s->ti_pending_cur_w; s->ti_cur_h = s->ti_pending_cur_h;
+    }
+    // done.serial MUST equal the number of commit requests on THIS object.
+    const uint32_t serial = st ? ++st->commit_serial : 0;
+    zwp_text_input_v3_send_done(r, serial);
+    // Upcall Android to raise/hide the soft keyboard for the new enable state.
+    ti_emit_state(/*enabled_override=*/-1);
+}
+const struct zwp_text_input_v3_interface kTextInputImpl = {
+    ti_destroy, ti_enable, ti_disable, ti_set_surrounding_text,
+    ti_set_text_change_cause, ti_set_content_type, ti_set_cursor_rectangle,
+    ti_commit};
+
+void ti_resource_destroy(struct wl_resource* r) {
+    drop_resource(g_text_inputs, r);
+    if (auto* st = static_cast<TextInputState*>(wl_resource_get_user_data(r)))
+        delete st;
+}
+
+void tim_get_text_input(struct wl_client* client, struct wl_resource* mgr,
+                        uint32_t id, struct wl_resource* /*seat*/) {
+    struct wl_resource* res = wl_resource_create(
+        client, &zwp_text_input_v3_interface, wl_resource_get_version(mgr), id);
+    if (!res) { wl_client_post_no_memory(client); return; }
+    auto* st = new TextInputState();
+    wl_resource_set_implementation(res, &kTextInputImpl, st, ti_resource_destroy);
+    g_text_inputs.push_back(res);
+    // If this client already owns keyboard focus, send the initial enter so the
+    // object tracks the current focus surface (mirrors the protocol's focus model).
+    if (g_focus_surface && ti_owns_focus(res))
+        zwp_text_input_v3_send_enter(res, g_focus_surface);
+    ALR_WL_LOGI("zwp_text_input_manager_v3.get_text_input bound (now %zu)",
+                g_text_inputs.size());
+}
+void tim_destroy(struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); }
+const struct zwp_text_input_manager_v3_interface kTextInputManagerImpl = {
+    tim_destroy, tim_get_text_input};
+
 }  // namespace
 
 // ===========================================================================
@@ -1902,6 +2137,18 @@ void Compositor::bind_data_device_manager(struct wl_client* client, void* /*data
     ALR_WL_LOGI("client bound: wl_data_device_manager v%u", version);
 }
 
+void Compositor::bind_text_input_manager(struct wl_client* client, void* /*data*/,
+                                         uint32_t version, uint32_t id) {
+    struct wl_resource* r = wl_resource_create(
+        client, &zwp_text_input_manager_v3_interface, static_cast<int>(version), id);
+    if (!r) {
+        wl_client_post_no_memory(client);
+        return;
+    }
+    wl_resource_set_implementation(r, &kTextInputManagerImpl, nullptr, nullptr);
+    ALR_WL_LOGI("client bound: zwp_text_input_manager_v3 v%u", version);
+}
+
 // ---------------------------------------------------------------------------
 // CR-4 (chromium --ozone-platform=wayland) global-requirement audit.
 //
@@ -1954,9 +2201,14 @@ bool Compositor::register_globals() {
     // GDK 3.24 won't bind wl_seat until wl_data_device_manager is also present.
     g_data_device_manager_ = wl_global_create(
         display_, &wl_data_device_manager_interface, 3, this, bind_data_device_manager);
+    // zwp_text_input_manager_v3 (v1): GTK3/4, Qt6 and chromium/Ozone speak it on
+    // caret focus to raise the Android soft keyboard and receive composed/CJK/emoji
+    // text. Absent => those toolkits silently fall back to raw wl_keyboard (no IME).
+    g_text_input_manager_ = wl_global_create(
+        display_, &zwp_text_input_manager_v3_interface, 1, this, bind_text_input_manager);
     (void)kShmVersion;  // wl_shm is created by wl_display_init_shm().
     if (!g_compositor_ || !g_seat_ || !g_output_ || !g_xdg_wm_base_ ||
-        !g_subcompositor_ || !g_data_device_manager_) {
+        !g_subcompositor_ || !g_data_device_manager_ || !g_text_input_manager_) {
         ALR_WL_LOGE("wl_global_create failed for one or more globals");
         return false;
     }
@@ -2048,7 +2300,7 @@ bool Compositor::setup() {
     setup_ok_ = true;
     status_ = "ALR WAYLAND COMPOSITOR: started socket=" + config_.socket_path +
               " globals=wl_compositor,wl_shm,wl_seat,wl_output,xdg_wm_base,"
-              "wl_subcompositor,wl_data_device_manager";
+              "wl_subcompositor,wl_data_device_manager,zwp_text_input_manager_v3";
     ALR_WL_LOGI("%s", status_.c_str());
     return true;
 }
@@ -2369,6 +2621,41 @@ void Compositor::drain_input_queue() {
             g_keyboard_entered = true;
             break;
         }
+        case InjectKind::ImeCommit:
+        case InjectKind::ImePreedit:
+        case InjectKind::ImeDelete: {
+            // Route IME edits to the focused client's enabled zwp_text_input_v3
+            // objects via commit_string / preedit_string / delete_surrounding_text,
+            // each followed by a done. The done.serial echoes that object's commit
+            // count (TextInputState::commit_serial) so GTK applies the batch.
+            if (!g_focus_surface) break;
+            struct wl_client* fc = wl_resource_get_client(g_focus_surface);
+            for (struct wl_resource* ti : g_text_inputs) {
+                if (wl_resource_get_client(ti) != fc) continue;
+                switch (e.kind) {
+                case InjectKind::ImeCommit:
+                    // Clear any composing run first, then commit the literal text
+                    // (protocol §done evaluation order: preedit -> delete -> commit).
+                    zwp_text_input_v3_send_preedit_string(ti, "", 0, 0);
+                    zwp_text_input_v3_send_commit_string(ti, e.text.c_str());
+                    break;
+                case InjectKind::ImePreedit:
+                    // Live composing text; cursor at preedit_cursor (begin==end => a
+                    // caret line, not a selection highlight).
+                    zwp_text_input_v3_send_preedit_string(
+                        ti, e.text.c_str(), e.preedit_cursor, e.preedit_cursor);
+                    break;
+                case InjectKind::ImeDelete:
+                    zwp_text_input_v3_send_delete_surrounding_text(
+                        ti, e.before_bytes, e.after_bytes);
+                    break;
+                default: break;
+                }
+                auto* st = static_cast<TextInputState*>(wl_resource_get_user_data(ti));
+                zwp_text_input_v3_send_done(ti, st ? st->commit_serial : 0);
+            }
+            break;
+        }
         }
     }
     wl_display_flush_clients(display_);
@@ -2648,6 +2935,99 @@ void alr_wayland_inject_key(uint32_t evdev_key, uint32_t pressed) {
     e.kind = InjectKind::Key;
     e.button = evdev_key; e.state = pressed; e.time_ms = now_ms();
     enqueue_inject(e);
+}
+
+// ---- Android IME -> guest text-input (alr_text_input.hpp) ----
+// These are the compositor-side IMPLEMENTATIONS of the boundary header. They are
+// callable from the Android UI thread: alr_ime_commit_text / *_delete_surrounding
+// enqueue onto g_inject_queue and wake the reactor, exactly like the inject_* path,
+// so the wl_resource sends happen on the compositor thread. The state callback +
+// focus-has-text-input query touch compositor-thread state without locks; they are
+// read by the JNI bridge during setup (set_state_callback, once) and from Android's
+// InputConnection (focus_has_text_input) where a benign stale read is acceptable.
+void alr_ime_set_state_callback(AlrImeStateFn fn, void* user_data) {
+    g_ime_state_cb = fn;
+    g_ime_state_ud = user_data;
+}
+
+void alr_ime_commit_text(const char* utf8, int32_t len) {
+    InjectEvent e{};
+    e.kind = InjectKind::ImeCommit;
+    if (utf8 && len > 0) e.text.assign(utf8, static_cast<size_t>(len));
+    else if (utf8)       e.text.assign(utf8);
+    e.time_ms = now_ms();
+    enqueue_inject(e);
+}
+
+void alr_ime_delete_surrounding(uint32_t before_bytes, uint32_t after_bytes) {
+    InjectEvent e{};
+    e.kind = InjectKind::ImeDelete;
+    e.before_bytes = before_bytes;
+    e.after_bytes = after_bytes;
+    e.time_ms = now_ms();
+    enqueue_inject(e);
+}
+
+void alr_ime_preedit(const char* utf8, int32_t len, int32_t cursor_byte) {
+    InjectEvent e{};
+    e.kind = InjectKind::ImePreedit;
+    if (utf8 && len > 0) e.text.assign(utf8, static_cast<size_t>(len));
+    else if (utf8)       e.text.assign(utf8);
+    e.preedit_cursor = cursor_byte;
+    e.time_ms = now_ms();
+    enqueue_inject(e);
+}
+
+bool alr_ime_inject_codepoint(uint32_t codepoint) {
+    // FALLBACK keysym/keymap path for guests that DON'T bind zwp_text_input_v3
+    // (foot/SDL/raw xkb). v1 supports the ASCII printable range reachable on the
+    // shipped US keymap (alr_xkb_keymap_us.h); a Shift level is synthesized for the
+    // upper-shift glyphs. Code points outside that set return false so the caller
+    // falls back to commit_string (if any v3 object exists) or drops the char (the
+    // documented dynamic-keymap upgrade is out of scope — see the design §5).
+    if (codepoint > 0x7f) return false;
+    // evdev keycode + whether Shift is needed, for each reachable ASCII char.
+    uint32_t key = 0; bool shift = false;
+    const auto base = [&](uint32_t c, uint32_t k) { if (codepoint == c) { key = k; } };
+    const auto sh   = [&](uint32_t c, uint32_t k) { if (codepoint == c) { key = k; shift = true; } };
+    // Letters: lowercase a..z -> KEY_A.., uppercase via Shift.
+    if (codepoint >= 'a' && codepoint <= 'z') {
+        static const uint8_t kRow[26] = {30,48,46,32,18,33,34,35,23,36,37,38,50,
+                                         49,24,25,16,19,31,20,22,47,17,45,21,44};
+        key = kRow[codepoint - 'a'];
+    } else if (codepoint >= 'A' && codepoint <= 'Z') {
+        static const uint8_t kRow[26] = {30,48,46,32,18,33,34,35,23,36,37,38,50,
+                                         49,24,25,16,19,31,20,22,47,17,45,21,44};
+        key = kRow[codepoint - 'A']; shift = true;
+    } else if (codepoint >= '1' && codepoint <= '9') {
+        key = 2 + (codepoint - '1');               // KEY_1..KEY_9
+    } else {
+        base('0', 11);                              base(' ', 57);
+        base('\n', 28); base('\t', 15); base('\b', 14);
+        base('-', 12);  sh('_', 12);   base('=', 13);  sh('+', 13);
+        base('[', 26);  sh('{', 26);   base(']', 27);  sh('}', 27);
+        base('\\', 43); sh('|', 43);   base(';', 39);  sh(':', 39);
+        base('\'', 40); sh('"', 40);   base('`', 41);  sh('~', 41);
+        base(',', 51);  sh('<', 51);   base('.', 52);  sh('>', 52);
+        base('/', 53);  sh('?', 53);
+        sh('!', 2); sh('@', 3); sh('#', 4); sh('$', 5); sh('%', 6);
+        sh('^', 7); sh('&', 8); sh('*', 9); sh('(', 10); sh(')', 11);
+    }
+    if (key == 0) return false;
+    constexpr uint32_t kKeyLeftShift = 42;
+    if (shift) alr_wayland_inject_key(kKeyLeftShift, 1);
+    alr_wayland_inject_key(key, 1);
+    alr_wayland_inject_key(key, 0);
+    if (shift) alr_wayland_inject_key(kKeyLeftShift, 0);
+    return true;
+}
+
+bool alr_ime_focus_has_text_input() {
+    // True iff the focused surface has an ENABLED zwp_text_input_v3. Read on the
+    // Android side to decide commit_string vs key synthesis (a stale read at most
+    // mis-routes one keystroke; the next commit corrects it). Compositor-thread state.
+    SurfaceState* s = ti_focused_state();
+    return s && s->ti_enabled;
 }
 int alr_wayland_inject_selftest(double x, double y) {
     // A synthetic burst exercising pointer + touch + keyboard, as a real tap at
