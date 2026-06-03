@@ -182,38 +182,38 @@ int main() {
     AlrVkEncoder e;
     alr_vk_enc_init(&e, req.data(), static_cast<uint32_t>(req.size()));
     // command pool
-    alr_vk_enc_create_command_pool_begin(&e, kVdev, kVpool, /*flags=*/0x2u,
-                                         /*queueFamilyIndex=*/0u);
+    alr_vk_enc_gen_create_command_pool_begin(&e, kVdev, kVpool, /*flags=*/0x2u,
+                                             /*queueFamilyIndex=*/0u);
     alr_vk_gen_pnext_count(&e, 0);
     // buffer + its reqs + a memory alloc + bind + map
-    alr_vk_enc_create_buffer_begin(&e, kVdev, kVbuf, /*flags=*/0u, /*size=*/65536ull,
-                                   /*usage=*/0x80u /*VERTEX*/, /*sharingMode=*/0u);
+    alr_vk_enc_gen_create_buffer_begin(&e, kVdev, kVbuf, /*flags=*/0u, /*size=*/65536ull,
+                                       /*usage=*/0x80u /*VERTEX*/, /*sharingMode=*/0u);
     alr_vk_gen_pnext_count(&e, 0);
-    alr_vk_enc_get_buffer_memory_requirements(&e, kVdev, kVbuf);
-    alr_vk_enc_allocate_memory_begin(&e, kVdev, kVmem, /*allocationSize=*/65536ull,
-                                     /*memoryTypeIndex=*/0u);
+    alr_vk_enc_gen_get_buffer_memory_requirements(&e, kVdev, kVbuf);
+    alr_vk_enc_gen_allocate_memory_begin(&e, kVdev, kVmem, /*allocationSize=*/65536ull,
+                                         /*memoryTypeIndex=*/0u);
     alr_vk_gen_pnext_count(&e, 0);
-    alr_vk_enc_bind_buffer_memory(&e, kVdev, kVbuf, kVmem, /*memoryOffset=*/0ull);
-    alr_vk_enc_map_memory(&e, kVdev, kVmem, /*offset=*/0ull, /*size=*/65536ull);
+    alr_vk_enc_gen_bind_buffer_memory(&e, kVdev, kVbuf, kVmem, /*memoryOffset=*/0ull);
+    alr_vk_enc_gen_map_memory(&e, kVdev, kVmem, /*offset=*/0ull, /*size=*/65536ull);
     // image + its reqs + view
-    alr_vk_enc_create_image_begin(&e, kVdev, kVimg, /*flags=*/0u, /*imageType=*/1u /*2D*/,
-                                  /*format=*/37u /*R8G8B8A8_UNORM*/, /*w=*/128u, /*h=*/128u,
-                                  /*d=*/1u, /*mip=*/1u, /*layers=*/1u, /*samples=*/1u,
-                                  /*tiling=*/0u, /*usage=*/0x10u /*COLOR_ATTACHMENT*/,
-                                  /*sharingMode=*/0u, /*initialLayout=*/0u);
+    alr_vk_enc_gen_create_image_begin(&e, kVdev, kVimg, /*flags=*/0u, /*imageType=*/1u /*2D*/,
+                                      /*format=*/37u /*R8G8B8A8_UNORM*/, /*w=*/128u, /*h=*/128u,
+                                      /*d=*/1u, /*mip=*/1u, /*layers=*/1u, /*samples=*/1u,
+                                      /*tiling=*/0u, /*usage=*/0x10u /*COLOR_ATTACHMENT*/,
+                                      /*sharingMode=*/0u, /*initialLayout=*/0u);
     alr_vk_gen_pnext_count(&e, 0);
-    alr_vk_enc_get_image_memory_requirements(&e, kVdev, kVimg);
-    alr_vk_enc_create_image_view_begin(&e, kVdev, kVview, /*flags=*/0u, /*image=*/kVimg,
-                                       /*viewType=*/1u /*2D*/, /*format=*/37u,
-                                       /*comp r,g,b,a=*/0u, 0u, 0u, 0u,
-                                       /*aspect=*/0x1u /*COLOR*/, 0u, 1u, 0u, 1u);
+    alr_vk_enc_gen_get_image_memory_requirements(&e, kVdev, kVimg);
+    alr_vk_enc_gen_create_image_view_begin(&e, kVdev, kVview, /*flags=*/0u, /*image=*/kVimg,
+                                           /*viewType=*/1u /*2D*/, /*format=*/37u,
+                                           /*comp r,g,b,a=*/0u, 0u, 0u, 0u,
+                                           /*aspect=*/0x1u /*COLOR*/, 0u, 1u, 0u, 1u);
     alr_vk_gen_pnext_count(&e, 0);
     // tear the handles down
-    alr_vk_enc_destroy_image_view(&e, kVdev, kVview);
-    alr_vk_enc_destroy_image(&e, kVdev, kVimg);
-    alr_vk_enc_destroy_buffer(&e, kVdev, kVbuf);
-    alr_vk_enc_free_memory(&e, kVdev, kVmem);
-    alr_vk_enc_destroy_command_pool(&e, kVdev, kVpool);
+    alr_vk_enc_gen_destroy_image_view(&e, kVdev, kVview);
+    alr_vk_enc_gen_destroy_image(&e, kVdev, kVimg);
+    alr_vk_enc_gen_destroy_buffer(&e, kVdev, kVbuf);
+    alr_vk_enc_gen_free_memory(&e, kVdev, kVmem);
+    alr_vk_enc_gen_destroy_command_pool(&e, kVdev, kVpool);
     alr_vk_enc_u8(&e, static_cast<uint8_t>(ALR_VK_OP_END));
     check(!e.overflow, "request batch encodes within buffer");
 

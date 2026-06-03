@@ -367,6 +367,231 @@ inline void vk_gen_real_destroy_image_view(VkDecodeState& st, uint32_t vdev,
     t.views.erase(vview);
 }
 
+// ===========================================================================
+// WAVE A — shader module / pipeline cache / sampler / fence / semaphore / event /
+// query pool. These are the create-resource objects ANGLE's RendererVk builds right after
+// device creation. All are non-dispatchable handles stored in VkGenTables; the create
+// forwards the registry-typed POD prefix (rebuilt from the wire scalars) to real Mali and
+// stores the handle, the destroy looks it up + releases it. Only the shader module carries
+// a blob (the SPIR-V words); the rest are pure scalar forwards.
+// ===========================================================================
+
+// ---- shader module (the SPIR-V blob rides the wire; codeSize/pCode rebuilt from it) ----
+inline VkResult vk_gen_real_create_shader_module(
+    VkDecodeState& st, uint32_t vdev, uint32_t vshmod, uint32_t flags,
+    const uint8_t* spirv, uint32_t spirv_len, const std::vector<uint32_t>& pnext_types,
+    const std::vector<std::vector<uint8_t>>& pnext_bytes) {
+    (void)pnext_types; (void)pnext_bytes;
+    auto dit = st.real_dev.find(vdev);
+    if (dit == st.real_dev.end()) return VK_ERROR_INITIALIZATION_FAILED;
+    // SPIR-V is a stream of 32-bit words; the byte length must be a non-zero multiple of 4.
+    // A malformed blob is rejected here so the real driver never parses garbage.
+    if (!spirv || spirv_len == 0 || (spirv_len & 3u) != 0)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    VkShaderModuleCreateInfo sci{};
+    sci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    sci.flags = flags;
+    sci.codeSize = spirv_len;  // codeSize is in BYTES (Vulkan spec)
+    sci.pCode = reinterpret_cast<const uint32_t*>(spirv);
+    VkShaderModule mod = VK_NULL_HANDLE;
+    VkResult r = vkCreateShaderModule(dit->second.dev, &sci, nullptr, &mod);
+    if (r == VK_SUCCESS) gen_tables(st).shader_modules[vshmod] = mod;
+    return r;
+}
+
+inline void vk_gen_real_destroy_shader_module(VkDecodeState& st, uint32_t vdev,
+                                              uint32_t vshmod) {
+    auto& t = gen_tables(st);
+    auto it = t.shader_modules.find(vshmod);
+    auto dit = st.real_dev.find(vdev);
+    if (it != t.shader_modules.end() && dit != st.real_dev.end() && it->second != VK_NULL_HANDLE)
+        vkDestroyShaderModule(dit->second.dev, it->second, nullptr);
+    t.shader_modules.erase(vshmod);
+}
+
+// ---- pipeline cache (empty cache: initialDataSize 0 for the bring-up) ----
+inline VkResult vk_gen_real_create_pipeline_cache(
+    VkDecodeState& st, uint32_t vdev, uint32_t vpcache, uint32_t flags,
+    const std::vector<uint32_t>& pnext_types,
+    const std::vector<std::vector<uint8_t>>& pnext_bytes) {
+    (void)pnext_types; (void)pnext_bytes;
+    auto dit = st.real_dev.find(vdev);
+    if (dit == st.real_dev.end()) return VK_ERROR_INITIALIZATION_FAILED;
+    VkPipelineCacheCreateInfo pci{};
+    pci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    pci.flags = flags;
+    pci.initialDataSize = 0;  // warm-cache (pInitialData) deferred — ANGLE's first is empty
+    pci.pInitialData = nullptr;
+    VkPipelineCache cache = VK_NULL_HANDLE;
+    VkResult r = vkCreatePipelineCache(dit->second.dev, &pci, nullptr, &cache);
+    if (r == VK_SUCCESS) gen_tables(st).pipeline_caches[vpcache] = cache;
+    return r;
+}
+
+inline void vk_gen_real_destroy_pipeline_cache(VkDecodeState& st, uint32_t vdev,
+                                               uint32_t vpcache) {
+    auto& t = gen_tables(st);
+    auto it = t.pipeline_caches.find(vpcache);
+    auto dit = st.real_dev.find(vdev);
+    if (it != t.pipeline_caches.end() && dit != st.real_dev.end() && it->second != VK_NULL_HANDLE)
+        vkDestroyPipelineCache(dit->second.dev, it->second, nullptr);
+    t.pipeline_caches.erase(vpcache);
+}
+
+// ---- sampler (full scalar POD prefix; the f32 fields ride the wire as floats) ----
+inline VkResult vk_gen_real_create_sampler(
+    VkDecodeState& st, uint32_t vdev, uint32_t vsamp, uint32_t flags, uint32_t magFilter,
+    uint32_t minFilter, uint32_t mipmapMode, uint32_t addressModeU, uint32_t addressModeV,
+    uint32_t addressModeW, float mipLodBias, uint32_t anisotropyEnable, float maxAnisotropy,
+    uint32_t compareEnable, uint32_t compareOp, float minLod, float maxLod,
+    uint32_t borderColor, uint32_t unnormalizedCoordinates,
+    const std::vector<uint32_t>& pnext_types,
+    const std::vector<std::vector<uint8_t>>& pnext_bytes) {
+    (void)pnext_types; (void)pnext_bytes;
+    auto dit = st.real_dev.find(vdev);
+    if (dit == st.real_dev.end()) return VK_ERROR_INITIALIZATION_FAILED;
+    VkSamplerCreateInfo sci{};
+    sci.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    sci.flags = flags;
+    sci.magFilter = static_cast<VkFilter>(magFilter);
+    sci.minFilter = static_cast<VkFilter>(minFilter);
+    sci.mipmapMode = static_cast<VkSamplerMipmapMode>(mipmapMode);
+    sci.addressModeU = static_cast<VkSamplerAddressMode>(addressModeU);
+    sci.addressModeV = static_cast<VkSamplerAddressMode>(addressModeV);
+    sci.addressModeW = static_cast<VkSamplerAddressMode>(addressModeW);
+    sci.mipLodBias = mipLodBias;
+    sci.anisotropyEnable = anisotropyEnable ? VK_TRUE : VK_FALSE;
+    sci.maxAnisotropy = maxAnisotropy;
+    sci.compareEnable = compareEnable ? VK_TRUE : VK_FALSE;
+    sci.compareOp = static_cast<VkCompareOp>(compareOp);
+    sci.minLod = minLod;
+    sci.maxLod = maxLod;
+    sci.borderColor = static_cast<VkBorderColor>(borderColor);
+    sci.unnormalizedCoordinates = unnormalizedCoordinates ? VK_TRUE : VK_FALSE;
+    VkSampler samp = VK_NULL_HANDLE;
+    VkResult r = vkCreateSampler(dit->second.dev, &sci, nullptr, &samp);
+    if (r == VK_SUCCESS) gen_tables(st).samplers[vsamp] = samp;
+    return r;
+}
+
+inline void vk_gen_real_destroy_sampler(VkDecodeState& st, uint32_t vdev, uint32_t vsamp) {
+    auto& t = gen_tables(st);
+    auto it = t.samplers.find(vsamp);
+    auto dit = st.real_dev.find(vdev);
+    if (it != t.samplers.end() && dit != st.real_dev.end() && it->second != VK_NULL_HANDLE)
+        vkDestroySampler(dit->second.dev, it->second, nullptr);
+    t.samplers.erase(vsamp);
+}
+
+// ---- fence (flags only; VK_FENCE_CREATE_SIGNALED_BIT is the one meaningful flag) ----
+inline VkResult vk_gen_real_create_fence(
+    VkDecodeState& st, uint32_t vdev, uint32_t vfence, uint32_t flags,
+    const std::vector<uint32_t>& pnext_types,
+    const std::vector<std::vector<uint8_t>>& pnext_bytes) {
+    (void)pnext_types; (void)pnext_bytes;
+    auto dit = st.real_dev.find(vdev);
+    if (dit == st.real_dev.end()) return VK_ERROR_INITIALIZATION_FAILED;
+    VkFenceCreateInfo fci{};
+    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    fci.flags = flags;
+    VkFence fence = VK_NULL_HANDLE;
+    VkResult r = vkCreateFence(dit->second.dev, &fci, nullptr, &fence);
+    if (r == VK_SUCCESS) gen_tables(st).fences[vfence] = fence;
+    return r;
+}
+
+inline void vk_gen_real_destroy_fence(VkDecodeState& st, uint32_t vdev, uint32_t vfence) {
+    auto& t = gen_tables(st);
+    auto it = t.fences.find(vfence);
+    auto dit = st.real_dev.find(vdev);
+    if (it != t.fences.end() && dit != st.real_dev.end() && it->second != VK_NULL_HANDLE)
+        vkDestroyFence(dit->second.dev, it->second, nullptr);
+    t.fences.erase(vfence);
+}
+
+// ---- semaphore (flags only; a timeline semaphore's type pNext is deferred) ----
+inline VkResult vk_gen_real_create_semaphore(
+    VkDecodeState& st, uint32_t vdev, uint32_t vsem, uint32_t flags,
+    const std::vector<uint32_t>& pnext_types,
+    const std::vector<std::vector<uint8_t>>& pnext_bytes) {
+    (void)pnext_types; (void)pnext_bytes;
+    auto dit = st.real_dev.find(vdev);
+    if (dit == st.real_dev.end()) return VK_ERROR_INITIALIZATION_FAILED;
+    VkSemaphoreCreateInfo sci{};
+    sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    sci.flags = flags;
+    VkSemaphore sem = VK_NULL_HANDLE;
+    VkResult r = vkCreateSemaphore(dit->second.dev, &sci, nullptr, &sem);
+    if (r == VK_SUCCESS) gen_tables(st).semaphores[vsem] = sem;
+    return r;
+}
+
+inline void vk_gen_real_destroy_semaphore(VkDecodeState& st, uint32_t vdev, uint32_t vsem) {
+    auto& t = gen_tables(st);
+    auto it = t.semaphores.find(vsem);
+    auto dit = st.real_dev.find(vdev);
+    if (it != t.semaphores.end() && dit != st.real_dev.end() && it->second != VK_NULL_HANDLE)
+        vkDestroySemaphore(dit->second.dev, it->second, nullptr);
+    t.semaphores.erase(vsem);
+}
+
+// ---- event (flags only) ----
+inline VkResult vk_gen_real_create_event(
+    VkDecodeState& st, uint32_t vdev, uint32_t vevent, uint32_t flags,
+    const std::vector<uint32_t>& pnext_types,
+    const std::vector<std::vector<uint8_t>>& pnext_bytes) {
+    (void)pnext_types; (void)pnext_bytes;
+    auto dit = st.real_dev.find(vdev);
+    if (dit == st.real_dev.end()) return VK_ERROR_INITIALIZATION_FAILED;
+    VkEventCreateInfo eci{};
+    eci.sType = VK_STRUCTURE_TYPE_EVENT_CREATE_INFO;
+    eci.flags = flags;
+    VkEvent ev = VK_NULL_HANDLE;
+    VkResult r = vkCreateEvent(dit->second.dev, &eci, nullptr, &ev);
+    if (r == VK_SUCCESS) gen_tables(st).events[vevent] = ev;
+    return r;
+}
+
+inline void vk_gen_real_destroy_event(VkDecodeState& st, uint32_t vdev, uint32_t vevent) {
+    auto& t = gen_tables(st);
+    auto it = t.events.find(vevent);
+    auto dit = st.real_dev.find(vdev);
+    if (it != t.events.end() && dit != st.real_dev.end() && it->second != VK_NULL_HANDLE)
+        vkDestroyEvent(dit->second.dev, it->second, nullptr);
+    t.events.erase(vevent);
+}
+
+// ---- query pool (scalar POD prefix) ----
+inline VkResult vk_gen_real_create_query_pool(
+    VkDecodeState& st, uint32_t vdev, uint32_t vqpool, uint32_t flags, uint32_t queryType,
+    uint32_t queryCount, uint32_t pipelineStatistics,
+    const std::vector<uint32_t>& pnext_types,
+    const std::vector<std::vector<uint8_t>>& pnext_bytes) {
+    (void)pnext_types; (void)pnext_bytes;
+    auto dit = st.real_dev.find(vdev);
+    if (dit == st.real_dev.end()) return VK_ERROR_INITIALIZATION_FAILED;
+    VkQueryPoolCreateInfo qci{};
+    qci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    qci.flags = flags;
+    qci.queryType = static_cast<VkQueryType>(queryType);
+    qci.queryCount = queryCount ? queryCount : 1;
+    qci.pipelineStatistics = pipelineStatistics;
+    VkQueryPool pool = VK_NULL_HANDLE;
+    VkResult r = vkCreateQueryPool(dit->second.dev, &qci, nullptr, &pool);
+    if (r == VK_SUCCESS) gen_tables(st).query_pools[vqpool] = pool;
+    return r;
+}
+
+inline void vk_gen_real_destroy_query_pool(VkDecodeState& st, uint32_t vdev,
+                                           uint32_t vqpool) {
+    auto& t = gen_tables(st);
+    auto it = t.query_pools.find(vqpool);
+    auto dit = st.real_dev.find(vdev);
+    if (it != t.query_pools.end() && dit != st.real_dev.end() && it->second != VK_NULL_HANDLE)
+        vkDestroyQueryPool(dit->second.dev, it->second, nullptr);
+    t.query_pools.erase(vqpool);
+}
+
 }  // namespace alr::gpu
 
 #endif  // ALR_VK_DECODE_REAL

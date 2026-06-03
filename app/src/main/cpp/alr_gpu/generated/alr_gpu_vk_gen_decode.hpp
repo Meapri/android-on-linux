@@ -33,11 +33,19 @@ namespace alr::gpu {
 // editing the hand-written struct. One instance per VkDecodeState, via gen_tables(st).
 struct VkGenTables {
 #ifdef ALR_VK_DECODE_REAL
-    std::map<uint32_t, VkCommandPool> pools;    // vpool  -> real
-    std::map<uint32_t, VkBuffer> buffers;       // vbuf   -> real
-    std::map<uint32_t, VkImage> images;         // vimg   -> real
-    std::map<uint32_t, VkImageView> views;      // vview  -> real
-    std::map<uint32_t, VkDeviceMemory> memory;  // vmem   -> real
+    std::map<uint32_t, VkCommandPool> pools;    // vpool   -> real
+    std::map<uint32_t, VkBuffer> buffers;       // vbuf    -> real
+    std::map<uint32_t, VkImage> images;         // vimg    -> real
+    std::map<uint32_t, VkImageView> views;      // vview   -> real
+    std::map<uint32_t, VkDeviceMemory> memory;  // vmem    -> real
+    // WAVE A render-resource handle tables (virtual id -> real Mali handle).
+    std::map<uint32_t, VkShaderModule> shader_modules;  // vshmod  -> real
+    std::map<uint32_t, VkPipelineCache> pipeline_caches; // vpcache -> real
+    std::map<uint32_t, VkSampler> samplers;     // vsamp   -> real
+    std::map<uint32_t, VkFence> fences;         // vfence  -> real
+    std::map<uint32_t, VkSemaphore> semaphores; // vsem    -> real
+    std::map<uint32_t, VkEvent> events;         // vevent  -> real
+    std::map<uint32_t, VkQueryPool> query_pools; // vqpool  -> real
 #endif
     // Arena offset assigned to each device-memory virtual id (HOST_VISIBLE only).
     // UINT64_MAX == not arena-backed (e.g. a DEVICE_LOCAL alloc). Tracked even in
@@ -469,6 +477,360 @@ inline bool decode_vk_gen_op(uint8_t op, VkReader& r, VkDecodeState& st,
 #endif
             if (gp && gp->destroy_handle)
                 gp->destroy_handle(gp->ctx, ALR_VK_GEN_OP_DESTROY_IMAGE_VIEW, vdev, vhandle);
+            st.decoded++;
+            return true;
+        }
+        case ALR_VK_GEN_OP_CREATE_SHADER_MODULE: {  // vkCreateShaderModule
+            uint32_t vdev = 0, vhandle = 0;
+            if (!r.u32(vdev) || !r.u32(vhandle)) { st.ok = false; return true; }
+            uint32_t flags = 0;
+            if (!(r.u32(flags))) { st.ok = false; return true; }
+            const uint8_t* blob_data = nullptr; uint32_t blob_len = 0;
+            if (!r.blob(blob_data, blob_len)) { st.ok = false; return true; }
+            if (blob_len > (1u << 24)) { st.ok = false; return true; }  // 16MiB cap
+            uint32_t pnext_count = 0;
+            std::vector<uint32_t> pnext_types;
+            std::vector<std::vector<uint8_t>> pnext_bytes;
+            if (!r.u32(pnext_count)) { st.ok = false; return true; }
+            if (pnext_count > 32) { st.ok = false; return true; }
+            for (uint32_t i = 0; i < pnext_count; ++i) {
+                uint32_t stype = 0; const uint8_t* d = nullptr; uint32_t n = 0;
+                if (!r.u32(stype) || !r.blob(d, n)) { st.ok = false; return true; }
+                if (n > 1024) { st.ok = false; return true; }
+                pnext_types.push_back(stype);
+                pnext_bytes.emplace_back(d, d + n);
+            }
+            (void)pnext_count;
+            int res = -1;
+#ifdef ALR_VK_DECODE_REAL
+            if (!gp) {
+                res = static_cast<int>(vk_gen_real_create_shader_module(
+                    st, vdev, vhandle, flags,
+                    blob_data, blob_len,
+                    pnext_types, pnext_bytes));
+            }
+#endif
+            if (gp && gp->create_handle)
+                res = gp->create_handle(gp->ctx, ALR_VK_GEN_OP_CREATE_SHADER_MODULE, vdev, vhandle,
+                                        (uint64_t)flags, (uint64_t)0);
+            reply.u8(static_cast<uint8_t>(ALR_VK_REPLY_GEN_ESCAPE));
+            reply.u16(static_cast<uint16_t>(ALR_VK_GEN_REPLY_CREATE_SHADER_MODULE));
+            reply.u32(vhandle);
+            reply.i32(res);
+            st.decoded++;
+            return true;
+        }
+        case ALR_VK_GEN_OP_DESTROY_SHADER_MODULE: {  // vkDestroyShaderModule
+            uint32_t vdev = 0, vhandle = 0;
+            if (!r.u32(vdev) || !r.u32(vhandle)) { st.ok = false; return true; }
+            (void)vdev;
+#ifdef ALR_VK_DECODE_REAL
+            if (!gp) {
+                vk_gen_real_destroy_shader_module(st, vdev, vhandle);
+            }
+#endif
+            if (gp && gp->destroy_handle)
+                gp->destroy_handle(gp->ctx, ALR_VK_GEN_OP_DESTROY_SHADER_MODULE, vdev, vhandle);
+            st.decoded++;
+            return true;
+        }
+        case ALR_VK_GEN_OP_CREATE_PIPELINE_CACHE: {  // vkCreatePipelineCache
+            uint32_t vdev = 0, vhandle = 0;
+            if (!r.u32(vdev) || !r.u32(vhandle)) { st.ok = false; return true; }
+            uint32_t flags = 0;
+            if (!(r.u32(flags))) { st.ok = false; return true; }
+            uint32_t pnext_count = 0;
+            std::vector<uint32_t> pnext_types;
+            std::vector<std::vector<uint8_t>> pnext_bytes;
+            if (!r.u32(pnext_count)) { st.ok = false; return true; }
+            if (pnext_count > 32) { st.ok = false; return true; }
+            for (uint32_t i = 0; i < pnext_count; ++i) {
+                uint32_t stype = 0; const uint8_t* d = nullptr; uint32_t n = 0;
+                if (!r.u32(stype) || !r.blob(d, n)) { st.ok = false; return true; }
+                if (n > 1024) { st.ok = false; return true; }
+                pnext_types.push_back(stype);
+                pnext_bytes.emplace_back(d, d + n);
+            }
+            (void)pnext_count;
+            int res = -1;
+#ifdef ALR_VK_DECODE_REAL
+            if (!gp) {
+                res = static_cast<int>(vk_gen_real_create_pipeline_cache(
+                    st, vdev, vhandle, flags,
+                    pnext_types, pnext_bytes));
+            }
+#endif
+            if (gp && gp->create_handle)
+                res = gp->create_handle(gp->ctx, ALR_VK_GEN_OP_CREATE_PIPELINE_CACHE, vdev, vhandle,
+                                        (uint64_t)flags, (uint64_t)0);
+            reply.u8(static_cast<uint8_t>(ALR_VK_REPLY_GEN_ESCAPE));
+            reply.u16(static_cast<uint16_t>(ALR_VK_GEN_REPLY_CREATE_PIPELINE_CACHE));
+            reply.u32(vhandle);
+            reply.i32(res);
+            st.decoded++;
+            return true;
+        }
+        case ALR_VK_GEN_OP_DESTROY_PIPELINE_CACHE: {  // vkDestroyPipelineCache
+            uint32_t vdev = 0, vhandle = 0;
+            if (!r.u32(vdev) || !r.u32(vhandle)) { st.ok = false; return true; }
+            (void)vdev;
+#ifdef ALR_VK_DECODE_REAL
+            if (!gp) {
+                vk_gen_real_destroy_pipeline_cache(st, vdev, vhandle);
+            }
+#endif
+            if (gp && gp->destroy_handle)
+                gp->destroy_handle(gp->ctx, ALR_VK_GEN_OP_DESTROY_PIPELINE_CACHE, vdev, vhandle);
+            st.decoded++;
+            return true;
+        }
+        case ALR_VK_GEN_OP_CREATE_SAMPLER: {  // vkCreateSampler
+            uint32_t vdev = 0, vhandle = 0;
+            if (!r.u32(vdev) || !r.u32(vhandle)) { st.ok = false; return true; }
+            uint32_t flags = 0; uint32_t magFilter = 0; uint32_t minFilter = 0; uint32_t mipmapMode = 0; uint32_t addressModeU = 0; uint32_t addressModeV = 0; uint32_t addressModeW = 0; float mipLodBias = 0; uint32_t anisotropyEnable = 0; float maxAnisotropy = 0; uint32_t compareEnable = 0; uint32_t compareOp = 0; float minLod = 0; float maxLod = 0; uint32_t borderColor = 0; uint32_t unnormalizedCoordinates = 0;
+            if (!(r.u32(flags) && r.u32(magFilter) && r.u32(minFilter) && r.u32(mipmapMode) && r.u32(addressModeU) && r.u32(addressModeV) && r.u32(addressModeW) && r.f32(mipLodBias) && r.u32(anisotropyEnable) && r.f32(maxAnisotropy) && r.u32(compareEnable) && r.u32(compareOp) && r.f32(minLod) && r.f32(maxLod) && r.u32(borderColor) && r.u32(unnormalizedCoordinates))) { st.ok = false; return true; }
+            uint32_t pnext_count = 0;
+            std::vector<uint32_t> pnext_types;
+            std::vector<std::vector<uint8_t>> pnext_bytes;
+            if (!r.u32(pnext_count)) { st.ok = false; return true; }
+            if (pnext_count > 32) { st.ok = false; return true; }
+            for (uint32_t i = 0; i < pnext_count; ++i) {
+                uint32_t stype = 0; const uint8_t* d = nullptr; uint32_t n = 0;
+                if (!r.u32(stype) || !r.blob(d, n)) { st.ok = false; return true; }
+                if (n > 1024) { st.ok = false; return true; }
+                pnext_types.push_back(stype);
+                pnext_bytes.emplace_back(d, d + n);
+            }
+            (void)pnext_count;
+            int res = -1;
+#ifdef ALR_VK_DECODE_REAL
+            if (!gp) {
+                res = static_cast<int>(vk_gen_real_create_sampler(
+                    st, vdev, vhandle, flags, magFilter, minFilter, mipmapMode, addressModeU, addressModeV, addressModeW, mipLodBias, anisotropyEnable, maxAnisotropy, compareEnable, compareOp, minLod, maxLod, borderColor, unnormalizedCoordinates,
+                    pnext_types, pnext_bytes));
+            }
+#endif
+            if (gp && gp->create_handle)
+                res = gp->create_handle(gp->ctx, ALR_VK_GEN_OP_CREATE_SAMPLER, vdev, vhandle,
+                                        (uint64_t)flags, (uint64_t)magFilter);
+            reply.u8(static_cast<uint8_t>(ALR_VK_REPLY_GEN_ESCAPE));
+            reply.u16(static_cast<uint16_t>(ALR_VK_GEN_REPLY_CREATE_SAMPLER));
+            reply.u32(vhandle);
+            reply.i32(res);
+            st.decoded++;
+            return true;
+        }
+        case ALR_VK_GEN_OP_DESTROY_SAMPLER: {  // vkDestroySampler
+            uint32_t vdev = 0, vhandle = 0;
+            if (!r.u32(vdev) || !r.u32(vhandle)) { st.ok = false; return true; }
+            (void)vdev;
+#ifdef ALR_VK_DECODE_REAL
+            if (!gp) {
+                vk_gen_real_destroy_sampler(st, vdev, vhandle);
+            }
+#endif
+            if (gp && gp->destroy_handle)
+                gp->destroy_handle(gp->ctx, ALR_VK_GEN_OP_DESTROY_SAMPLER, vdev, vhandle);
+            st.decoded++;
+            return true;
+        }
+        case ALR_VK_GEN_OP_CREATE_FENCE: {  // vkCreateFence
+            uint32_t vdev = 0, vhandle = 0;
+            if (!r.u32(vdev) || !r.u32(vhandle)) { st.ok = false; return true; }
+            uint32_t flags = 0;
+            if (!(r.u32(flags))) { st.ok = false; return true; }
+            uint32_t pnext_count = 0;
+            std::vector<uint32_t> pnext_types;
+            std::vector<std::vector<uint8_t>> pnext_bytes;
+            if (!r.u32(pnext_count)) { st.ok = false; return true; }
+            if (pnext_count > 32) { st.ok = false; return true; }
+            for (uint32_t i = 0; i < pnext_count; ++i) {
+                uint32_t stype = 0; const uint8_t* d = nullptr; uint32_t n = 0;
+                if (!r.u32(stype) || !r.blob(d, n)) { st.ok = false; return true; }
+                if (n > 1024) { st.ok = false; return true; }
+                pnext_types.push_back(stype);
+                pnext_bytes.emplace_back(d, d + n);
+            }
+            (void)pnext_count;
+            int res = -1;
+#ifdef ALR_VK_DECODE_REAL
+            if (!gp) {
+                res = static_cast<int>(vk_gen_real_create_fence(
+                    st, vdev, vhandle, flags,
+                    pnext_types, pnext_bytes));
+            }
+#endif
+            if (gp && gp->create_handle)
+                res = gp->create_handle(gp->ctx, ALR_VK_GEN_OP_CREATE_FENCE, vdev, vhandle,
+                                        (uint64_t)flags, (uint64_t)0);
+            reply.u8(static_cast<uint8_t>(ALR_VK_REPLY_GEN_ESCAPE));
+            reply.u16(static_cast<uint16_t>(ALR_VK_GEN_REPLY_CREATE_FENCE));
+            reply.u32(vhandle);
+            reply.i32(res);
+            st.decoded++;
+            return true;
+        }
+        case ALR_VK_GEN_OP_DESTROY_FENCE: {  // vkDestroyFence
+            uint32_t vdev = 0, vhandle = 0;
+            if (!r.u32(vdev) || !r.u32(vhandle)) { st.ok = false; return true; }
+            (void)vdev;
+#ifdef ALR_VK_DECODE_REAL
+            if (!gp) {
+                vk_gen_real_destroy_fence(st, vdev, vhandle);
+            }
+#endif
+            if (gp && gp->destroy_handle)
+                gp->destroy_handle(gp->ctx, ALR_VK_GEN_OP_DESTROY_FENCE, vdev, vhandle);
+            st.decoded++;
+            return true;
+        }
+        case ALR_VK_GEN_OP_CREATE_SEMAPHORE: {  // vkCreateSemaphore
+            uint32_t vdev = 0, vhandle = 0;
+            if (!r.u32(vdev) || !r.u32(vhandle)) { st.ok = false; return true; }
+            uint32_t flags = 0;
+            if (!(r.u32(flags))) { st.ok = false; return true; }
+            uint32_t pnext_count = 0;
+            std::vector<uint32_t> pnext_types;
+            std::vector<std::vector<uint8_t>> pnext_bytes;
+            if (!r.u32(pnext_count)) { st.ok = false; return true; }
+            if (pnext_count > 32) { st.ok = false; return true; }
+            for (uint32_t i = 0; i < pnext_count; ++i) {
+                uint32_t stype = 0; const uint8_t* d = nullptr; uint32_t n = 0;
+                if (!r.u32(stype) || !r.blob(d, n)) { st.ok = false; return true; }
+                if (n > 1024) { st.ok = false; return true; }
+                pnext_types.push_back(stype);
+                pnext_bytes.emplace_back(d, d + n);
+            }
+            (void)pnext_count;
+            int res = -1;
+#ifdef ALR_VK_DECODE_REAL
+            if (!gp) {
+                res = static_cast<int>(vk_gen_real_create_semaphore(
+                    st, vdev, vhandle, flags,
+                    pnext_types, pnext_bytes));
+            }
+#endif
+            if (gp && gp->create_handle)
+                res = gp->create_handle(gp->ctx, ALR_VK_GEN_OP_CREATE_SEMAPHORE, vdev, vhandle,
+                                        (uint64_t)flags, (uint64_t)0);
+            reply.u8(static_cast<uint8_t>(ALR_VK_REPLY_GEN_ESCAPE));
+            reply.u16(static_cast<uint16_t>(ALR_VK_GEN_REPLY_CREATE_SEMAPHORE));
+            reply.u32(vhandle);
+            reply.i32(res);
+            st.decoded++;
+            return true;
+        }
+        case ALR_VK_GEN_OP_DESTROY_SEMAPHORE: {  // vkDestroySemaphore
+            uint32_t vdev = 0, vhandle = 0;
+            if (!r.u32(vdev) || !r.u32(vhandle)) { st.ok = false; return true; }
+            (void)vdev;
+#ifdef ALR_VK_DECODE_REAL
+            if (!gp) {
+                vk_gen_real_destroy_semaphore(st, vdev, vhandle);
+            }
+#endif
+            if (gp && gp->destroy_handle)
+                gp->destroy_handle(gp->ctx, ALR_VK_GEN_OP_DESTROY_SEMAPHORE, vdev, vhandle);
+            st.decoded++;
+            return true;
+        }
+        case ALR_VK_GEN_OP_CREATE_EVENT: {  // vkCreateEvent
+            uint32_t vdev = 0, vhandle = 0;
+            if (!r.u32(vdev) || !r.u32(vhandle)) { st.ok = false; return true; }
+            uint32_t flags = 0;
+            if (!(r.u32(flags))) { st.ok = false; return true; }
+            uint32_t pnext_count = 0;
+            std::vector<uint32_t> pnext_types;
+            std::vector<std::vector<uint8_t>> pnext_bytes;
+            if (!r.u32(pnext_count)) { st.ok = false; return true; }
+            if (pnext_count > 32) { st.ok = false; return true; }
+            for (uint32_t i = 0; i < pnext_count; ++i) {
+                uint32_t stype = 0; const uint8_t* d = nullptr; uint32_t n = 0;
+                if (!r.u32(stype) || !r.blob(d, n)) { st.ok = false; return true; }
+                if (n > 1024) { st.ok = false; return true; }
+                pnext_types.push_back(stype);
+                pnext_bytes.emplace_back(d, d + n);
+            }
+            (void)pnext_count;
+            int res = -1;
+#ifdef ALR_VK_DECODE_REAL
+            if (!gp) {
+                res = static_cast<int>(vk_gen_real_create_event(
+                    st, vdev, vhandle, flags,
+                    pnext_types, pnext_bytes));
+            }
+#endif
+            if (gp && gp->create_handle)
+                res = gp->create_handle(gp->ctx, ALR_VK_GEN_OP_CREATE_EVENT, vdev, vhandle,
+                                        (uint64_t)flags, (uint64_t)0);
+            reply.u8(static_cast<uint8_t>(ALR_VK_REPLY_GEN_ESCAPE));
+            reply.u16(static_cast<uint16_t>(ALR_VK_GEN_REPLY_CREATE_EVENT));
+            reply.u32(vhandle);
+            reply.i32(res);
+            st.decoded++;
+            return true;
+        }
+        case ALR_VK_GEN_OP_DESTROY_EVENT: {  // vkDestroyEvent
+            uint32_t vdev = 0, vhandle = 0;
+            if (!r.u32(vdev) || !r.u32(vhandle)) { st.ok = false; return true; }
+            (void)vdev;
+#ifdef ALR_VK_DECODE_REAL
+            if (!gp) {
+                vk_gen_real_destroy_event(st, vdev, vhandle);
+            }
+#endif
+            if (gp && gp->destroy_handle)
+                gp->destroy_handle(gp->ctx, ALR_VK_GEN_OP_DESTROY_EVENT, vdev, vhandle);
+            st.decoded++;
+            return true;
+        }
+        case ALR_VK_GEN_OP_CREATE_QUERY_POOL: {  // vkCreateQueryPool
+            uint32_t vdev = 0, vhandle = 0;
+            if (!r.u32(vdev) || !r.u32(vhandle)) { st.ok = false; return true; }
+            uint32_t flags = 0; uint32_t queryType = 0; uint32_t queryCount = 0; uint32_t pipelineStatistics = 0;
+            if (!(r.u32(flags) && r.u32(queryType) && r.u32(queryCount) && r.u32(pipelineStatistics))) { st.ok = false; return true; }
+            uint32_t pnext_count = 0;
+            std::vector<uint32_t> pnext_types;
+            std::vector<std::vector<uint8_t>> pnext_bytes;
+            if (!r.u32(pnext_count)) { st.ok = false; return true; }
+            if (pnext_count > 32) { st.ok = false; return true; }
+            for (uint32_t i = 0; i < pnext_count; ++i) {
+                uint32_t stype = 0; const uint8_t* d = nullptr; uint32_t n = 0;
+                if (!r.u32(stype) || !r.blob(d, n)) { st.ok = false; return true; }
+                if (n > 1024) { st.ok = false; return true; }
+                pnext_types.push_back(stype);
+                pnext_bytes.emplace_back(d, d + n);
+            }
+            (void)pnext_count;
+            int res = -1;
+#ifdef ALR_VK_DECODE_REAL
+            if (!gp) {
+                res = static_cast<int>(vk_gen_real_create_query_pool(
+                    st, vdev, vhandle, flags, queryType, queryCount, pipelineStatistics,
+                    pnext_types, pnext_bytes));
+            }
+#endif
+            if (gp && gp->create_handle)
+                res = gp->create_handle(gp->ctx, ALR_VK_GEN_OP_CREATE_QUERY_POOL, vdev, vhandle,
+                                        (uint64_t)flags, (uint64_t)queryType);
+            reply.u8(static_cast<uint8_t>(ALR_VK_REPLY_GEN_ESCAPE));
+            reply.u16(static_cast<uint16_t>(ALR_VK_GEN_REPLY_CREATE_QUERY_POOL));
+            reply.u32(vhandle);
+            reply.i32(res);
+            st.decoded++;
+            return true;
+        }
+        case ALR_VK_GEN_OP_DESTROY_QUERY_POOL: {  // vkDestroyQueryPool
+            uint32_t vdev = 0, vhandle = 0;
+            if (!r.u32(vdev) || !r.u32(vhandle)) { st.ok = false; return true; }
+            (void)vdev;
+#ifdef ALR_VK_DECODE_REAL
+            if (!gp) {
+                vk_gen_real_destroy_query_pool(st, vdev, vhandle);
+            }
+#endif
+            if (gp && gp->destroy_handle)
+                gp->destroy_handle(gp->ctx, ALR_VK_GEN_OP_DESTROY_QUERY_POOL, vdev, vhandle);
             st.decoded++;
             return true;
         }

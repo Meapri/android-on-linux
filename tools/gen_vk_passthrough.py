@@ -100,7 +100,13 @@ GEN_REPLY_BASE = 1     # u16 generated reply sub-opcodes (1.. ; 0 reserved)
 # band (used by run_vk_icd_present_probe), so its generated ICD function/table-row are
 # suppressed; its generated encoder + host decode still exist (the host servicer can
 # replay a 300.. command-pool op, and the host wire test covers it).
-ICD_SKIP = {"vkCreateCommandPool", "vkDestroyCommandPool"}
+ICD_SKIP = {"vkCreateCommandPool", "vkDestroyCommandPool",
+            # vkCreate/DestroyShaderModule are hand-written in the ICD on the 218/225 band
+            # (the bring-up triangle uploads its own SPIR-V through it). The generated ICD
+            # function would collide on the C symbol, so suppress the generated ICD row; the
+            # generated encoder + host decode (300.. band) are still emitted so the host wire
+            # test + servicer cover the generated shader-module path.
+            "vkCreateShaderModule", "vkDestroyShaderModule"}
 
 # ---------------------------------------------------------------------------
 # PER-ENTRYPOINT SPECS. Each entry declares the marshalling INTENT the registry can't
@@ -253,6 +259,119 @@ SPECS = [
         "name": "vkDestroyImageView", "kind": "destroy_handle",
         "handle_param": ("imageView", "VkImageView"),
     },
+    # =======================================================================
+    # WAVE A — the create-resource forwards ANGLE's RendererVk hits right after
+    # vkCreateDevice / vkGetPhysicalDeviceMemoryProperties: a shader module (the SPIR-V
+    # blob), the pipeline cache, a default sampler, and the sync primitives (fence /
+    # semaphore / event) + a query pool. All but the shader module are SCALAR-ONLY
+    # create_handle forwards (the registry-typed POD prefix is shipped + the real Mali
+    # handle returned). The shader module rides create_handle's NEW optional trailing
+    # `blob_field` (codeSize/pCode SPIR-V), marshalled the same way the hand-written
+    # CREATE_SHADER_MODULE (op 218) ships its blob — but generated, so it composes with the
+    # generated reply band. These let ANGLE build its shader/sampler/sync objects on Mali.
+    # =======================================================================
+    # ---- shader module (SPIR-V blob: the heaviest WAVE-A item) ----
+    {
+        "name": "vkCreateShaderModule", "kind": "create_handle",
+        "ci": "VkShaderModuleCreateInfo",
+        # flags is the only POD scalar; the SPIR-V words ride the trailing blob (codeSize
+        # bytes at pCode). The host rebuilds VkShaderModuleCreateInfo from { flags, blob }.
+        "ci_fields": [("flags", "u32")],
+        # blob_field: (the C member holding the byte length, the C member holding the data
+        # pointer). create_handle ships it as a length-prefixed blob AFTER the scalar CI
+        # fields and BEFORE the pNext chain; the host decode reads it back as (ptr,len) and
+        # the real-Mali body passes it as codeSize/pCode.
+        "blob_field": ("codeSize", "pCode"),
+        "out": "VkShaderModule",
+    },
+    {
+        "name": "vkDestroyShaderModule", "kind": "destroy_handle",
+        "handle_param": ("shaderModule", "VkShaderModule"),
+        # NOTE: vkCreate/DestroyShaderModule are ALSO hand-written on the 218/225 band (used
+        # by the bring-up triangle). The generated ICD function would collide, so both are in
+        # ICD_SKIP — the generated encoder + host decode still exist (for completeness + the
+        # host wire test). ANGLE keeps using the generated *create* via the 300.. band only
+        # because the hand-written one is what the ICD table exports; see ICD_SKIP note.
+    },
+    # ---- pipeline cache (scalar-only; ANGLE creates one empty cache up front) ----
+    {
+        "name": "vkCreatePipelineCache", "kind": "create_handle",
+        "ci": "VkPipelineCacheCreateInfo",
+        # initialDataSize/pInitialData (a warm cache blob) is NOT shipped for the bring-up:
+        # ANGLE's first cache is empty (initialDataSize==0). A warm-cache rung would add a
+        # blob_field; deferred (honest scope) — an empty cache is the create ANGLE issues.
+        "ci_fields": [("flags", "u32")],
+        "out": "VkPipelineCache",
+    },
+    {
+        "name": "vkDestroyPipelineCache", "kind": "destroy_handle",
+        "handle_param": ("pipelineCache", "VkPipelineCache"),
+    },
+    # ---- sampler (scalar-only POD prefix) ----
+    {
+        "name": "vkCreateSampler", "kind": "create_handle",
+        "ci": "VkSamplerCreateInfo",
+        "ci_fields": [
+            ("flags", "u32"), ("magFilter", "u32"), ("minFilter", "u32"),
+            ("mipmapMode", "u32"), ("addressModeU", "u32"), ("addressModeV", "u32"),
+            ("addressModeW", "u32"), ("mipLodBias", "f32"), ("anisotropyEnable", "u32"),
+            ("maxAnisotropy", "f32"), ("compareEnable", "u32"), ("compareOp", "u32"),
+            ("minLod", "f32"), ("maxLod", "f32"), ("borderColor", "u32"),
+            ("unnormalizedCoordinates", "u32"),
+        ],
+        "out": "VkSampler",
+    },
+    {
+        "name": "vkDestroySampler", "kind": "destroy_handle",
+        "handle_param": ("sampler", "VkSampler"),
+    },
+    # ---- fence (scalar-only: just flags) ----
+    {
+        "name": "vkCreateFence", "kind": "create_handle",
+        "ci": "VkFenceCreateInfo",
+        "ci_fields": [("flags", "u32")],
+        "out": "VkFence",
+    },
+    {
+        "name": "vkDestroyFence", "kind": "destroy_handle",
+        "handle_param": ("fence", "VkFence"),
+    },
+    # ---- semaphore (scalar-only: flags; a timeline semaphore's pNext type is deferred) ----
+    {
+        "name": "vkCreateSemaphore", "kind": "create_handle",
+        "ci": "VkSemaphoreCreateInfo",
+        "ci_fields": [("flags", "u32")],
+        "out": "VkSemaphore",
+    },
+    {
+        "name": "vkDestroySemaphore", "kind": "destroy_handle",
+        "handle_param": ("semaphore", "VkSemaphore"),
+    },
+    # ---- event (scalar-only: flags) ----
+    {
+        "name": "vkCreateEvent", "kind": "create_handle",
+        "ci": "VkEventCreateInfo",
+        "ci_fields": [("flags", "u32")],
+        "out": "VkEvent",
+    },
+    {
+        "name": "vkDestroyEvent", "kind": "destroy_handle",
+        "handle_param": ("event", "VkEvent"),
+    },
+    # ---- query pool (scalar-only POD prefix) ----
+    {
+        "name": "vkCreateQueryPool", "kind": "create_handle",
+        "ci": "VkQueryPoolCreateInfo",
+        "ci_fields": [
+            ("flags", "u32"), ("queryType", "u32"), ("queryCount", "u32"),
+            ("pipelineStatistics", "u32"),
+        ],
+        "out": "VkQueryPool",
+    },
+    {
+        "name": "vkDestroyQueryPool", "kind": "destroy_handle",
+        "handle_param": ("queryPool", "VkQueryPool"),
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -323,16 +442,20 @@ def wire_enc_call(wt, var):
     return {
         "u32": f"alr_vk_enc_u32(e, {var});",
         "u64": f"alr_vk_enc_u64(e, {var});",
+        "i32": f"alr_vk_enc_i32(e, {var});",
+        "f32": f"alr_vk_enc_f32(e, {var});",
         "vhandle": f"alr_vk_enc_u32(e, {var});",
     }[wt]
 
 
 def reader_call(wt, var):
-    return {"u32": f"r.u32({var})", "u64": f"r.u64({var})", "vhandle": f"r.u32({var})"}[wt]
+    return {"u32": f"r.u32({var})", "u64": f"r.u64({var})", "i32": f"r.i32({var})",
+            "f32": f"r.f32({var})", "vhandle": f"r.u32({var})"}[wt]
 
 
 def ctype_for(wt):
-    return {"u32": "uint32_t", "u64": "uint64_t", "vhandle": "uint32_t"}[wt]
+    return {"u32": "uint32_t", "u64": "uint64_t", "i32": "int32_t",
+            "f32": "float", "vhandle": "uint32_t"}[wt]
 
 
 def wire_var(fname):
@@ -435,15 +558,25 @@ def gen_proto_encoder(op):
         params = ["AlrVkEncoder *e", "uint32_t vdev", f"uint32_t {op['vout']}"]
         for fname, wt in op["ci_wire_fields"]:
             params.append(f"{ctype_for(wt)} {wire_var(fname)}")
+        if op.get("blob_field"):
+            # A trailing length-prefixed blob (e.g. shader-module SPIR-V): the data pointer +
+            # byte length, shipped via alr_vk_enc_blob AFTER the scalar CI fields and BEFORE
+            # the pNext chain. The host decode reads it in the same position.
+            params.append("const void *blob_data")
+            params.append("uint32_t blob_len")
         a(f"// Encoder for {name}. Ships the device + the guest's virtual {op['out']} id +")
-        a(f"// the {op['ci']} POD prefix. Append the allowlisted pNext chain after via")
-        a("// alr_vk_gen_pnext_count/alr_vk_gen_pnext (CREATE_DEVICE2's feature-chain shape).")
+        a(f"// the {op['ci']} POD prefix" +
+          (" + a trailing blob" if op.get("blob_field") else "") + ". Append the allowlisted")
+        a("// pNext chain after via alr_vk_gen_pnext_count/alr_vk_gen_pnext (CREATE_DEVICE2's")
+        a("// feature-chain shape).")
         a(f"static inline void {enc}_begin({', '.join(params)}) {{")
         a(f"    alr_vk_gen_op_begin(e, {op['op_enum']});")
         a("    alr_vk_enc_u32(e, vdev);")
         a(f"    alr_vk_enc_u32(e, {op['vout']});")
         for fname, wt in op["ci_wire_fields"]:
             a(f"    {wire_enc_call(wt, wire_var(fname))}")
+        if op.get("blob_field"):
+            a("    alr_vk_enc_blob(e, blob_data, blob_len);")
         a("}")
     elif k == "alloc_memory":
         a(f"// Encoder for {name} (same-process arena). Ships the device + virtual memory id")
@@ -609,11 +742,19 @@ def gen_decode_state_ext():
     a("// editing the hand-written struct. One instance per VkDecodeState, via gen_tables(st).")
     a("struct VkGenTables {")
     a("#ifdef ALR_VK_DECODE_REAL")
-    a("    std::map<uint32_t, VkCommandPool> pools;    // vpool  -> real")
-    a("    std::map<uint32_t, VkBuffer> buffers;       // vbuf   -> real")
-    a("    std::map<uint32_t, VkImage> images;         // vimg   -> real")
-    a("    std::map<uint32_t, VkImageView> views;      // vview  -> real")
-    a("    std::map<uint32_t, VkDeviceMemory> memory;  // vmem   -> real")
+    a("    std::map<uint32_t, VkCommandPool> pools;    // vpool   -> real")
+    a("    std::map<uint32_t, VkBuffer> buffers;       // vbuf    -> real")
+    a("    std::map<uint32_t, VkImage> images;         // vimg    -> real")
+    a("    std::map<uint32_t, VkImageView> views;      // vview   -> real")
+    a("    std::map<uint32_t, VkDeviceMemory> memory;  // vmem    -> real")
+    a("    // WAVE A render-resource handle tables (virtual id -> real Mali handle).")
+    a("    std::map<uint32_t, VkShaderModule> shader_modules;  // vshmod  -> real")
+    a("    std::map<uint32_t, VkPipelineCache> pipeline_caches; // vpcache -> real")
+    a("    std::map<uint32_t, VkSampler> samplers;     // vsamp   -> real")
+    a("    std::map<uint32_t, VkFence> fences;         // vfence  -> real")
+    a("    std::map<uint32_t, VkSemaphore> semaphores; // vsem    -> real")
+    a("    std::map<uint32_t, VkEvent> events;         // vevent  -> real")
+    a("    std::map<uint32_t, VkQueryPool> query_pools; // vqpool  -> real")
     a("#endif")
     a("    // Arena offset assigned to each device-memory virtual id (HOST_VISIBLE only).")
     a("    // UINT64_MAX == not arena-backed (e.g. a DEVICE_LOCAL alloc). Tracked even in")
@@ -685,12 +826,21 @@ def gen_decode_case(op):
         if decls:
             a("            " + " ".join(decls))
             a("            if (!(" + " && ".join(reads) + ")) { st.ok = false; return true; }")
+        if op.get("blob_field"):
+            # Read the trailing blob (data ptr into the wire buffer + length) BEFORE the
+            # pNext chain, matching the encoder's order. Bound it so a bogus length can't
+            # make the real driver read an arbitrary blob.
+            a("            const uint8_t* blob_data = nullptr; uint32_t blob_len = 0;")
+            a("            if (!r.blob(blob_data, blob_len)) { st.ok = false; return true; }")
+            a("            if (blob_len > (1u << 24)) { st.ok = false; return true; }  // 16MiB cap")
         a(gen_pnext_read())
         a("            int res = -1;")
         a("#ifdef ALR_VK_DECODE_REAL")
         a("            if (!gp) {")
         a(f"                res = static_cast<int>(vk_gen_real_{op['short']}(")
         a(f"                    st, vdev, vhandle{(', ' + op['ci_call_args']) if op['ci_call_args'] else ''},")
+        if op.get("blob_field"):
+            a("                    blob_data, blob_len,")
         a("                    pnext_types, pnext_bytes));")
         a("            }")
         a("#endif")
@@ -867,6 +1017,7 @@ def gen_icd_fn(op):
     a = L.append
     if k in ("create_handle", "create_pool"):
         out_ty = op["out"]
+        blob = op.get("blob_field")
         a(f"static VkResult VKAPI_CALL {fn}(VkDevice device, const {op['ci']} *pCreateInfo,")
         a(f"                          const VkAllocationCallbacks *pAllocator, {out_ty} *pHandle) {{")
         a("    (void)pAllocator;")
@@ -875,16 +1026,38 @@ def gen_icd_fn(op):
         a("    if (!dev || !pCreateInfo || !pHandle) return VK_ERROR_INITIALIZATION_FAILED;")
         a(f"    vid = alr_alloc(&{op['counter']}, 1);")
         a("    if (alr_icd_ring_ok()) {")
-        a("        uint8_t req[256]; AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];")
-        a("        alr_vk_enc_init(&e, req, sizeof(req));")
-        a(f"        {op['enc_name']}_begin(&e, dev->vdev, vid{op['icd_ci_args']});")
-        a("        alr_vk_gen_pnext_count(&e, 0);  // first batch: no pNext forwarded yet")
-        a("        alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);")
-        a("        if (!e.overflow) {")
-        a("            uint32_t rlen = alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));")
-        a(f"            if (rlen) (void)alr_icd_gen_scan_result(reply, rlen, (uint16_t){op['reply_enum']}, &res);")
-        a("            else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;")
-        a("        } else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;")
+        if blob:
+            blen, bdata = blob  # the C members: byte-length and data pointer
+            # A blob create (e.g. SPIR-V) is unbounded, so the request rides a heap buffer
+            # sized to the blob + a fixed header slack (scalars + pNext-count + END). The
+            # roundtrip-on-heap path mirrors the stack path but frees afterward.
+            a("        AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];")
+            a(f"        size_t blob_len = (size_t)pCreateInfo->{blen};")
+            a(f"        const void *blob_data = (const void *)pCreateInfo->{bdata};")
+            a("        size_t cap = blob_len + 256;  // header slack")
+            a("        uint8_t *req = (uint8_t *)malloc(cap);")
+            a("        if (!req) return VK_ERROR_OUT_OF_HOST_MEMORY;")
+            a("        alr_vk_enc_init(&e, req, cap);")
+            a(f"        {op['enc_name']}_begin(&e, dev->vdev, vid{op['icd_ci_args']}, blob_data, (uint32_t)blob_len);")
+            a("        alr_vk_gen_pnext_count(&e, 0);  // pNext forwarding deferred for this create")
+            a("        alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);")
+            a("        if (!e.overflow) {")
+            a("            uint32_t rlen = alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));")
+            a(f"            if (rlen) (void)alr_icd_gen_scan_result(reply, rlen, (uint16_t){op['reply_enum']}, &res);")
+            a("            else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;")
+            a("        } else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;")
+            a("        free(req);")
+        else:
+            a("        uint8_t req[256]; AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];")
+            a("        alr_vk_enc_init(&e, req, sizeof(req));")
+            a(f"        {op['enc_name']}_begin(&e, dev->vdev, vid{op['icd_ci_args']});")
+            a("        alr_vk_gen_pnext_count(&e, 0);  // first batch: no pNext forwarded yet")
+            a("        alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);")
+            a("        if (!e.overflow) {")
+            a("            uint32_t rlen = alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));")
+            a(f"            if (rlen) (void)alr_icd_gen_scan_result(reply, rlen, (uint16_t){op['reply_enum']}, &res);")
+            a("            else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;")
+            a("        } else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;")
         a("    }")
         a("    if (res != 0) return (VkResult)res;")
         a(f"    *pHandle = ({out_ty})(uintptr_t)vid;  // non-dispatchable: carries the virtual id")
@@ -1155,6 +1328,14 @@ COUNTERS = {
     "VkImage": "g_next_vimg",
     "VkImageView": "g_next_vview",
     "VkDeviceMemory": "g_next_vmem",
+    # WAVE A render-resource virtual-id pools (disjoint high ranges; see alr_icd_vulkan.c).
+    "VkShaderModule": "g_next_vshmod",
+    "VkPipelineCache": "g_next_vpcache",
+    "VkSampler": "g_next_vsamp",
+    "VkFence": "g_next_vfence",
+    "VkSemaphore": "g_next_vsem",
+    "VkEvent": "g_next_vevent",
+    "VkQueryPool": "g_next_vqpool",
 }
 VHANDLE_VAR = {
     "VkCommandPool": "vpool",
@@ -1162,6 +1343,13 @@ VHANDLE_VAR = {
     "VkImage": "vimg",
     "VkImageView": "vview",
     "VkDeviceMemory": "vmem",
+    "VkShaderModule": "vshmod",
+    "VkPipelineCache": "vpcache",
+    "VkSampler": "vsamp",
+    "VkFence": "vfence",
+    "VkSemaphore": "vsem",
+    "VkEvent": "vevent",
+    "VkQueryPool": "vqpool",
 }
 SHORT = {
     "vkCreateCommandPool": "create_command_pool",
@@ -1177,6 +1365,21 @@ SHORT = {
     "vkDestroyImage": "destroy_image",
     "vkDestroyImageView": "destroy_image_view",
     "vkFreeMemory": "free_memory",
+    # WAVE A.
+    "vkCreateShaderModule": "create_shader_module",
+    "vkDestroyShaderModule": "destroy_shader_module",
+    "vkCreatePipelineCache": "create_pipeline_cache",
+    "vkDestroyPipelineCache": "destroy_pipeline_cache",
+    "vkCreateSampler": "create_sampler",
+    "vkDestroySampler": "destroy_sampler",
+    "vkCreateFence": "create_fence",
+    "vkDestroyFence": "destroy_fence",
+    "vkCreateSemaphore": "create_semaphore",
+    "vkDestroySemaphore": "destroy_semaphore",
+    "vkCreateEvent": "create_event",
+    "vkDestroyEvent": "destroy_event",
+    "vkCreateQueryPool": "create_query_pool",
+    "vkDestroyQueryPool": "destroy_query_pool",
 }
 # Reply-record payload sizes (after the u8 opcode) for the ICD skip table.
 REPLY_SKIP = {
@@ -1203,7 +1406,12 @@ def resolve_ops(reg):
         # u8 op/reply enums (which already use names like ALR_VK_OP_CREATE_COMMAND_POOL).
         op["op_enum"] = "ALR_VK_GEN_OP_" + out_snake.upper()
         op["op_num"] = op_num
-        op["enc_name"] = "alr_vk_enc_" + out_snake
+        # The generated encoder symbols live in a DISTINCT "alr_vk_enc_gen_" namespace so a
+        # generated entrypoint whose snake name equals a HAND-WRITTEN 0..229 encoder (e.g.
+        # vkDestroyShaderModule -> alr_vk_enc_destroy_shader_module exists on the 225 band)
+        # never collides at link. These are static-inline marshalling helpers, not the wire
+        # ABI (the wire is the opcodes, which are unchanged), so the name is free to namespace.
+        op["enc_name"] = "alr_vk_enc_gen_" + out_snake
         op["icd_fn"] = "alr_" + name
         op["short"] = SHORT.get(name, out_snake)
         op_num += 1
@@ -1229,14 +1437,17 @@ def resolve_ops(reg):
             if k in ("create_handle", "create_pool"):
                 op["ci_wire_fields"] = list(spec["ci_fields"])
                 icd_args = []
+                # The cast must match the encoder's per-field parameter C type (ctype_for):
+                # u32->uint32_t, u64->uint64_t, i32->int32_t, f32->float, a virtual handle
+                # ref->uint32_t (the handle carries its virtual id in its low bits).
+                _cast = {"u32": "(uint32_t)", "u64": "(uint64_t)", "i32": "(int32_t)",
+                         "f32": "(float)", "vhandle": "(uint32_t)(uintptr_t)"}
                 for fname, wt in spec["ci_fields"]:
                     if fname.startswith("@"):
                         member = fname[1:].split(":", 1)[0]
                         icd_args.append(f"(uint32_t)(uintptr_t)pCreateInfo->{member}")
                     else:
-                        icd_args.append(
-                            f"(uint32_t)pCreateInfo->{fname}" if wt == "u32"
-                            else f"(uint64_t)pCreateInfo->{fname}")
+                        icd_args.append(f"{_cast[wt]}pCreateInfo->{fname}")
                 op["icd_ci_args"] = ("" if not icd_args else ", " + ", ".join(icd_args))
                 call_args = [wire_var(f) for f, _ in spec["ci_fields"]]
                 op["ci_call_args"] = ", ".join(call_args) if call_args else ""

@@ -85,6 +85,29 @@ typedef int32_t  VkCompositeAlphaFlagBitsKHR;
 typedef int32_t  VkImageLayout;
 typedef int32_t  VkCommandBufferLevel;
 
+/* ---- WAVE A (generated create-resource forwards) ABI additions: the non-dispatchable
+ * handles + their CreateInfo flag/enum fields. Non-dispatchable handles are uint64_t (the
+ * official VK_DEFINE_NON_DISPATCHABLE_HANDLE ABI). The enum-typed CreateInfo fields are
+ * declared int/uint sized; the generated ICD function only reads them as scalars and ships
+ * them opaquely on the wire (the host rebuilds the real CreateInfo + casts back). ---- */
+typedef uint64_t VkPipelineCache;
+typedef uint64_t VkSampler;
+typedef uint64_t VkEvent;
+typedef uint64_t VkQueryPool;
+typedef uint32_t VkPipelineCacheCreateFlags;
+typedef uint32_t VkSamplerCreateFlags;
+typedef uint32_t VkFenceCreateFlags;
+typedef uint32_t VkSemaphoreCreateFlags;
+typedef uint32_t VkEventCreateFlags;
+typedef uint32_t VkQueryPoolCreateFlags;
+typedef uint32_t VkQueryPipelineStatisticFlags;
+typedef int32_t  VkFilter;
+typedef int32_t  VkSamplerMipmapMode;
+typedef int32_t  VkSamplerAddressMode;
+typedef int32_t  VkCompareOp;
+typedef int32_t  VkBorderColor;
+typedef int32_t  VkQueryType;
+
 typedef enum VkResult {
     VK_SUCCESS = 0,
     VK_NOT_READY = 1,
@@ -571,6 +594,66 @@ typedef struct VkImageViewCreateInfo {
     VkComponentMapping      components;
     VkImageSubresourceRange subresourceRange;
 } VkImageViewCreateInfo;
+
+/* ---- WAVE A CreateInfo structs (full ABI layout, field-for-field with the official
+ * header). The generated ICD forwarders read the scalar fields the codegen SPEC lists and
+ * ship them on the wire; the host rebuilds the real CreateInfo. Only the shader-module
+ * CreateInfo (already defined above) carries a blob. ---- */
+typedef struct VkPipelineCacheCreateInfo {
+    VkStructureType            sType;
+    const void                *pNext;
+    VkPipelineCacheCreateFlags flags;
+    size_t                     initialDataSize;
+    const void                *pInitialData;
+} VkPipelineCacheCreateInfo;
+
+typedef struct VkSamplerCreateInfo {
+    VkStructureType      sType;
+    const void          *pNext;
+    VkSamplerCreateFlags flags;
+    VkFilter             magFilter;
+    VkFilter             minFilter;
+    VkSamplerMipmapMode  mipmapMode;
+    VkSamplerAddressMode addressModeU;
+    VkSamplerAddressMode addressModeV;
+    VkSamplerAddressMode addressModeW;
+    float                mipLodBias;
+    VkBool32             anisotropyEnable;
+    float                maxAnisotropy;
+    VkBool32             compareEnable;
+    VkCompareOp          compareOp;
+    float                minLod;
+    float                maxLod;
+    VkBorderColor        borderColor;
+    VkBool32             unnormalizedCoordinates;
+} VkSamplerCreateInfo;
+
+typedef struct VkFenceCreateInfo {
+    VkStructureType    sType;
+    const void        *pNext;
+    VkFenceCreateFlags flags;
+} VkFenceCreateInfo;
+
+typedef struct VkSemaphoreCreateInfo {
+    VkStructureType        sType;
+    const void            *pNext;
+    VkSemaphoreCreateFlags flags;
+} VkSemaphoreCreateInfo;
+
+typedef struct VkEventCreateInfo {
+    VkStructureType    sType;
+    const void        *pNext;
+    VkEventCreateFlags flags;
+} VkEventCreateInfo;
+
+typedef struct VkQueryPoolCreateInfo {
+    VkStructureType               sType;
+    const void                   *pNext;
+    VkQueryPoolCreateFlags        flags;
+    VkQueryType                   queryType;
+    uint32_t                      queryCount;
+    VkQueryPipelineStatisticFlags pipelineStatistics;
+} VkQueryPoolCreateInfo;
 
 /* The "2" sType values (official Vulkan constants). */
 #define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 1000059000
