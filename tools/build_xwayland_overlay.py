@@ -122,6 +122,11 @@ class XOverlay:
     ok_marker: str
     keep_prefixes: tuple[str, ...] = ()
     expect_sonames: tuple[str, ...] = ()
+    expect_files: tuple[str, ...] = ()  # rootfs-absolute paths the overlay MUST ship as
+                                        # real files (e.g. /usr/bin/xkbcomp) — a leaf
+                                        # binary the run path exec()s but no DT_NEEDED
+                                        # pulls; asserted so a recipe regression that
+                                        # drops it FAILS the build, not the device.
     note: str = ""
 
 
@@ -135,7 +140,18 @@ X_OVERLAYS: dict[str, XOverlay] = {
     # SecurityPolicy / serverconfig data Xwayland reads at startup.
     "xwayland": XOverlay(
         name="xwayland",
-        leaf_packages=("xwayland",),
+        # `xwayland` is the X server; `x11-xkb-utils` provides `xkbcomp` — the EXTERNAL
+        # keyboard-map compiler Xwayland exec()s at startup to build its virtual-core
+        # keyboard keymap. WITHOUT it a ROOTFUL Xwayland aborts AFTER taking the X0 lock
+        # with "XKB: Failed to compile keymap / Keyboard initialization failed ... missing
+        # or incorrect setup of xkeyboard-config" → "(EE) Failed to activate virtual core
+        # keyboard: 2" (device-proven: the X0-lock EPERM is fixed by the interposer's
+        # link→rename fallback, exposing THIS next blocker). xkbcomp is exec'd (not a
+        # DT_NEEDED of Xwayland), so the DT_NEEDED-minimal flattener never pulls it — it
+        # must be named as its own leaf package. The xkb DATA (rules/symbols/keycodes) is
+        # already in the base under /usr/share/X11/xkb; xkbcomp links libxkbfile.so.1
+        # (base-provided). Riding the SAME xwayland-stage.tar keeps the staging wiring.
+        leaf_packages=("xwayland", "x11-xkb-utils"),
         exec_path="/usr/bin/Xwayland",
         launch_arg="-version",
         ok_marker="X.Org",  # "X.Org X Server" / "XWAYLAND" appears in -version output
@@ -144,8 +160,12 @@ X_OVERLAYS: dict[str, XOverlay] = {
             "/usr/lib/xorg",               # any Xwayland-private modules under here
             "/usr/share/X11/XErrorDB",
         ),
+        # xkbcomp is the load-bearing addition: assert it ships so a recipe/flattener
+        # regression that drops it fails the BUILD, not the device (Xwayland keymap).
+        expect_files=("/usr/bin/xkbcomp",),
         note="ROOTFUL is the default (no -rootless → no XWM needed); launched -shm "
-        "(compositor is wl_shm-only) so glamor/DRI3/GBM/EGL stay inert. DISPLAY=:0.",
+        "(compositor is wl_shm-only) so glamor/DRI3/GBM/EGL stay inert. DISPLAY=:0. "
+        "Bundles xkbcomp (x11-xkb-utils) for the X server's virtual-core keymap compile.",
     ),
     # A simple X11 app to prove the screen: x11-apps ships xcalc/xeyes/xlogo/xclock.
     # These link the X CLIENT libs the BASE already provides (libX11/libXt/libXaw/…)
@@ -196,6 +216,10 @@ class XOverlayBuild:
     # the built tar as a real-or-alias member. Non-empty => the overlay would ship
     # an app that can't resolve a linked soname on device (e.g. libXaw.so.7) => FAIL.
     missing_expected: tuple[str, ...] = ()
+    # rootfs-absolute paths the recipe REQUIRED (expect_files) that are NOT present
+    # as real file members. Non-empty => the overlay is missing an exec'd helper the
+    # run path needs (e.g. /usr/bin/xkbcomp for the Xwayland keymap compile) => FAIL.
+    missing_files: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -204,6 +228,7 @@ class XOverlayBuild:
             and not self.violations
             and not self.missing_soname
             and not self.missing_expected
+            and not self.missing_files
             and self.conformant
         )
 
@@ -246,6 +271,10 @@ def build_x_overlay(
         s for s in overlay.expect_sonames
         if not overlay_has_soname(m["out_tar"], s)
     )
+    missing_files = tuple(
+        f for f in overlay.expect_files
+        if not overlay_has_exec(m["out_tar"], f)
+    )
 
     return XOverlayBuild(
         overlay=overlay.name,
@@ -258,6 +287,7 @@ def build_x_overlay(
         conformant=rep.conformant,
         has_exec=has_exec,
         missing_expected=missing_expected,
+        missing_files=missing_files,
     )
 
 
@@ -401,10 +431,12 @@ def _selftest() -> int:
           all(ov.leaf_packages for ov in X_OVERLAYS.values()))
     check("every exec_path is rootfs-absolute (/...)",
           all(ov.exec_path.startswith("/") for ov in X_OVERLAYS.values()))
-    check("xwayland leaf is the `xwayland` package",
-          X_OVERLAYS["xwayland"].leaf_packages == ("xwayland",))
+    check("xwayland leaf = xwayland + x11-xkb-utils (xkbcomp for the keymap compile)",
+          X_OVERLAYS["xwayland"].leaf_packages == ("xwayland", "x11-xkb-utils"))
     check("xwayland exec is /usr/bin/Xwayland (the X server binary)",
           X_OVERLAYS["xwayland"].exec_path == "/usr/bin/Xwayland")
+    check("xwayland requires /usr/bin/xkbcomp (exec'd; no DT_NEEDED pulls it)",
+          "/usr/bin/xkbcomp" in X_OVERLAYS["xwayland"].expect_files)
     check("x11app leaf is the `x11-apps` package",
           X_OVERLAYS["x11app"].leaf_packages == ("x11-apps",))
     check("x11app exec is an x11-apps binary (xcalc)",

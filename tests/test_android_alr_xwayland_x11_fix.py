@@ -111,3 +111,71 @@ def test_xwayland_launch_argv_and_display_unchanged():
     text = MAIN.read_text()
     # the rootful argv the run path execs (sized to the device panel)
     assert "/usr/bin/Xwayland\\n:0\\n-shm\\n-geometry\\n${outW}x${outH}" in text
+
+
+# --------------------------------------------------------------------------- #
+# (3) X0-lock hard-link fallback — Android /data forbids hard links
+# --------------------------------------------------------------------------- #
+# DEVICE-PROVEN root cause: the ALR rootfs lives on Android /data, whose filesystem
+# REFUSES hard links — link()/linkat() return EPERM even for the app's own uid in its
+# own dir (`ln a b` -> "Permission denied"; rename()/symlink() work). The X server's
+# LockServer() create()s /tmp/.Xnn-tmp and link()s it onto /tmp/.X0-lock to atomically
+# claim the display; the link EPERMs -> "Fatal server error: Linking lock file
+# (/tmp/.X0-lock) in place failed: Permission denied" -> Xwayland aborts before binding
+# the X socket. FIX: the interposer's link/linkat wrappers fall back to an atomic
+# rename() of the same (rewritten) paths on EPERM/EACCES.
+
+def test_interposer_link_falls_back_to_rename_on_eperm():
+    text = INTERPOSE.read_text()
+    # a shared link emit helper that retries via rename on the hard-link-forbidden errno
+    assert "alr_link_emit" in text
+    helper_at = text.index("static int alr_link_emit(")
+    helper = text[helper_at: text.index("\nint link(", helper_at)]
+    # it tries the real link, then on EPERM/EACCES retries the real rename
+    assert 'ALR_REAL(real_link' in helper
+    assert "errno == EPERM || errno == EACCES" in helper
+    assert 'ALR_REAL(real_rename' in helper
+    # link() routes through the helper (not a bare real() call anymore)
+    link_at = text.index("int link(const char *oldp, const char *newp)")
+    link_body = text[link_at: text.index("int linkat(", link_at)]
+    assert "alr_link_emit(rw(oldp" in link_body
+
+
+def test_interposer_linkat_falls_back_to_renameat_on_eperm():
+    text = INTERPOSE.read_text()
+    linkat_at = text.index("int linkat(int oldfd, const char *oldp, int newfd, const char *newp, int flags)")
+    body = text[linkat_at: linkat_at + 1400]
+    # same EPERM/EACCES fallback, but via renameat and ONLY for the AT_FDCWD lock pattern
+    assert "errno == EPERM || errno == EACCES" in body
+    assert "oldfd == AT_FDCWD && newfd == AT_FDCWD" in body
+    assert 'ALR_REAL(real_renameat' in body
+
+
+def test_interposer_link_fallback_preserves_genuine_errors():
+    """The fallback must ONLY trigger on the hard-link-forbidden errnos so a real
+    link error (EEXIST = lock already held, ENOENT = missing source) is still
+    reported truthfully and rename is not wrongly attempted."""
+    text = INTERPOSE.read_text()
+    helper_at = text.index("static int alr_link_emit(")
+    helper = text[helper_at: text.index("\nint link(", helper_at)]
+    # the rename retry is GUARDED by the errno check (not unconditional)
+    assert helper.index("EPERM") < helper.index("real_rename")
+    # if rename also fails, the ORIGINAL link errno is restored (saved/restored)
+    assert "int saved = errno;" in helper
+    assert "errno = saved;" in helper
+
+
+# --------------------------------------------------------------------------- #
+# (4) xkbcomp ships with Xwayland — the next blocker after the lock fix
+# --------------------------------------------------------------------------- #
+# With the X0-lock fixed, a ROOTFUL Xwayland next exec()s `xkbcomp` to compile its
+# virtual-core keyboard keymap; the base lacks it -> "XKB: Failed to compile keymap" /
+# "Failed to activate virtual core keyboard: 2". xkbcomp is exec'd (NOT a DT_NEEDED of
+# Xwayland), so the DT_NEEDED-minimal flattener won't pull it — it must be a named leaf
+# package (x11-xkb-utils) in the SAME xwayland overlay.
+
+def test_xwayland_overlay_bundles_xkbcomp_for_the_keymap_compile():
+    from tools.build_xwayland_overlay import X_OVERLAYS
+    xw = X_OVERLAYS["xwayland"]
+    assert "x11-xkb-utils" in xw.leaf_packages
+    assert "/usr/bin/xkbcomp" in xw.expect_files

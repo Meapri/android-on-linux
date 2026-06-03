@@ -50,7 +50,12 @@ def test_every_overlay_has_a_leaf_package():
 
 def test_xwayland_leaf_is_the_xwayland_package():
     xw = X_OVERLAYS["xwayland"]
-    assert xw.leaf_packages == ("xwayland",)
+    # The X server + x11-xkb-utils (xkbcomp, the keymap compiler the ROOTFUL X server
+    # exec()s — without it Xwayland aborts AFTER taking the X0 lock with "XKB: Failed
+    # to compile keymap" / "Failed to activate virtual core keyboard: 2").
+    assert xw.leaf_packages == ("xwayland", "x11-xkb-utils")
+    # xkbcomp is exec'd (not a DT_NEEDED), so it is asserted as a required file member.
+    assert "/usr/bin/xkbcomp" in xw.expect_files
     # the X SERVER binary (capital X) — the base ships only the X client libs.
     assert xw.exec_path == "/usr/bin/Xwayland"
     # display-free exec smoke for the loader (prints the version banner, exits).

@@ -54,19 +54,20 @@ static int alr_icd_diag_on(void) {
 #define ALR_ICD_DIAG(...) do { if (alr_icd_diag_on()) { \
     fprintf(stderr, "[alr-icd] " __VA_ARGS__); fputc('\n', stderr); fflush(stderr); } } while (0)
 
-/* Fires at dlopen of libvulkan.so.1 (BEFORE any vk* call). Under ALR_ICD_DIAG it proves
- * definitively whether a client (ANGLE) loaded OUR ICD — if ANGLE fails to even reach
- * vkCreateInstance, this line still tells us our .so is in its address space + which
+/* Fires when this ICD is loaded (BEFORE any vk* call). After the Part B rename our
+ * SONAME is libalr_mali_icd.so, and the Khronos Vulkan-Loader dlopen()s us via the
+ * alr_icd.json manifest (NOT the client directly). Under ALR_ICD_DIAG it proves
+ * definitively whether the loader reached OUR ICD — if ANGLE fails to even reach
+ * vkCreateInstance, this line still tells us our .so is in the address space + which
  * vk* symbols it can resolve. */
 __attribute__((constructor))
 static void alr_icd_ctor(void) {
-    /* Fires at dlopen of libvulkan.so.1 (BEFORE any vk* call). Under ALR_ICD_DIAG it
-     * proves definitively whether a client (ANGLE) loaded OUR ICD — if this line is
-     * ABSENT from the guest output with ALR_ICD_DIAG on, the client never dlopened our
-     * ICD (it resolved a different libvulkan or failed to load one). Device-verified that
-     * a plain dlopen("libvulkan.so.1")+dlsym DOES hit this ctor + resolves
-     * vkGetInstanceProcAddr/vkCreateInstance under the ALR in-process loader. */
-    ALR_ICD_DIAG("CTOR: ALR guest libvulkan.so.1 loaded into client; ring_ok=%d",
+    /* Under ALR_ICD_DIAG this proves the Khronos loader loaded OUR Mali ICD — if this
+     * line is ABSENT from the guest output with ALR_ICD_DIAG on, the loader never loaded
+     * libalr_mali_icd.so (manifest not found / wrong library_path / the host loader won).
+     * The direct-SONAME guests (alr-vk-enum/tri, DT_NEEDED libalr_mali_icd.so) also hit
+     * this ctor + resolve vkGetInstanceProcAddr/vkCreateInstance under the ALR loader. */
+    ALR_ICD_DIAG("CTOR: ALR guest Mali ICD (libalr_mali_icd.so) loaded into client; ring_ok=%d",
                  alr_icd_ring_ok());
 }
 

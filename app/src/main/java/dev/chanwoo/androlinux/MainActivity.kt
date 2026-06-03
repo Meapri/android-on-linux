@@ -381,6 +381,23 @@ class MainActivity : Activity() {
                     android.util.Log.i("alr_loader", "angle-stage: overlay done (extracted=${ovr.extracted} skipped=${ovr.skipped.size})")
                     if (ovr.skipped.isNotEmpty()) android.util.Log.w("alr_loader", "angle-stage: guard skipped:\n${ovr.skipped.joinToString("\n")}")
                 }
+                // GPU Part B — ICD discovery redirect: stage the REAL Khronos Vulkan-Loader
+                // (vk-loader-stage.tar → /usr/lib/androlinux/libvulkan.so.1 + alr_icd.json).
+                // ANGLE dlopen("libvulkan.so.1") → (interposer redirect) → this Khronos loader
+                // → reads alr_icd.json (VK_DRIVER_FILES) → loads our renamed Mali ICD
+                // (libalr_mali_icd.so, vk-icd overlay) → Mali. Rides the .alr-angle gate so a
+                // normal cold start never stages it (no-regression). The base ships no
+                // libvulkan, so this is a clean drop (the loader's libvulkan.so.1 + the ICD's
+                // libalr_mali_icd.so are distinct files; the vk-icd overlay no longer ships a
+                // libvulkan.so symlink, so nothing shadows the loader).
+                val vkLoaderTar = java.io.File("/data/local/tmp/vk-loader-stage.tar")
+                val vkLoaderMarker = java.io.File(rootfsStatus.rootfsDir, ".vk-loader-staged-${vkLoaderTar.length()}")
+                if (vkLoaderTar.isFile && !vkLoaderMarker.isFile) {
+                    val ovr = RootfsInstaller(this@MainActivity).extractOverlayTar(vkLoaderTar, rootfsStatus.rootfsDir)
+                    vkLoaderMarker.writeText("staged\n")
+                    android.util.Log.i("alr_loader", "vk-loader-stage: overlay done (extracted=${ovr.extracted} skipped=${ovr.skipped.size})")
+                    if (ovr.skipped.isNotEmpty()) android.util.Log.w("alr_loader", "vk-loader-stage: guard skipped:\n${ovr.skipped.joinToString("\n")}")
+                }
             } catch (e: Throwable) {
                 android.util.Log.e("alr_loader", "angle-stage EXC: ${android.util.Log.getStackTraceString(e)}")
             }
@@ -2070,6 +2087,14 @@ class MainActivity : Activity() {
                                 android.util.Log.i("alr_loader", "xwayland: bin=${xwBin.isFile} (waited ${xwWaited}ms)")
                                 if (xwBin.isFile) {
                                     val framesBeforeXw = nativeWaylandCompositorStatus().intFieldAfter("alr wl frames=")
+                                    // The ROOTFUL X server fork()s + exec()s `xkbcomp` to compile its
+                                    // virtual-core keyboard keymap at startup (device-proven: with
+                                    // xkbcomp present but exec re-entry OFF the compile still fails with
+                                    // "XKB: Failed to compile keymap" because the forked xkbcomp child
+                                    // never runs under the in-process loader). Enable ALR's in-process
+                                    // exec re-entry (same flag the chromium launches use) so the
+                                    // exec(xkbcomp) is re-launched in-process and the keymap compiles.
+                                    android.system.Os.setenv("ALR_REEXEC_INPROC", "1", true)
                                     // Start the ROOTFUL X server on its OWN thread (it is a
                                     // persistent wl client — it does not exit). argv (verified vs
                                     // Xwayland(1)): `:0 -shm -geometry WxH`. DISPLAY :0; -shm = the
@@ -2230,12 +2255,15 @@ class MainActivity : Activity() {
             // and ANGLE dlopen()s these as the "system" EGL/GLES; with the GPU ring
             // attached (loader, gated on ALR_GPU_ACCEL=1) they drive the host Mali
             // executor (the same shim that scored glmark2-es2 1074 on-device).
-            // vk-icd: the guest Vulkan ICD overlay (/usr/lib/androlinux/libvulkan.so.1 +
-            // unversioned symlink + alr_icd.json manifest). A guest launched with
-            // ALR_VK_ICD=1 binds it as libvulkan and marshals to real Mali over the VK
-            // ring (alr_gpu/guest_icd/, host servicer alr_gpu_vk_host_service.hpp). Built
-            // by tools/build_vk_icd_overlay.py -> /data/local/tmp/vk-icd-stage.tar.
-            for (name in listOf("interpose", "nss", "chromium-net", "xkb-gegl", "gpushim", "vk-icd", "chromium-gui")) {
+            // vk-icd + vk-loader (GPU Part B — ICD discovery redirect): the guest Mali ICD
+            // overlay ships /usr/lib/androlinux/libalr_mali_icd.so (RENAMED from libvulkan.so.1);
+            // the vk-loader overlay ships the REAL Khronos Vulkan-Loader at
+            // /usr/lib/androlinux/libvulkan.so.1 + the alr_icd.json manifest pointing at our ICD.
+            // ANGLE (chromium --use-angle) dlopen("libvulkan.so.1") → interposer redirect →
+            // Khronos loader → alr_icd.json → libalr_mali_icd.so → real Mali over the VK ring
+            // (alr_gpu/guest_icd/, host servicer alr_gpu_vk_host_service.hpp). Built by
+            // tools/build_vk_icd_overlay.py + tools/build_vk_loader_overlay.py.
+            for (name in listOf("interpose", "nss", "chromium-net", "xkb-gegl", "gpushim", "vk-icd", "vk-loader", "chromium-gui")) {
                 try {
                     val tar = File("/data/local/tmp/$name-stage.tar")
                     val marker = File(rootfsDir, ".$name-staged-${tar.length()}")
@@ -3300,21 +3328,29 @@ class MainActivity : Activity() {
         if (!java.io.File("/data/local/tmp/.alr-angle").isFile) return
         Thread {
             try {
-                // The vk-icd overlay (our guest libvulkan.so.1 ICD) only auto-stages on the
-                // cronly path; the ANGLE proof runs in the normal flow, so stage it HERE
-                // (marker-guarded, idempotent) — ANGLE's Vulkan backend dlopens libvulkan.so.1
-                // and fails its RendererVk init if the ICD isn't present.
-                try {
-                    val icdTar = java.io.File("/data/local/tmp/vk-icd-stage.tar")
-                    val icdMarker = java.io.File(rootfsDir, ".vk-icd-staged-${icdTar.length()}")
-                    if (icdTar.isFile && !icdMarker.isFile) {
-                        val ovr = RootfsInstaller(this@MainActivity).extractOverlayTar(icdTar, rootfsDir)
-                        icdMarker.writeText("staged\n")
-                        android.util.Log.i("alr_loader", "angle-gles: vk-icd staged (extracted=${ovr.extracted} skipped=${ovr.skipped.size})")
+                // GPU Part B — ICD discovery redirect. ANGLE dlopens "libvulkan.so.1"; the
+                // interposer redirects that to OUR staged Khronos Vulkan-Loader, which reads
+                // alr_icd.json and loads our RENAMED Mali ICD. So two overlays must be on disk:
+                //   vk-loader → /usr/lib/androlinux/libvulkan.so.1 (Khronos loader) + alr_icd.json
+                //   vk-icd    → /usr/lib/androlinux/libalr_mali_icd.so (our renamed Mali ICD)
+                // Both only auto-stage on the cronly path; the ANGLE proof runs in the normal
+                // flow, so stage BOTH here (marker-guarded, idempotent). The vk-loader overlay
+                // also rides the .alr-angle staging thread above; double-staging is a no-op.
+                fun stageOverlay(name: String) {
+                    try {
+                        val tar = java.io.File("/data/local/tmp/$name-stage.tar")
+                        val mk = java.io.File(rootfsDir, ".$name-staged-${tar.length()}")
+                        if (tar.isFile && !mk.isFile) {
+                            val ovr = RootfsInstaller(this@MainActivity).extractOverlayTar(tar, rootfsDir)
+                            mk.writeText("staged\n")
+                            android.util.Log.i("alr_loader", "angle-gles: $name staged (extracted=${ovr.extracted} skipped=${ovr.skipped.size})")
+                        }
+                    } catch (e: Throwable) {
+                        android.util.Log.e("alr_loader", "angle-gles: $name stage EXC: ${android.util.Log.getStackTraceString(e)}")
                     }
-                } catch (e: Throwable) {
-                    android.util.Log.e("alr_loader", "angle-gles: vk-icd stage EXC: ${android.util.Log.getStackTraceString(e)}")
                 }
+                stageOverlay("vk-icd")
+                stageOverlay("vk-loader")
                 // Wait (bounded) for the angle overlay to finish staging into
                 // /usr/lib/androlinux-angle (its marker is written by the angle-stage thread)
                 // AND for the cube binary it ships to land, so we never race the extract.
@@ -3325,18 +3361,19 @@ class MainActivity : Activity() {
                 val vkBin = java.io.File(rootfsDir, "usr/bin/alr-angle-vk")
                 val cubeBin = java.io.File(rootfsDir, "usr/bin/alr-gles-cube")
                 val angleGles = java.io.File(rootfsDir, "usr/lib/androlinux-angle/libGLESv2.so.2")
-                // CRUCIAL: also wait for the vk-icd overlay (our guest libvulkan.so.1 ICD,
-                // staged by a concurrent thread) — ANGLE's Vulkan backend dlopens it, so if
-                // it's not on disk yet ANGLE fails its RendererVk init before reaching our ICD.
-                val icdLib = java.io.File(rootfsDir, "usr/lib/androlinux/libvulkan.so.1")
+                // CRUCIAL: wait for BOTH the Khronos loader (libvulkan.so.1, vk-loader overlay)
+                // and our renamed Mali ICD (libalr_mali_icd.so, vk-icd overlay) — ANGLE's
+                // dlopen("libvulkan.so.1") → loader → ICD chain needs both on disk first.
+                val loaderLib = java.io.File(rootfsDir, "usr/lib/androlinux/libvulkan.so.1")
+                val icdLib = java.io.File(rootfsDir, "usr/lib/androlinux/libalr_mali_icd.so")
                 var waited = 0
-                while (waited < 40000 && !(angleMarker.isFile && angleGles.isFile && icdLib.isFile && (vkBin.isFile || cubeBin.isFile))) {
+                while (waited < 40000 && !(angleMarker.isFile && angleGles.isFile && loaderLib.isFile && icdLib.isFile && (vkBin.isFile || cubeBin.isFile))) {
                     Thread.sleep(500); waited += 500
                 }
-                if (!(angleGles.isFile && icdLib.isFile && (vkBin.isFile || cubeBin.isFile))) {
+                if (!(angleGles.isFile && loaderLib.isFile && icdLib.isFile && (vkBin.isFile || cubeBin.isFile))) {
                     android.util.Log.w(
                         "alr_loader",
-                        "angle-gles: skipped (vk=${vkBin.isFile} cube=${cubeBin.isFile} angleGLES=${angleGles.isFile} icd=${icdLib.isFile} waited=${waited}ms)",
+                        "angle-gles: skipped (vk=${vkBin.isFile} cube=${cubeBin.isFile} angleGLES=${angleGles.isFile} loader=${loaderLib.isFile} icd=${icdLib.isFile} waited=${waited}ms)",
                     )
                     return@Thread
                 }
@@ -3350,6 +3387,10 @@ class MainActivity : Activity() {
                 android.system.Os.setenv("ALR_TEE_GUEST_STDOUT", "1", true)
                 android.system.Os.setenv("ALR_SHIM_DIAG", "1", true)
                 android.system.Os.setenv("VK_LOADER_DEBUG", "all", true)
+                // Part B: surface the interposer's dlopen-redirect diag ("dlopen
+                // vulkan->loader …") so a device run can prove whether ANGLE's
+                // dlopen("libvulkan.so.1") was rewritten to the staged Khronos loader.
+                android.system.Os.setenv("ALR_INTERPOSE_DIAG", "1", true)
                 // ALR_ICD_DIAG=1 is set by the loader under ALR_ANGLE, so our guest
                 // libvulkan.so.1 ICD emits its [alr-icd] per-entrypoint call trace.
                 fun runAngle(label: String, program: String) {
@@ -3377,6 +3418,7 @@ class MainActivity : Activity() {
                 android.system.Os.unsetenv("ALR_GPU_ACCEL")
                 android.system.Os.unsetenv("ALR_SHIM_DIAG")
                 android.system.Os.unsetenv("VK_LOADER_DEBUG")
+                android.system.Os.unsetenv("ALR_INTERPOSE_DIAG")
             } catch (e: Throwable) {
                 android.util.Log.e("alr_loader", "angle-gles EXC: ${android.util.Log.getStackTraceString(e)}")
             }

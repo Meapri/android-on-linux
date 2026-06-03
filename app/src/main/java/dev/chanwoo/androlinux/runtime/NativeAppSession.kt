@@ -261,9 +261,12 @@ class NativeAppSession internal constructor(
     private companion object {
         // Overlay tars a GUI guest may use (superset; only present ones are staged).
         // Mirrors runChromiumStandalone's staging set, minus chromium-only overlays.
-        // vk-icd ships the guest Vulkan ICD (libvulkan.so.1) the loader binds when a
-        // launch opts into ALR_VK_ICD=1; staged best-effort like the rest (no-op when
-        // its tar is absent), so a normal GUI launch is unaffected.
+        // vk-icd ships the guest Mali ICD (libalr_mali_icd.so, RENAMED from libvulkan.so.1)
+        // the loader binds when a launch opts into ALR_VK_ICD=1; vk-loader ships the real
+        // Khronos Vulkan-Loader (libvulkan.so.1) + alr_icd.json for the GPU Part B ICD
+        // discovery redirect (ANGLE dlopen("libvulkan.so.1") → loader → our ICD). Both are
+        // distinct files in /usr/lib/androlinux (no collision); staged best-effort like the
+        // rest (no-op when their tars are absent), so a normal GUI launch is unaffected.
         //
         // NOTE: the ANGLE overlay (angle-stage.tar, a SYSTEM ANGLE libEGL.so.1/
         // libGLESv2.so.2 → /usr/lib/androlinux for the GL→Vulkan→our-ICD breadth path)
@@ -272,7 +275,7 @@ class NativeAppSession internal constructor(
         // ANGLE is an explicit OPT-IN gated on /data/local/tmp/.alr-angle in
         // MainActivity — never auto-staged here where it could shadow gpushim.
         private val OVERLAY_NAMES =
-            listOf("interpose", "nss", "xkb-gegl", "babl-gegl", "x11", "pulse", "vk-icd")
+            listOf("interpose", "nss", "xkb-gegl", "babl-gegl", "x11", "pulse", "vk-icd", "vk-loader")
 
         // The loader report's status line, e.g. "alr native loader child exit=0 signal=0".
         private val SIGNAL_RE = Regex("""child exit=(-?\d+) signal=(\d+)""")
