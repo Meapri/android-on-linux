@@ -1968,6 +1968,13 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
             guest_env.push_back(std::string("ALR_ICD_DIAG=") + icd_diag);
         else if (angle_requested)
             guest_env.push_back("ALR_ICD_DIAG=1");
+        // ALR_ICD_TRAP (codegen device-iterate diagnostic): under it our guest ICD hands
+        // ANGLE a logging trampoline for any unimplemented device fn it CALLS (instead of
+        // NULL), turning the silent NULL-deref crash into an [alr-icd] "TRAP CALLED <name>"
+        // trace of ANGLE's real call order. Forwarded only if the host set it (default-off;
+        // no-regression runs never see it).
+        if (const char* icd_trap = ::getenv("ALR_ICD_TRAP"))
+            guest_env.push_back(std::string("ALR_ICD_TRAP=") + icd_trap);
         // ICD DISCOVERY REDIRECT (Part B, the LOADER route): when the real Khronos
         // Vulkan-Loader is staged (vk-loader overlay → /usr/lib/androlinux/libvulkan.so.1)
         // and ANGLE/volk dlopens "libvulkan.so.1", the loader discovers our (renamed) Mali

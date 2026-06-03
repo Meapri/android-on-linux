@@ -3554,6 +3554,12 @@ class MainActivity : Activity() {
                 android.system.Os.setenv("ALR_TEE_GUEST_STDOUT", "1", true)
                 android.system.Os.setenv("ALR_SHIM_DIAG", "1", true)
                 android.system.Os.setenv("VK_LOADER_DEBUG", "all", true)
+                // DIAGNOSTIC (codegen device-iterate): hand ANGLE a logging trampoline for
+                // any unimplemented device fn it CALLS (instead of NULL), so the guest's
+                // [alr-icd] "TRAP CALLED <name>" trace reveals the exact next entrypoint to
+                // implement rather than ANGLE crashing on a NULL fn pointer. ICD-side gated
+                // on ALR_ICD_TRAP; strictly diagnostic, default-off everywhere else.
+                android.system.Os.setenv("ALR_ICD_TRAP", "1", true)
                 // Part B: surface the interposer's dlopen-redirect diag ("dlopen
                 // vulkan->loader …") so a device run can prove whether ANGLE's
                 // dlopen("libvulkan.so.1") was rewritten to the staged Khronos loader.

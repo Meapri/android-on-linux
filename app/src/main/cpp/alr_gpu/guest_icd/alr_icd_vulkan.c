@@ -135,6 +135,30 @@ static uint32_t g_next_vbuf    = 7000000;
 static uint32_t g_next_vimg    = 8000000;
 static uint32_t g_next_vview   = 8500000;
 static uint32_t g_next_vmem    = 9000000;
+/* WAVE A generated create-resource virtual-id pools (shader module / pipeline cache /
+ * sampler / fence / semaphore / event / query pool). Disjoint high ranges so a stray id is
+ * diagnosable; referenced by the generated ICD entrypoints (alr_gpu_vk_gen_icd.inc). Note
+ * g_next_vshader (5000) is the HAND-WRITTEN 218-band shader module — distinct from the
+ * generated g_next_vshmod, so the two shader-module paths never alias a virtual id. */
+/* g_next_vshmod: the generated shader-module create is in ICD_SKIP (hand-written on the
+ * 218 band), so the generated ICD function that would consume this counter is not emitted.
+ * Kept (with the other WAVE A counters) for a uniform pool layout + so a future un-skip
+ * needs no new counter; marked unused so -Werror builds stay green. */
+__attribute__((unused)) static uint32_t g_next_vshmod  = 10000000;
+static uint32_t g_next_vpcache = 11000000;
+static uint32_t g_next_vsamp   = 12000000;
+static uint32_t g_next_vfence  = 13000000;
+static uint32_t g_next_vsem    = 14000000;
+static uint32_t g_next_vevent  = 15000000;
+static uint32_t g_next_vqpool  = 16000000;
+/* WAVE B generated descriptor/layout virtual-id pools. */
+static uint32_t g_next_vdsl     = 17000000;
+static uint32_t g_next_vplayout = 18000000;
+static uint32_t g_next_vdpool   = 19000000;
+static uint32_t g_next_vdset    = 20000000;
+/* WAVE C generated render-pass / framebuffer virtual-id pools. */
+static uint32_t g_next_vrpass   = 21000000;
+static uint32_t g_next_vfb      = 22000000;
 /* The vcmd of the most recent coarse draw-record (alrVkCmdDrawTriangleModules). The
  * single-surface bring-up records then presents, so QUEUE_PRESENT (which keys the host's
  * recorded draw by vcmd) uses this. A multi-surface breadth rung carries vcmd explicitly
@@ -1356,6 +1380,79 @@ static PFN_vkVoidFunction VKAPI_CALL alr_vkGetInstanceProcAddr(VkInstance instan
     return alr_lookup(pName);
 }
 
+/* ---- DIAGNOSTIC TRAP POOL (gated on ALR_ICD_TRAP=1) -----------------------------------
+ * ANGLE's volk resolves the ENTIRE device dispatch table up front (one vkGetDeviceProcAddr
+ * per known function), so the resolution log can't tell us which UNIMPLEMENTED function it
+ * actually CALLS first (it crashes on the NULL pointer with no further trace). To find the
+ * real wall, under ALR_ICD_TRAP we hand back — instead of NULL — a per-name trampoline that
+ * LOGS "[alr-icd] TRAP CALLED <name>" the first time it is invoked and returns 0
+ * (== VK_SUCCESS for a VkResult fn; a NULL handle / no-op for the rest). That turns the
+ * silent crash into an ordered trace of the device functions ANGLE genuinely uses, so the
+ * next entrypoints to implement are read off directly. OFF by default (returns NULL — the
+ * correct GDPA answer), so it never perturbs the no-regression path. ---- */
+#define ALR_TRAP_POOL 128
+static const char *g_trap_names[ALR_TRAP_POOL];
+static int         g_trap_count = 0;
+static int         g_trap_fired[ALR_TRAP_POOL];
+static pthread_mutex_t g_trap_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int alr_icd_trap_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("ALR_ICD_TRAP"); v = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    return v;
+}
+/* The shared trampoline body: log this slot's name once, return 0. Variadic so it matches
+ * any Vulkan calling convention on AArch64 (args are ignored; we only need the LOG). */
+static uintptr_t alr_trap_body(int slot) {
+    if (slot >= 0 && slot < ALR_TRAP_POOL) {
+        /* Log the first few invocations per name (count in g_trap_fired) so a hot loop
+         * doesn't flood the log but a repeated call is still visible. */
+        if (g_trap_fired[slot] < 3) {
+            g_trap_fired[slot]++;
+            ALR_ICD_DIAG("TRAP CALLED %s (unimplemented device fn ANGLE invoked; call #%d)",
+                         g_trap_names[slot] ? g_trap_names[slot] : "?", g_trap_fired[slot]);
+        }
+    }
+    return 0;
+}
+/* 128 distinct entry points, each bound to its slot index, all funneling to alr_trap_body.
+ * Generated with a macro so the pool is compact + maintainable. */
+#define ALR_TRAP_FN(n) static uintptr_t alr_trap_##n(void) { return alr_trap_body(n); }
+#define ALR_TRAP_FN8(b) ALR_TRAP_FN(b##0) ALR_TRAP_FN(b##1) ALR_TRAP_FN(b##2) ALR_TRAP_FN(b##3) \
+                        ALR_TRAP_FN(b##4) ALR_TRAP_FN(b##5) ALR_TRAP_FN(b##6) ALR_TRAP_FN(b##7)
+/* slots 0..127 */
+ALR_TRAP_FN8(0) ALR_TRAP_FN8(1) ALR_TRAP_FN8(2) ALR_TRAP_FN8(3) ALR_TRAP_FN8(4) ALR_TRAP_FN8(5)
+ALR_TRAP_FN8(6) ALR_TRAP_FN8(7) ALR_TRAP_FN8(8) ALR_TRAP_FN8(9) ALR_TRAP_FN8(10) ALR_TRAP_FN8(11)
+ALR_TRAP_FN8(12) ALR_TRAP_FN8(13) ALR_TRAP_FN8(14) ALR_TRAP_FN8(15)
+#undef ALR_TRAP_FN8
+#undef ALR_TRAP_FN
+#define ALR_TRAP_PTR(n) (PFN_vkVoidFunction)alr_trap_##n
+static const PFN_vkVoidFunction g_trap_fns[ALR_TRAP_POOL] = {
+#define ALR_TRAP_ROW8(b) ALR_TRAP_PTR(b##0), ALR_TRAP_PTR(b##1), ALR_TRAP_PTR(b##2), \
+    ALR_TRAP_PTR(b##3), ALR_TRAP_PTR(b##4), ALR_TRAP_PTR(b##5), ALR_TRAP_PTR(b##6), ALR_TRAP_PTR(b##7),
+    ALR_TRAP_ROW8(0) ALR_TRAP_ROW8(1) ALR_TRAP_ROW8(2) ALR_TRAP_ROW8(3) ALR_TRAP_ROW8(4)
+    ALR_TRAP_ROW8(5) ALR_TRAP_ROW8(6) ALR_TRAP_ROW8(7) ALR_TRAP_ROW8(8) ALR_TRAP_ROW8(9)
+    ALR_TRAP_ROW8(10) ALR_TRAP_ROW8(11) ALR_TRAP_ROW8(12) ALR_TRAP_ROW8(13) ALR_TRAP_ROW8(14)
+    ALR_TRAP_ROW8(15)
+#undef ALR_TRAP_ROW8
+#undef ALR_TRAP_PTR
+};
+/* Resolve (or assign) a trap trampoline for an unimplemented `pName`. The name string comes
+ * from the loader's static table (stable lifetime), so we store the pointer directly. */
+static PFN_vkVoidFunction alr_icd_trap_for(const char *pName) {
+    int i, slot = -1;
+    if (!pName) return NULL;
+    pthread_mutex_lock(&g_trap_lock);
+    for (i = 0; i < g_trap_count; ++i)
+        if (g_trap_names[i] && strcmp(g_trap_names[i], pName) == 0) { slot = i; break; }
+    if (slot < 0 && g_trap_count < ALR_TRAP_POOL) {
+        slot = g_trap_count++;
+        g_trap_names[slot] = pName;  /* loader table string: stable */
+    }
+    pthread_mutex_unlock(&g_trap_lock);
+    return (slot >= 0) ? g_trap_fns[slot] : NULL;
+}
+
 static PFN_vkVoidFunction VKAPI_CALL alr_vkGetDeviceProcAddr(VkDevice device,
                                                              const char *pName) {
     (void)device;
@@ -1363,7 +1460,16 @@ static PFN_vkVoidFunction VKAPI_CALL alr_vkGetDeviceProcAddr(VkDevice device,
     /* Log device-fn resolution so a device run sees the LAST entrypoint ANGLE's RendererVk
      * resolves before it stops — and crucially which ones we return NULL for (the next
      * passthrough entrypoints to implement; ANGLE may call a NULL device fn). */
-    if (!fn) ALR_ICD_DIAG("vkGetDeviceProcAddr(%s) -> NULL (unimplemented)", pName ? pName : "?");
+    if (!fn) {
+        ALR_ICD_DIAG("vkGetDeviceProcAddr(%s) -> NULL (unimplemented)", pName ? pName : "?");
+        /* Under ALR_ICD_TRAP, hand back a logging trampoline instead of NULL so a CALL to
+         * this unimplemented fn is traced (revealing ANGLE's real call order) rather than
+         * crashing silently. Strictly diagnostic; default path is unchanged (NULL). */
+        if (alr_icd_trap_on()) {
+            PFN_vkVoidFunction trap = alr_icd_trap_for(pName);
+            if (trap) return trap;
+        }
+    }
     return fn;
 }
 
