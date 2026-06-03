@@ -86,6 +86,7 @@
 
 #ifdef ALR_HAVE_WAYLAND
 #include "alr_wayland/alr_compositor.hpp"
+#include "alr_wayland/alr_present_source.hpp"  // §5-C present sink (VK-M4 swapchain present)
 #include "alr_wayland/alr_text_input.hpp"  // Android IME <-> guest text-input bridge
 #endif
 
@@ -1835,6 +1836,22 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     alr::gpu::VkRing vk_ring{};
     bool vk_ring_attached = false;
     if (vk_icd_requested) {
+#ifdef ALR_HAVE_WAYLAND
+        // VK-M4 (PRESENT rung): route a presented swapchain AHB to the in-app Wayland
+        // compositor (zero-copy onto the SurfaceView), so a guest Vulkan app's
+        // vkQueuePresentKHR makes a window appear. The decode's QUEUE_PRESENT calls this
+        // sink (alr::gpu::vk_present_sink) on the servicer thread; install it BEFORE
+        // attach (which starts that thread). The sink forwards to WS-3's §5-C entry; it
+        // returns whether the compositor is ready to actually composite GPU frames (so a
+        // device without the EGL/GL ext keeps degrading rather than claiming present).
+        // (Wayland-less builds — e.g. armeabi-v7a — leave the sink null; present then
+        // renders + reads back but isn't displayed, which is the conformant degrade.)
+        alr::gpu::set_vk_present_sink([](void* ahb, int w, int h, uint64_t serial) -> bool {
+            if (!ahb || w <= 0 || h <= 0) return false;
+            alr::wayland::alr_wayland_submit_gpu_frame(ahb, w, h, serial);
+            return alr::wayland::alr_wayland_gpu_present_ready();
+        });
+#endif  // ALR_HAVE_WAYLAND
         if (alr::gpu::alr_loader_attach_vk_ring(vk_ring)) {
             vk_ring_attached = true;
             for (const auto& kv : alr::gpu::vk_ring_guest_env(vk_ring))
@@ -7428,6 +7445,23 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeAlrGpuVkIcdServiceProbe(
     jobject /* thiz */) {
     const auto report = alr::gpu::run_vk_icd_servicer_probe();
     __android_log_print(ANDROID_LOG_INFO, "alr_loader", "vk-icd-service:\n%s", report.c_str());
+    return env->NewStringUTF(report.c_str());
+}
+
+// VK-M4 (guest Vulkan ICD PRESENT rung): HOST-side self-test of guest-supplied SPIR-V
+// over the wire (CREATE_SHADER_MODULE) + an AHB-backed swapchain whose QUEUE_PRESENT
+// routes the rendered image to the compositor sink. A host producer emits the SAME
+// VK-M4 batch a guest Vulkan triangle app emits; the servicer replays it on real Mali,
+// and the reply is decoded to assert the GUEST's fragment shader produced the expected
+// center-pixel color into the swapchain image (proof the guest's own SPIR-V ran on Mali
+// AND was handed to present). Gating line: "ALR VK ICD PRESENT: PASS". The forked-guest
+// end-to-end (a window on the SurfaceView) is the alr-vk-tri device test.
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeAlrGpuVkIcdPresentProbe(
+    JNIEnv* env,
+    jobject /* thiz */) {
+    const auto report = alr::gpu::run_vk_icd_present_probe();
+    __android_log_print(ANDROID_LOG_INFO, "alr_loader", "vk-icd-present:\n%s", report.c_str());
     return env->NewStringUTF(report.c_str());
 }
 

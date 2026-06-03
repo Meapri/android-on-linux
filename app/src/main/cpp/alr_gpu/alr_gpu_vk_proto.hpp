@@ -119,8 +119,67 @@ enum AlrVkOp {
     // render-pass / graphics-pipeline / vertex-buffer / bind / draw path on real Mali.
     // A later step promotes the SPIR-V + vertex data to wire blobs (CREATE_SHADER_MODULE
     // / CREATE_BUFFER ops) — the op number space below 230 is reserved for them.
-    ALR_VK_OP_CMD_BEGIN_DRAW = 217
+    ALR_VK_OP_CMD_BEGIN_DRAW = 217,
     //   u32 vdev, u32 vcmd, u32 width, u32 height, f32 bg_r, f32 bg_g, f32 bg_b, f32 bg_a
+
+    // ======================================================================
+    // VK-M4 (PRESENT rung): GUEST-SUPPLIED SPIR-V + an AHB-backed swapchain that
+    // routes the rendered image to the in-app Wayland compositor (a wl_surface on
+    // the SurfaceView). This closes the loop from "Mali ran a draw" (VK-M3) to "a
+    // REAL guest Vulkan app's OWN shaders rendered AND a window appeared on screen".
+    // Numbers stay in the reserved <230 SPIR-V/swapchain band (proto §VK-M3 note).
+    // ======================================================================
+
+    // Upload the guest's OWN SPIR-V blob for a shader module, bound to virtual id
+    // `vshader` on `vdev`. The host vkCreateShaderModule's it on real Mali (so the
+    // guest app's shaders run on the GPU — not the host-embedded triangle SPIR-V).
+    // No round-trip needed to *create* (client-side virtual id); the VkResult comes
+    // back in ALR_VK_REPLY_SHADER so the guest can fail a bad blob. `stage` is the
+    // VkShaderStageFlagBits the module is for (advisory; the pipeline stage binds it).
+    ALR_VK_OP_CREATE_SHADER_MODULE = 218,
+    //   u32 vdev, u32 vshader, u32 stage, blob spirv   (spirv = u32 byte-len + bytes)
+
+    // Create an AHB-backed swapchain `vswapchain` on `vdev` of `width`×`height` with
+    // `image_count` images. Each swapchain image IS an AHB COLOR_ATTACHMENT render
+    // target the host owns (the proven round7 AHB image), so a present can route the
+    // AHB to the compositor zero-copy. No real VkSurface/VK_KHR_swapchain is created
+    // on Mali — the ICD's swapchain is a thin host-side rotation of AHB targets whose
+    // present hands the finished AHB to the in-app compositor (the device has no
+    // on-screen VkSurface; the Android SurfaceView is reached via the compositor).
+    ALR_VK_OP_CREATE_SWAPCHAIN = 219,
+    //   u32 vdev, u32 vswapchain, u32 width, u32 height, u32 image_count
+
+    // Destroy the shader module `vshader` (releases the host's real VkShaderModule).
+    ALR_VK_OP_DESTROY_SHADER_MODULE = 225,  // u32 vdev, u32 vshader
+
+    // Acquire the next swapchain image index from `vswapchain`. The host rotates its
+    // AHB ring and returns the index in ALR_VK_REPLY_ACQUIRE (round-trip: the guest
+    // needs the index before recording into that image).
+    ALR_VK_OP_ACQUIRE_NEXT_IMAGE = 226,  // u32 vdev, u32 vswapchain
+
+    // Record a clear-to-background + one-triangle DRAW that uses the GUEST'S shader
+    // modules (`vvert`/`vfrag`, previously CREATE_SHADER_MODULE'd) into swapchain
+    // image `image_index` of `vswapchain` on `vdev`, into command buffer `vcmd`. This
+    // is the VK-M3 CMD_BEGIN_DRAW promoted to (a) the guest's own SPIR-V and (b) a
+    // swapchain render target (vs. a throwaway AHB). The matching QUEUE_PRESENT routes
+    // the result to the compositor. The triangle's NDC vertices come from the host's
+    // proven vertex buffer (kAlrVkTriVerts) so the guest's vert shader must take a
+    // vec2 at location 0 (the bring-up contract; a later rung ships vertices on wire).
+    ALR_VK_OP_CMD_BEGIN_DRAW_MODULES = 227,
+    //   u32 vdev, u32 vcmd, u32 vswapchain, u32 image_index, u32 vvert, u32 vfrag,
+    //   u32 width, u32 height, f32 bg_r, f32 bg_g, f32 bg_b, f32 bg_a
+
+    // Submit `vcmd` (recorded by CMD_BEGIN_DRAW_MODULES) on `vqueue`, wait for the
+    // GPU, then PRESENT swapchain image `image_index` of `vswapchain`: the host routes
+    // that image's AHB to the in-app Wayland compositor (alr_wayland_submit_gpu_frame),
+    // which composites it onto the SurfaceView as a wl_surface. The center-pixel
+    // readback still comes back (ALR_VK_REPLY_PRESENT) so a HEADLESS host self-test can
+    // assert the guest's shader produced the expected color without a display.
+    ALR_VK_OP_QUEUE_PRESENT = 228,
+    //   u32 vdev, u32 vqueue, u32 vcmd, u32 vswapchain, u32 image_index
+
+    // Destroy the swapchain `vswapchain` (frees its AHB image ring).
+    ALR_VK_OP_DESTROY_SWAPCHAIN = 229  // u32 vdev, u32 vswapchain
 };
 
 // ---- Reply record opcodes (host -> guest), carried in the reply blob. The reply is
@@ -158,12 +217,36 @@ enum AlrVkReply {
     // center pixel (so the guest verifies the GPU clear landed). The render result is
     // a separate code (0 == the whole device->submit chain succeeded; non-zero = the
     // host-side stage that failed, see AlrVkRenderResult).
-    ALR_VK_REPLY_SUBMIT = 224
+    ALR_VK_REPLY_SUBMIT = 224,
     //   u32 vdev
     //   u32 vcmd
     //   i32 submit_result        (VkResult of vkQueueSubmit; 0 == VK_SUCCESS)
     //   i32 render_result        (AlrVkRenderResult; 0 == clear rendered + read back)
     //   u8  px_r, px_g, px_b, px_a  (center pixel of the cleared target, 0..255)
+
+    // ---- VK-M4 (PRESENT rung) replies ----
+    // result of CREATE_SHADER_MODULE: the VkResult of vkCreateShaderModule on Mali.
+    ALR_VK_REPLY_SHADER = 225,  // u32 vshader, i32 vk_result
+
+    // result of CREATE_SWAPCHAIN: the VkResult + the image count the host actually
+    // allocated (it may clamp the request to its AHB ring capacity).
+    ALR_VK_REPLY_SWAPCHAIN = 226,  // u32 vswapchain, i32 vk_result, u32 image_count
+
+    // result of ACQUIRE_NEXT_IMAGE: the acquired image index (and VkResult). The guest
+    // records into / presents this index.
+    ALR_VK_REPLY_ACQUIRE = 227,  // u32 vswapchain, u32 image_index, i32 vk_result
+
+    // result of QUEUE_PRESENT: the submit+present VkResult, the render-path outcome,
+    // and the center pixel of the presented image (so a headless self-test asserts the
+    // guest shader's color even with no display). `presented` is 1 if the AHB was
+    // actually handed to the compositor sink (0 if no sink wired — still a valid render).
+    ALR_VK_REPLY_PRESENT = 228
+    //   u32 vswapchain
+    //   u32 image_index
+    //   i32 submit_result        (VkResult; 0 == VK_SUCCESS)
+    //   i32 render_result        (AlrVkRenderResult; 0 == drew + read back)
+    //   u8  presented            (1 if routed to the compositor sink)
+    //   u8  px_r, px_g, px_b, px_a   (center pixel of the presented image, 0..255)
 };
 
 // Host-side render-path outcome carried in ALR_VK_REPLY_SUBMIT::render_result. 0 means
@@ -178,8 +261,11 @@ enum AlrVkRenderResult {
     ALR_VK_RENDER_READBACK = 5,          // could not read the target back on the CPU
     ALR_VK_RENDER_NO_CLEAR_RECORDED = 6, // submit with no prior CMD_BEGIN_CLEAR
     // ---- VK-M3 draw-breadth stages (the bare-clear path never returns these) ----
-    ALR_VK_RENDER_PIPELINE = 7           // shader-module / pipeline-layout / vertex-buffer
+    ALR_VK_RENDER_PIPELINE = 7,          // shader-module / pipeline-layout / vertex-buffer
                                          // / graphics-pipeline create failed (DRAW path)
+    // ---- VK-M4 present stages ----
+    ALR_VK_RENDER_NO_SWAPCHAIN = 8,      // vswapchain / image_index not known to the host
+    ALR_VK_RENDER_NO_SHADER = 9          // a referenced guest shader module id was unknown
 };
 
 // VkPhysicalDeviceType mirror (so the guest/self-test can name the type without
@@ -319,6 +405,80 @@ static inline void alr_vk_enc_queue_submit(AlrVkEncoder *e, uint32_t vdev,
 static inline void alr_vk_enc_destroy_device(AlrVkEncoder *e, uint32_t vdev) {
     alr_vk_enc_u8(e, (uint8_t)ALR_VK_OP_DESTROY_DEVICE);
     alr_vk_enc_u32(e, vdev);
+}
+
+/* ---- VK-M4 (PRESENT rung) request builders ---- */
+/* Upload the guest's own SPIR-V (spirv_bytes/spirv_len) as shader module `vshader`. */
+static inline void alr_vk_enc_create_shader_module(AlrVkEncoder *e, uint32_t vdev,
+                                                   uint32_t vshader, uint32_t stage,
+                                                   const void *spirv_bytes,
+                                                   uint32_t spirv_len) {
+    alr_vk_enc_u8(e, (uint8_t)ALR_VK_OP_CREATE_SHADER_MODULE);
+    alr_vk_enc_u32(e, vdev);
+    alr_vk_enc_u32(e, vshader);
+    alr_vk_enc_u32(e, stage);
+    alr_vk_enc_blob(e, spirv_bytes, spirv_len);
+}
+static inline void alr_vk_enc_destroy_shader_module(AlrVkEncoder *e, uint32_t vdev,
+                                                    uint32_t vshader) {
+    alr_vk_enc_u8(e, (uint8_t)ALR_VK_OP_DESTROY_SHADER_MODULE);
+    alr_vk_enc_u32(e, vdev);
+    alr_vk_enc_u32(e, vshader);
+}
+static inline void alr_vk_enc_create_swapchain(AlrVkEncoder *e, uint32_t vdev,
+                                               uint32_t vswapchain, uint32_t width,
+                                               uint32_t height, uint32_t image_count) {
+    alr_vk_enc_u8(e, (uint8_t)ALR_VK_OP_CREATE_SWAPCHAIN);
+    alr_vk_enc_u32(e, vdev);
+    alr_vk_enc_u32(e, vswapchain);
+    alr_vk_enc_u32(e, width);
+    alr_vk_enc_u32(e, height);
+    alr_vk_enc_u32(e, image_count);
+}
+static inline void alr_vk_enc_destroy_swapchain(AlrVkEncoder *e, uint32_t vdev,
+                                                uint32_t vswapchain) {
+    alr_vk_enc_u8(e, (uint8_t)ALR_VK_OP_DESTROY_SWAPCHAIN);
+    alr_vk_enc_u32(e, vdev);
+    alr_vk_enc_u32(e, vswapchain);
+}
+static inline void alr_vk_enc_acquire_next_image(AlrVkEncoder *e, uint32_t vdev,
+                                                 uint32_t vswapchain) {
+    alr_vk_enc_u8(e, (uint8_t)ALR_VK_OP_ACQUIRE_NEXT_IMAGE);
+    alr_vk_enc_u32(e, vdev);
+    alr_vk_enc_u32(e, vswapchain);
+}
+/* Record a clear-bg + triangle DRAW using the guest's own shader modules into the
+ * swapchain image `image_index`. f32×4 is the background clear color. */
+static inline void alr_vk_enc_cmd_begin_draw_modules(AlrVkEncoder *e, uint32_t vdev,
+                                                     uint32_t vcmd, uint32_t vswapchain,
+                                                     uint32_t image_index, uint32_t vvert,
+                                                     uint32_t vfrag, uint32_t width,
+                                                     uint32_t height, float bg_r,
+                                                     float bg_g, float bg_b, float bg_a) {
+    alr_vk_enc_u8(e, (uint8_t)ALR_VK_OP_CMD_BEGIN_DRAW_MODULES);
+    alr_vk_enc_u32(e, vdev);
+    alr_vk_enc_u32(e, vcmd);
+    alr_vk_enc_u32(e, vswapchain);
+    alr_vk_enc_u32(e, image_index);
+    alr_vk_enc_u32(e, vvert);
+    alr_vk_enc_u32(e, vfrag);
+    alr_vk_enc_u32(e, width);
+    alr_vk_enc_u32(e, height);
+    alr_vk_enc_f32(e, bg_r);
+    alr_vk_enc_f32(e, bg_g);
+    alr_vk_enc_f32(e, bg_b);
+    alr_vk_enc_f32(e, bg_a);
+}
+/* Submit `vcmd` + present swapchain image `image_index` (route its AHB to the compositor). */
+static inline void alr_vk_enc_queue_present(AlrVkEncoder *e, uint32_t vdev, uint32_t vqueue,
+                                            uint32_t vcmd, uint32_t vswapchain,
+                                            uint32_t image_index) {
+    alr_vk_enc_u8(e, (uint8_t)ALR_VK_OP_QUEUE_PRESENT);
+    alr_vk_enc_u32(e, vdev);
+    alr_vk_enc_u32(e, vqueue);
+    alr_vk_enc_u32(e, vcmd);
+    alr_vk_enc_u32(e, vswapchain);
+    alr_vk_enc_u32(e, image_index);
 }
 
 /* aarch64-linux-gnu (the guest target) is little-endian, so the memcpy-of-native

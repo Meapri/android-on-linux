@@ -135,7 +135,37 @@ struct VkClearRecord {
     uint32_t width = 0;
     uint32_t height = 0;
     float clear[4] = {0, 0, 0, 0};  // RGBA, 0..1 (the DRAW's background when is_draw)
+
+    // ---- VK-M4 (PRESENT rung): a clear+draw that uses the GUEST'S own shader modules
+    // and renders into a swapchain image (vs. VK-M3's host-embedded SPIR-V + throwaway
+    // AHB). When is_present_draw, QUEUE_PRESENT runs vk_real_draw_present (guest shaders
+    // -> swapchain AHB -> compositor) instead of vk_real_draw_submit. ----
+    bool is_present_draw = false;
+    uint32_t vswapchain = 0;
+    uint32_t image_index = 0;
+    uint32_t vvert = 0;       // guest vertex shader-module virtual id
+    uint32_t vfrag = 0;       // guest fragment shader-module virtual id
 };
+
+// ---------------------------------------------------------------------------
+// VK-M4 present sink — how the host routes a finished swapchain AHB to the on-screen
+// compositor WITHOUT this decode header depending on alr_wayland/**. The host servicer
+// (alr_gpu_vk_host_service.hpp) installs a sink that forwards to
+// alr::wayland::alr_wayland_submit_gpu_frame; a headless self-test leaves it null (the
+// present still renders + reads back, just isn't displayed). The AHardwareBuffer* is
+// carried as void* so this declaration is header-compilable with no Android headers.
+//   ahb    : the finished swapchain image's AHardwareBuffer* (BORROWED for the call;
+//            the sink acquires its own ref if it retains it — matches §5-C contract).
+//   w / h  : pixel dimensions.  serial : monotonic present serial (pacing/debug).
+// Returns true if the frame was accepted by a real sink (1 -> ALR_VK_REPLY_PRESENT
+// presented=1). A null sink returns false (presented=0).
+// ---------------------------------------------------------------------------
+using VkPresentSink = bool (*)(void* ahb, int w, int h, uint64_t serial);
+inline VkPresentSink& vk_present_sink() {
+    static VkPresentSink sink = nullptr;
+    return sink;
+}
+inline void set_vk_present_sink(VkPresentSink s) { vk_present_sink() = s; }
 
 // The fixed triangle color the VK-M3 draw fragment shader emits (kAlrVkTri*Spv below).
 // MUST equal the vec4 constant baked into the fragment SPIR-V — the wire test + the host
@@ -231,8 +261,11 @@ struct VkDecodeState {
     std::map<uint32_t, bool> pools;                // vpool -> created
     std::map<uint32_t, bool> cmds;                 // vcmd -> allocated
     std::map<uint32_t, VkClearRecord> clears;      // vcmd -> pending clear record
+    std::map<uint32_t, uint32_t> swapchains;       // vswapchain -> image_count (wire-mode)
+    std::map<uint32_t, bool> shaders;              // vshader -> created (wire-mode)
     bool ok = true;
     int decoded = 0;  // request ops dispatched
+    uint64_t present_serial = 0;  // VK-M4: monotonic serial handed to the present sink
 
 #ifdef ALR_VK_DECODE_REAL
     std::map<uint32_t, VkInstance> real_inst;      // vinst -> real VkInstance
@@ -247,6 +280,28 @@ struct VkDecodeState {
     std::map<uint32_t, VkQueue> real_queue;        // vqueue -> queue
     std::map<uint32_t, std::pair<uint32_t, VkCommandPool>> real_pool;  // vpool -> (vdev, pool)
     std::map<uint32_t, std::pair<uint32_t, VkCommandBuffer>> real_cmd; // vcmd -> (vdev, cmd)
+
+    // ---- VK-M4 (PRESENT rung): guest-supplied shader modules + AHB-backed swapchains.
+    // A shader module is the guest's OWN SPIR-V vkCreateShaderModule'd on Mali. A
+    // swapchain owns a persistent ring of AHB COLOR_ATTACHMENT images (the proven
+    // round7 AHB target, kept alive across frames so a present can route an image's AHB
+    // to the compositor and acquire/present can rotate). ----
+    std::map<uint32_t, std::pair<uint32_t, VkShaderModule>> real_shader;  // vshader -> (vdev, mod)
+    struct SwapImage {
+        AHardwareBuffer* ahb = nullptr;   // the image's backing AHB (host owns one ref)
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory mem = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;
+    };
+    struct RealSwapchain {
+        uint32_t vdev = 0;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+        uint32_t next = 0;                // round-robin acquire cursor
+        std::vector<SwapImage> images;    // image ring (each an AHB color attachment)
+    };
+    std::map<uint32_t, RealSwapchain> real_swapchain;  // vswapchain -> AHB image ring
 #endif
 };
 
@@ -1074,6 +1129,528 @@ inline int vk_real_draw_submit(VkDecodeState& st, uint32_t vdev, uint32_t vqueue
     return ALR_VK_RENDER_OK;
 }
 
+// ===========================================================================
+// VK-M4 (PRESENT rung) — guest-supplied SPIR-V shader modules + an AHB-backed
+// swapchain whose images route to the in-app Wayland compositor.
+// ===========================================================================
+
+// Create the guest's OWN shader module from its SPIR-V blob on the real Mali device.
+// `spirv`/`spirv_len` is the raw blob the guest shipped over the wire. Returns the
+// VkResult; on success records st.real_shader[vshader]. We re-check the SPIR-V magic
+// + 4-byte alignment up front so a corrupt/odd blob fails diagnosably rather than UB
+// in the driver.
+inline VkResult vk_real_create_shader_module(VkDecodeState& st, uint32_t vdev,
+                                             uint32_t vshader, const uint8_t* spirv,
+                                             uint32_t spirv_len) {
+    auto dit = st.real_dev.find(vdev);
+    if (dit == st.real_dev.end()) return VK_ERROR_INITIALIZATION_FAILED;
+    if (spirv == nullptr || spirv_len < 8 || (spirv_len % 4) != 0)
+        return VK_ERROR_INITIALIZATION_FAILED;  // SPIR-V is a u32 word stream
+    uint32_t magic = 0;
+    std::memcpy(&magic, spirv, 4);
+    if (magic != 0x07230203u) return VK_ERROR_INITIALIZATION_FAILED;  // not SPIR-V
+    // vkCreateShaderModule requires pCode 4-byte aligned; the wire blob may not be, so
+    // copy into an aligned uint32 vector.
+    std::vector<uint32_t> words(spirv_len / 4);
+    std::memcpy(words.data(), spirv, spirv_len);
+    VkShaderModuleCreateInfo smci{};
+    smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    smci.codeSize = spirv_len;
+    smci.pCode = words.data();
+    VkShaderModule mod = VK_NULL_HANDLE;
+    VkResult r = vkCreateShaderModule(dit->second.dev, &smci, nullptr, &mod);
+    if (r == VK_SUCCESS) {
+        st.real_shader[vshader] = {vdev, mod};
+        st.shaders[vshader] = true;
+    }
+    return r;
+}
+
+inline void vk_real_destroy_shader_module(VkDecodeState& st, uint32_t vdev,
+                                          uint32_t vshader) {
+    auto sit = st.real_shader.find(vshader);
+    if (sit == st.real_shader.end()) return;
+    auto dit = st.real_dev.find(vdev);
+    if (dit != st.real_dev.end() && sit->second.second != VK_NULL_HANDLE)
+        vkDestroyShaderModule(dit->second.dev, sit->second.second, nullptr);
+    st.real_shader.erase(sit);
+    st.shaders.erase(vshader);
+}
+
+// Allocate ONE AHB-backed COLOR_ATTACHMENT image (the proven round7 target) into `out`,
+// on device `dev`/`phys`. GPU_FRAMEBUFFER | GPU_SAMPLED_IMAGE so the compositor can also
+// import it as a sampled external image; CPU_READ_OFTEN so a headless self-test reads
+// the center pixel back. Returns true on success; fills out.{ahb,image,mem,view}.
+// (No VkPhysicalDevice needed: AHB import derives its memory type from the AHB props'
+// memoryTypeBits, not vkGetPhysicalDeviceMemoryProperties.)
+inline bool vk_real_alloc_swap_image(VkDevice dev, uint32_t w,
+                                     uint32_t h, VkFormat& color_fmt,
+                                     VkDecodeState::SwapImage& out) {
+    auto p_ahb_props = reinterpret_cast<PFN_vkGetAndroidHardwareBufferPropertiesANDROID>(
+        vkGetDeviceProcAddr(dev, "vkGetAndroidHardwareBufferPropertiesANDROID"));
+    if (!p_ahb_props) return false;
+    AHardwareBuffer_Desc d{};
+    d.width = w;
+    d.height = h;
+    d.layers = 1;
+    d.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+    // GPU_FRAMEBUFFER (render into) + GPU_SAMPLED_IMAGE (compositor samples it as an
+    // external-OES texture, the §5-C zero-copy path) + CPU_READ_OFTEN (headless readback).
+    d.usage = AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER |
+              AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN;
+    AHardwareBuffer* ahb = nullptr;
+    if (AHardwareBuffer_allocate(&d, &ahb) != 0 || ahb == nullptr) return false;
+
+    VkAndroidHardwareBufferFormatPropertiesANDROID fmt_props{};
+    fmt_props.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID;
+    VkAndroidHardwareBufferPropertiesANDROID ahb_props{};
+    ahb_props.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID;
+    ahb_props.pNext = &fmt_props;
+    if (p_ahb_props(dev, ahb, &ahb_props) != VK_SUCCESS) { AHardwareBuffer_release(ahb); return false; }
+    color_fmt = (fmt_props.format != VK_FORMAT_UNDEFINED) ? fmt_props.format
+                                                          : VK_FORMAT_R8G8B8A8_UNORM;
+
+    VkExternalMemoryImageCreateInfo ext_img{};
+    ext_img.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+    ext_img.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
+    VkImageCreateInfo img_ci{};
+    img_ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    img_ci.pNext = &ext_img;
+    img_ci.imageType = VK_IMAGE_TYPE_2D;
+    img_ci.format = color_fmt;
+    img_ci.extent = {w, h, 1};
+    img_ci.mipLevels = 1;
+    img_ci.arrayLayers = 1;
+    img_ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    img_ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    img_ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    img_ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    img_ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImage image = VK_NULL_HANDLE;
+    if (vkCreateImage(dev, &img_ci, nullptr, &image) != VK_SUCCESS) {
+        AHardwareBuffer_release(ahb);
+        return false;
+    }
+    uint32_t mem_type = 0;
+    bool found_type = false;
+    for (uint32_t i = 0; i < 32; ++i)
+        if (ahb_props.memoryTypeBits & (1u << i)) { mem_type = i; found_type = true; break; }
+    if (!found_type) { vkDestroyImage(dev, image, nullptr); AHardwareBuffer_release(ahb); return false; }
+    VkImportAndroidHardwareBufferInfoANDROID import_info{};
+    import_info.sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID;
+    import_info.buffer = ahb;
+    VkMemoryDedicatedAllocateInfo dedicated{};
+    dedicated.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+    dedicated.image = image;
+    dedicated.pNext = &import_info;
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.pNext = &dedicated;
+    mai.allocationSize = ahb_props.allocationSize;
+    mai.memoryTypeIndex = mem_type;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    if (vkAllocateMemory(dev, &mai, nullptr, &mem) != VK_SUCCESS ||
+        vkBindImageMemory(dev, image, mem, 0) != VK_SUCCESS) {
+        if (mem) vkFreeMemory(dev, mem, nullptr);
+        vkDestroyImage(dev, image, nullptr);
+        AHardwareBuffer_release(ahb);
+        return false;
+    }
+    VkImageViewCreateInfo vci{};
+    vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vci.image = image;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = color_fmt;
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkImageView view = VK_NULL_HANDLE;
+    if (vkCreateImageView(dev, &vci, nullptr, &view) != VK_SUCCESS) {
+        vkFreeMemory(dev, mem, nullptr);
+        vkDestroyImage(dev, image, nullptr);
+        AHardwareBuffer_release(ahb);
+        return false;
+    }
+    out.ahb = ahb;
+    out.image = image;
+    out.mem = mem;
+    out.view = view;
+    return true;
+}
+
+inline void vk_real_free_swap_image(VkDevice dev, VkDecodeState::SwapImage& im) {
+    if (im.view) vkDestroyImageView(dev, im.view, nullptr);
+    if (im.image) vkDestroyImage(dev, im.image, nullptr);
+    if (im.mem) vkFreeMemory(dev, im.mem, nullptr);
+    if (im.ahb) AHardwareBuffer_release(im.ahb);
+    im = VkDecodeState::SwapImage{};
+}
+
+// Create an AHB-backed swapchain: a persistent ring of `image_count` AHB color
+// attachments (clamped 1..4). Returns the VkResult; fills st.real_swapchain[vswapchain]
+// and `image_count_out` (what was actually allocated).
+inline VkResult vk_real_create_swapchain(VkDecodeState& st, uint32_t vdev,
+                                         uint32_t vswapchain, uint32_t width,
+                                         uint32_t height, uint32_t image_count,
+                                         uint32_t& image_count_out) {
+    image_count_out = 0;
+    auto dit = st.real_dev.find(vdev);
+    if (dit == st.real_dev.end()) return VK_ERROR_INITIALIZATION_FAILED;
+    VkDevice dev = dit->second.dev;
+    const uint32_t w = width ? width : 64;
+    const uint32_t h = height ? height : 64;
+    uint32_t n = image_count ? image_count : 2;
+    if (n > 4) n = 4;  // bound the AHB ring (double/triple buffering is plenty)
+
+    VkDecodeState::RealSwapchain sc;
+    sc.vdev = vdev;
+    sc.width = w;
+    sc.height = h;
+    sc.next = 0;
+    VkFormat fmt = VK_FORMAT_R8G8B8A8_UNORM;
+    for (uint32_t i = 0; i < n; ++i) {
+        VkDecodeState::SwapImage im;
+        VkFormat got_fmt = fmt;
+        if (!vk_real_alloc_swap_image(dev, w, h, got_fmt, im)) {
+            for (auto& already : sc.images) vk_real_free_swap_image(dev, already);
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        fmt = got_fmt;
+        sc.images.push_back(im);
+    }
+    sc.format = fmt;
+    st.real_swapchain[vswapchain] = std::move(sc);
+    st.swapchains[vswapchain] = static_cast<uint32_t>(st.real_swapchain[vswapchain].images.size());
+    image_count_out = static_cast<uint32_t>(st.real_swapchain[vswapchain].images.size());
+    return VK_SUCCESS;
+}
+
+inline void vk_real_destroy_swapchain(VkDecodeState& st, uint32_t vswapchain) {
+    auto it = st.real_swapchain.find(vswapchain);
+    if (it == st.real_swapchain.end()) return;
+    auto dit = st.real_dev.find(it->second.vdev);
+    if (dit != st.real_dev.end()) {
+        vkDeviceWaitIdle(dit->second.dev);
+        for (auto& im : it->second.images) vk_real_free_swap_image(dit->second.dev, im);
+    }
+    st.real_swapchain.erase(it);
+    st.swapchains.erase(vswapchain);
+}
+
+// Acquire the next image index from a swapchain (round-robin over its AHB ring).
+// Returns true + sets `index_out` on success.
+inline bool vk_real_acquire_next_image(VkDecodeState& st, uint32_t vswapchain,
+                                       uint32_t& index_out) {
+    auto it = st.real_swapchain.find(vswapchain);
+    if (it == st.real_swapchain.end() || it->second.images.empty()) return false;
+    index_out = it->second.next;
+    it->second.next = (it->second.next + 1u) %
+                      static_cast<uint32_t>(it->second.images.size());
+    return true;
+}
+
+// Render a clear-bg + one triangle using the GUEST'S shader modules into the swapchain
+// image `image_index`, submit + wait, route the image's AHB to the present sink, and
+// read the center pixel back. This is vk_real_draw_submit promoted to (a) the guest's
+// own SPIR-V (st.real_shader[rec.vvert/vfrag]) and (b) a persistent swapchain AHB (so
+// the compositor can hold/import it). Returns an AlrVkRenderResult; fills px[4] +
+// *presented_out (1 if the sink accepted the AHB). The render-pass/pipeline objects are
+// per-call (cheap); only the AHB image ring persists in the swapchain.
+inline int vk_real_draw_present(VkDecodeState& st, uint32_t vdev, uint32_t vqueue,
+                                uint32_t vcmd, const VkClearRecord& rec, uint8_t px[4],
+                                uint8_t* presented_out) {
+    px[0] = px[1] = px[2] = px[3] = 0;
+    if (presented_out) *presented_out = 0;
+    if (!rec.recorded || !rec.is_present_draw) return ALR_VK_RENDER_NO_CLEAR_RECORDED;
+    auto dit = st.real_dev.find(vdev);
+    auto qit = st.real_queue.find(vqueue);
+    auto cit = st.real_cmd.find(vcmd);
+    if (dit == st.real_dev.end() || qit == st.real_queue.end() || cit == st.real_cmd.end())
+        return ALR_VK_RENDER_NO_DEVICE;
+    auto scit = st.real_swapchain.find(rec.vswapchain);
+    if (scit == st.real_swapchain.end() ||
+        rec.image_index >= scit->second.images.size())
+        return ALR_VK_RENDER_NO_SWAPCHAIN;
+    auto vsit = st.real_shader.find(rec.vvert);
+    auto fsit = st.real_shader.find(rec.vfrag);
+    if (vsit == st.real_shader.end() || fsit == st.real_shader.end())
+        return ALR_VK_RENDER_NO_SHADER;
+
+    VkDevice dev = dit->second.dev;
+    VkPhysicalDevice phys = dit->second.phys;
+    VkQueue queue = qit->second;
+    VkCommandBuffer cmd = cit->second.second;
+    VkDecodeState::RealSwapchain& sc = scit->second;
+    VkDecodeState::SwapImage& target = sc.images[rec.image_index];
+    const uint32_t w = sc.width;
+    const uint32_t h = sc.height;
+    const VkFormat color_fmt = sc.format;
+    VkShaderModule vert_mod = vsit->second.second;
+    VkShaderModule frag_mod = fsit->second.second;
+
+    // Per-call render pass / framebuffer / pipeline / vertex buffer (the swapchain image
+    // itself persists). Cleanup destroys only these per-call objects, NOT the AHB image.
+    VkRenderPass rp = VK_NULL_HANDLE;
+    VkFramebuffer fb = VK_NULL_HANDLE;
+    VkPipelineLayout pipe_layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkBuffer vbuf = VK_NULL_HANDLE;
+    VkDeviceMemory vmem = VK_NULL_HANDLE;
+    auto cleanup = [&]() {
+        if (vbuf) vkDestroyBuffer(dev, vbuf, nullptr);
+        if (vmem) vkFreeMemory(dev, vmem, nullptr);
+        if (pipeline) vkDestroyPipeline(dev, pipeline, nullptr);
+        if (pipe_layout) vkDestroyPipelineLayout(dev, pipe_layout, nullptr);
+        if (fb) vkDestroyFramebuffer(dev, fb, nullptr);
+        if (rp) vkDestroyRenderPass(dev, rp, nullptr);
+    };
+
+    VkAttachmentDescription att{};
+    att.format = color_fmt;
+    att.samples = VK_SAMPLE_COUNT_1_BIT;
+    att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    att.finalLayout = VK_IMAGE_LAYOUT_GENERAL;  // GENERAL: defined for the queue-family
+                                                // release to the compositor + CPU read
+    VkAttachmentReference att_ref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sub{};
+    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount = 1;
+    sub.pColorAttachments = &att_ref;
+    VkSubpassDependency dep{};
+    dep.srcSubpass = 0;
+    dep.dstSubpass = VK_SUBPASS_EXTERNAL;
+    dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep.dstStageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+    dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dep.dstAccessMask = 0;
+    VkRenderPassCreateInfo rpci{};
+    rpci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    rpci.attachmentCount = 1;
+    rpci.pAttachments = &att;
+    rpci.subpassCount = 1;
+    rpci.pSubpasses = &sub;
+    rpci.dependencyCount = 1;
+    rpci.pDependencies = &dep;
+    if (vkCreateRenderPass(dev, &rpci, nullptr, &rp) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_RECORD; }
+
+    VkFramebufferCreateInfo fbci{};
+    fbci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    fbci.renderPass = rp;
+    fbci.attachmentCount = 1;
+    fbci.pAttachments = &target.view;
+    fbci.width = w;
+    fbci.height = h;
+    fbci.layers = 1;
+    if (vkCreateFramebuffer(dev, &fbci, nullptr, &fb) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_RECORD; }
+
+    VkPipelineLayoutCreateInfo plci{};
+    plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;  // empty layout
+    if (vkCreatePipelineLayout(dev, &plci, nullptr, &pipe_layout) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_PIPELINE; }
+
+    // Vertex buffer (HOST_VISIBLE) with the 3 NDC triangle verts (bring-up contract:
+    // the guest vert shader takes a vec2 at location 0; a later rung ships verts on wire).
+    VkBufferCreateInfo bci{};
+    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size = sizeof(kAlrVkTriVerts);
+    bci.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(dev, &bci, nullptr, &vbuf) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_PIPELINE; }
+    VkMemoryRequirements vreq{};
+    vkGetBufferMemoryRequirements(dev, vbuf, &vreq);
+    VkPhysicalDeviceMemoryProperties mp{};
+    vkGetPhysicalDeviceMemoryProperties(phys, &mp);
+    uint32_t vtype = UINT32_MAX;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
+        const bool usable = (vreq.memoryTypeBits & (1u << i)) != 0;
+        const bool host_visible =
+            (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+            (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (usable && host_visible) { vtype = i; break; }
+    }
+    if (vtype == UINT32_MAX) { cleanup(); return ALR_VK_RENDER_PIPELINE; }
+    VkMemoryAllocateInfo vai{};
+    vai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    vai.allocationSize = vreq.size;
+    vai.memoryTypeIndex = vtype;
+    if (vkAllocateMemory(dev, &vai, nullptr, &vmem) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_PIPELINE; }
+    if (vkBindBufferMemory(dev, vbuf, vmem, 0) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_PIPELINE; }
+    void* vmap = nullptr;
+    if (vkMapMemory(dev, vmem, 0, sizeof(kAlrVkTriVerts), 0, &vmap) != VK_SUCCESS || !vmap) { cleanup(); return ALR_VK_RENDER_PIPELINE; }
+    std::memcpy(vmap, kAlrVkTriVerts, sizeof(kAlrVkTriVerts));
+    vkUnmapMemory(dev, vmem);
+
+    // Graphics pipeline driven by the GUEST'S vert+frag modules.
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vert_mod;
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = frag_mod;
+    stages[1].pName = "main";
+
+    VkVertexInputBindingDescription vib{};
+    vib.binding = 0;
+    vib.stride = sizeof(AlrVkVert2);
+    vib.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+    VkVertexInputAttributeDescription via{};
+    via.location = 0;
+    via.binding = 0;
+    via.format = VK_FORMAT_R32G32_SFLOAT;  // vec2 inPos at location 0
+    via.offset = 0;
+    VkPipelineVertexInputStateCreateInfo vis{};
+    vis.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vis.vertexBindingDescriptionCount = 1;
+    vis.pVertexBindingDescriptions = &vib;
+    vis.vertexAttributeDescriptionCount = 1;
+    vis.pVertexAttributeDescriptions = &via;
+
+    VkPipelineInputAssemblyStateCreateInfo ias{};
+    ias.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ias.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkViewport vp{};
+    vp.width = static_cast<float>(w);
+    vp.height = static_cast<float>(h);
+    vp.maxDepth = 1.0f;
+    VkRect2D scissor{};
+    scissor.extent = {w, h};
+    VkPipelineViewportStateCreateInfo vps{};
+    vps.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vps.viewportCount = 1;
+    vps.pViewports = &vp;
+    vps.scissorCount = 1;
+    vps.pScissors = &scissor;
+
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineColorBlendAttachmentState cba{};
+    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    cba.blendEnable = VK_FALSE;
+    VkPipelineColorBlendStateCreateInfo cb{};
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 1;
+    cb.pAttachments = &cba;
+
+    VkGraphicsPipelineCreateInfo gp{};
+    gp.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    gp.stageCount = 2;
+    gp.pStages = stages;
+    gp.pVertexInputState = &vis;
+    gp.pInputAssemblyState = &ias;
+    gp.pViewportState = &vps;
+    gp.pRasterizationState = &rs;
+    gp.pMultisampleState = &ms;
+    gp.pColorBlendState = &cb;
+    gp.layout = pipe_layout;
+    gp.renderPass = rp;
+    gp.subpass = 0;
+    if (vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gp, nullptr, &pipeline) != VK_SUCCESS) {
+        cleanup();
+        return ALR_VK_RENDER_PIPELINE;
+    }
+
+    // Record: clear bg, bind pipeline + verts, draw 3, release to the external consumer.
+    vkResetCommandBuffer(cmd, 0);
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(cmd, &bi) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_RECORD; }
+    VkClearValue clear{};
+    clear.color = {{rec.clear[0], rec.clear[1], rec.clear[2], rec.clear[3]}};
+    VkRenderPassBeginInfo rbi{};
+    rbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rbi.renderPass = rp;
+    rbi.framebuffer = fb;
+    rbi.renderArea.extent = {w, h};
+    rbi.clearValueCount = 1;
+    rbi.pClearValues = &clear;
+    vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    VkDeviceSize voff = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &vbuf, &voff);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+    vkCmdEndRenderPass(cmd);
+    // Release the color image to the external consumer (the compositor's GPU import +
+    // the CPU readback). Same barrier as the throwaway-AHB draw path.
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.srcQueueFamilyIndex = dit->second.gfx_family;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+    barrier.image = target.image;
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) { cleanup(); return ALR_VK_RENDER_RECORD; }
+
+    // Submit + fence-wait.
+    VkFence fence = VK_NULL_HANDLE;
+    VkFenceCreateInfo fci{};
+    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    if (vkCreateFence(dev, &fci, nullptr, &fence) != VK_SUCCESS) fence = VK_NULL_HANDLE;
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    if (vkQueueSubmit(queue, 1, &si, fence) != VK_SUCCESS) {
+        if (fence) vkDestroyFence(dev, fence, nullptr);
+        cleanup();
+        return ALR_VK_RENDER_SUBMIT;
+    }
+    if (fence) {
+        vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX);
+        vkDestroyFence(dev, fence, nullptr);
+    } else {
+        vkQueueWaitIdle(queue);
+    }
+
+    // PRESENT: route the rendered AHB to the in-app compositor (zero-copy onto the
+    // SurfaceView). The sink borrows the AHB and acquires its own ref if it retains it.
+    if (vk_present_sink() != nullptr) {
+        const uint64_t serial = st.present_serial++;
+        const bool ok = vk_present_sink()(target.ahb, static_cast<int>(w),
+                                          static_cast<int>(h), serial);
+        if (presented_out) *presented_out = ok ? 1u : 0u;
+    }
+
+    // Read the presented image's center pixel back (the guest shader's color) so a
+    // headless self-test (no display) still proves the guest SPIR-V ran on Mali.
+    AHardwareBuffer_Desc got{};
+    AHardwareBuffer_describe(target.ahb, &got);
+    void* cpu = nullptr;
+    if (AHardwareBuffer_lock(target.ahb, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN, -1, nullptr, &cpu) == 0 &&
+        cpu != nullptr) {
+        const uint32_t stride_px = got.stride ? got.stride : w;
+        const auto* base = static_cast<const unsigned char*>(cpu);
+        const size_t off = (static_cast<size_t>(h / 2) * stride_px + (w / 2)) * 4;
+        for (int i = 0; i < 4; ++i) px[i] = base[off + i];
+        AHardwareBuffer_unlock(target.ahb, nullptr);
+    } else {
+        cleanup();
+        return ALR_VK_RENDER_READBACK;
+    }
+
+    cleanup();
+    return ALR_VK_RENDER_OK;
+}
+
 inline void vk_real_destroy_device(VkDecodeState& st, uint32_t vdev) {
     auto it = st.real_dev.find(vdev);
     if (it == st.real_dev.end()) return;
@@ -1091,6 +1668,27 @@ inline void vk_real_destroy_device(VkDecodeState& st, uint32_t vdev) {
     for (auto cit = st.real_cmd.begin(); cit != st.real_cmd.end();) {
         if (cit->second.first == vdev) cit = st.real_cmd.erase(cit);
         else ++cit;
+    }
+    // VK-M4: free swapchains (their AHB images) + shader modules owned by this device
+    // BEFORE vkDestroyDevice (their VkImage/VkShaderModule belong to `dev`).
+    for (auto sit = st.real_swapchain.begin(); sit != st.real_swapchain.end();) {
+        if (sit->second.vdev == vdev) {
+            for (auto& im : sit->second.images) vk_real_free_swap_image(dev, im);
+            st.swapchains.erase(sit->first);
+            sit = st.real_swapchain.erase(sit);
+        } else {
+            ++sit;
+        }
+    }
+    for (auto sh = st.real_shader.begin(); sh != st.real_shader.end();) {
+        if (sh->second.first == vdev) {
+            if (sh->second.second != VK_NULL_HANDLE)
+                vkDestroyShaderModule(dev, sh->second.second, nullptr);
+            st.shaders.erase(sh->first);
+            sh = st.real_shader.erase(sh);
+        } else {
+            ++sh;
+        }
     }
     vkDestroyDevice(dev, nullptr);
     st.real_dev.erase(it);
@@ -1136,6 +1734,23 @@ struct VkProvider {
     int (*draw_submit)(void* ctx, uint32_t vdev, uint32_t vqueue, uint32_t vcmd,
                        const VkClearRecord& rec, uint8_t px[4]) = nullptr;
     void (*destroy_device)(void* ctx, uint32_t vdev) = nullptr;
+    // ---- VK-M4 (PRESENT rung) seams (synthetic = wire mode; null callbacks no-op). ----
+    // Create the guest's shader module from its SPIR-V; return VkResult (0 == success).
+    int (*create_shader_module)(void* ctx, uint32_t vdev, uint32_t vshader,
+                                const uint8_t* spirv, uint32_t spirv_len) = nullptr;
+    void (*destroy_shader_module)(void* ctx, uint32_t vdev, uint32_t vshader) = nullptr;
+    // Create an AHB-backed swapchain; return VkResult, set *image_count_out.
+    int (*create_swapchain)(void* ctx, uint32_t vdev, uint32_t vswapchain, uint32_t width,
+                            uint32_t height, uint32_t image_count,
+                            uint32_t* image_count_out) = nullptr;
+    void (*destroy_swapchain)(void* ctx, uint32_t vswapchain) = nullptr;
+    // Acquire the next swapchain image; return true + set *index_out.
+    bool (*acquire_next_image)(void* ctx, uint32_t vswapchain, uint32_t* index_out) = nullptr;
+    // Replay the guest-shader clear+draw into the swapchain image + present; fill px[4]
+    // (post-draw center pixel) + *presented (1 if routed to the sink); return
+    // AlrVkRenderResult.
+    int (*draw_present)(void* ctx, uint32_t vdev, uint32_t vqueue, uint32_t vcmd,
+                        const VkClearRecord& rec, uint8_t px[4], uint8_t* presented) = nullptr;
     void* ctx = nullptr;
 };
 
@@ -1328,6 +1943,163 @@ inline bool decode_vk_batch(const uint8_t* data, size_t len, VkDecodeState& st,
                 break;
             }
 
+            // ---- VK-M4 (PRESENT rung) ops ----
+            case ALR_VK_OP_CREATE_SHADER_MODULE: {
+                uint32_t vdev = 0, vshader = 0, stage = 0;
+                const uint8_t* spirv = nullptr; uint32_t spirv_len = 0;
+                if (!r.u32(vdev) || !r.u32(vshader) || !r.u32(stage) ||
+                    !r.blob(spirv, spirv_len)) { st.ok = false; break; }
+                (void)stage;  // advisory; the pipeline stage binds the module
+                int res = -1;
+#ifdef ALR_VK_DECODE_REAL
+                if (!provider)
+                    res = static_cast<int>(
+                        vk_real_create_shader_module(st, vdev, vshader, spirv, spirv_len));
+#endif
+                if (provider && provider->create_shader_module)
+                    res = provider->create_shader_module(provider->ctx, vdev, vshader,
+                                                         spirv, spirv_len);
+                if (res == 0) st.shaders[vshader] = true;
+                reply.u8(static_cast<uint8_t>(ALR_VK_REPLY_SHADER));
+                reply.u32(vshader);
+                reply.i32(res);
+                st.decoded++;
+                break;
+            }
+
+            case ALR_VK_OP_DESTROY_SHADER_MODULE: {
+                uint32_t vdev = 0, vshader = 0;
+                if (!r.u32(vdev) || !r.u32(vshader)) { st.ok = false; break; }
+#ifdef ALR_VK_DECODE_REAL
+                if (!provider) vk_real_destroy_shader_module(st, vdev, vshader);
+#endif
+                if (provider && provider->destroy_shader_module)
+                    provider->destroy_shader_module(provider->ctx, vdev, vshader);
+                st.shaders.erase(vshader);
+                st.decoded++;
+                break;
+            }
+
+            case ALR_VK_OP_CREATE_SWAPCHAIN: {
+                uint32_t vdev = 0, vsw = 0, w = 0, h = 0, cnt = 0;
+                if (!r.u32(vdev) || !r.u32(vsw) || !r.u32(w) || !r.u32(h) || !r.u32(cnt)) {
+                    st.ok = false; break;
+                }
+                int res = -1;
+                uint32_t got_count = 0;
+#ifdef ALR_VK_DECODE_REAL
+                if (!provider)
+                    res = static_cast<int>(
+                        vk_real_create_swapchain(st, vdev, vsw, w, h, cnt, got_count));
+#endif
+                if (provider && provider->create_swapchain)
+                    res = provider->create_swapchain(provider->ctx, vdev, vsw, w, h, cnt,
+                                                     &got_count);
+                if (res == 0) st.swapchains[vsw] = got_count;
+                reply.u8(static_cast<uint8_t>(ALR_VK_REPLY_SWAPCHAIN));
+                reply.u32(vsw);
+                reply.i32(res);
+                reply.u32(got_count);
+                st.decoded++;
+                break;
+            }
+
+            case ALR_VK_OP_DESTROY_SWAPCHAIN: {
+                uint32_t vdev = 0, vsw = 0;
+                if (!r.u32(vdev) || !r.u32(vsw)) { st.ok = false; break; }
+                (void)vdev;
+#ifdef ALR_VK_DECODE_REAL
+                if (!provider) vk_real_destroy_swapchain(st, vsw);
+#endif
+                if (provider && provider->destroy_swapchain)
+                    provider->destroy_swapchain(provider->ctx, vsw);
+                st.swapchains.erase(vsw);
+                st.decoded++;
+                break;
+            }
+
+            case ALR_VK_OP_ACQUIRE_NEXT_IMAGE: {
+                uint32_t vdev = 0, vsw = 0;
+                if (!r.u32(vdev) || !r.u32(vsw)) { st.ok = false; break; }
+                (void)vdev;
+                uint32_t index = 0;
+                bool got = false;
+#ifdef ALR_VK_DECODE_REAL
+                if (!provider) got = vk_real_acquire_next_image(st, vsw, index);
+#endif
+                if (provider && provider->acquire_next_image)
+                    got = provider->acquire_next_image(provider->ctx, vsw, &index);
+                reply.u8(static_cast<uint8_t>(ALR_VK_REPLY_ACQUIRE));
+                reply.u32(vsw);
+                reply.u32(index);
+                reply.i32(got ? 0 : -1);
+                st.decoded++;
+                break;
+            }
+
+            case ALR_VK_OP_CMD_BEGIN_DRAW_MODULES: {
+                uint32_t vdev = 0, vcmd = 0, vsw = 0, img = 0, vvert = 0, vfrag = 0,
+                         w = 0, h = 0;
+                float br = 0, bg = 0, bb = 0, ba = 0;
+                if (!r.u32(vdev) || !r.u32(vcmd) || !r.u32(vsw) || !r.u32(img) ||
+                    !r.u32(vvert) || !r.u32(vfrag) || !r.u32(w) || !r.u32(h) ||
+                    !r.f32(br) || !r.f32(bg) || !r.f32(bb) || !r.f32(ba)) {
+                    st.ok = false; break;
+                }
+                VkClearRecord rec;
+                rec.recorded = true;
+                rec.is_draw = true;
+                rec.is_present_draw = true;
+                rec.width = w;
+                rec.height = h;
+                rec.clear[0] = br; rec.clear[1] = bg; rec.clear[2] = bb; rec.clear[3] = ba;
+                rec.vswapchain = vsw;
+                rec.image_index = img;
+                rec.vvert = vvert;
+                rec.vfrag = vfrag;
+                st.clears[vcmd] = rec;
+                st.decoded++;
+                break;
+            }
+
+            case ALR_VK_OP_QUEUE_PRESENT: {
+                uint32_t vdev = 0, vqueue = 0, vcmd = 0, vsw = 0, img = 0;
+                if (!r.u32(vdev) || !r.u32(vqueue) || !r.u32(vcmd) || !r.u32(vsw) ||
+                    !r.u32(img)) { st.ok = false; break; }
+                (void)vsw; (void)img;  // the recorded clear carries the swapchain/image
+                int submit_res = 0;
+                int render_res = ALR_VK_RENDER_NO_CLEAR_RECORDED;
+                uint8_t px[4] = {0, 0, 0, 0};
+                uint8_t presented = 0;
+                auto cit = st.clears.find(vcmd);
+                const VkClearRecord rec =
+                    (cit != st.clears.end()) ? cit->second : VkClearRecord{};
+#ifdef ALR_VK_DECODE_REAL
+                if (!provider)
+                    render_res = vk_real_draw_present(st, vdev, vqueue, vcmd, rec, px,
+                                                      &presented);
+#endif
+                if (provider && provider->draw_present)
+                    render_res = provider->draw_present(provider->ctx, vdev, vqueue, vcmd,
+                                                        rec, px, &presented);
+                if (render_res != ALR_VK_RENDER_OK &&
+                    render_res != ALR_VK_RENDER_NO_CLEAR_RECORDED)
+                    submit_res = -1;
+                if (cit != st.clears.end()) st.clears.erase(cit);  // consume the record
+                reply.u8(static_cast<uint8_t>(ALR_VK_REPLY_PRESENT));
+                reply.u32(vsw);
+                reply.u32(img);
+                reply.i32(submit_res);
+                reply.i32(render_res);
+                reply.u8(presented);
+                reply.u8(px[0]);
+                reply.u8(px[1]);
+                reply.u8(px[2]);
+                reply.u8(px[3]);
+                st.decoded++;
+                break;
+            }
+
             case ALR_VK_OP_QUEUE_SUBMIT: {
                 uint32_t vdev = 0, vqueue = 0, vcmd = 0;
                 if (!r.u32(vdev) || !r.u32(vqueue) || !r.u32(vcmd)) { st.ok = false; break; }
@@ -1416,12 +2188,39 @@ struct VkReplySubmit {
     int32_t render_result = 0;  // AlrVkRenderResult
     uint8_t px[4] = {0, 0, 0, 0};
 };
+// ---- VK-M4 (PRESENT rung) reply records ----
+struct VkReplyShader {
+    uint32_t vshader = 0;
+    int32_t result = 0;
+};
+struct VkReplySwapchain {
+    uint32_t vswapchain = 0;
+    int32_t result = 0;
+    uint32_t image_count = 0;
+};
+struct VkReplyAcquire {
+    uint32_t vswapchain = 0;
+    uint32_t image_index = 0;
+    int32_t result = 0;
+};
+struct VkReplyPresent {
+    uint32_t vswapchain = 0;
+    uint32_t image_index = 0;
+    int32_t submit_result = 0;
+    int32_t render_result = 0;  // AlrVkRenderResult
+    uint8_t presented = 0;      // 1 if routed to the compositor sink
+    uint8_t px[4] = {0, 0, 0, 0};
+};
 struct VkDecodedReply {
     std::vector<VkReplyInstance> instances;
     std::vector<VkReplyPhysCount> enumerations;
     std::map<uint32_t, VkPhysProps> props;  // vphys -> props
     std::vector<VkReplyDevice> devices;      // VK-M2 body
     std::vector<VkReplySubmit> submits;      // VK-M2 body
+    std::vector<VkReplyShader> shaders;        // VK-M4
+    std::vector<VkReplySwapchain> swapchains;  // VK-M4
+    std::vector<VkReplyAcquire> acquires;      // VK-M4
+    std::vector<VkReplyPresent> presents;      // VK-M4
     bool ok = true;
 };
 
@@ -1493,6 +2292,42 @@ inline bool decode_vk_reply(const uint8_t* data, size_t len, VkDecodedReply& out
                     return false;
                 }
                 out.submits.push_back(rs);
+                break;
+            }
+            case ALR_VK_REPLY_SHADER: {
+                VkReplyShader sh{};
+                if (!r.u32(sh.vshader) || !r.i32(sh.result)) { out.ok = false; return false; }
+                out.shaders.push_back(sh);
+                break;
+            }
+            case ALR_VK_REPLY_SWAPCHAIN: {
+                VkReplySwapchain sw{};
+                if (!r.u32(sw.vswapchain) || !r.i32(sw.result) || !r.u32(sw.image_count)) {
+                    out.ok = false;
+                    return false;
+                }
+                out.swapchains.push_back(sw);
+                break;
+            }
+            case ALR_VK_REPLY_ACQUIRE: {
+                VkReplyAcquire ac{};
+                if (!r.u32(ac.vswapchain) || !r.u32(ac.image_index) || !r.i32(ac.result)) {
+                    out.ok = false;
+                    return false;
+                }
+                out.acquires.push_back(ac);
+                break;
+            }
+            case ALR_VK_REPLY_PRESENT: {
+                VkReplyPresent pr{};
+                if (!r.u32(pr.vswapchain) || !r.u32(pr.image_index) ||
+                    !r.i32(pr.submit_result) || !r.i32(pr.render_result) ||
+                    !r.u8(pr.presented) || !r.u8(pr.px[0]) || !r.u8(pr.px[1]) ||
+                    !r.u8(pr.px[2]) || !r.u8(pr.px[3])) {
+                    out.ok = false;
+                    return false;
+                }
+                out.presents.push_back(pr);
                 break;
             }
             default:

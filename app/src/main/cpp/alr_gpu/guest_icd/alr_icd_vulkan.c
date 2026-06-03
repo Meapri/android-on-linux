@@ -36,6 +36,7 @@
 #include "alr_gpu_vk_proto.hpp"  /* AlrVkEncoder + AlrVkOp/AlrVkReply wire (C-clean) */
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,6 +73,14 @@ typedef struct AlrIcdQueue {
     AlrIcdDevice*  dev;
 } AlrIcdQueue;
 
+/* VK-M4: a command buffer IS a dispatchable handle (loader magic first), carrying the
+ * virtual vcmd id + a back-pointer to its device (so record/present know vdev/vqueue). */
+typedef struct AlrIcdCommandBuffer {
+    VK_LOADER_DATA loader;   /* MUST be first */
+    uint32_t       vcmd;     /* virtual command-buffer id on the wire */
+    AlrIcdDevice*  dev;
+} AlrIcdCommandBuffer;
+
 /* ---- monotonic virtual-id allocators (start at 1; 0 reserved). The ENUM rung is
  * light; one global lock serializes id allocation + handle bookkeeping. ---- */
 static pthread_mutex_t g_id_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -79,6 +88,19 @@ static uint32_t g_next_vinst   = 1;
 static uint32_t g_next_vphys   = 100;   /* matches the probe's vphys_base convention */
 static uint32_t g_next_vdev    = 1000;
 static uint32_t g_next_vqueue  = 2000;
+/* VK-M4 (PRESENT rung) virtual-id pools (disjoint ranges so a stray id is diagnosable). */
+static uint32_t g_next_vpool   = 3000;
+static uint32_t g_next_vcmd    = 4000;
+static uint32_t g_next_vshader = 5000;
+static uint32_t g_next_vswap   = 6000;
+/* The vcmd of the most recent coarse draw-record (alrVkCmdDrawTriangleModules). The
+ * single-surface bring-up records then presents, so QUEUE_PRESENT (which keys the host's
+ * recorded draw by vcmd) uses this. A multi-surface breadth rung carries vcmd explicitly
+ * in the present path; for the bring-up triangle this global is correct + simple. */
+static _Atomic uint32_t g_last_record_vcmd = 0;
+uint32_t alr_icd_last_record_vcmd(void) {
+    return atomic_load_explicit(&g_last_record_vcmd, memory_order_acquire);
+}
 
 static uint32_t alr_alloc(uint32_t *counter, uint32_t step) {
     uint32_t v;
@@ -490,6 +512,312 @@ static void VKAPI_CALL alr_vkGetDeviceQueue(VkDevice device, uint32_t queueFamil
 }
 
 /* ============================================================================
+ * VK-M4 (PRESENT rung) entry points: command pool/buffer, GUEST SPIR-V shader module,
+ * AHB-backed swapchain (create/images/acquire), the coarse draw-record, and present.
+ * Each marshals its request over alr_icd_roundtrip; the non-dispatchable handles carry
+ * the virtual id directly (uint64), the command buffer is a dispatchable object.
+ * ============================================================================ */
+
+/* Scan a reply stream for ONE present-rung record's payload, by op. Returns 1 if the
+ * requested op was found and filled the out params (caller passes only the ones it
+ * needs; others may be NULL). A tiny dedicated reader since alr_icd_parse_reply only
+ * knows the ENUM-rung ops. */
+static int alr_icd_scan_reply(const uint8_t *data, uint32_t len, uint8_t want_op,
+                              int32_t *out_result, uint32_t *out_a, uint8_t *out_px) {
+    AlrRd r; uint8_t op;
+    r.p = data; r.n = len; r.pos = 0;
+    for (;;) {
+        if (!rd_u8(&r, &op)) break;
+        if (op == ALR_VK_REPLY_END) break;
+        if (op == ALR_VK_REPLY_SHADER) {
+            uint32_t vshader; int32_t res;
+            if (!rd_u32(&r, &vshader) || !rd_i32(&r, &res)) return 0;
+            if (op == want_op) { if (out_result) *out_result = res; return 1; }
+        } else if (op == ALR_VK_REPLY_SWAPCHAIN) {
+            uint32_t vsw, cnt; int32_t res;
+            if (!rd_u32(&r, &vsw) || !rd_i32(&r, &res) || !rd_u32(&r, &cnt)) return 0;
+            if (op == want_op) {
+                if (out_result) *out_result = res;
+                if (out_a) *out_a = cnt;
+                return 1;
+            }
+        } else if (op == ALR_VK_REPLY_ACQUIRE) {
+            uint32_t vsw, idx; int32_t res;
+            if (!rd_u32(&r, &vsw) || !rd_u32(&r, &idx) || !rd_i32(&r, &res)) return 0;
+            if (op == want_op) {
+                if (out_result) *out_result = res;
+                if (out_a) *out_a = idx;
+                return 1;
+            }
+        } else if (op == ALR_VK_REPLY_PRESENT) {
+            uint32_t vsw, idx; int32_t sr, rr; uint8_t pres, px[4];
+            if (!rd_u32(&r, &vsw) || !rd_u32(&r, &idx) || !rd_i32(&r, &sr) ||
+                !rd_i32(&r, &rr) || !rd_u8(&r, &pres) || !rd_u8(&r, &px[0]) ||
+                !rd_u8(&r, &px[1]) || !rd_u8(&r, &px[2]) || !rd_u8(&r, &px[3])) return 0;
+            if (op == want_op) {
+                if (out_result) *out_result = sr;
+                if (out_a) *out_a = (uint32_t)pres;
+                if (out_px) { out_px[0]=px[0]; out_px[1]=px[1]; out_px[2]=px[2]; out_px[3]=px[3]; }
+                return 1;
+            }
+        } else {
+            /* an ENUM-rung record we don't care about here: skip its fixed payload via
+             * the full parser would be heavy; instead bail (present-rung batches don't
+             * mix in ENUM records in practice). */
+            return 0;
+        }
+    }
+    return 0;
+}
+
+static VkResult VKAPI_CALL alr_vkCreateCommandPool(VkDevice device,
+                                                   const VkCommandPoolCreateInfo *pCreateInfo,
+                                                   const VkAllocationCallbacks *pAllocator,
+                                                   VkCommandPool *pCommandPool) {
+    (void)pCreateInfo; (void)pAllocator;
+    AlrIcdDevice *dev = (AlrIcdDevice *)device;
+    uint32_t vpool;
+    if (!dev || !pCommandPool) return VK_ERROR_INITIALIZATION_FAILED;
+    vpool = alr_alloc(&g_next_vpool, 1);
+    if (alr_icd_ring_ok()) {
+        uint8_t req[32]; AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
+        alr_vk_enc_init(&e, req, sizeof(req));
+        alr_vk_enc_create_command_pool(&e, dev->vdev, vpool);
+        alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
+        if (!e.overflow) (void)alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
+    }
+    *pCommandPool = (VkCommandPool)vpool;  /* non-dispatchable: carries the virtual id */
+    return VK_SUCCESS;
+}
+
+static void VKAPI_CALL alr_vkDestroyCommandPool(VkDevice device, VkCommandPool commandPool,
+                                                const VkAllocationCallbacks *pAllocator) {
+    (void)device; (void)commandPool; (void)pAllocator;
+    /* The host frees pools with the device (vk_real_destroy_device); no per-pool op. */
+}
+
+static VkResult VKAPI_CALL alr_vkAllocateCommandBuffers(VkDevice device,
+                                                        const VkCommandBufferAllocateInfo *pAllocateInfo,
+                                                        VkCommandBuffer *pCommandBuffers) {
+    AlrIcdDevice *dev = (AlrIcdDevice *)device;
+    uint32_t i, count;
+    if (!dev || !pAllocateInfo || !pCommandBuffers) return VK_ERROR_INITIALIZATION_FAILED;
+    count = pAllocateInfo->commandBufferCount;
+    for (i = 0; i < count; ++i) {
+        AlrIcdCommandBuffer *cb = (AlrIcdCommandBuffer *)calloc(1, sizeof(AlrIcdCommandBuffer));
+        if (!cb) { return VK_ERROR_OUT_OF_HOST_MEMORY; }
+        alr_set_loader_magic_value(cb);
+        cb->vcmd = alr_alloc(&g_next_vcmd, 1);
+        cb->dev = dev;
+        if (alr_icd_ring_ok()) {
+            uint8_t req[32]; AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
+            uint32_t vpool = (uint32_t)(uintptr_t)pAllocateInfo->commandPool;
+            alr_vk_enc_init(&e, req, sizeof(req));
+            alr_vk_enc_allocate_command_buffers(&e, dev->vdev, vpool, cb->vcmd);
+            alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
+            if (!e.overflow) (void)alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
+        }
+        pCommandBuffers[i] = (VkCommandBuffer)cb;
+    }
+    return VK_SUCCESS;
+}
+
+static VkResult VKAPI_CALL alr_vkCreateShaderModule(VkDevice device,
+                                                    const VkShaderModuleCreateInfo *pCreateInfo,
+                                                    const VkAllocationCallbacks *pAllocator,
+                                                    VkShaderModule *pShaderModule) {
+    (void)pAllocator;
+    AlrIcdDevice *dev = (AlrIcdDevice *)device;
+    uint32_t vshader, stage = 0;
+    int32_t res = 0;
+    if (!dev || !pCreateInfo || !pShaderModule || !pCreateInfo->pCode ||
+        pCreateInfo->codeSize == 0)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    vshader = alr_alloc(&g_next_vshader, 1);
+    if (alr_icd_ring_ok()) {
+        /* The SPIR-V can be larger than a tiny stack buffer; size the request buffer to
+         * fit the op header (13 bytes) + the blob (4-byte len + bytes). */
+        uint32_t code_len = (uint32_t)pCreateInfo->codeSize;
+        uint32_t need = 16 + 4 + code_len;
+        uint8_t *req = (uint8_t *)malloc(need);
+        uint8_t reply[ALR_ICD_REPLY_SCRATCH];
+        if (!req) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        AlrVkEncoder e;
+        alr_vk_enc_init(&e, req, need);
+        alr_vk_enc_create_shader_module(&e, dev->vdev, vshader, stage,
+                                        pCreateInfo->pCode, code_len);
+        alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
+        if (!e.overflow) {
+            uint32_t rlen = alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
+            if (rlen) (void)alr_icd_scan_reply(reply, rlen, (uint8_t)ALR_VK_REPLY_SHADER,
+                                               &res, NULL, NULL);
+            else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;
+        } else {
+            res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;
+        }
+        free(req);
+    }
+    if (res != 0) return (VkResult)res;
+    *pShaderModule = (VkShaderModule)vshader;  /* non-dispatchable: virtual id */
+    return VK_SUCCESS;
+}
+
+static void VKAPI_CALL alr_vkDestroyShaderModule(VkDevice device, VkShaderModule shaderModule,
+                                                 const VkAllocationCallbacks *pAllocator) {
+    (void)pAllocator;
+    AlrIcdDevice *dev = (AlrIcdDevice *)device;
+    if (!dev || shaderModule == 0 || !alr_icd_ring_ok()) return;  /* non-dispatchable: 0 == null */
+    uint8_t req[32]; AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
+    alr_vk_enc_init(&e, req, sizeof(req));
+    alr_vk_enc_destroy_shader_module(&e, dev->vdev, (uint32_t)shaderModule);
+    alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
+    if (!e.overflow) (void)alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
+}
+
+static VkResult VKAPI_CALL alr_vkCreateSwapchainKHR(VkDevice device,
+                                                    const VkSwapchainCreateInfoKHR *pCreateInfo,
+                                                    const VkAllocationCallbacks *pAllocator,
+                                                    VkSwapchainKHR *pSwapchain) {
+    (void)pAllocator;
+    AlrIcdDevice *dev = (AlrIcdDevice *)device;
+    uint32_t vswap, w, h, want_count, got_count = 0;
+    int32_t res = 0;
+    if (!dev || !pCreateInfo || !pSwapchain) return VK_ERROR_INITIALIZATION_FAILED;
+    vswap = alr_alloc(&g_next_vswap, 1);
+    w = pCreateInfo->imageExtent.width ? pCreateInfo->imageExtent.width : 64;
+    h = pCreateInfo->imageExtent.height ? pCreateInfo->imageExtent.height : 64;
+    want_count = pCreateInfo->minImageCount ? pCreateInfo->minImageCount : 2;
+    if (alr_icd_ring_ok()) {
+        uint8_t req[48]; AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
+        alr_vk_enc_init(&e, req, sizeof(req));
+        alr_vk_enc_create_swapchain(&e, dev->vdev, vswap, w, h, want_count);
+        alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
+        if (!e.overflow) {
+            uint32_t rlen = alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
+            if (rlen) (void)alr_icd_scan_reply(reply, rlen, (uint8_t)ALR_VK_REPLY_SWAPCHAIN,
+                                               &res, &got_count, NULL);
+            else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;
+        } else {
+            res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;
+        }
+    }
+    if (res != 0) return (VkResult)res;
+    /* Stash the image count in the high bits so vkGetSwapchainImagesKHR can report it
+     * without a round-trip (the count is stable). vswap fits in 24 bits (pool 6000+). */
+    *pSwapchain = (VkSwapchainKHR)(((uint64_t)got_count << 32) | (uint64_t)vswap);
+    return VK_SUCCESS;
+}
+
+static void VKAPI_CALL alr_vkDestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain,
+                                                 const VkAllocationCallbacks *pAllocator) {
+    (void)pAllocator;
+    AlrIcdDevice *dev = (AlrIcdDevice *)device;
+    if (!dev || swapchain == 0 || !alr_icd_ring_ok()) return;  /* non-dispatchable: 0 == null */
+    uint32_t vswap = (uint32_t)(swapchain & 0xffffffffu);
+    uint8_t req[32]; AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
+    alr_vk_enc_init(&e, req, sizeof(req));
+    alr_vk_enc_destroy_swapchain(&e, dev->vdev, vswap);
+    alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
+    if (!e.overflow) (void)alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
+}
+
+static VkResult VKAPI_CALL alr_vkGetSwapchainImagesKHR(VkDevice device, VkSwapchainKHR swapchain,
+                                                       uint32_t *pSwapchainImageCount,
+                                                       VkImage *pSwapchainImages) {
+    (void)device;
+    uint32_t count, i;
+    if (!pSwapchainImageCount) return VK_ERROR_INITIALIZATION_FAILED;
+    count = (uint32_t)(swapchain >> 32);  /* image count stashed in the high word */
+    if (count == 0) count = 1;
+    if (pSwapchainImages == NULL) { *pSwapchainImageCount = count; return VK_SUCCESS; }
+    uint32_t to_write = (*pSwapchainImageCount < count) ? *pSwapchainImageCount : count;
+    /* The "images" are virtual: image index i (the host owns the real AHB images). The
+     * guest only ever passes the index back via acquire/present, so the handle == index. */
+    for (i = 0; i < to_write; ++i) pSwapchainImages[i] = (VkImage)(uint64_t)i;
+    *pSwapchainImageCount = to_write;
+    return (to_write < count) ? VK_INCOMPLETE : VK_SUCCESS;
+}
+
+static VkResult VKAPI_CALL alr_vkAcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain,
+                                                     uint64_t timeout, VkSemaphore semaphore,
+                                                     VkFence fence, uint32_t *pImageIndex) {
+    (void)timeout; (void)semaphore; (void)fence;
+    AlrIcdDevice *dev = (AlrIcdDevice *)device;
+    uint32_t vswap, idx = 0; int32_t res = 0;
+    if (!dev || !pImageIndex) return VK_ERROR_INITIALIZATION_FAILED;
+    vswap = (uint32_t)(swapchain & 0xffffffffu);
+    if (alr_icd_ring_ok()) {
+        uint8_t req[32]; AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
+        alr_vk_enc_init(&e, req, sizeof(req));
+        alr_vk_enc_acquire_next_image(&e, dev->vdev, vswap);
+        alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
+        if (!e.overflow) {
+            uint32_t rlen = alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
+            if (rlen) (void)alr_icd_scan_reply(reply, rlen, (uint8_t)ALR_VK_REPLY_ACQUIRE,
+                                               &res, &idx, NULL);
+            else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;
+        }
+    }
+    if (res != 0) return (VkResult)res;
+    *pImageIndex = idx;
+    return VK_SUCCESS;
+}
+
+/* Coarse draw-record: marshal CMD_BEGIN_DRAW_MODULES (host builds the renderpass +
+ * pipeline from the guest's shader modules + draws into the swapchain image). */
+void VKAPI_CALL alrVkCmdDrawTriangleModules(VkCommandBuffer commandBuffer,
+                                            VkSwapchainKHR swapchain, uint32_t imageIndex,
+                                            VkShaderModule vertModule, VkShaderModule fragModule,
+                                            uint32_t width, uint32_t height, float bg_r,
+                                            float bg_g, float bg_b, float bg_a) {
+    AlrIcdCommandBuffer *cb = (AlrIcdCommandBuffer *)commandBuffer;
+    if (!cb || !cb->dev || !alr_icd_ring_ok()) return;
+    atomic_store_explicit(&g_last_record_vcmd, cb->vcmd, memory_order_release);
+    uint32_t vswap = (uint32_t)(swapchain & 0xffffffffu);
+    uint8_t req[64]; AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
+    alr_vk_enc_init(&e, req, sizeof(req));
+    alr_vk_enc_cmd_begin_draw_modules(&e, cb->dev->vdev, cb->vcmd, vswap, imageIndex,
+                                      (uint32_t)vertModule, (uint32_t)fragModule, width,
+                                      height, bg_r, bg_g, bg_b, bg_a);
+    alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
+    if (!e.overflow) (void)alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
+}
+
+static VkResult VKAPI_CALL alr_vkQueuePresentKHR(VkQueue queue,
+                                                 const VkPresentInfoKHR *pPresentInfo) {
+    AlrIcdQueue *q = (AlrIcdQueue *)queue;
+    int32_t res = 0;
+    if (!q || !q->dev || !pPresentInfo || pPresentInfo->swapchainCount == 0 ||
+        !pPresentInfo->pSwapchains || !pPresentInfo->pImageIndices)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    /* The host keys the recorded draw by vcmd; QUEUE_PRESENT submits that command buffer,
+     * then routes the rendered swapchain AHB to the compositor. The single-surface
+     * bring-up records into one command buffer (alrVkCmdDrawTriangleModules) then
+     * presents, so we use the most-recently-recorded vcmd. A multi-surface breadth rung
+     * carries vcmd explicitly per swapchain. */
+    uint32_t vcmd = alr_icd_last_record_vcmd();
+    for (uint32_t i = 0; i < pPresentInfo->swapchainCount; ++i) {
+        uint32_t vswap = (uint32_t)(pPresentInfo->pSwapchains[i] & 0xffffffffu);
+        uint32_t img = pPresentInfo->pImageIndices[i];
+        if (alr_icd_ring_ok()) {
+            uint8_t req[48]; AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
+            alr_vk_enc_init(&e, req, sizeof(req));
+            alr_vk_enc_queue_present(&e, q->dev->vdev, q->vqueue, vcmd, vswap, img);
+            alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
+            if (!e.overflow) {
+                uint32_t rlen = alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
+                int32_t one = 0;
+                if (rlen && alr_icd_scan_reply(reply, rlen, (uint8_t)ALR_VK_REPLY_PRESENT,
+                                               &one, NULL, NULL))
+                    res = one;
+            }
+        }
+        if (pPresentInfo->pResults) pPresentInfo->pResults[i] = (VkResult)res;
+    }
+    return (VkResult)res;
+}
+
+/* ============================================================================
  * Dispatch — vkGetInstanceProcAddr / vkGetDeviceProcAddr. The app/loader resolves
  * every entry point through these. We return our ENUM-rung implementations and
  * vkGetInstanceProcAddr / vkGetDeviceProcAddr themselves (a global GIPA also resolves
@@ -511,6 +839,18 @@ static PFN_vkVoidFunction alr_lookup(const char *pName) {
         ALR_ENTRY("vkCreateDevice", alr_vkCreateDevice),
         ALR_ENTRY("vkDestroyDevice", alr_vkDestroyDevice),
         ALR_ENTRY("vkGetDeviceQueue", alr_vkGetDeviceQueue),
+        /* ---- VK-M4 (PRESENT rung) ---- */
+        ALR_ENTRY("vkCreateCommandPool", alr_vkCreateCommandPool),
+        ALR_ENTRY("vkDestroyCommandPool", alr_vkDestroyCommandPool),
+        ALR_ENTRY("vkAllocateCommandBuffers", alr_vkAllocateCommandBuffers),
+        ALR_ENTRY("vkCreateShaderModule", alr_vkCreateShaderModule),
+        ALR_ENTRY("vkDestroyShaderModule", alr_vkDestroyShaderModule),
+        ALR_ENTRY("vkCreateSwapchainKHR", alr_vkCreateSwapchainKHR),
+        ALR_ENTRY("vkDestroySwapchainKHR", alr_vkDestroySwapchainKHR),
+        ALR_ENTRY("vkGetSwapchainImagesKHR", alr_vkGetSwapchainImagesKHR),
+        ALR_ENTRY("vkAcquireNextImageKHR", alr_vkAcquireNextImageKHR),
+        ALR_ENTRY("vkQueuePresentKHR", alr_vkQueuePresentKHR),
+        ALR_ENTRY("alrVkCmdDrawTriangleModules", alrVkCmdDrawTriangleModules),
     };
     size_t i;
     if (!pName) return NULL;
@@ -617,4 +957,55 @@ __attribute__((visibility("default")))
 void VKAPI_CALL vkGetDeviceQueue(VkDevice device, uint32_t queueFamilyIndex,
                                  uint32_t queueIndex, VkQueue *pQueue) {
     alr_vkGetDeviceQueue(device, queueFamilyIndex, queueIndex, pQueue);
+}
+
+/* ---- VK-M4 (PRESENT rung) public symbols (a guest app linked -lvulkan calls these). ---- */
+__attribute__((visibility("default")))
+VkResult VKAPI_CALL vkCreateCommandPool(VkDevice device, const VkCommandPoolCreateInfo *pCreateInfo,
+                                        const VkAllocationCallbacks *pAllocator, VkCommandPool *pCommandPool) {
+    return alr_vkCreateCommandPool(device, pCreateInfo, pAllocator, pCommandPool);
+}
+__attribute__((visibility("default")))
+void VKAPI_CALL vkDestroyCommandPool(VkDevice device, VkCommandPool commandPool,
+                                     const VkAllocationCallbacks *pAllocator) {
+    alr_vkDestroyCommandPool(device, commandPool, pAllocator);
+}
+__attribute__((visibility("default")))
+VkResult VKAPI_CALL vkAllocateCommandBuffers(VkDevice device, const VkCommandBufferAllocateInfo *pAllocateInfo,
+                                             VkCommandBuffer *pCommandBuffers) {
+    return alr_vkAllocateCommandBuffers(device, pAllocateInfo, pCommandBuffers);
+}
+__attribute__((visibility("default")))
+VkResult VKAPI_CALL vkCreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo *pCreateInfo,
+                                         const VkAllocationCallbacks *pAllocator, VkShaderModule *pShaderModule) {
+    return alr_vkCreateShaderModule(device, pCreateInfo, pAllocator, pShaderModule);
+}
+__attribute__((visibility("default")))
+void VKAPI_CALL vkDestroyShaderModule(VkDevice device, VkShaderModule shaderModule,
+                                      const VkAllocationCallbacks *pAllocator) {
+    alr_vkDestroyShaderModule(device, shaderModule, pAllocator);
+}
+__attribute__((visibility("default")))
+VkResult VKAPI_CALL vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *pCreateInfo,
+                                         const VkAllocationCallbacks *pAllocator, VkSwapchainKHR *pSwapchain) {
+    return alr_vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+}
+__attribute__((visibility("default")))
+void VKAPI_CALL vkDestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain,
+                                      const VkAllocationCallbacks *pAllocator) {
+    alr_vkDestroySwapchainKHR(device, swapchain, pAllocator);
+}
+__attribute__((visibility("default")))
+VkResult VKAPI_CALL vkGetSwapchainImagesKHR(VkDevice device, VkSwapchainKHR swapchain,
+                                            uint32_t *pSwapchainImageCount, VkImage *pSwapchainImages) {
+    return alr_vkGetSwapchainImagesKHR(device, swapchain, pSwapchainImageCount, pSwapchainImages);
+}
+__attribute__((visibility("default")))
+VkResult VKAPI_CALL vkAcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout,
+                                          VkSemaphore semaphore, VkFence fence, uint32_t *pImageIndex) {
+    return alr_vkAcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, pImageIndex);
+}
+__attribute__((visibility("default")))
+VkResult VKAPI_CALL vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo) {
+    return alr_vkQueuePresentKHR(queue, pPresentInfo);
 }
