@@ -2847,6 +2847,23 @@ class MainActivity : Activity() {
                     "alr_loader",
                     "aptupdate: fakeroot.so=${fakerootSo.isFile} apt-get=${aptGetBin.isFile} hosts=${hostsFile.isFile} sources=${srcFile.isFile} (waited ${w}ms)",
                 )
+                // AUTHENTICATED apt path /tmp prep (same idiom as the Xwayland X0-lock
+                // /tmp(1777) prep above): noble apt's gpgv verify execs apt-key, which
+                // `mktemp -d`s a throwaway gpg home UNDER /tmp (guest-visible /tmp =
+                // <rootfs>/tmp via the loader's path mediation). The base tar's /tmp is
+                // mode 0700 owner-only; that already lets the same-uid apt-key write, but
+                // a prior run can leave it absent/odd, and apt-key+gpgv are happiest with
+                // the canonical sticky 1777. Ensure /tmp exists + is 1777 from the APP side
+                // (direct UNMEDIATED host-rootfs access) so apt-key's mktemp never fails on
+                // perms → no "Unknown error executing apt-key". Idempotent + best-effort.
+                try {
+                    val aTmp = java.io.File(rootfsDir, "tmp")
+                    aTmp.mkdirs()
+                    android.system.Os.chmod(aTmp.absolutePath, 0x3FF /* 01777 */)
+                    android.util.Log.i("alr_loader", "aptupdate: prepped /tmp(1777)=${aTmp.isDirectory}")
+                } catch (e: Throwable) {
+                    android.util.Log.w("alr_loader", "aptupdate: /tmp prep EXC: ${e.message}")
+                }
                 android.system.Os.setenv("ALR_FAKEROOT", "1", true)
                 android.system.Os.setenv("ALR_REEXEC_INPROC", "1", true)
                 android.system.Os.setenv("ALR_INTERPOSE_DIAG", "1", true)
