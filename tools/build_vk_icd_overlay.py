@@ -1,21 +1,34 @@
 #!/usr/bin/env python3
 """build_vk_icd_overlay.py — assemble the §5-E `vk-icd-stage.tar` overlay carrying
-the ALR guest Vulkan ICD (libvulkan.so.1) into /usr/lib/androlinux.
+the ALR guest Vulkan Mali ICD (libalr_mali_icd.so) into /usr/lib/androlinux.
+
+ICD DISCOVERY REDIRECT (Part B) — why the SONAME is libalr_mali_icd.so, NOT libvulkan.so.1
+-----------------------------------------------------------------------------------------
+Our guest ICD was RENAMED from libvulkan.so.1 to **libalr_mali_icd.so** so it COEXISTS
+with the real Khronos Vulkan-Loader, which now owns libvulkan.so.1 in the SAME directory
+(/usr/lib/androlinux) via the companion vk-loader overlay (tools/build_vk_loader_overlay.py).
+An ANGLE/volk guest does dlopen("libvulkan.so.1") → reaches the Khronos LOADER → the loader
+reads the discovery manifest alr_icd.json (shipped by the vk-loader overlay, library_path =
+/usr/lib/androlinux/libalr_mali_icd.so) → loads THIS file as the ICD → Mali-G615. If our ICD
+kept the name libvulkan.so.1, the loader would try to load ITSELF as the ICD (fatal).
 
 This is the staging counterpart of the GLES shim's gpushim layout (README:
 /usr/lib/androlinux/libGLESv2.so.2 + libEGL.so.1 + unversioned symlinks). It produces a
 conformant overlay tar (tools/STAGE_TAR_SPEC.md):
   - `./`-rooted, relative paths only;
-  - the .so shipped as a single real file at the bare SONAME `libvulkan.so.1`, mode 0755
-    (ALR/Android file-backed PROT_EXEC under untrusted_app rejects a non-exec .so — §10.1);
-  - an unversioned `libvulkan.so -> libvulkan.so.1` relative symlink (dev/link convenience);
-  - the Khronos ICD manifest `alr_icd.json` (only consulted on the LOADER route, via
-    VK_ICD_FILENAMES; harmless on the direct-SONAME route).
+  - the .so shipped as a single real file at the bare SONAME `libalr_mali_icd.so`, mode 0755
+    (ALR/Android file-backed PROT_EXEC under untrusted_app rejects a non-exec .so — §10.1).
+
+This overlay ships ONLY the renamed ICD .so. It deliberately does NOT ship:
+  * a libvulkan.so / libvulkan.so.1 symlink — the Khronos loader (vk-loader overlay) owns
+    those names; a libvulkan.so here would shadow the loader for a dlopen("libvulkan.so").
+  * an alr_icd.json manifest — the vk-loader overlay supplies the authoritative manifest
+    (its library_path is the ABSOLUTE /usr/lib/androlinux/libalr_mali_icd.so). The
+    direct-SONAME guests (alr-vk-enum / alr-vk-tri, which DT_NEEDED libalr_mali_icd.so)
+    bind the ICD directly and need no manifest at all.
 
 Tar member layout:
-  ./usr/lib/androlinux/libvulkan.so.1     (real ICD, 0755)
-  ./usr/lib/androlinux/libvulkan.so       (-> libvulkan.so.1)
-  ./usr/lib/androlinux/alr_icd.json       (ICD manifest, library_path = ./libvulkan.so.1)
+  ./usr/lib/androlinux/libalr_mali_icd.so     (real ICD, 0755)
 
 The .so is built by app/src/main/cpp/alr_gpu/guest_icd/build-icd.sh (zig cc, glibc-2.34
 NEEDED-clean). This script either consumes a pre-built .so (--so PATH) or runs build-icd.sh.
@@ -29,7 +42,6 @@ from __future__ import annotations
 
 import argparse
 import io
-import json
 import os
 import subprocess
 import sys
@@ -37,20 +49,9 @@ import tarfile
 import tempfile
 
 ANDROLINUX_DIR = "usr/lib/androlinux"
-SONAME = "libvulkan.so.1"
-UNVERSIONED = "libvulkan.so"
-MANIFEST = "alr_icd.json"
-
-# Khronos ICD manifest. library_path is RELATIVE to the manifest's own directory, so the
-# loader resolves it next to alr_icd.json (both land in /usr/lib/androlinux). api_version
-# is the Vulkan version the ICD advertises (Mali-G615 is 1.3; the ENUM rung surfaces it).
-ICD_MANIFEST = {
-    "file_format_version": "1.0.0",
-    "ICD": {
-        "library_path": "./" + SONAME,
-        "api_version": "1.3.0",
-    },
-}
+# The ICD's RENAMED SONAME (was libvulkan.so.1). It coexists with the Khronos loader's
+# libvulkan.so.1 in the same dir; the loader's alr_icd.json (vk-loader overlay) names it.
+SONAME = "libalr_mali_icd.so"
 
 
 def _repo_root() -> str:
@@ -58,7 +59,7 @@ def _repo_root() -> str:
 
 
 def _build_icd_so(out_dir: str) -> str:
-    """Run build-icd.sh and return the path to the produced libvulkan.so.1."""
+    """Run build-icd.sh and return the path to the produced libalr_mali_icd.so."""
     script = os.path.join(
         _repo_root(), "app", "src", "main", "cpp", "alr_gpu", "guest_icd", "build-icd.sh"
     )
@@ -94,8 +95,6 @@ def build_overlay(out_tar: str, so_path: str | None = None,
     with open(so_path, "rb") as f:
         so_bytes = f.read()
 
-    manifest_bytes = (json.dumps(ICD_MANIFEST, indent=2) + "\n").encode("utf-8")
-
     members = []
     client_bytes = 0
     with tarfile.open(out_tar, "w") as tar:
@@ -107,20 +106,10 @@ def build_overlay(out_tar: str, so_path: str | None = None,
             tar.addfile(ti, io.BytesIO(data))
             members.append(("file", "./" + rel, mode))
 
-        def add_symlink(rel: str, target: str):
-            ti = tarfile.TarInfo("./" + rel)
-            ti.type = tarfile.SYMTYPE
-            ti.linkname = target  # RELATIVE (in-dir) target per §5-E safe-symlink rule
-            ti.mode = 0o777
-            tar.addfile(ti)
-            members.append(("symlink", "./" + rel, target))
-
-        # The real ICD .so — mode 0755 (the ALR exec-bit requirement, §10.1).
+        # The real ICD .so under its RENAMED SONAME — mode 0755 (ALR exec-bit, §10.1).
+        # NO libvulkan.so symlink (the Khronos loader owns that name) and NO alr_icd.json
+        # (the vk-loader overlay supplies the authoritative absolute-path manifest).
         add_file(f"{ANDROLINUX_DIR}/{SONAME}", so_bytes, 0o755)
-        # Unversioned dev symlink (relative, in-dir).
-        add_symlink(f"{ANDROLINUX_DIR}/{UNVERSIONED}", SONAME)
-        # ICD manifest (loader route only).
-        add_file(f"{ANDROLINUX_DIR}/{MANIFEST}", manifest_bytes, 0o644)
         # Optional: the guest client programs under /usr/bin (mode 0755 exec bit).
         if clients_dir is not None:
             for name in CLIENT_NAMES:
@@ -146,9 +135,10 @@ def build_overlay(out_tar: str, so_path: str | None = None,
 
 def _selftest() -> int:
     """Build the overlay (from a fake .so so we need no toolchain), then validate its
-    SHAPE: ./-rooted, the .so is a single real file at the bare SONAME mode 0755, the
-    unversioned symlink is relative+in-dir, and the manifest parses with a relative
-    library_path. (The full §5-E validation against a base runs via
+    SHAPE: ./-rooted, the ICD .so is a single real file at the bare SONAME
+    libalr_mali_icd.so mode 0755, and the overlay ships NEITHER a libvulkan.so symlink
+    (the Khronos loader owns that name) NOR an alr_icd.json (the vk-loader overlay owns
+    the manifest). (The full §5-E validation against a base runs via
     `python -m tools.stage_tar_spec --overlay <tar>` in the build flow.)"""
     with tempfile.TemporaryDirectory() as d:
         fake_so = os.path.join(d, SONAME)
@@ -166,32 +156,20 @@ def _selftest() -> int:
                 if ".." in n.split("/"):
                     errors.append(f"member escapes: {n}")
             so_member = f"./{ANDROLINUX_DIR}/{SONAME}"
-            link_member = f"./{ANDROLINUX_DIR}/{UNVERSIONED}"
-            man_member = f"./{ANDROLINUX_DIR}/{MANIFEST}"
             if so_member not in names:
-                errors.append("missing libvulkan.so.1")
+                errors.append(f"missing {SONAME}")
             else:
                 ti = tar.getmember(so_member)
                 if not ti.isfile():
-                    errors.append("libvulkan.so.1 is not a real file")
+                    errors.append(f"{SONAME} is not a real file")
                 if (ti.mode & 0o111) == 0:
-                    errors.append(f"libvulkan.so.1 not executable (mode {oct(ti.mode)})")
-            if link_member not in names:
-                errors.append("missing libvulkan.so symlink")
-            else:
-                ti = tar.getmember(link_member)
-                if not ti.issym():
-                    errors.append("libvulkan.so is not a symlink")
-                elif ti.linkname != SONAME or "/" in ti.linkname:
-                    errors.append(f"libvulkan.so target not relative/in-dir: {ti.linkname}")
-            if man_member not in names:
-                errors.append("missing alr_icd.json")
-            else:
-                data = tar.extractfile(man_member).read()
-                man = json.loads(data)
-                lib = man.get("ICD", {}).get("library_path", "")
-                if not lib.startswith("./"):
-                    errors.append(f"manifest library_path not relative: {lib}")
+                    errors.append(f"{SONAME} not executable (mode {oct(ti.mode)})")
+            # The overlay must NOT carry the loader-owned libvulkan name or the manifest.
+            for forbidden in (f"./{ANDROLINUX_DIR}/libvulkan.so",
+                              f"./{ANDROLINUX_DIR}/libvulkan.so.1",
+                              f"./{ANDROLINUX_DIR}/alr_icd.json"):
+                if forbidden in names:
+                    errors.append(f"overlay must not ship {forbidden} (owned by vk-loader overlay)")
 
         if errors:
             print("SELFTEST FAIL:")
@@ -206,7 +184,7 @@ def _selftest() -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build the vk-icd-stage.tar overlay.")
     ap.add_argument("--out", help="output overlay tar path")
-    ap.add_argument("--so", help="pre-built libvulkan.so.1 (else build-icd.sh runs)")
+    ap.add_argument("--so", help="pre-built libalr_mali_icd.so (else build-icd.sh runs)")
     ap.add_argument("--base", help="base rootfs (dir|tar) for an optional guard check")
     ap.add_argument("--with-clients", action="store_true",
                     help="also bundle the guest client programs (alr-vk-enum, alr-vk-tri) "
@@ -225,14 +203,14 @@ def main() -> int:
     clients_dir = None
     if args.with_clients:
         # Prefer an explicit dir, else infer from --so's directory (the build script puts
-        # the clients next to libvulkan.so.1). If neither + --so is absent, build_overlay
+        # the clients next to libalr_mali_icd.so). If neither + --so is absent, build_overlay
         # falls back to the freshly-built temp out dir.
         clients_dir = args.clients_dir or (os.path.dirname(os.path.abspath(args.so))
                                            if args.so else None)
     summary = build_overlay(args.out, so_path=args.so, clients_dir=clients_dir)
     extra = (f", clients = {summary['client_bytes']} bytes"
              if summary.get("client_bytes") else "")
-    print(f"wrote {summary['out']} (libvulkan.so.1 = {summary['so_bytes']} bytes{extra})")
+    print(f"wrote {summary['out']} ({SONAME} = {summary['so_bytes']} bytes{extra})")
     for kind, name, val in summary["members"]:
         print(f"  {kind:8} {name}  {val}")
     return 0

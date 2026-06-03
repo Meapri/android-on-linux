@@ -1956,14 +1956,53 @@ int renameat2(int oldfd, const char *oldp, int newfd, const char *newp,
  * rename/renameat pattern. CAUTION: for symlink/symlinkat the FIRST arg is the
  * symlink *contents* (target), stored verbatim by the kernel -- it is NOT a
  * filesystem location to resolve now, so it must NOT be rewritten; only the
- * linkpath (where the symlink is created) is rewritten. */
+ * linkpath (where the symlink is created) is rewritten.
+ *
+ * HARD-LINK FALLBACK (device-proven, Xwayland X0-lock):
+ * --------------------------------------------------------------------------
+ * The ALR rootfs lives on Android /data, whose filesystem REFUSES hard links —
+ * link()/linkat() return EPERM/EACCES even for the app's own uid in its own dir
+ * (verified: `ln a b` -> "Permission denied"; rename() and symlink() work). This
+ * breaks any program that uses link() as an atomic "claim this name" primitive —
+ * notably the X server's LockServer() (os/utils.c): it create()s /tmp/.Xnn-tmp and
+ * link()s it to /tmp/.X0-lock to atomically take the display lock. The link EPERMs
+ * -> "Fatal server error: Linking lock file (/tmp/.X0-lock) in place failed:
+ * Permission denied" -> Xwayland aborts -> the X socket is never bound -> no X app
+ * (xcalc) can connect.
+ * FIX: when the real link/linkat fails with EPERM/EACCES, retry the operation as a
+ * rename() of the SAME (already-rewritten) paths. rename() is atomic and supported
+ * on /data, and gives the exact semantics the lock pattern needs (the new name now
+ * names the file; the temp source is consumed — the caller's subsequent unlink(tmp)
+ * just ENOENTs harmlessly). We ONLY fall back on the link-unsupported errnos, so a
+ * genuine link error (e.g. EEXIST = lock already held, ENOENT = missing source) is
+ * still reported truthfully, and filesystems that DO support hard links keep exact
+ * link semantics (the fallback never runs). Cross-directory links degrade to a move,
+ * which is correct for the temp->lock case and the dominant real-world link() use. */
+
+static int alr_link_emit(const char *o_rw, const char *n_rw) {
+    /* o_rw/n_rw are already rootfs-rewritten. Try a real hard link; on the Android
+     * /data "no hard links" errno, fall back to an atomic rename of the same paths. */
+    static int (*real_link)(const char *, const char *);
+    ALR_REAL(real_link, int (*)(const char *, const char *), "link");
+    int r = real_link(o_rw, n_rw);
+    if (r == 0) return 0;
+    if (errno == EPERM || errno == EACCES) {
+        int saved = errno;
+        static int (*real_rename)(const char *, const char *);
+        ALR_REAL(real_rename, int (*)(const char *, const char *), "rename");
+        if (real_rename) {
+            int rr = real_rename(o_rw, n_rw);
+            if (rr == 0) { alr_diag("link->rename(EPERM)", o_rw, n_rw, 0); return 0; }
+        }
+        errno = saved;   /* rename also failed -> report the original link errno */
+    }
+    return r;
+}
 
 int link(const char *oldp, const char *newp) {
-    static int (*real)(const char *, const char *);
-    ALR_REAL(real, int (*)(const char *, const char *), "link");
     char b1[ALR_PBUF], b2[ALR_PBUF];
     /* both args are existing/target filesystem paths -> rewrite both */
-    return real(rw(oldp, b1, sizeof b1), rw(newp, b2, sizeof b2));
+    return alr_link_emit(rw(oldp, b1, sizeof b1), rw(newp, b2, sizeof b2));
 }
 int linkat(int oldfd, const char *oldp, int newfd, const char *newp, int flags) {
     static int (*real)(int, const char *, int, const char *, int);
@@ -1971,7 +2010,23 @@ int linkat(int oldfd, const char *oldp, int newfd, const char *newp, int flags) 
     char b1[ALR_PBUF], b2[ALR_PBUF];
     const char *o = (oldp && oldp[0] == '/') ? rw(oldp, b1, sizeof b1) : oldp;
     const char *n = (newp && newp[0] == '/') ? rw(newp, b2, sizeof b2) : newp;
-    return real(oldfd, o, newfd, n, flags);
+    int r = real(oldfd, o, newfd, n, flags);
+    if (r == 0) return 0;
+    /* Same Android-/data hard-link fallback as link(): on EPERM/EACCES, when BOTH
+     * sides are AT_FDCWD-relative-or-absolute (the lock-file pattern; no fd anchor),
+     * retry as renameat() of the same rewritten paths. We restrict the fallback to the
+     * AT_FDCWD case so a dirfd-anchored link keeps its exact (un-faked) behavior. */
+    if ((errno == EPERM || errno == EACCES) && oldfd == AT_FDCWD && newfd == AT_FDCWD) {
+        int saved = errno;
+        static int (*real_renameat)(int, const char *, int, const char *);
+        ALR_REAL(real_renameat, int (*)(int, const char *, int, const char *), "renameat");
+        if (real_renameat) {
+            int rr = real_renameat(AT_FDCWD, o, AT_FDCWD, n);
+            if (rr == 0) { alr_diag("linkat->renameat(EPERM)", o, n, 0); return 0; }
+        }
+        errno = saved;
+    }
+    return r;
 }
 int symlink(const char *target, const char *linkpath) {
     static int (*real)(const char *, const char *);
@@ -2030,6 +2085,86 @@ int name_to_handle_at(int dirfd, const char *path, struct file_handle *handle,
     char b[ALR_PBUF];
     const char *p = (path && path[0] == '/') ? rw(path, b, sizeof b) : path;
     return real(dirfd, p, handle, mount_id, flags);
+}
+
+/* =================================================================== */
+/* dlopen — ICD discovery redirect (GPU Part B)                        */
+/* =================================================================== */
+/*
+ * ANGLE / volk / a generic Vulkan client does dlopen("libvulkan.so.1") (a BARE
+ * SONAME, no path) to find the Vulkan loader. ld.so resolves a bare soname via the
+ * usual search (LD_LIBRARY_PATH, default dirs) — but on Android the host
+ * /system/lib64/libvulkan.so is reachable and may win, so the client gets Android's
+ * OWN loader, which never reads our alr_icd.json and never loads our Mali ICD →
+ * ANGLE dies at "Internal Vulkan error -3".
+ *
+ * FIX: intercept dlopen and, for the bare Vulkan loader sonames (libvulkan.so /
+ * libvulkan.so.1), rewrite the request to the ABSOLUTE rootfs path of OUR staged
+ * Khronos Vulkan-Loader, <rootfs>/usr/lib/androlinux/libvulkan.so.1 (the vk-loader
+ * overlay). An absolute path makes ld.so load EXACTLY that file (no search, so the
+ * host /system loader can never win). That Khronos loader then reads alr_icd.json
+ * (VK_DRIVER_FILES, runtime_report.cpp) → loads libalr_mali_icd.so → Mali.
+ *
+ * GUARDS (fail-safe — never break a working guest):
+ *   - only the exact bare basenames "libvulkan.so" / "libvulkan.so.1" are matched
+ *     (an already-absolute/relative path, or any other soname, passes through);
+ *   - the redirect is taken ONLY if the rootfs loader file actually EXISTS (probed
+ *     via faccessat on the real host path, NOT mediated): if the vk-loader overlay
+ *     is not staged (e.g. the direct-SONAME alr-vk-enum path, where only
+ *     libalr_mali_icd.so exists), we leave the dlopen untouched so nothing regresses;
+ *   - interposer disabled (no ALR_ROOTFS) → pure passthrough.
+ * RTLD_NOLOAD callers (probe-only) still resolve the absolute path correctly.
+ */
+static int alr_basename_is(const char *path, const char *want) {
+    if (!path || !want) return 0;
+    /* Compare the final path component of `path` against `want` (exact). */
+    const char *base = path;
+    for (const char *q = path; *q; ++q) if (*q == '/') base = q + 1;
+    size_t i = 0;
+    for (; want[i]; ++i) if (base[i] != want[i]) return 0;
+    return base[i] == '\0';   /* full-length match, no trailing chars */
+}
+
+void *dlopen(const char *filename, int flag) {
+    static void *(*real)(const char *, int);
+    ALR_REAL(real, void *(*)(const char *, int), "dlopen");
+    if (!real) return NULL;   /* never on glibc */
+
+    /* Only consider a BARE Vulkan loader soname while the interposer is enabled.
+     * Anything else (NULL = "the main program", any other soname, or a path that
+     * contains a slash — already absolute/relative) takes the untouched real dlopen.
+     * alr_basename_is() does an EXACT final-component match, so "/abs/libvulkan.so.1"
+     * (a path) does NOT match the bare "libvulkan.so.1" only because the basename is
+     * equal — therefore also require the request to be slash-free, so an explicit
+     * absolute path the caller chose is honored verbatim. */
+    int has_slash = 0;
+    if (filename) for (const char *q = filename; *q; ++q) if (*q == '/') { has_slash = 1; break; }
+    if (filename && !has_slash && g_rootfs_len != 0 &&
+        (alr_basename_is(filename, "libvulkan.so.1") ||
+         alr_basename_is(filename, "libvulkan.so"))) {
+        if (!g_inited) alr_init();
+        /* Build <rootfs>/usr/lib/androlinux/libvulkan.so.1 (the Khronos loader). */
+        static const char kRel[] = "/usr/lib/androlinux/libvulkan.so.1";
+        char abs[ALR_PBUF];
+        size_t w = 0;
+        if (g_rootfs_len + (sizeof(kRel) - 1) + 1 <= sizeof(abs)) {
+            for (size_t i = 0; i < g_rootfs_len; ++i) abs[w++] = g_rootfs[i];
+            for (size_t i = 0; i < sizeof(kRel); ++i) abs[w++] = kRel[i];  /* copies NUL */
+            /* Take the redirect ONLY if the staged loader file exists (else the
+             * vk-loader overlay isn't present — leave dlopen as-is). faccessat on the
+             * REAL host path (already-rootfs → rw() would no-op it anyway). */
+            static int (*real_faccessat)(int, const char *, int, int);
+            ALR_REAL(real_faccessat, int (*)(int, const char *, int, int), "faccessat");
+            if (real_faccessat && real_faccessat(AT_FDCWD, abs, F_OK, 0) == 0) {
+                void *h = real(abs, flag);
+                alr_diag("dlopen vulkan->loader", filename, abs, h ? 0 : -1);
+                if (h) return h;
+                /* Loader present but failed to load: fall through to the real dlopen so
+                 * the caller sees a truthful dlerror() for the original request. */
+            }
+        }
+    }
+    return real(filename, flag);
 }
 
 /* =================================================================== */

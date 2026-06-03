@@ -1939,9 +1939,18 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
             guest_env.push_back(std::string("ALR_ICD_DIAG=") + icd_diag);
         else if (angle_requested)
             guest_env.push_back("ALR_ICD_DIAG=1");
-        // If a future build takes the LOADER route (real Khronos loader + our ICD
-        // manifest) instead of the direct-SONAME route, point the loader at the manifest
-        // the vk-icd overlay stages. Harmless for the direct route (no loader reads it).
+        // ICD DISCOVERY REDIRECT (Part B, the LOADER route): when the real Khronos
+        // Vulkan-Loader is staged (vk-loader overlay → /usr/lib/androlinux/libvulkan.so.1)
+        // and ANGLE/volk dlopens "libvulkan.so.1", the loader discovers our (renamed) Mali
+        // ICD via this manifest. The manifest (alr_icd.json) is shipped by the vk-loader
+        // overlay and its library_path is the ABSOLUTE /usr/lib/androlinux/libalr_mali_icd.so.
+        // VK_DRIVER_FILES is the MODERN loader's authoritative driver-manifest selector
+        // (it OVERRIDES the system ICD search entirely, so the host /system ICDs are not
+        // also enumerated); VK_ICD_FILENAMES is the legacy alias kept for older loaders.
+        // Both point at the same manifest. Harmless on the direct-SONAME route (alr-vk-enum/
+        // tri DT_NEEDED libalr_mali_icd.so and bind it directly — no loader reads these).
+        guest_env.push_back("VK_DRIVER_FILES=" + config.rootfs_dir +
+                            "/usr/lib/androlinux/alr_icd.json");
         guest_env.push_back("VK_ICD_FILENAMES=" + config.rootfs_dir +
                             "/usr/lib/androlinux/alr_icd.json");
     }
@@ -2087,7 +2096,15 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         // can exceed 32; an undersized cap would silently TRUNCATE the tail
         // (dropping the GpuRing vars, or LD_PRELOAD itself if reordered), so keep
         // generous headroom. envp_ptrs[] is sized to match.
-        constexpr std::size_t kMaxEnv = 48;
+        // GPU Part B: the ANGLE-on-Vulkan path stacks the MOST env vars — the base GUI
+        // set + ALR_ROOTFS/GUEST_EXE/PCGATE + LD_PRELOAD + the GpuRing block (EGL/GLES
+        // ring fds) + the VkRing block (VK ring fds) + VK_DRIVER_FILES + VK_ICD_FILENAMES
+        // + VK_LOADER_DEBUG + ALR_ICD_DIAG + XDG_SESSION_TYPE + ALR_INTERPOSE_DIAG. That
+        // measured >48, so the old cap SILENTLY TRUNCATED the tail (the VK_DRIVER_FILES /
+        // VkRing vars), which is why ANGLE never discovered our ICD. Raised to 64 with
+        // margin; envp_ptrs[] is sized to match. (A truncated env is the WORST failure
+        // mode here — it drops exactly the late VK discovery vars — so over-provision.)
+        constexpr std::size_t kMaxEnv = 64;
         const std::size_t n_env = guest_env.size() < kMaxEnv ? guest_env.size() : kMaxEnv;
         uintptr_t envp_ptrs[kMaxEnv] = {0};
         for (std::size_t i = n_env; i-- > 0;) {
