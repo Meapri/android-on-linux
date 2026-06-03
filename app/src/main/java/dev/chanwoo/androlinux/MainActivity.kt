@@ -407,6 +407,11 @@ class MainActivity : Activity() {
         // marker — without needing a display (the GUI bodies are launched on the compositor
         // by the integration drain). Same pkgfunc pattern as launchPackageManagerProbes.
         launchToolkitProbes(rootfsStatus.rootfsDir, rootfsManifest.name)
+        // ANGLE-on-Vulkan device proof (GPU north-star rung). MARKER-GATED on
+        // /data/local/tmp/.alr-angle → normal cold starts never run it (no-regression).
+        // Runs alr-gles-cube under ALR_ANGLE=1 + ALR_VK_ICD=1 so ANGLE translates GLES2 →
+        // Vulkan → our guest libvulkan.so.1 ICD → Mali; logs "angle-gles:" to alr_loader.
+        launchAngleGlesProbe(rootfsStatus.rootfsDir, rootfsManifest.name)
         val nativeCommandRunner = NativeCommandRunner(
             File(applicationInfo.nativeLibraryDir),
             File(cacheDir, "proot-tmp"),
@@ -3275,6 +3280,105 @@ class MainActivity : Activity() {
                 }
             } catch (e: Throwable) {
                 android.util.Log.e("alr_loader", "toolkit EXC: ${android.util.Log.getStackTraceString(e)}")
+            }
+        }.start()
+    }
+
+    // ANGLE-on-Vulkan device proof (the GPU north-star rung). MARKER-GATED on
+    // /data/local/tmp/.alr-angle so a normal cold start NEVER runs it (strict
+    // no-regression: gpushim's glmark2 path is untouched). When the marker is present,
+    // this runs the minimal GLES2 client `alr-gles-cube` (staged at /usr/bin by the angle
+    // overlay) through the ALR loader with ALR_ANGLE=1 (ANGLE's libEGL.so.1/libGLESv2.so.2
+    // resolve FIRST from /usr/lib/androlinux-angle) + ALR_VK_ICD=1 (ANGLE's Vulkan backend
+    // dlopens our guest libvulkan.so.1 ICD + the VK rings attach). The cube does exactly
+    // eglGetDisplay→eglInitialize→eglChooseConfig→eglCreateContext→glClear→glDrawArrays→
+    // eglSwapBuffers — i.e. INIT + CLEAR + PRESENT. The loader report (tag alr_loader,
+    // "angle-gles:") carries the exec verdict, the fault pc@<so>+off (root-cause aid for
+    // the ELF-entry SIGSEGV), and the guest stdout (GL_RENDERER). ALR_TEE_GUEST_STDOUT
+    // streams ANGLE's own stderr (init trace) to logcat as it arrives.
+    private fun launchAngleGlesProbe(rootfsDir: File, rootfsName: String) {
+        if (!java.io.File("/data/local/tmp/.alr-angle").isFile) return
+        Thread {
+            try {
+                // The vk-icd overlay (our guest libvulkan.so.1 ICD) only auto-stages on the
+                // cronly path; the ANGLE proof runs in the normal flow, so stage it HERE
+                // (marker-guarded, idempotent) — ANGLE's Vulkan backend dlopens libvulkan.so.1
+                // and fails its RendererVk init if the ICD isn't present.
+                try {
+                    val icdTar = java.io.File("/data/local/tmp/vk-icd-stage.tar")
+                    val icdMarker = java.io.File(rootfsDir, ".vk-icd-staged-${icdTar.length()}")
+                    if (icdTar.isFile && !icdMarker.isFile) {
+                        val ovr = RootfsInstaller(this@MainActivity).extractOverlayTar(icdTar, rootfsDir)
+                        icdMarker.writeText("staged\n")
+                        android.util.Log.i("alr_loader", "angle-gles: vk-icd staged (extracted=${ovr.extracted} skipped=${ovr.skipped.size})")
+                    }
+                } catch (e: Throwable) {
+                    android.util.Log.e("alr_loader", "angle-gles: vk-icd stage EXC: ${android.util.Log.getStackTraceString(e)}")
+                }
+                // Wait (bounded) for the angle overlay to finish staging into
+                // /usr/lib/androlinux-angle (its marker is written by the angle-stage thread)
+                // AND for the cube binary it ships to land, so we never race the extract.
+                val angleTar = java.io.File("/data/local/tmp/angle-stage.tar")
+                val angleMarker = java.io.File(rootfsDir, ".angle-staged-${angleTar.length()}")
+                // The real ANGLE-on-Vulkan client (forces VULKAN_ANGLE + headless pbuffer);
+                // the cube is the eglGetDisplay fallback (ANGLE picks X11 → no-X-display).
+                val vkBin = java.io.File(rootfsDir, "usr/bin/alr-angle-vk")
+                val cubeBin = java.io.File(rootfsDir, "usr/bin/alr-gles-cube")
+                val angleGles = java.io.File(rootfsDir, "usr/lib/androlinux-angle/libGLESv2.so.2")
+                // CRUCIAL: also wait for the vk-icd overlay (our guest libvulkan.so.1 ICD,
+                // staged by a concurrent thread) — ANGLE's Vulkan backend dlopens it, so if
+                // it's not on disk yet ANGLE fails its RendererVk init before reaching our ICD.
+                val icdLib = java.io.File(rootfsDir, "usr/lib/androlinux/libvulkan.so.1")
+                var waited = 0
+                while (waited < 40000 && !(angleMarker.isFile && angleGles.isFile && icdLib.isFile && (vkBin.isFile || cubeBin.isFile))) {
+                    Thread.sleep(500); waited += 500
+                }
+                if (!(angleGles.isFile && icdLib.isFile && (vkBin.isFile || cubeBin.isFile))) {
+                    android.util.Log.w(
+                        "alr_loader",
+                        "angle-gles: skipped (vk=${vkBin.isFile} cube=${cubeBin.isFile} angleGLES=${angleGles.isFile} icd=${icdLib.isFile} waited=${waited}ms)",
+                    )
+                    return@Thread
+                }
+                // Opt this guest into ANGLE-on-Vulkan: ALR_ANGLE puts androlinux-angle first
+                // on LD_LIBRARY_PATH; ALR_VK_ICD binds our libvulkan.so.1 ICD + the VK rings.
+                // VK_LOADER_DEBUG=all lights up any ICD-discovery trace. Tee the guest's
+                // stderr (ANGLE init log) to logcat live. All are host-env reads in the loader.
+                android.system.Os.setenv("ALR_ANGLE", "1", true)
+                android.system.Os.setenv("ALR_VK_ICD", "1", true)
+                android.system.Os.setenv("ALR_GPU_ACCEL", "1", true)
+                android.system.Os.setenv("ALR_TEE_GUEST_STDOUT", "1", true)
+                android.system.Os.setenv("ALR_SHIM_DIAG", "1", true)
+                android.system.Os.setenv("VK_LOADER_DEBUG", "all", true)
+                // ALR_ICD_DIAG=1 is set by the loader under ALR_ANGLE, so our guest
+                // libvulkan.so.1 ICD emits its [alr-icd] per-entrypoint call trace.
+                fun runAngle(label: String, program: String) {
+                    android.util.Log.i("alr_loader", "angle-gles: launching $label under ANGLE(Vulkan)->our VK ICD->Mali (waited=${waited}ms)")
+                    val out = nativeAlrNativeLoaderProbe(
+                        packageName,
+                        applicationInfo.nativeLibraryDir,
+                        filesDir.absolutePath,
+                        cacheDir.absolutePath,
+                        rootfsName,
+                        program,
+                    )
+                    val exec = out.lineStartingWith("ALR NATIVE LOADER GUEST EXEC:")
+                    val fault = out.lineStartingWith("alr native loader fault pc@")
+                    val rendererLine = out.split("\n").firstOrNull { it.contains("GL_RENDERER=") } ?: ""
+                    android.util.Log.i("alr_loader", "angle-gles[$label]: exec=[$exec] fault=[$fault] $rendererLine")
+                    android.util.Log.i("alr_loader", "angle-gles[$label]-out:\n$out")
+                }
+                // The Vulkan-backend client is the real proof; run it first.
+                if (vkBin.isFile) runAngle("alr-angle-vk", "/usr/bin/alr-angle-vk")
+                // Also run the eglGetDisplay cube (documents the X11-default fallback path).
+                if (cubeBin.isFile) runAngle("alr-gles-cube", "/usr/bin/alr-gles-cube\n8")
+                android.system.Os.unsetenv("ALR_ANGLE")
+                android.system.Os.unsetenv("ALR_VK_ICD")
+                android.system.Os.unsetenv("ALR_GPU_ACCEL")
+                android.system.Os.unsetenv("ALR_SHIM_DIAG")
+                android.system.Os.unsetenv("VK_LOADER_DEBUG")
+            } catch (e: Throwable) {
+                android.util.Log.e("alr_loader", "angle-gles EXC: ${android.util.Log.getStackTraceString(e)}")
             }
         }.start()
     }

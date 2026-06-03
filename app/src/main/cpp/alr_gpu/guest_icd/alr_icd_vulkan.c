@@ -38,8 +38,37 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* ICD call-trace diagnostic (gated on ALR_ICD_DIAG): emits one "[alr-icd]" line per
+ * traced entrypoint to stderr → the loader's guest-stdout capture / logcat. Lets a
+ * device run see EXACTLY which vk* calls a real client (ANGLE) makes and which one it
+ * stops at — the precise ANGLE-on-Vulkan blocker. Zero cost when the env var is unset. */
+static int alr_icd_diag_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("ALR_ICD_DIAG"); v = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    return v;
+}
+#define ALR_ICD_DIAG(...) do { if (alr_icd_diag_on()) { \
+    fprintf(stderr, "[alr-icd] " __VA_ARGS__); fputc('\n', stderr); fflush(stderr); } } while (0)
+
+/* Fires at dlopen of libvulkan.so.1 (BEFORE any vk* call). Under ALR_ICD_DIAG it proves
+ * definitively whether a client (ANGLE) loaded OUR ICD — if ANGLE fails to even reach
+ * vkCreateInstance, this line still tells us our .so is in its address space + which
+ * vk* symbols it can resolve. */
+__attribute__((constructor))
+static void alr_icd_ctor(void) {
+    /* Fires at dlopen of libvulkan.so.1 (BEFORE any vk* call). Under ALR_ICD_DIAG it
+     * proves definitively whether a client (ANGLE) loaded OUR ICD — if this line is
+     * ABSENT from the guest output with ALR_ICD_DIAG on, the client never dlopened our
+     * ICD (it resolved a different libvulkan or failed to load one). Device-verified that
+     * a plain dlopen("libvulkan.so.1")+dlsym DOES hit this ctor + resolves
+     * vkGetInstanceProcAddr/vkCreateInstance under the ALR in-process loader. */
+    ALR_ICD_DIAG("CTOR: ALR guest libvulkan.so.1 loaded into client; ring_ok=%d",
+                 alr_icd_ring_ok());
+}
 
 /* ============================================================================
  * Dispatchable-handle objects. A Vulkan dispatchable handle's first word MUST be
@@ -262,6 +291,7 @@ static VkResult VKAPI_CALL alr_vkCreateInstance(const VkInstanceCreateInfo *pCre
     uint32_t vinst, app_api, rlen;
     int32_t inst_result = 0;
 
+    ALR_ICD_DIAG("vkCreateInstance enter (ring_ok=%d)", alr_icd_ring_ok());
     if (!pInstance) return VK_ERROR_INITIALIZATION_FAILED;
     inst = (AlrIcdInstance *)calloc(1, sizeof(AlrIcdInstance));
     if (!inst) return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -290,9 +320,10 @@ static VkResult VKAPI_CALL alr_vkCreateInstance(const VkInstanceCreateInfo *pCre
             if (rlen) alr_icd_parse_reply(reply, rlen, NULL, NULL, &inst_result, NULL, NULL);
         }
     }
-    if (inst_result != 0) { free(inst); return (VkResult)inst_result; }
+    if (inst_result != 0) { free(inst); ALR_ICD_DIAG("vkCreateInstance FAIL host_result=%d", inst_result); return (VkResult)inst_result; }
 
     *pInstance = (VkInstance)inst;
+    ALR_ICD_DIAG("vkCreateInstance OK vinst=%u", vinst);
     return VK_SUCCESS;
 }
 
@@ -317,6 +348,8 @@ static VkResult VKAPI_CALL alr_vkEnumeratePhysicalDevices(VkInstance instance,
     AlrIcdInstance *inst = (AlrIcdInstance *)instance;
     uint32_t count = 0, base = 0, i;
     if (!inst || !pPhysicalDeviceCount) return VK_ERROR_INITIALIZATION_FAILED;
+    ALR_ICD_DIAG("vkEnumeratePhysicalDevices (fill=%p ring_ok=%d)",
+                 (void *)pPhysicalDevices, alr_icd_ring_ok());
 
     /* Marshal the enumerate the FIRST time (cache the count/base on the instance so a
      * two-call query — count, then fill — doesn't re-enumerate, matching Vulkan
@@ -439,13 +472,15 @@ static VkResult VKAPI_CALL alr_vkCreateDevice(VkPhysicalDevice physicalDevice,
                                               const VkDeviceCreateInfo *pCreateInfo,
                                               const VkAllocationCallbacks *pAllocator,
                                               VkDevice *pDevice) {
-    (void)pCreateInfo; (void)pAllocator;
+    (void)pAllocator;
     AlrIcdPhysicalDevice *pd = (AlrIcdPhysicalDevice *)physicalDevice;
     AlrIcdDevice *dev;
     uint32_t vdev, gfx_family = 0;
     int32_t dev_result = 0;
+    ALR_ICD_DIAG("vkCreateDevice enter (ext_count=%u ring_ok=%d)",
+                 pCreateInfo ? pCreateInfo->enabledExtensionCount : 0u, alr_icd_ring_ok());
     if (!pd || !pDevice) return VK_ERROR_INITIALIZATION_FAILED;
-    if (!alr_icd_ring_ok()) return VK_ERROR_INITIALIZATION_FAILED;  /* no GPU to create on */
+    if (!alr_icd_ring_ok()) { ALR_ICD_DIAG("vkCreateDevice FAIL no-ring"); return VK_ERROR_INITIALIZATION_FAILED; }  /* no GPU to create on */
 
     dev = (AlrIcdDevice *)calloc(1, sizeof(AlrIcdDevice));
     if (!dev) return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -818,6 +853,134 @@ static VkResult VKAPI_CALL alr_vkQueuePresentKHR(VkQueue queue,
 }
 
 /* ============================================================================
+ * ANGLE-init enumeration/query rung. ANGLE's RendererVk issues these READ-ONLY
+ * bring-up queries (instance/device extension + version + feature + memory + format
+ * enumeration) BEFORE it creates any device object. They are answered CLIENT-SIDE with
+ * conservative, conformant values (no host round-trip needed during bring-up), which
+ * lets ANGLE progress THROUGH vkCreateInstance/vkEnumeratePhysicalDevices/vkCreateDevice
+ * to the first device-OBJECT call (vkAllocateMemory / vkCreateImage / vkCreateRenderPass)
+ * — the documented boundary where the coarse marshalling wire cannot follow ANGLE's
+ * fine-grained Vulkan usage. Implementing them here is real ICD breadth AND pins the
+ * gap precisely at the object-creation layer rather than the (now-covered) query layer.
+ * ============================================================================ */
+
+/* Helper: copy a fixed list of extension names into the caller's array with the standard
+ * two-call (count, then fill) Vulkan semantics. */
+static VkResult alr_fill_ext_props(const char *const *names, const uint32_t *specs,
+                                   uint32_t avail, uint32_t *pCount,
+                                   VkExtensionProperties *pProps) {
+    uint32_t i;
+    if (!pCount) return VK_ERROR_INITIALIZATION_FAILED;
+    if (pProps == NULL) { *pCount = avail; return VK_SUCCESS; }
+    uint32_t n = (*pCount < avail) ? *pCount : avail;
+    for (i = 0; i < n; ++i) {
+        memset(pProps[i].extensionName, 0, VK_MAX_EXTENSION_NAME_SIZE);
+        strncpy(pProps[i].extensionName, names[i], VK_MAX_EXTENSION_NAME_SIZE - 1);
+        pProps[i].specVersion = specs ? specs[i] : 1;
+    }
+    *pCount = n;
+    return (n < avail) ? VK_INCOMPLETE : VK_SUCCESS;
+}
+
+VkResult VKAPI_CALL alr_vkEnumerateInstanceVersion(uint32_t *pApiVersion) {
+    if (pApiVersion) *pApiVersion = VK_API_VERSION_1_1;  /* we model a 1.1 ICD */
+    ALR_ICD_DIAG("vkEnumerateInstanceVersion -> 1.1");
+    return VK_SUCCESS;
+}
+
+VkResult VKAPI_CALL alr_vkEnumerateInstanceExtensionProperties(
+    const char *pLayerName, uint32_t *pPropertyCount, VkExtensionProperties *pProperties) {
+    (void)pLayerName;
+    /* The WSI surface extensions ANGLE's DisplayVk* probes for, plus the
+     * get-physical-device-properties2 it always enables. The actual surface creation
+     * is the host/compositor's job (the present rung); reporting them lets ANGLE's
+     * RendererVk pick a path instead of bailing at instance creation. */
+    static const char *const exts[] = {
+        "VK_KHR_surface",
+        "VK_KHR_wayland_surface",
+        "VK_KHR_xcb_surface",
+        "VK_EXT_headless_surface",
+        "VK_KHR_get_physical_device_properties2",
+        "VK_KHR_external_memory_capabilities",
+        "VK_EXT_debug_utils",
+    };
+    ALR_ICD_DIAG("vkEnumerateInstanceExtensionProperties (props=%p count=%u)",
+                 (void *)pProperties, pProperties && pPropertyCount ? *pPropertyCount : 0u);
+    return alr_fill_ext_props(exts, NULL,
+                              (uint32_t)(sizeof(exts) / sizeof(exts[0])),
+                              pPropertyCount, pProperties);
+}
+
+VkResult VKAPI_CALL alr_vkEnumerateInstanceLayerProperties(
+    uint32_t *pPropertyCount, VkLayerProperties *pProperties) {
+    (void)pProperties;
+    if (pPropertyCount) *pPropertyCount = 0;  /* no implicit layers in the guest ICD */
+    return VK_SUCCESS;
+}
+
+static VkResult VKAPI_CALL alr_vkEnumerateDeviceExtensionProperties(
+    VkPhysicalDevice physicalDevice, const char *pLayerName,
+    uint32_t *pPropertyCount, VkExtensionProperties *pProperties) {
+    (void)physicalDevice; (void)pLayerName;
+    /* The device-level extensions ANGLE enables for a basic render+present path. */
+    static const char *const exts[] = {
+        "VK_KHR_swapchain",
+        "VK_KHR_maintenance1",
+        "VK_KHR_dedicated_allocation",
+        "VK_KHR_get_memory_requirements2",
+        "VK_KHR_bind_memory2",
+    };
+    ALR_ICD_DIAG("vkEnumerateDeviceExtensionProperties (props=%p)", (void *)pProperties);
+    return alr_fill_ext_props(exts, NULL,
+                              (uint32_t)(sizeof(exts) / sizeof(exts[0])),
+                              pPropertyCount, pProperties);
+}
+
+static void VKAPI_CALL alr_vkGetPhysicalDeviceFeatures(
+    VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures *pFeatures) {
+    (void)physicalDevice;
+    /* Conservative: report NO optional features (all VkBool32 = 0). ANGLE treats a
+     * cleared features struct as "core 1.0 only" and disables the optional code paths;
+     * a richer answer would marshal the real Mali features (next rung). */
+    if (pFeatures) memset(pFeatures, 0, sizeof(*pFeatures));
+    ALR_ICD_DIAG("vkGetPhysicalDeviceFeatures -> all-zero");
+}
+
+static void VKAPI_CALL alr_vkGetPhysicalDeviceMemoryProperties(
+    VkPhysicalDevice physicalDevice, VkPhysicalDeviceMemoryProperties *pMemProps) {
+    (void)physicalDevice;
+    if (!pMemProps) return;
+    memset(pMemProps, 0, sizeof(*pMemProps));
+    /* One device-local heap; one DEVICE_LOCAL type + one HOST_VISIBLE|COHERENT type —
+     * the minimal shape a UMA mobile GPU (Mali) exposes. Real values would marshal from
+     * the host's vkGetPhysicalDeviceMemoryProperties (next rung). */
+    pMemProps->memoryHeapCount = 1;
+    pMemProps->memoryHeaps[0].size = (VkDeviceSize)2 * 1024 * 1024 * 1024;  /* 2 GiB */
+    pMemProps->memoryHeaps[0].flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
+    pMemProps->memoryTypeCount = 2;
+    pMemProps->memoryTypes[0].heapIndex = 0;
+    pMemProps->memoryTypes[0].propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    pMemProps->memoryTypes[1].heapIndex = 0;
+    pMemProps->memoryTypes[1].propertyFlags =
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    ALR_ICD_DIAG("vkGetPhysicalDeviceMemoryProperties -> 1 heap, 2 types");
+}
+
+static void VKAPI_CALL alr_vkGetPhysicalDeviceFormatProperties(
+    VkPhysicalDevice physicalDevice, VkFormat format, VkFormatProperties *pFormatProperties) {
+    (void)physicalDevice; (void)format;
+    /* Advertise broad support so ANGLE's format-capability probe doesn't reject the
+     * basic RGBA render path. 0x7FFFFFFF = "all feature bits" (conservative-permissive;
+     * a precise answer would marshal vkGetPhysicalDeviceFormatProperties — next rung). */
+    if (pFormatProperties) {
+        pFormatProperties->linearTilingFeatures = 0x7FFFFFFF;
+        pFormatProperties->optimalTilingFeatures = 0x7FFFFFFF;
+        pFormatProperties->bufferFeatures = 0x7FFFFFFF;
+    }
+}
+
+/* ============================================================================
  * Dispatch — vkGetInstanceProcAddr / vkGetDeviceProcAddr. The app/loader resolves
  * every entry point through these. We return our ENUM-rung implementations and
  * vkGetInstanceProcAddr / vkGetDeviceProcAddr themselves (a global GIPA also resolves
@@ -836,6 +999,14 @@ static PFN_vkVoidFunction alr_lookup(const char *pName) {
         ALR_ENTRY("vkEnumeratePhysicalDevices", alr_vkEnumeratePhysicalDevices),
         ALR_ENTRY("vkGetPhysicalDeviceProperties", alr_vkGetPhysicalDeviceProperties),
         ALR_ENTRY("vkGetPhysicalDeviceQueueFamilyProperties", alr_vkGetPhysicalDeviceQueueFamilyProperties),
+        /* ---- ANGLE-init enumeration/query rung (read-only bring-up) ---- */
+        ALR_ENTRY("vkEnumerateInstanceVersion", alr_vkEnumerateInstanceVersion),
+        ALR_ENTRY("vkEnumerateInstanceExtensionProperties", alr_vkEnumerateInstanceExtensionProperties),
+        ALR_ENTRY("vkEnumerateInstanceLayerProperties", alr_vkEnumerateInstanceLayerProperties),
+        ALR_ENTRY("vkEnumerateDeviceExtensionProperties", alr_vkEnumerateDeviceExtensionProperties),
+        ALR_ENTRY("vkGetPhysicalDeviceFeatures", alr_vkGetPhysicalDeviceFeatures),
+        ALR_ENTRY("vkGetPhysicalDeviceMemoryProperties", alr_vkGetPhysicalDeviceMemoryProperties),
+        ALR_ENTRY("vkGetPhysicalDeviceFormatProperties", alr_vkGetPhysicalDeviceFormatProperties),
         ALR_ENTRY("vkCreateDevice", alr_vkCreateDevice),
         ALR_ENTRY("vkDestroyDevice", alr_vkDestroyDevice),
         ALR_ENTRY("vkGetDeviceQueue", alr_vkGetDeviceQueue),
@@ -942,6 +1113,47 @@ void VKAPI_CALL vkGetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice physic
                                                          uint32_t *pCount,
                                                          VkQueueFamilyProperties *pProps) {
     alr_vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, pCount, pProps);
+}
+/* Global commands (NULL-instance enumerate) ANGLE may call by exported symbol, plus the
+ * physical-device queries it issues during RendererVk bring-up. Thin forwarders. */
+__attribute__((visibility("default")))
+VkResult VKAPI_CALL vkEnumerateInstanceVersion(uint32_t *pApiVersion) {
+    return alr_vkEnumerateInstanceVersion(pApiVersion);
+}
+__attribute__((visibility("default")))
+VkResult VKAPI_CALL vkEnumerateInstanceExtensionProperties(const char *pLayerName,
+                                                           uint32_t *pPropertyCount,
+                                                           VkExtensionProperties *pProperties) {
+    return alr_vkEnumerateInstanceExtensionProperties(pLayerName, pPropertyCount, pProperties);
+}
+__attribute__((visibility("default")))
+VkResult VKAPI_CALL vkEnumerateInstanceLayerProperties(uint32_t *pPropertyCount,
+                                                       VkLayerProperties *pProperties) {
+    return alr_vkEnumerateInstanceLayerProperties(pPropertyCount, pProperties);
+}
+__attribute__((visibility("default")))
+VkResult VKAPI_CALL vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice,
+                                                         const char *pLayerName,
+                                                         uint32_t *pPropertyCount,
+                                                         VkExtensionProperties *pProperties) {
+    return alr_vkEnumerateDeviceExtensionProperties(physicalDevice, pLayerName,
+                                                     pPropertyCount, pProperties);
+}
+__attribute__((visibility("default")))
+void VKAPI_CALL vkGetPhysicalDeviceFeatures(VkPhysicalDevice physicalDevice,
+                                            VkPhysicalDeviceFeatures *pFeatures) {
+    alr_vkGetPhysicalDeviceFeatures(physicalDevice, pFeatures);
+}
+__attribute__((visibility("default")))
+void VKAPI_CALL vkGetPhysicalDeviceMemoryProperties(VkPhysicalDevice physicalDevice,
+                                                    VkPhysicalDeviceMemoryProperties *pMemProps) {
+    alr_vkGetPhysicalDeviceMemoryProperties(physicalDevice, pMemProps);
+}
+__attribute__((visibility("default")))
+void VKAPI_CALL vkGetPhysicalDeviceFormatProperties(VkPhysicalDevice physicalDevice,
+                                                    VkFormat format,
+                                                    VkFormatProperties *pFormatProperties) {
+    alr_vkGetPhysicalDeviceFormatProperties(physicalDevice, format, pFormatProperties);
 }
 __attribute__((visibility("default")))
 VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physicalDevice,

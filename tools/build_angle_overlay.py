@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """build_angle_overlay.py — assemble the ``angle-stage.tar`` overlay carrying a
 SYSTEM **ANGLE** (libEGL.so.1 + libGLESv2.so.2, Vulkan backend) into
-``/usr/lib/androlinux`` so GLES/EGL guests get GL → Vulkan → our guest VK ICD →
-Mali, instead of falling back to software.
+``/usr/lib/androlinux-angle`` (a PRIVATE dir, kept separate from the shared
+``/usr/lib/androlinux`` so it never clobbers the device-proven gpushim GLES libs)
+so GLES/EGL guests get GL → Vulkan → our guest VK ICD → Mali, instead of falling
+back to software.
 
 Why ANGLE, and why these exact bytes
 -------------------------------------
@@ -45,11 +47,11 @@ Overlay layout (mirrors the gpushim/vk-icd staging — README + build_vk_icd_ove
 file-backed PROT_EXEC requirement under untrusted_app — §10.1); unversioned
 symlinks relative + in-dir:
 
-  ./usr/lib/androlinux/libGLESv2.so.2   (real ANGLE GLESv2, 0755)
-  ./usr/lib/androlinux/libGLESv2.so     -> libGLESv2.so.2
-  ./usr/lib/androlinux/libEGL.so.1      (real ANGLE EGL, 0755)
-  ./usr/lib/androlinux/libEGL.so        -> libEGL.so.1
-  ./usr/lib/androlinux/libXNVCtrl.so.0  (real, flat, 0755 — base-missing DT_NEEDED)
+  ./usr/lib/androlinux-angle/libGLESv2.so.2   (real ANGLE GLESv2, 0755)
+  ./usr/lib/androlinux-angle/libGLESv2.so     -> libGLESv2.so.2
+  ./usr/lib/androlinux-angle/libEGL.so.1      (real ANGLE EGL, 0755)
+  ./usr/lib/androlinux-angle/libEGL.so        -> libEGL.so.1
+  ./usr/lib/androlinux-angle/libXNVCtrl.so.0  (real, flat, 0755 — base-missing DT_NEEDED)
 
 WHY both versioned + unversioned names (load-bearing, not just dev convenience):
   * a GLES app links ``-lEGL -lGLESv2`` → DT_NEEDED records the standard Linux
@@ -63,15 +65,17 @@ WHY both versioned + unversioned names (load-bearing, not just dev convenience):
     (provided by the vk-icd overlay). The unversioned ``libEGL.so``/``libGLESv2.so``
     symlinks cover any tool that asks for the bare names.
 
-Loader wiring (already in place — see runtime_report.cpp)
----------------------------------------------------------
-The launcher opts a GLES/ANGLE guest into the Mali path with **ALR_GPU_ACCEL=1**
-(prepends ``/usr/lib/androlinux`` to LD_LIBRARY_PATH so ANGLE's libEGL/libGLESv2
-resolve first) **and ALR_VK_ICD=1** (prepends the same dir AND attaches the VK
-request/reply rings AND sets ``VK_ICD_FILENAMES`` → our ``alr_icd.json`` so
-ANGLE's Vulkan backend binds our guest ``libvulkan.so.1`` ICD). Both gates
-prepend the same dir, so they compose; no env change is required here — this
-overlay just supplies the ANGLE bytes that wiring expects.
+Loader wiring (see runtime_report.cpp)
+--------------------------------------
+The launcher opts a GLES/ANGLE guest into the Mali path with **ALR_ANGLE=1**
+(prepends ``/usr/lib/androlinux-angle`` AHEAD of ``/usr/lib/androlinux`` on
+LD_LIBRARY_PATH so ANGLE's libEGL.so.1/libGLESv2.so.2 win over gpushim's) **plus
+ALR_VK_ICD=1** (attaches the VK request/reply rings AND sets ``VK_ICD_FILENAMES``
+→ our ``alr_icd.json`` so ANGLE's Vulkan backend binds our guest
+``libvulkan.so.1`` ICD, which lives in the shared ``/usr/lib/androlinux`` dir and
+is found next on the path). ``ALR_GPU_ACCEL=1`` additionally attaches the GLES
+Mali ring (only relevant to the gpushim path, harmless here). This overlay just
+supplies the ANGLE bytes that wiring expects, in the private dir.
 
 Usage
 -----
@@ -104,7 +108,14 @@ from tools.stage_tar_spec import validate_stage_tar
 # Constants
 # --------------------------------------------------------------------------- #
 
-ANDROLINUX_DIR = "usr/lib/androlinux"
+# ANGLE ships into its OWN private dir, NOT the shared /usr/lib/androlinux, so it can
+# NEVER clobber the device-proven gpushim libEGL.so.1/libGLESv2.so.2 (last-writer-wins
+# was the old collision). The loader prepends THIS dir ahead of /usr/lib/androlinux on
+# LD_LIBRARY_PATH only under ALR_ANGLE=1, so ANGLE's EGL/GLES resolve first while its
+# runtime dlopen of libvulkan.so.1 still finds our VK ICD in /usr/lib/androlinux (next
+# on the path). With ALR_ANGLE unset this dir is simply never on the path → gpushim is
+# byte-for-byte the proven path (strict no-regression).
+ANDROLINUX_DIR = "usr/lib/androlinux-angle"
 
 # Versioned SONAMEs a normal GLES app's DT_NEEDED records (resolved by filename on
 # LD_LIBRARY_PATH); the ANGLE bytes are placed here as the real files.
@@ -203,8 +214,22 @@ def build_overlay(
     egl_bytes: bytes,
     gles_bytes: bytes,
     nvctrl_bytes: bytes,
+    cube_bytes: bytes | None = None,
+    vk_client_bytes: bytes | None = None,
 ) -> dict:
-    """Write the angle overlay tar from the three provided blobs. Returns a summary."""
+    """Write the angle overlay tar from the three provided blobs. Returns a summary.
+
+    ``cube_bytes`` (optional): the ``alr-gles-cube`` test client (an ordinary glibc
+    GLES2 binary, DT_NEEDED libEGL.so/libGLESv2.so). Staged at ``/usr/bin/alr-gles-cube``
+    so the loader can run it under ALR_ANGLE=1 as the minimal ANGLE init+clear+present
+    proof (eglInitialize → eglCreateContext → glClear → eglSwapBuffers). When the cube
+    runs, ANGLE's EGL/GLES resolve from androlinux-angle (first on LD_LIBRARY_PATH).
+
+    ``vk_client_bytes`` (optional): the ``alr-angle-vk`` client (alr-angle-vk.c) which
+    EXPLICITLY drives ANGLE's Vulkan backend via eglGetPlatformDisplayEXT(VULKAN_ANGLE) +
+    a headless pbuffer (no X/Wayland), so ANGLE → our libvulkan.so.1 ICD → Mali. Staged at
+    ``/usr/bin/alr-angle-vk``. This is the actual ANGLE-on-Vulkan device proof (the cube's
+    eglGetDisplay path makes ANGLE pick X11 → "Could not open the default X display")."""
     members: list[tuple[str, str, object]] = []
     with tarfile.open(out_tar, "w") as tar:
 
@@ -232,17 +257,26 @@ def build_overlay(
         add_symlink(f"{ANDROLINUX_DIR}/{EGL_UNVERSIONED}", EGL_SONAME)
         # The base-missing DT_NEEDED lib, shipped flat at the bare SONAME (0755).
         add_file(f"{ANDROLINUX_DIR}/{NVCTRL_SONAME}", nvctrl_bytes, 0o755)
+        # The optional ANGLE init+clear+present test clients at /usr/bin (0755, exec-bit).
+        if cube_bytes is not None:
+            add_file("usr/bin/alr-gles-cube", cube_bytes, 0o755)
+        if vk_client_bytes is not None:
+            add_file("usr/bin/alr-angle-vk", vk_client_bytes, 0o755)
 
     return {
         "out": str(out_tar),
         "egl_bytes": len(egl_bytes),
         "gles_bytes": len(gles_bytes),
         "nvctrl_bytes": len(nvctrl_bytes),
+        "cube_bytes": (len(cube_bytes) if cube_bytes is not None else 0),
+        "vk_client_bytes": (len(vk_client_bytes) if vk_client_bytes is not None else 0),
         "members": members,
     }
 
 
-def build_from_mirror(out_tar: str | Path, cache: Path, *, opener=None) -> dict:
+def build_from_mirror(out_tar: str | Path, cache: Path, *, opener=None,
+                      cube_bytes: bytes | None = None,
+                      vk_client_bytes: bytes | None = None) -> dict:
     """NETWORK path: fetch the three blobs, then assemble the overlay."""
     blobs = fetch_angle_bytes(cache, opener=opener)
     return build_overlay(
@@ -250,6 +284,8 @@ def build_from_mirror(out_tar: str | Path, cache: Path, *, opener=None) -> dict:
         egl_bytes=blobs["egl"],
         gles_bytes=blobs["gles"],
         nvctrl_bytes=blobs["nvctrl"],
+        cube_bytes=cube_bytes,
+        vk_client_bytes=vk_client_bytes,
     )
 
 
@@ -351,6 +387,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--so-egl", help="pre-extracted ANGLE libEGL.so bytes (offline)")
     ap.add_argument("--so-gles", help="pre-extracted ANGLE libGLESv2.so bytes (offline)")
     ap.add_argument("--so-nvctrl", help="pre-extracted libXNVCtrl.so.0(.0.0) bytes (offline)")
+    ap.add_argument("--cube", help="optional alr-gles-cube test client to stage at "
+                                   "/usr/bin/alr-gles-cube (the ANGLE init+clear+present probe)")
+    ap.add_argument("--vk-client", help="optional alr-angle-vk client to stage at "
+                                        "/usr/bin/alr-angle-vk (forces ANGLE's Vulkan backend, "
+                                        "headless pbuffer — the real ANGLE-on-Vulkan device proof)")
     ap.add_argument("--selftest", action="store_true", help="run the offline shape self-test")
     args = ap.parse_args(argv)
 
@@ -360,6 +401,8 @@ def main(argv: list[str] | None = None) -> int:
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     base = args.base if args.base else None
+    cube_bytes = Path(args.cube).read_bytes() if args.cube else None
+    vk_client_bytes = Path(args.vk_client).read_bytes() if args.vk_client else None
 
     offline = bool(args.so_egl or args.so_gles or args.so_nvctrl)
     if offline:
@@ -372,9 +415,12 @@ def main(argv: list[str] | None = None) -> int:
             egl_bytes=Path(args.so_egl).read_bytes(),
             gles_bytes=Path(args.so_gles).read_bytes(),
             nvctrl_bytes=Path(args.so_nvctrl).read_bytes(),
+            cube_bytes=cube_bytes,
+            vk_client_bytes=vk_client_bytes,
         )
     else:
-        summary = build_from_mirror(out, Path(args.cache))
+        summary = build_from_mirror(out, Path(args.cache), cube_bytes=cube_bytes,
+                                    vk_client_bytes=vk_client_bytes)
 
     print(f"wrote {summary['out']}")
     print(f"  libEGL.so.1     = {summary['egl_bytes']} bytes (ANGLE)")
