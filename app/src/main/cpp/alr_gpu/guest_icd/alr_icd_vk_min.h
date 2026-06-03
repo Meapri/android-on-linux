@@ -50,6 +50,35 @@ typedef struct VkInstance_T*        VkInstance;
 typedef struct VkPhysicalDevice_T*  VkPhysicalDevice;
 typedef struct VkDevice_T*          VkDevice;
 typedef struct VkQueue_T*           VkQueue;
+/* VkCommandBuffer is ALSO a dispatchable handle (pointer); the rest below are NON-
+ * dispatchable (uint64 handles in the official ABI on 64-bit too — they are always
+ * uint64_t, never pointers, per VK_DEFINE_NON_DISPATCHABLE_HANDLE). The ALR ICD's
+ * VK-M4 present rung uses these. */
+typedef struct VkCommandBuffer_T*   VkCommandBuffer;
+
+/* ---- VK-M4 (PRESENT rung) ABI additions. Non-dispatchable handles are uint64_t in the
+ * official Vulkan ABI on every platform (VK_DEFINE_NON_DISPATCHABLE_HANDLE), so we
+ * declare them as uint64_t — byte/ABI-identical, no pointer-size dependence. ---- */
+typedef uint64_t VkCommandPool;
+typedef uint64_t VkShaderModule;
+typedef uint64_t VkSwapchainKHR;
+typedef uint64_t VkImage;
+typedef uint64_t VkSemaphore;
+typedef uint64_t VkFence;
+typedef uint64_t VkSurfaceKHR;
+typedef uint32_t VkShaderStageFlags;
+typedef uint32_t VkImageUsageFlags;
+typedef uint32_t VkSwapchainCreateFlagsKHR;
+typedef uint32_t VkCommandPoolCreateFlags;
+typedef uint32_t VkShaderModuleCreateFlags;
+typedef int32_t  VkFormat;            /* enum-sized; we pass values opaquely */
+typedef int32_t  VkColorSpaceKHR;
+typedef int32_t  VkPresentModeKHR;
+typedef int32_t  VkSharingMode;
+typedef int32_t  VkSurfaceTransformFlagBitsKHR;
+typedef int32_t  VkCompositeAlphaFlagBitsKHR;
+typedef int32_t  VkImageLayout;
+typedef int32_t  VkCommandBufferLevel;
 
 typedef enum VkResult {
     VK_SUCCESS = 0,
@@ -69,8 +98,26 @@ typedef enum VkStructureType {
     VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO = 1,
     VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO = 2,
     VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO = 3,
+    /* VK-M4 (PRESENT rung) sTypes (official values). */
+    VK_STRUCTURE_TYPE_SUBMIT_INFO = 4,
+    VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO = 16,
+    VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO = 39,
+    VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO = 40,
+    VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR = 1000001000,
+    VK_STRUCTURE_TYPE_PRESENT_INFO_KHR = 1000001001,
     VK_STRUCTURE_TYPE_MAX_ENUM = 0x7FFFFFFF
 } VkStructureType;
+
+/* Selected VK-M4 enum values the guest app may set (passed opaquely to the ICD). */
+#define VK_SHADER_STAGE_VERTEX_BIT 0x00000001u
+#define VK_SHADER_STAGE_FRAGMENT_BIT 0x00000010u
+#define VK_FORMAT_R8G8B8A8_UNORM 37
+#define VK_PRESENT_MODE_FIFO_KHR 2
+#define VK_SHARING_MODE_EXCLUSIVE 0
+#define VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT 0x00000010u
+#define VK_COMMAND_BUFFER_LEVEL_PRIMARY 0
+#define VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT 0x00000002u
+#define VK_SUBPASS_CONTENTS_INLINE 0
 
 typedef enum VkPhysicalDeviceType {
     VK_PHYSICAL_DEVICE_TYPE_OTHER = 0,
@@ -136,6 +183,79 @@ typedef struct VkDeviceCreateInfo {
     const void*                        pEnabledFeatures;  /* VkPhysicalDeviceFeatures* (ignored) */
 } VkDeviceCreateInfo;
 
+/* ---- VK-M4 (PRESENT rung) structs. Only the fields the ALR ICD reads are meaningful;
+ * the rest are mirrored for ABI size/offset fidelity (the app fills the full struct).
+ * The ICD marshals the SPIR-V blob / extent / image count and ignores the rest (it has
+ * no on-screen VkSurface — the SurfaceView is reached via the in-app compositor). ---- */
+typedef struct VkExtent2D { uint32_t width; uint32_t height; } VkExtent2D;
+
+typedef struct VkCommandPoolCreateInfo {
+    VkStructureType            sType;
+    const void*                pNext;
+    VkCommandPoolCreateFlags   flags;
+    uint32_t                   queueFamilyIndex;
+} VkCommandPoolCreateInfo;
+
+typedef struct VkCommandBufferAllocateInfo {
+    VkStructureType        sType;
+    const void*            pNext;
+    VkCommandPool          commandPool;
+    VkCommandBufferLevel   level;
+    uint32_t               commandBufferCount;
+} VkCommandBufferAllocateInfo;
+
+typedef struct VkShaderModuleCreateInfo {
+    VkStructureType              sType;
+    const void*                 pNext;
+    VkShaderModuleCreateFlags   flags;
+    size_t                      codeSize;   /* in BYTES */
+    const uint32_t*             pCode;
+} VkShaderModuleCreateInfo;
+
+typedef struct VkSwapchainCreateInfoKHR {
+    VkStructureType                  sType;
+    const void*                      pNext;
+    VkSwapchainCreateFlagsKHR        flags;
+    VkSurfaceKHR                     surface;        /* ignored by the ALR ICD */
+    uint32_t                         minImageCount;
+    VkFormat                         imageFormat;
+    VkColorSpaceKHR                  imageColorSpace;
+    VkExtent2D                       imageExtent;
+    uint32_t                         imageArrayLayers;
+    VkImageUsageFlags                imageUsage;
+    VkSharingMode                    imageSharingMode;
+    uint32_t                         queueFamilyIndexCount;
+    const uint32_t*                  pQueueFamilyIndices;
+    VkSurfaceTransformFlagBitsKHR    preTransform;
+    VkCompositeAlphaFlagBitsKHR      compositeAlpha;
+    VkPresentModeKHR                 presentMode;
+    VkBool32                         clipped;
+    VkSwapchainKHR                   oldSwapchain;
+} VkSwapchainCreateInfoKHR;
+
+typedef struct VkPresentInfoKHR {
+    VkStructureType          sType;
+    const void*              pNext;
+    uint32_t                 waitSemaphoreCount;
+    const VkSemaphore*       pWaitSemaphores;
+    uint32_t                 swapchainCount;
+    const VkSwapchainKHR*    pSwapchains;
+    const uint32_t*          pImageIndices;
+    VkResult*                pResults;
+} VkPresentInfoKHR;
+
+typedef struct VkSubmitInfo {
+    VkStructureType                sType;
+    const void*                    pNext;
+    uint32_t                       waitSemaphoreCount;
+    const VkSemaphore*             pWaitSemaphores;
+    const VkFlags*                 pWaitDstStageMask;
+    uint32_t                       commandBufferCount;
+    const VkCommandBuffer*         pCommandBuffers;
+    uint32_t                       signalSemaphoreCount;
+    const VkSemaphore*             pSignalSemaphores;
+} VkSubmitInfo;
+
 typedef struct VkQueueFamilyProperties {
     VkQueueFlags    queueFlags;
     uint32_t        queueCount;
@@ -185,6 +305,17 @@ typedef void (VKAPI_PTR *PFN_vkGetPhysicalDeviceQueueFamilyProperties)(VkPhysica
 typedef VkResult (VKAPI_PTR *PFN_vkCreateDevice)(VkPhysicalDevice, const VkDeviceCreateInfo*, const VkAllocationCallbacks*, VkDevice*);
 typedef void (VKAPI_PTR *PFN_vkDestroyDevice)(VkDevice, const VkAllocationCallbacks*);
 typedef void (VKAPI_PTR *PFN_vkGetDeviceQueue)(VkDevice, uint32_t, uint32_t, VkQueue*);
+/* ---- VK-M4 (PRESENT rung) PFNs ---- */
+typedef VkResult (VKAPI_PTR *PFN_vkCreateCommandPool)(VkDevice, const VkCommandPoolCreateInfo*, const VkAllocationCallbacks*, VkCommandPool*);
+typedef void (VKAPI_PTR *PFN_vkDestroyCommandPool)(VkDevice, VkCommandPool, const VkAllocationCallbacks*);
+typedef VkResult (VKAPI_PTR *PFN_vkAllocateCommandBuffers)(VkDevice, const VkCommandBufferAllocateInfo*, VkCommandBuffer*);
+typedef VkResult (VKAPI_PTR *PFN_vkCreateShaderModule)(VkDevice, const VkShaderModuleCreateInfo*, const VkAllocationCallbacks*, VkShaderModule*);
+typedef void (VKAPI_PTR *PFN_vkDestroyShaderModule)(VkDevice, VkShaderModule, const VkAllocationCallbacks*);
+typedef VkResult (VKAPI_PTR *PFN_vkCreateSwapchainKHR)(VkDevice, const VkSwapchainCreateInfoKHR*, const VkAllocationCallbacks*, VkSwapchainKHR*);
+typedef void (VKAPI_PTR *PFN_vkDestroySwapchainKHR)(VkDevice, VkSwapchainKHR, const VkAllocationCallbacks*);
+typedef VkResult (VKAPI_PTR *PFN_vkGetSwapchainImagesKHR)(VkDevice, VkSwapchainKHR, uint32_t*, VkImage*);
+typedef VkResult (VKAPI_PTR *PFN_vkAcquireNextImageKHR)(VkDevice, VkSwapchainKHR, uint64_t, VkSemaphore, VkFence, uint32_t*);
+typedef VkResult (VKAPI_PTR *PFN_vkQueuePresentKHR)(VkQueue, const VkPresentInfoKHR*);
 
 /* ---- public Vulkan function prototypes (so a client TU like alr-vk-enum.c that
  * links -lvulkan can call them by name). These bind to the ICD's exported symbols.
@@ -202,6 +333,30 @@ VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceQueueFamilyProperties(VkPhysicalDe
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCreateInfo, const VkAllocationCallbacks *pAllocator, VkDevice *pDevice);
 VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice device, const VkAllocationCallbacks *pAllocator);
 VKAPI_ATTR void VKAPI_CALL vkGetDeviceQueue(VkDevice device, uint32_t queueFamilyIndex, uint32_t queueIndex, VkQueue *pQueue);
+/* ---- VK-M4 (PRESENT rung) public prototypes ---- */
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateCommandPool(VkDevice device, const VkCommandPoolCreateInfo *pCreateInfo, const VkAllocationCallbacks *pAllocator, VkCommandPool *pCommandPool);
+VKAPI_ATTR void VKAPI_CALL vkDestroyCommandPool(VkDevice device, VkCommandPool commandPool, const VkAllocationCallbacks *pAllocator);
+VKAPI_ATTR VkResult VKAPI_CALL vkAllocateCommandBuffers(VkDevice device, const VkCommandBufferAllocateInfo *pAllocateInfo, VkCommandBuffer *pCommandBuffers);
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo *pCreateInfo, const VkAllocationCallbacks *pAllocator, VkShaderModule *pShaderModule);
+VKAPI_ATTR void VKAPI_CALL vkDestroyShaderModule(VkDevice device, VkShaderModule shaderModule, const VkAllocationCallbacks *pAllocator);
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *pCreateInfo, const VkAllocationCallbacks *pAllocator, VkSwapchainKHR *pSwapchain);
+VKAPI_ATTR void VKAPI_CALL vkDestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain, const VkAllocationCallbacks *pAllocator);
+VKAPI_ATTR VkResult VKAPI_CALL vkGetSwapchainImagesKHR(VkDevice device, VkSwapchainKHR swapchain, uint32_t *pSwapchainImageCount, VkImage *pSwapchainImages);
+VKAPI_ATTR VkResult VKAPI_CALL vkAcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout, VkSemaphore semaphore, VkFence fence, uint32_t *pImageIndex);
+VKAPI_ATTR VkResult VKAPI_CALL vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo);
+
+/* ---- ALR bring-up convenience: record the clear+triangle-draw (using the guest's own
+ * vert/frag shader modules) into `commandBuffer`, targeting swapchain image `imageIndex`.
+ * This folds the coarse CMD_BEGIN_DRAW_MODULES wire op (the renderpass + pipeline + draw
+ * are built host-side on real Mali) into ONE call, because the ALR ENUM/PRESENT wire is
+ * deliberately coarse-grained (it marshals draw INTENT, not every vkCmd*). A guest app
+ * still creates instance/device/swapchain and ships its OWN SPIR-V — this is just the
+ * record primitive for the coarse wire. A later breadth rung exposes fine-grained vkCmd*.
+ * bg_rgba is the background the renderpass clears to (the triangle is the shader's color). */
+VKAPI_ATTR void VKAPI_CALL alrVkCmdDrawTriangleModules(
+    VkCommandBuffer commandBuffer, VkSwapchainKHR swapchain, uint32_t imageIndex,
+    VkShaderModule vertModule, VkShaderModule fragModule, uint32_t width, uint32_t height,
+    float bg_r, float bg_g, float bg_b, float bg_a);
 #ifdef __cplusplus
 }
 #endif

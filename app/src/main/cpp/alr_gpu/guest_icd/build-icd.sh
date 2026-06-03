@@ -50,6 +50,14 @@ echo "== link alr-vk-enum (-lvulkan) =="
     -L"$OUT" -Wl,-rpath,'$ORIGIN' -lvulkan \
     -o "$OUT/alr-vk-enum"
 
+echo "== link alr-vk-tri (VK-M4 PRESENT: guest SPIR-V + AHB swapchain + present, -lvulkan) =="
+# The guest triangle app: uploads its OWN SPIR-V (alr_vk_tri_spirv.h) and presents an
+# AHB-backed swapchain (routed to the in-app compositor). Binds ONLY our libvulkan.so.1.
+"${CC[@]}" -O2 -I"$HERE" -I"$ALR_GPU_DIR" \
+    "$HERE/alr-vk-tri.c" \
+    -L"$OUT" -Wl,-rpath,'$ORIGIN' -lvulkan \
+    -o "$OUT/alr-vk-tri"
+
 echo
 echo "== artifacts =="
 ls -l "$OUT"

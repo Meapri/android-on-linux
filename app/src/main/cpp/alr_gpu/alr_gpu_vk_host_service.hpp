@@ -469,6 +469,174 @@ inline std::string run_vk_icd_servicer_probe() {
     return out.str();
 }
 
+// ===========================================================================
+// run_vk_icd_present_probe — HOST-side self-test of the VK-M4 PRESENT rung: the guest's
+// OWN SPIR-V over the wire + an AHB-backed swapchain whose present routes to the
+// compositor sink. WITHOUT a guest process, it stands in for the guest ICD with a
+// host-side producer that emits the EXACT VK-M4 batch a guest Vulkan triangle app emits:
+//   create instance -> enumerate -> create device -> get queue -> create pool ->
+//   alloc cmd -> CREATE_SHADER_MODULE(vert SPIR-V) -> CREATE_SHADER_MODULE(frag SPIR-V)
+//   -> CREATE_SWAPCHAIN -> ACQUIRE_NEXT_IMAGE -> CMD_BEGIN_DRAW_MODULES -> QUEUE_PRESENT,
+// pushes it through the request ring, lets the servicer replay it on real Mali + write
+// the reply ring, then decodes the reply and asserts: shaders created, swapchain has >=1
+// image, acquire returned an index, and the presented center pixel is the GUEST shader's
+// color (kAlrVkTriColor*), distinct from the clear background — i.e. the guest's SPIR-V
+// ran on Mali AND its result was handed to the present sink. The SPIR-V it ships is the
+// proven triangle SPIR-V (kAlrVkTri*Spv) carried OVER THE WIRE (not host-embedded in the
+// pipeline) — that is the milestone: guest-supplied shaders. A counting present sink
+// asserts the AHB was routed. Gating first line: "ALR VK ICD PRESENT: PASS/FAIL".
+// ===========================================================================
+inline std::string run_vk_icd_present_probe() {
+    std::ostringstream out;
+    constexpr uint32_t kRingBytes = 1u << 16;  // 64 KiB each (SPIR-V blobs ~1 KiB fit)
+    constexpr uint32_t kVinst = 9, kVphysBase = 100, kVdev = 1000, kVqueue = 2000;
+    constexpr uint32_t kVpool = 1500, kVcmd = 1600, kVvert = 1700, kVfrag = 1701,
+                       kVswap = 1800;
+    constexpr uint32_t kW = 128, kH = 128;
+
+    // A counting present sink so the probe asserts the AHB was actually routed (the
+    // device build's runtime sink forwards to the compositor; here we just count).
+    static std::atomic<int> g_probe_present_count{0};
+    g_probe_present_count.store(0, std::memory_order_release);
+    const VkPresentSink prev_sink = vk_present_sink();
+    set_vk_present_sink([](void* ahb, int w, int h, uint64_t serial) -> bool {
+        (void)ahb; (void)w; (void)h; (void)serial;
+        g_probe_present_count.fetch_add(1, std::memory_order_acq_rel);
+        return true;  // "accepted" for the self-test
+    });
+
+    std::vector<uint8_t> req_region(ring_region_size(kRingBytes), 0u);
+    std::vector<uint8_t> rep_region(ring_region_size(kRingBytes), 0u);
+    if (!ring_init(req_region.data(), kRingBytes) || !ring_init(rep_region.data(), kRingBytes)) {
+        set_vk_present_sink(prev_sink);
+        out << "ALR VK ICD PRESENT: FAIL\nalr vk icd present error=ring-init";
+        return out.str();
+    }
+
+    VkRingServicer svc(req_region.data(), rep_region.data(), /*doorbell=*/-1);
+    if (!svc.start()) {
+        set_vk_present_sink(prev_sink);
+        out << "ALR VK ICD PRESENT: FAIL\nalr vk icd present error=servicer-start:" << svc.error();
+        return out.str();
+    }
+
+    RingProducer req_prod(req_region.data());
+    RingConsumer rep_cons(rep_region.data());
+
+    // ---- Batch 1: bring the device up + UPLOAD THE GUEST SPIR-V + create swapchain +
+    // acquire (acquire returns an image index we need before recording). ----
+    // The SPIR-V shipped is the proven triangle SPIR-V carried OVER THE WIRE — exactly
+    // what a guest app's vkCreateShaderModule would marshal. (Reusing the validated blob
+    // keeps the self-test deterministic; the wire path is identical for any guest SPIR-V.)
+    std::vector<uint8_t> b1(4096);
+    AlrVkEncoder e;
+    alr_vk_enc_init(&e, b1.data(), static_cast<uint32_t>(b1.size()));
+    alr_vk_enc_create_instance(&e, kVinst, (1u << 22) | (1u << 12));  // API 1.1
+    alr_vk_enc_enumerate_phys(&e, kVinst, kVphysBase);
+    alr_vk_enc_create_device(&e, kVinst, kVphysBase, kVdev);
+    alr_vk_enc_get_device_queue(&e, kVdev, 0, kVqueue);
+    alr_vk_enc_create_command_pool(&e, kVdev, kVpool);
+    alr_vk_enc_allocate_command_buffers(&e, kVdev, kVpool, kVcmd);
+    alr_vk_enc_create_shader_module(&e, kVdev, kVvert, /*stage VERTEX*/ 0x00000001u,
+                                    kAlrVkTriVertSpv, sizeof(kAlrVkTriVertSpv));
+    alr_vk_enc_create_shader_module(&e, kVdev, kVfrag, /*stage FRAGMENT*/ 0x00000010u,
+                                    kAlrVkTriFragSpv, sizeof(kAlrVkTriFragSpv));
+    alr_vk_enc_create_swapchain(&e, kVdev, kVswap, kW, kH, /*image_count=*/2);
+    alr_vk_enc_acquire_next_image(&e, kVdev, kVswap);
+    alr_vk_enc_u8(&e, static_cast<uint8_t>(ALR_VK_OP_END));
+    const bool pushed1 = !e.overflow && req_prod.append(b1.data(), static_cast<uint32_t>(e.len));
+    req_prod.flush_and_wait(1u << 24);
+
+    std::vector<uint8_t> rep1(rep_cons.available());
+    const uint32_t got1 = rep_cons.snapshot(rep1.data(), static_cast<uint32_t>(rep1.size()));
+    rep_cons.advance(got1);
+    VkDecodedReply d1;
+    const bool reply1_ok = decode_vk_reply(rep1.data(), got1, d1);
+
+    const bool shaders_ok = d1.shaders.size() == 2 && d1.shaders[0].result == 0 &&
+                            d1.shaders[1].result == 0;
+    const bool swap_ok = d1.swapchains.size() == 1 && d1.swapchains[0].result == 0 &&
+                         d1.swapchains[0].image_count >= 1;
+    const bool acquire_ok = d1.acquires.size() == 1 && d1.acquires[0].result == 0;
+    const uint32_t img_index = acquire_ok ? d1.acquires[0].image_index : 0;
+
+    // ---- Batch 2: record the guest-shader draw into the acquired image + present. ----
+    std::vector<uint8_t> b2(256);
+    AlrVkEncoder e2;
+    alr_vk_enc_init(&e2, b2.data(), static_cast<uint32_t>(b2.size()));
+    alr_vk_enc_cmd_begin_draw_modules(&e2, kVdev, kVcmd, kVswap, img_index, kVvert, kVfrag,
+                                      kW, kH, /*bg=*/0.0f, 0.0f, 0.0f, 1.0f);
+    alr_vk_enc_queue_present(&e2, kVdev, kVqueue, kVcmd, kVswap, img_index);
+    alr_vk_enc_u8(&e2, static_cast<uint8_t>(ALR_VK_OP_END));
+    const bool pushed2 = !e2.overflow && req_prod.append(b2.data(), static_cast<uint32_t>(e2.len));
+    req_prod.flush_and_wait(1u << 24);
+
+    std::vector<uint8_t> rep2(rep_cons.available());
+    const uint32_t got2 = rep_cons.snapshot(rep2.data(), static_cast<uint32_t>(rep2.size()));
+    rep_cons.advance(got2);
+    VkDecodedReply d2;
+    const bool reply2_ok = decode_vk_reply(rep2.data(), got2, d2);
+
+    const bool present_present = d2.presents.size() == 1;
+    const VkReplyPresent pr = present_present ? d2.presents[0] : VkReplyPresent{};
+    const bool render_ok = present_present && pr.render_result == 0 && pr.submit_result == 0;
+    // The guest fragment shader emits kAlrVkTriColor* (~242/26/204); the center pixel must
+    // be ~that (not the 0,0,0 background) — proof the GUEST's SPIR-V drew on Mali.
+    auto near8 = [](uint8_t got, float want01) {
+        const int want = static_cast<int>(want01 * 255.0f + 0.5f);
+        const int diff = static_cast<int>(got) - want;
+        return (diff < 0 ? -diff : diff) <= 12;  // tiler/UNORM rounding slack
+    };
+    const bool color_ok = present_present &&
+                          near8(pr.px[0], kAlrVkTriColorR) &&
+                          near8(pr.px[1], kAlrVkTriColorG) &&
+                          near8(pr.px[2], kAlrVkTriColorB);
+    const bool routed_ok = pr.presented != 0 &&
+                           g_probe_present_count.load(std::memory_order_acquire) >= 1;
+
+    svc.stop();
+    set_vk_present_sink(prev_sink);
+
+    const bool pass = pushed1 && pushed2 && reply1_ok && reply2_ok && shaders_ok &&
+                      swap_ok && acquire_ok && present_present && render_ok && color_ok &&
+                      routed_ok && svc.error().empty();
+
+    out << "ALR VK ICD PRESENT: " << (pass ? "PASS" : "FAIL");
+    out << "\nalr vk icd present model=guest SPIR-V over the wire (CREATE_SHADER_MODULE) "
+           "+ AHB-backed swapchain (CREATE_SWAPCHAIN/ACQUIRE) + QUEUE_PRESENT routes the "
+           "rendered AHB to the compositor sink; replayed on real Mali libvulkan";
+    out << "\nalr vk icd present batches=" << svc.batches_serviced();
+    out << "\nalr vk icd present shaders created="
+        << (shaders_ok ? "2 (vert+frag, guest SPIR-V)" : "FAILED");
+    if (swap_ok)
+        out << "\nalr vk icd present swapchain images=" << d1.swapchains[0].image_count;
+    else
+        out << "\nalr vk icd present swapchain=FAILED";
+    out << "\nalr vk icd present acquired image index=" << img_index
+        << (acquire_ok ? "" : " (acquire FAILED)");
+    if (present_present) {
+        out << "\nalr vk icd present render_result=" << pr.render_result
+            << " submit_result=" << pr.submit_result;
+        out << "\nalr vk icd present center pixel=" << static_cast<int>(pr.px[0]) << ","
+            << static_cast<int>(pr.px[1]) << "," << static_cast<int>(pr.px[2]) << ","
+            << static_cast<int>(pr.px[3])
+            << " (expect guest-frag ~" << static_cast<int>(kAlrVkTriColorR * 255) << ","
+            << static_cast<int>(kAlrVkTriColorG * 255) << ","
+            << static_cast<int>(kAlrVkTriColorB * 255) << ")";
+        out << "\nalr vk icd present color match=" << (color_ok ? "yes" : "NO");
+        out << "\nalr vk icd present routed to sink=" << (pr.presented ? "yes" : "no")
+            << " sink calls=" << g_probe_present_count.load(std::memory_order_acquire);
+    } else {
+        out << "\nalr vk icd present reply=absent";
+    }
+    out << "\nalr vk icd present note=guest's OWN SPIR-V drove the Mali pipeline (not the "
+           "host-embedded shader); the on-device end-to-end is alr-vk-tri (a guest Vulkan "
+           "triangle app that creates instance/device/swapchain, records its own shaders, "
+           "and presents -> triangle on the SurfaceView)";
+    out << "\nalr vk icd present error=" << (svc.error().empty() ? "(none)" : svc.error());
+    return out.str();
+}
+
 }  // namespace alr::gpu
 
 #endif  // ALR_GPU_ALR_GPU_VK_HOST_SERVICE_HPP

@@ -736,6 +736,16 @@ class MainActivity : Activity() {
         val alrVkIcdServicePassed =
             alrVkIcdServiceProbe.lineStartingWith("ALR VK ICD SERVICE:") ==
                 "ALR VK ICD SERVICE: PASS"
+        // VK-M4 (guest Vulkan ICD PRESENT rung): host-side self-test of GUEST-SUPPLIED
+        // SPIR-V over the wire (CREATE_SHADER_MODULE) + an AHB-backed swapchain whose
+        // QUEUE_PRESENT routes the rendered image to the compositor sink. Asserts the
+        // guest's OWN fragment shader produced the expected color into the swapchain
+        // image on real Mali. logcat tag "vk-icd-present:". (The forked-guest end-to-end
+        // — a triangle window on the SurfaceView — is the alr-vk-tri device test.)
+        val alrVkIcdPresentProbe = nativeAlrGpuVkIcdPresentProbe()
+        val alrVkIcdPresentPassed =
+            alrVkIcdPresentProbe.lineStartingWith("ALR VK ICD PRESENT:") ==
+                "ALR VK ICD PRESENT: PASS"
         // Goal-2 (Chromium) prep: V8-style iterative W^X executable memory. PASS => V8
         // JIT runs without --jitless on this untrusted_app domain.
         val jitWxProbe = nativeJitWxProbe()
@@ -964,6 +974,7 @@ class MainActivity : Activity() {
             "\nALR VK RENDER MARSHAL (guest Vulkan device+queue+cmdbuf+clear -> real Mali -> AHB readback): ${if (alrVkRenderPassed) "PASS" else "FAIL"}" +
             "\nALR VK DRAW MARSHAL (guest Vulkan graphics-pipeline vkCmdDraw -> real Mali -> AHB readback): ${if (alrVkDrawPassed) "PASS" else "FAIL"}" +
             "\nALR VK ICD SERVICE (guest libvulkan.so.1 ICD path: servicer drains ring -> real Mali enum -> reply ring): ${if (alrVkIcdServicePassed) "PASS" else "FAIL"}" +
+            "\nALR VK ICD PRESENT (guest-supplied SPIR-V over the wire + AHB swapchain -> real Mali draw -> present sink): ${if (alrVkIcdPresentPassed) "PASS" else "FAIL"}" +
             "\nALR JIT WX CYCLE (V8-style iterative RW<->RX exec memory; PASS => Chromium V8 needs no --jitless): ${if (jitWxPassed) "PASS" else "FAIL"}" +
             "\nHOST GPU EGL/GLES EXECUTION: ${if (hostGpuHardwareCandidate) "PASS" else "FAIL"}" +
             "\nANDROID HOST VULKAN PROBE EXECUTION: ${if (hostVulkanHardwareCandidate) "PASS" else "FAIL"}" +
@@ -3686,6 +3697,7 @@ class MainActivity : Activity() {
     private external fun nativeAlrGpuVkRenderProbe(): String
     private external fun nativeAlrGpuVkDrawProbe(): String
     private external fun nativeAlrGpuVkIcdServiceProbe(): String
+    private external fun nativeAlrGpuVkIcdPresentProbe(): String
 
     private external fun nativeJitWxProbe(): String
 

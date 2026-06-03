@@ -242,8 +242,72 @@ int main() {
         if (!pass) printf("---- draw probe report ----\n%s\n", report.c_str());
     }
 
+    // 14) VK-M4 PRESENT rung: GUEST SPIR-V over the wire (CREATE_SHADER_MODULE) + an
+    //     AHB-backed swapchain (CREATE_SWAPCHAIN/ACQUIRE) + QUEUE_PRESENT. The synthetic
+    //     provider accepts the SPIR-V (magic check), serves a 2-image swapchain, rotates
+    //     acquire, and "presents" the triangle color. Asserts the new reply records
+    //     decode and the guest's shader color survives to the presented center pixel.
+    {
+        // A tiny but VALID SPIR-V header (magic + version + a couple words) — enough for
+        // the provider's magic check (the real path vkCreateShaderModule's it on Mali).
+        const uint32_t fake_spv[] = {0x07230203u, 0x00010300u, 0x0u, 0x1u};
+        SyntheticMaliProvider syn;
+        VkProvider prov = syn.as_provider();
+        VkDecodeState st;
+
+        // Batch A: device bring-up + shader uploads + swapchain + acquire.
+        std::vector<uint8_t> a(512);
+        AlrVkEncoder e; alr_vk_enc_init(&e, a.data(), (uint32_t)a.size());
+        alr_vk_enc_create_instance(&e, 1, kAlrVkApi13);
+        alr_vk_enc_enumerate_phys(&e, 1, 100);
+        alr_vk_enc_create_device(&e, 1, 100, 10);
+        alr_vk_enc_get_device_queue(&e, 10, 0, 20);
+        alr_vk_enc_create_command_pool(&e, 10, 30);
+        alr_vk_enc_allocate_command_buffers(&e, 10, 30, 40);
+        alr_vk_enc_create_shader_module(&e, 10, 50, 0x1u /*VERTEX*/,
+                                        fake_spv, (uint32_t)sizeof(fake_spv));
+        alr_vk_enc_create_shader_module(&e, 10, 51, 0x10u /*FRAGMENT*/,
+                                        fake_spv, (uint32_t)sizeof(fake_spv));
+        alr_vk_enc_create_swapchain(&e, 10, 60, 64, 64, 2);
+        alr_vk_enc_acquire_next_image(&e, 10, 60);
+        alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
+        VkReplyEncoder ra;
+        check(decode_vk_batch(a.data(), e.len, st, ra, &prov), "present batch-A decodes");
+        VkDecodedReply da;
+        check(decode_vk_reply(ra.bytes().data(), ra.bytes().size(), da), "present batch-A reply decodes");
+        check(da.shaders.size() == 2 && da.shaders[0].result == 0 && da.shaders[1].result == 0,
+              "2 guest shader modules created (SPIR-V over the wire)");
+        check(da.swapchains.size() == 1 && da.swapchains[0].result == 0 &&
+              da.swapchains[0].image_count == 2, "swapchain created with 2 images");
+        check(da.acquires.size() == 1 && da.acquires[0].result == 0, "acquire returned an index");
+        const uint32_t img = da.acquires.empty() ? 0 : da.acquires[0].image_index;
+
+        // Batch B: record the guest-shader draw into the acquired image + present.
+        std::vector<uint8_t> b(128);
+        AlrVkEncoder e2; alr_vk_enc_init(&e2, b.data(), (uint32_t)b.size());
+        alr_vk_enc_cmd_begin_draw_modules(&e2, 10, 40, 60, img, 50, 51, 64, 64,
+                                          0.0f, 0.0f, 0.0f, 1.0f);
+        alr_vk_enc_queue_present(&e2, 10, 20, 40, 60, img);
+        alr_vk_enc_u8(&e2, (uint8_t)ALR_VK_OP_END);
+        VkReplyEncoder rb;
+        check(decode_vk_batch(b.data(), e2.len, st, rb, &prov), "present batch-B decodes");
+        VkDecodedReply db;
+        check(decode_vk_reply(rb.bytes().data(), rb.bytes().size(), db), "present batch-B reply decodes");
+        check(db.presents.size() == 1, "one present reply");
+        if (db.presents.size() == 1) {
+            const auto& pr = db.presents[0];
+            check(pr.render_result == ALR_VK_RENDER_OK, "present render OK");
+            check(pr.presented == 1, "present routed to sink");
+            const int want_r = (int)(kAlrVkTriColorR * 255.0f + 0.5f);
+            check(std::abs((int)pr.px[0] - want_r) <= 1,
+                  "guest frag-shader color survives to the presented center pixel");
+        }
+        check(syn.present_count == 1, "synthetic device presented exactly once");
+    }
+
     if (failures == 0) {
-        printf("native_vk_marshal_test: ALL PASS (vk enumerate/props + clear-submit + DRAW(pipeline/vbuf/vkCmdDraw) marshalling)\n");
+        printf("native_vk_marshal_test: ALL PASS (vk enumerate/props + clear-submit + "
+               "DRAW(pipeline/vbuf/vkCmdDraw) + PRESENT(guest SPIR-V/swapchain) marshalling)\n");
         return 0;
     }
     printf("native_vk_marshal_test: %d FAILURE(S)\n", failures);

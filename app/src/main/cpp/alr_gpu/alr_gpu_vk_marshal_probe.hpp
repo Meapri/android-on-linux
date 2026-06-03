@@ -26,6 +26,7 @@
 
 #include <cstdint>
 #include <cstdlib>  // std::abs (clear-readback tolerance check)
+#include <cstring>  // std::memcpy (VK-M4 SPIR-V magic check in the synthetic provider)
 #include <sstream>
 #include <string>
 #include <vector>
@@ -116,6 +117,50 @@ struct SyntheticMaliProvider {
     static void destroy_device(void* ctx, uint32_t /*vdev*/) {
         static_cast<SyntheticMaliProvider*>(ctx)->device_created = false;
     }
+    // ---- VK-M4 (PRESENT rung) seams: the synthetic device accepts the guest's SPIR-V
+    // blob (asserting only the SPIR-V magic, like the real path), serves an AHB-less
+    // swapchain (2 images), rotates acquire, and "presents" by rasterizing the fixed
+    // triangle color into the center pixel + counting the present. This lets the wire
+    // round trip assert the SPIR-V/swapchain/present path end to end without a GPU. ----
+    uint32_t swap_next = 0;
+    int present_count = 0;
+    static int create_shader_module(void* /*ctx*/, uint32_t /*vdev*/, uint32_t /*vshader*/,
+                                    const uint8_t* spirv, uint32_t spirv_len) {
+        if (!spirv || spirv_len < 8 || (spirv_len % 4) != 0) return -1;
+        uint32_t magic = 0; std::memcpy(&magic, spirv, 4);
+        return (magic == 0x07230203u) ? 0 : -1;  // SPIR-V magic, as the real path checks
+    }
+    static void destroy_shader_module(void* /*ctx*/, uint32_t /*vdev*/, uint32_t /*vshader*/) {}
+    static int create_swapchain(void* /*ctx*/, uint32_t /*vdev*/, uint32_t /*vsw*/,
+                                uint32_t /*w*/, uint32_t /*h*/, uint32_t image_count,
+                                uint32_t* image_count_out) {
+        uint32_t n = image_count ? image_count : 2;
+        if (n > 4) n = 4;
+        if (image_count_out) *image_count_out = n;
+        return 0;
+    }
+    static void destroy_swapchain(void* /*ctx*/, uint32_t /*vsw*/) {}
+    static bool acquire_next_image(void* ctx, uint32_t /*vsw*/, uint32_t* index_out) {
+        SyntheticMaliProvider* s = static_cast<SyntheticMaliProvider*>(ctx);
+        if (index_out) *index_out = s->swap_next;
+        s->swap_next = (s->swap_next + 1u) % 2u;  // synthetic 2-image ring
+        return true;
+    }
+    static int draw_present(void* ctx, uint32_t /*vdev*/, uint32_t /*vqueue*/,
+                            uint32_t /*vcmd*/, const VkClearRecord& rec, uint8_t px[4],
+                            uint8_t* presented) {
+        if (!rec.recorded || !rec.is_present_draw) return ALR_VK_RENDER_NO_CLEAR_RECORDED;
+        // The guest's frag shader emits the fixed triangle color (the synthetic device
+        // can't run SPIR-V, but the real path produces exactly this; the wire test only
+        // needs the round trip + the color to survive marshalling).
+        px[0] = syn_to_u8(kAlrVkTriColorR);
+        px[1] = syn_to_u8(kAlrVkTriColorG);
+        px[2] = syn_to_u8(kAlrVkTriColorB);
+        px[3] = syn_to_u8(kAlrVkTriColorA);
+        static_cast<SyntheticMaliProvider*>(ctx)->present_count++;
+        if (presented) *presented = 1;  // "routed" (a real sink would composite it)
+        return ALR_VK_RENDER_OK;
+    }
     VkProvider as_provider() {
         VkProvider p{};
         p.create_instance = &create_instance;
@@ -129,6 +174,13 @@ struct SyntheticMaliProvider {
         p.clear_submit = &clear_submit;
         p.draw_submit = &draw_submit;  // VK-M3 draw seam
         p.destroy_device = &destroy_device;
+        // VK-M4 present-rung seams
+        p.create_shader_module = &create_shader_module;
+        p.destroy_shader_module = &destroy_shader_module;
+        p.create_swapchain = &create_swapchain;
+        p.destroy_swapchain = &destroy_swapchain;
+        p.acquire_next_image = &acquire_next_image;
+        p.draw_present = &draw_present;
         p.ctx = this;
         return p;
     }
