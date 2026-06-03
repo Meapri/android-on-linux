@@ -34,6 +34,7 @@
 
 #include <stdlib.h>  /* getenv, atoi (eglQuerySurface drawable size) */
 #include <string.h>
+#include <stdint.h>  /* intptr_t for eglGetPlatformDisplay attrib_list */
 
 /* ---- Opaque, non-NULL local sentinels. Their addresses are stable for the
  * process lifetime, so the cube's `dpy != EGL_NO_DISPLAY` etc. checks hold and
@@ -42,13 +43,32 @@ static int g_display_tag;   /* &g_display_tag is the one EGLDisplay we hand out 
 static int g_config_tag;    /* &g_config_tag  is the one EGLConfig  we hand out */
 static int g_surface_tag;   /* &g_surface_tag is the one EGLSurface we hand out */
 static int g_context_tag;   /* &g_context_tag is the one EGLContext we hand out */
+static int g_device_tag;    /* &g_device_tag  is the one EGLDeviceEXT (synthetic) for ANGLE's device path */
 
 #define ALR_EGL_DISPLAY ((EGLDisplay)&g_display_tag)
 #define ALR_EGL_CONFIG  ((EGLConfig)&g_config_tag)
 #define ALR_EGL_SURFACE ((EGLSurface)&g_surface_tag)
 #define ALR_EGL_CONTEXT ((EGLContext)&g_context_tag)
+#define ALR_EGL_DEVICE  ((void*)&g_device_tag)
+
+/* EGL_EXT_platform_device / EGL_EXT_device_query tokens (not in the tiny khr hdr). */
+#define ALR_EGL_PLATFORM_DEVICE_EXT 0x313F
+#define ALR_EGL_RENDERER_EXT        0x335F  /* EGL_RENDERER_EXT (device string) */
 
 static void egl_set_error(EGLint err) { alr_shim()->egl_error = err; }
+
+/* CR-3 device diagnostics: trace ANGLE's EGL call sequence into guest stderr (which
+ * the loader tees to logcat as alr_cr_out under ALR_TEE_GUEST_STDOUT). Gated on
+ * ALR_SHIM_DIAG=1 so it is silent in normal runs. This is what lets us see exactly
+ * which EGL entry ANGLE calls and what we return, to close "Failed to get system
+ * egl display" et al. */
+#include <stdio.h>
+static int alr_egl_diag_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("ALR_SHIM_DIAG"); v = (e && e[0] == '1') ? 1 : 0; }
+    return v;
+}
+#define ALR_EGL_DIAG(...) do { if (alr_egl_diag_on()) { fprintf(stderr, "[alr-egl] " __VA_ARGS__); fputc('\n', stderr); fflush(stderr); } } while (0)
 
 /* [LOCAL] return the single display sentinel; force-init the shim ring early so
  * a missing ring is reported up front (and so virtual-ID state exists). */
@@ -56,16 +76,95 @@ EGLDisplay eglGetDisplay(EGLNativeDisplayType display_id) {
     (void)display_id;
     (void)alr_shim();              /* triggers lazy ring attach */
     egl_set_error(EGL_SUCCESS);
+    ALR_EGL_DIAG("eglGetDisplay(native=%p) -> %p", (void*)display_id, (void*)ALR_EGL_DISPLAY);
     return ALR_EGL_DISPLAY;
+}
+
+/* CR-3 (chromium-gpu-path §4.1): ANGLE's gles-egl backend, having seen
+ * EGL_KHR/EXT_platform_* in our client extensions, resolves and calls
+ * eglGetPlatformDisplay / eglGetPlatformDisplayEXT (EGL 1.5 / EGL_EXT_platform_base)
+ * instead of the legacy eglGetDisplay. Both must return our single sentinel
+ * display (any platform/native arg is advisory — the real target is the host Mali
+ * context). Without these, eglGetProcAddress("eglGetPlatformDisplay") would be
+ * NULL and ANGLE's display init aborts. Signatures use void-pointer and
+ * intptr-shaped params so we don't depend on EGL 1.5 typedefs in the tiny header. */
+EGLDisplay eglGetPlatformDisplay(unsigned int platform, void *native_display,
+                                 const intptr_t *attrib_list) {
+    (void)native_display; (void)attrib_list;
+    (void)alr_shim();              /* triggers lazy ring attach */
+    egl_set_error(EGL_SUCCESS);
+    ALR_EGL_DIAG("eglGetPlatformDisplay(platform=0x%x, native=%p) -> %p",
+                 platform, native_display, (void*)ALR_EGL_DISPLAY);
+    return ALR_EGL_DISPLAY;
+}
+
+EGLDisplay eglGetPlatformDisplayEXT(unsigned int platform, void *native_display,
+                                    const EGLint *attrib_list) {
+    (void)native_display; (void)attrib_list;
+    (void)alr_shim();
+    egl_set_error(EGL_SUCCESS);
+    ALR_EGL_DIAG("eglGetPlatformDisplayEXT(platform=0x%x, native=%p) -> %p",
+                 platform, native_display, (void*)ALR_EGL_DISPLAY);
+    return ALR_EGL_DISPLAY;
+}
+
+/* CR-3 (EGL_EXT_device_enumeration/base/query): ANGLE's getNativeDisplay()
+ * enumerates devices, then makes the display from one. We expose exactly ONE
+ * synthetic device (no real /dev node — the host Mali executor is the GPU). This
+ * is what lets ANGLE's device path reach our eglGetPlatformDisplayEXT +
+ * eglInitialize and succeed, instead of bailing with "Failed to get system egl
+ * display". EGLDeviceEXT/EGLAttrib are modeled as void*/intptr (not in the tiny
+ * header); ANGLE only stores the opaque device handle and passes it back to us. */
+EGLBoolean eglQueryDevicesEXT(EGLint max_devices, void **devices, EGLint *num_devices) {
+    if (!num_devices) { egl_set_error(EGL_BAD_PARAMETER); return EGL_FALSE; }
+    if (devices == NULL) {
+        /* Count query. */
+        *num_devices = 1;
+    } else if (max_devices > 0) {
+        devices[0] = ALR_EGL_DEVICE;
+        *num_devices = 1;
+    } else {
+        egl_set_error(EGL_BAD_PARAMETER); return EGL_FALSE;
+    }
+    egl_set_error(EGL_SUCCESS);
+    ALR_EGL_DIAG("eglQueryDevicesEXT(max=%d, query=%d) -> n=%d dev=%p",
+                 max_devices, devices == NULL, *num_devices, (void*)ALR_EGL_DEVICE);
+    return EGL_TRUE;
+}
+const char *eglQueryDeviceStringEXT(void *device, EGLint name) {
+    if (device != ALR_EGL_DEVICE) { egl_set_error(EGL_BAD_PARAMETER); return (const char*)0; }
+    egl_set_error(EGL_SUCCESS);
+    switch (name) {
+        case EGL_VENDOR:             return "Android-on-Linux (ALR)";
+        case ALR_EGL_RENDERER_EXT:   return "ALR Mali passthrough";
+        case EGL_EXTENSIONS:         return "";   /* no device-level extensions */
+        default:                     return "";
+    }
+}
+EGLBoolean eglQueryDeviceAttribEXT(void *device, EGLint attribute, intptr_t *value) {
+    (void)attribute;
+    if (device != ALR_EGL_DEVICE || !value) { egl_set_error(EGL_BAD_PARAMETER); return EGL_FALSE; }
+    /* We expose no queryable device attributes (no DRM fd, no native handle). */
+    egl_set_error(EGL_BAD_PARAMETER); return EGL_FALSE;
+}
+EGLBoolean eglQueryDisplayAttribEXT(EGLDisplay dpy, EGLint attribute, intptr_t *value) {
+    if (dpy != ALR_EGL_DISPLAY || !value) { egl_set_error(EGL_BAD_PARAMETER); return EGL_FALSE; }
+    /* EGL_DEVICE_EXT (0x322C): hand back our synthetic device so ANGLE can round-trip. */
+    if (attribute == 0x322C) { *value = (intptr_t)ALR_EGL_DEVICE; egl_set_error(EGL_SUCCESS); return EGL_TRUE; }
+    egl_set_error(EGL_BAD_PARAMETER); return EGL_FALSE;
 }
 
 /* [LOCAL] pretend EGL 1.4. We don't gate on ring_ok here: a ring-less smoke run
  * (no GPU) should still let the app spin its loop and just produce no pixels. */
 EGLBoolean eglInitialize(EGLDisplay dpy, EGLint *major, EGLint *minor) {
-    if (dpy != ALR_EGL_DISPLAY) { egl_set_error(EGL_BAD_PARAMETER); return EGL_FALSE; }
+    if (dpy != ALR_EGL_DISPLAY) {
+        ALR_EGL_DIAG("eglInitialize(dpy=%p) BAD_DISPLAY (ours=%p)", (void*)dpy, (void*)ALR_EGL_DISPLAY);
+        egl_set_error(EGL_BAD_PARAMETER); return EGL_FALSE;
+    }
     if (major) *major = 1;
     if (minor) *minor = 4;
     egl_set_error(EGL_SUCCESS);
+    ALR_EGL_DIAG("eglInitialize(dpy=%p) -> TRUE (1.4)", (void*)dpy);
     return EGL_TRUE;
 }
 
@@ -91,6 +190,7 @@ EGLBoolean eglChooseConfig(EGLDisplay dpy, const EGLint *attrib_list,
         *num_config = 0;                                   /* zero-length output array */
     }
     egl_set_error(EGL_SUCCESS);
+    ALR_EGL_DIAG("eglChooseConfig(count_query=%d) -> n=%d", configs == NULL, *num_config);
     return EGL_TRUE;
 }
 
@@ -189,6 +289,7 @@ EGLContext eglCreateContext(EGLDisplay dpy, EGLConfig config, EGLContext share_c
     }
     (void)alr_shim();
     egl_set_error(EGL_SUCCESS);
+    ALR_EGL_DIAG("eglCreateContext -> %p", (void*)ALR_EGL_CONTEXT);
     return ALR_EGL_CONTEXT;
 }
 
@@ -254,6 +355,121 @@ EGLint eglGetError(void) {
     return e;
 }
 
+/* CR-3 (chromium-gpu-path 4.1): ANGLE's gles-egl backend resolves the FULL EGL
+ * 1.0 to 1.5 core entry-point set up front (egl_loader_autogen, via dlsym or
+ * eglGetProcAddress) and ABORTS display init if ANY is NULL. The device drain
+ * showed "Could not load EGL entry point eglBindTexImage" - glmark2 never needed
+ * these so they were absent. Safe LOCAL stubs for every core entry ANGLE loads.
+ * Types beyond the tiny khr header (image, sync, client-buffer) are modeled with
+ * void-pointer and EGLint params - ANGLE only needs the SYMBOL to be non-NULL; if
+ * it ever calls one on the gles-egl offscreen path we return an honest
+ * unsupported value (EGL_FALSE or a NO_* sentinel), which ANGLE handles. We do
+ * NOT implement EGLImage/dmabuf import meaningfully (no device node; sec 4.4):
+ *   eglBindTexImage / eglReleaseTexImage : pbuffer-tex binding, N/A offscreen.
+ *   eglCopyBuffers                       : no native pixmap target.
+ *   eglCreatePbufferFromClientBuffer     : no client-buffer source.
+ *   eglCreate/Destroy/ClientWait/WaitSync, eglGetSyncAttrib : fence sync; the
+ *       host glFinish in eglSwapBuffers is the real sync, so report unavailable.
+ *   eglCreate/DestroyImage(KHR)          : no EGLImage (dmabuf path off).
+ *   eglCreatePlatformWindow/PixmapSurface: EGL 1.5 ctors to our sentinels. */
+EGLBoolean eglBindTexImage(EGLDisplay dpy, EGLSurface surface, EGLint buffer) {
+    (void)surface; (void)buffer;
+    if (dpy != ALR_EGL_DISPLAY) { egl_set_error(EGL_BAD_PARAMETER); return EGL_FALSE; }
+    egl_set_error(EGL_SUCCESS); return EGL_TRUE;
+}
+EGLBoolean eglReleaseTexImage(EGLDisplay dpy, EGLSurface surface, EGLint buffer) {
+    (void)surface; (void)buffer;
+    if (dpy != ALR_EGL_DISPLAY) { egl_set_error(EGL_BAD_PARAMETER); return EGL_FALSE; }
+    egl_set_error(EGL_SUCCESS); return EGL_TRUE;
+}
+EGLBoolean eglCopyBuffers(EGLDisplay dpy, EGLSurface surface, void *target) {
+    (void)surface; (void)target;
+    if (dpy != ALR_EGL_DISPLAY) { egl_set_error(EGL_BAD_PARAMETER); return EGL_FALSE; }
+    egl_set_error(EGL_SUCCESS); return EGL_TRUE;
+}
+EGLSurface eglCreatePbufferFromClientBuffer(EGLDisplay dpy, EGLenum buftype,
+                                            void *buffer, EGLConfig config,
+                                            const EGLint *attrib_list) {
+    (void)buftype; (void)buffer; (void)attrib_list;
+    if (dpy != ALR_EGL_DISPLAY || config != ALR_EGL_CONFIG) {
+        egl_set_error(EGL_BAD_PARAMETER); return EGL_NO_SURFACE;
+    }
+    egl_set_error(EGL_SUCCESS); return ALR_EGL_SURFACE;
+}
+/* Fence sync (EGL 1.5 / KHR_fence_sync): not backed — eglSwapBuffers' host
+ * glFinish is the actual GPU sync. Return NO_SYNC so ANGLE treats sync as
+ * unavailable rather than crashing. */
+void *eglCreateSync(EGLDisplay dpy, EGLenum type, const intptr_t *attrib_list) {
+    (void)type; (void)attrib_list;
+    if (dpy != ALR_EGL_DISPLAY) { egl_set_error(EGL_BAD_PARAMETER); return (void*)0; }
+    egl_set_error(EGL_SUCCESS); return (void*)0;  /* EGL_NO_SYNC */
+}
+void *eglCreateSyncKHR(EGLDisplay dpy, EGLenum type, const EGLint *attrib_list) {
+    (void)type; (void)attrib_list;
+    if (dpy != ALR_EGL_DISPLAY) { egl_set_error(EGL_BAD_PARAMETER); return (void*)0; }
+    egl_set_error(EGL_SUCCESS); return (void*)0;
+}
+EGLBoolean eglDestroySync(EGLDisplay dpy, void *sync) {
+    (void)dpy; (void)sync; egl_set_error(EGL_SUCCESS); return EGL_TRUE;
+}
+EGLBoolean eglDestroySyncKHR(EGLDisplay dpy, void *sync) {
+    (void)dpy; (void)sync; egl_set_error(EGL_SUCCESS); return EGL_TRUE;
+}
+EGLint eglClientWaitSync(EGLDisplay dpy, void *sync, EGLint flags, uint64_t timeout) {
+    (void)dpy; (void)sync; (void)flags; (void)timeout;
+    egl_set_error(EGL_SUCCESS); return 0x30F6 /* EGL_CONDITION_SATISFIED */;
+}
+EGLint eglClientWaitSyncKHR(EGLDisplay dpy, void *sync, EGLint flags, uint64_t timeout) {
+    (void)dpy; (void)sync; (void)flags; (void)timeout;
+    egl_set_error(EGL_SUCCESS); return 0x30F6;
+}
+EGLBoolean eglWaitSync(EGLDisplay dpy, void *sync, EGLint flags) {
+    (void)dpy; (void)sync; (void)flags; egl_set_error(EGL_SUCCESS); return EGL_TRUE;
+}
+EGLBoolean eglGetSyncAttrib(EGLDisplay dpy, void *sync, EGLint attribute, intptr_t *value) {
+    (void)dpy; (void)sync; (void)attribute; (void)value;
+    egl_set_error(EGL_BAD_PARAMETER); return EGL_FALSE;
+}
+EGLBoolean eglGetSyncAttribKHR(EGLDisplay dpy, void *sync, EGLint attribute, EGLint *value) {
+    (void)dpy; (void)sync; (void)attribute; (void)value;
+    egl_set_error(EGL_BAD_PARAMETER); return EGL_FALSE;
+}
+/* EGLImage (EGL 1.5 / KHR_image_base): dmabuf import path is OFF (§4.4) → no
+ * image. NO_IMAGE so ANGLE doesn't take a zero-copy import path. */
+void *eglCreateImage(EGLDisplay dpy, EGLContext ctx, EGLenum target,
+                     void *buffer, const intptr_t *attrib_list) {
+    (void)dpy; (void)ctx; (void)target; (void)buffer; (void)attrib_list;
+    egl_set_error(EGL_SUCCESS); return (void*)0;  /* EGL_NO_IMAGE */
+}
+void *eglCreateImageKHR(EGLDisplay dpy, EGLContext ctx, EGLenum target,
+                        void *buffer, const EGLint *attrib_list) {
+    (void)dpy; (void)ctx; (void)target; (void)buffer; (void)attrib_list;
+    egl_set_error(EGL_SUCCESS); return (void*)0;
+}
+EGLBoolean eglDestroyImage(EGLDisplay dpy, void *image) {
+    (void)dpy; (void)image; egl_set_error(EGL_SUCCESS); return EGL_TRUE;
+}
+EGLBoolean eglDestroyImageKHR(EGLDisplay dpy, void *image) {
+    (void)dpy; (void)image; egl_set_error(EGL_SUCCESS); return EGL_TRUE;
+}
+/* EGL 1.5 platform surface ctors: route to our window/pbuffer sentinels. */
+EGLSurface eglCreatePlatformWindowSurface(EGLDisplay dpy, EGLConfig config,
+                                          void *native_window, const intptr_t *attrib_list) {
+    (void)native_window; (void)attrib_list;
+    if (dpy != ALR_EGL_DISPLAY || config != ALR_EGL_CONFIG) {
+        egl_set_error(EGL_BAD_PARAMETER); return EGL_NO_SURFACE;
+    }
+    egl_set_error(EGL_SUCCESS); return ALR_EGL_SURFACE;
+}
+EGLSurface eglCreatePlatformPixmapSurface(EGLDisplay dpy, EGLConfig config,
+                                          void *native_pixmap, const intptr_t *attrib_list) {
+    (void)native_pixmap; (void)attrib_list;
+    if (dpy != ALR_EGL_DISPLAY || config != ALR_EGL_CONFIG) {
+        egl_set_error(EGL_BAD_PARAMETER); return EGL_NO_SURFACE;
+    }
+    egl_set_error(EGL_SUCCESS); return ALR_EGL_SURFACE;
+}
+
 /* [LOCAL] resolve eglGetProcAddress for the names we export. We hand back our own
  * exported functions for the EGL/GLES2 entry points (so apps that go through
  * eglGetProcAddress instead of direct linkage still reach the shim). Anything we
@@ -263,6 +479,8 @@ __eglMustCastToProperFunctionPointerType eglGetProcAddress(const char *procname)
     struct { const char *n; void *f; } tbl[] = {
         /* EGL */
         { "eglGetDisplay",            (void*)eglGetDisplay },
+        { "eglGetPlatformDisplay",    (void*)eglGetPlatformDisplay },
+        { "eglGetPlatformDisplayEXT", (void*)eglGetPlatformDisplayEXT },
         { "eglInitialize",            (void*)eglInitialize },
         { "eglChooseConfig",          (void*)eglChooseConfig },
         { "eglGetConfigAttrib",       (void*)eglGetConfigAttrib },
@@ -290,6 +508,26 @@ __eglMustCastToProperFunctionPointerType eglGetProcAddress(const char *procname)
         { "eglReleaseThread",         (void*)eglReleaseThread },
         { "eglSurfaceAttrib",         (void*)eglSurfaceAttrib },
         { "eglGetConfigs",            (void*)eglGetConfigs },
+        /* CR-3: full EGL core ANGLE's egl_loader resolves (else display init aborts). */
+        { "eglBindTexImage",          (void*)eglBindTexImage },
+        { "eglReleaseTexImage",       (void*)eglReleaseTexImage },
+        { "eglCopyBuffers",           (void*)eglCopyBuffers },
+        { "eglCreatePbufferFromClientBuffer", (void*)eglCreatePbufferFromClientBuffer },
+        { "eglCreateSync",            (void*)eglCreateSync },
+        { "eglCreateSyncKHR",         (void*)eglCreateSyncKHR },
+        { "eglDestroySync",           (void*)eglDestroySync },
+        { "eglDestroySyncKHR",        (void*)eglDestroySyncKHR },
+        { "eglClientWaitSync",        (void*)eglClientWaitSync },
+        { "eglClientWaitSyncKHR",     (void*)eglClientWaitSyncKHR },
+        { "eglWaitSync",              (void*)eglWaitSync },
+        { "eglGetSyncAttrib",         (void*)eglGetSyncAttrib },
+        { "eglGetSyncAttribKHR",      (void*)eglGetSyncAttribKHR },
+        { "eglCreateImage",           (void*)eglCreateImage },
+        { "eglCreateImageKHR",        (void*)eglCreateImageKHR },
+        { "eglDestroyImage",          (void*)eglDestroyImage },
+        { "eglDestroyImageKHR",       (void*)eglDestroyImageKHR },
+        { "eglCreatePlatformWindowSurface", (void*)eglCreatePlatformWindowSurface },
+        { "eglCreatePlatformPixmapSurface", (void*)eglCreatePlatformPixmapSurface },
     };
     for (size_t i = 0; i < sizeof(tbl)/sizeof(tbl[0]); ++i) {
         if (strcmp(procname, tbl[i].n) == 0)
@@ -298,14 +536,81 @@ __eglMustCastToProperFunctionPointerType eglGetProcAddress(const char *procname)
     return (__eglMustCastToProperFunctionPointerType)0;
 }
 
-/* [LOCAL] static strings; identifies the ALR marshalling EGL. */
+/* CR-3 (chromium-gpu-path §4.3): the extension strings ANGLE's gles-egl backend
+ * queries on the SYSTEM EGL (= us) before it will build a display. We advertise
+ * ONLY the offscreen/surfaceless + create-context set, and DELIBERATELY omit
+ * everything dmabuf/GBM/DRM (EGL_EXT_image_dma_buf_import, EGL_*_platform_gbm,
+ * EGL_*_device_*, EGL_*_stream_*) so ANGLE never tries to open /dev/dri (absent +
+ * SELinux-denied for an untrusted_app) and instead falls to the surfaceless FBO
+ * path — exactly what our host Mali executor renders into (AhbRenderTarget). Same
+ * canned string answers both the client query (dpy == EGL_NO_DISPLAY) and the
+ * display query; that is harmless for ANGLE (it greps for the names it needs).
+ *   - EGL_EXT_client_extensions : lets ANGLE query extensions with no display.
+ *   - EGL_KHR_platform_*        : lets ANGLE pick a platform via
+ *                                 eglGetPlatformDisplay (surfaceless/Android/GBM-less).
+ *   - EGL_KHR_surfaceless_context: the offscreen FBO path (no window surface).
+ *   - EGL_KHR_create_context (+ _no_error / _robustness no-op): ANGLE creates its
+ *                                 ES context via eglCreateContext attribs. */
+/* CR-3 device finding (chromium-gpu-path §4.1 refinement): ANGLE's gles-egl
+ * FunctionsEGL::initialize, on a host with NO Wayland/GBM/surfaceless EGL platform
+ * advertised, takes its getNativeDisplay() path, which REQUIRES the device
+ * enumeration set — (EGL_EXT_device_enumeration | EGL_EXT_device_base) +
+ * EGL_EXT_platform_base + EGL_EXT_platform_device — and then enumerates devices via
+ * eglQueryDevicesEXT and builds the display with
+ * eglGetPlatformDisplayEXT(EGL_PLATFORM_DEVICE_EXT, device). Without these ANGLE
+ * bails BEFORE ever calling our eglGetDisplay/eglInitialize, yielding "Failed to
+ * get system egl display" (device-observed). So we advertise the device-enum set
+ * and return ONE synthetic device from eglQueryDevicesEXT — that drives ANGLE down
+ * the EGL_PLATFORM_DEVICE path onto our sentinel display (which has no real /dev
+ * node; the host Mali executor is the actual GPU). */
+static const char *const ALR_EGL_CLIENT_EXTS =
+    "EGL_EXT_client_extensions "
+    "EGL_KHR_platform_base "
+    "EGL_EXT_platform_base "
+    "EGL_KHR_platform_android "
+    "EGL_EXT_platform_device "
+    "EGL_EXT_device_enumeration "
+    "EGL_EXT_device_base "
+    "EGL_EXT_device_query "
+    "EGL_KHR_client_get_all_proc_addresses "
+    "EGL_KHR_get_all_proc_addresses";
+static const char *const ALR_EGL_DISPLAY_EXTS =
+    "EGL_KHR_surfaceless_context "
+    "EGL_KHR_create_context "
+    "EGL_KHR_create_context_no_error "
+    "EGL_EXT_create_context_robustness "
+    "EGL_KHR_get_all_proc_addresses "
+    "EGL_KHR_no_config_context "
+    "EGL_KHR_gl_colorspace "
+    "EGL_KHR_fence_sync";
+
+/* [LOCAL] static strings; identifies the ALR marshalling EGL.
+ * EGL_NO_DISPLAY (client) query is VALID per EGL_EXT_client_extensions and must
+ * NOT error — ANGLE issues it first to discover platform extensions. */
 const char *eglQueryString(EGLDisplay dpy, EGLint name) {
-    if (dpy != ALR_EGL_DISPLAY) { egl_set_error(EGL_BAD_PARAMETER); return (const char*)0; }
+    if (dpy == EGL_NO_DISPLAY) {
+        /* Client (no-display) query: only EXTENSIONS (+ optional VERSION) are
+         * defined; ANGLE only reads EXTENSIONS here. */
+        if (name == EGL_EXTENSIONS) {
+            egl_set_error(EGL_SUCCESS);
+            ALR_EGL_DIAG("eglQueryString(NO_DISPLAY, EXTENSIONS) -> client exts");
+            return ALR_EGL_CLIENT_EXTS;
+        }
+        ALR_EGL_DIAG("eglQueryString(NO_DISPLAY, 0x%x) -> NULL", name);
+        egl_set_error(EGL_BAD_PARAMETER); return (const char*)0;
+    }
+    if (dpy != ALR_EGL_DISPLAY) {
+        ALR_EGL_DIAG("eglQueryString(dpy=%p BAD, 0x%x) -> NULL", (void*)dpy, name);
+        egl_set_error(EGL_BAD_PARAMETER); return (const char*)0;
+    }
     switch (name) {
-        case EGL_VENDOR:      return "Android-on-Linux (ALR)";
-        case EGL_VERSION:     return "1.4 ALR-marshalling";
-        case EGL_CLIENT_APIS: return "OpenGL_ES";
-        case EGL_EXTENSIONS:  return "";
+        case EGL_VENDOR:      egl_set_error(EGL_SUCCESS); return "Android-on-Linux (ALR)";
+        case EGL_VERSION:     egl_set_error(EGL_SUCCESS); return "1.4 ALR-marshalling";
+        case EGL_CLIENT_APIS: egl_set_error(EGL_SUCCESS); return "OpenGL_ES";
+        case EGL_EXTENSIONS:
+            egl_set_error(EGL_SUCCESS);
+            ALR_EGL_DIAG("eglQueryString(dpy, EXTENSIONS) -> display exts");
+            return ALR_EGL_DISPLAY_EXTS;
         default:              egl_set_error(EGL_BAD_PARAMETER); return (const char*)0;
     }
 }

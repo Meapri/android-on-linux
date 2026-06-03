@@ -1535,12 +1535,28 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         "/alr-xdg";
     std::vector<std::string> guest_env;
     guest_env.push_back("GLIBC_TUNABLES=glibc.pthread.rseq=0");
+    // CR-3 (chromium-gpu-child-plan §3.A-1): generalize the GPU-shim gate beyond
+    // glmark2 to ANY accel-requesting guest. The launcher opts a guest into the
+    // Mali path by setting ALR_GPU_ACCEL=1 (the standalone chromium cronly path
+    // does this) — that is the ONLY non-glmark2 trigger, so GIMP/qt6/general
+    // guests are untouched (zero regression). The chromium argv additionally
+    // carries --use-gl=angle --use-angle=gles-egl so ANGLE dlopen()s our
+    // libEGL.so.1/libGLESv2.so.2; the env gate is what makes the loader (a) put
+    // /usr/lib/androlinux first on LD_LIBRARY_PATH (below) and (b) attach the GPU
+    // ring (further down). The two must move together: shim-on-path without a
+    // ring would make the shim run ring-less (no GPU), and a ring without the
+    // shim on path would leave ANGLE on a software backend.
+    bool gpu_accel_requested = config.program.find("glmark2") != std::string::npos;
+    {
+        const char* ga = ::getenv("ALR_GPU_ACCEL");
+        if (ga && ga[0] == '1') gpu_accel_requested = true;
+    }
     // CP-2: a GLES guest (glmark2) dlopens the GPU shim libEGL.so.1/libGLESv2.so.2 from
     // /usr/lib/androlinux — it MUST resolve ahead of any rootfs/vendor GL lib, so prepend
-    // that dir. Gated on glmark2 so the general path never risks shim-shadowing a real
-    // libEGL (non-GPU guests don't dlopen those sonames anyway).
+    // that dir. Gated on accel-request so the general path never risks shim-shadowing a
+    // real libEGL (non-GPU guests don't dlopen those sonames anyway).
     const std::string ld_shim =
-        config.program.find("glmark2") != std::string::npos
+        gpu_accel_requested
             ? (config.rootfs_dir + "/usr/lib/androlinux:") : std::string();
     guest_env.push_back("LD_LIBRARY_PATH=" + ld_shim +
                         config.rootfs_dir + "/lib/aarch64-linux-gnu:" +
@@ -1746,7 +1762,18 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     // shim then runs ring-less = quiet no-op).
     alr::gpu::GpuRing gpu_ring{};
     bool gpu_ring_attached = false;
-    if (config.program.find("glmark2") != std::string::npos) {
+    if (gpu_accel_requested) {
+        // CR-3 (chromium-gpu-child-plan §3.A-1/§3.A-3): attach for any accel
+        // guest, not only glmark2. For standalone chromium the GPU lives IN the
+        // launch (browser) process — --single-process + --in-process-gpu collapse
+        // renderer+GPU+utility into this one process the loader launched directly,
+        // so the ring fds we push into guest_env are inherited by the very process
+        // that does the GL (no fresh-execve GPU child, hence no B-3 env-propagation
+        // hop, hence no ring-fd renumbering risk). The shim then finds
+        // ALR_GPU_RING_FD/BYTES and drives the host Mali executor; glGetString
+        // (GL_RENDERER) reflects the host's real "Mali-G615" via the ring identity
+        // block (alr_gles_shim.c). attach failure → CPU-only (no env pushed; shim
+        // runs ring-less = quiet no-op), so a ring miss degrades, never crashes.
         alr::gpu::GpuRingAttachConfig gcfg;
         gcfg.fb_w = 1280;
         gcfg.fb_h = 720;

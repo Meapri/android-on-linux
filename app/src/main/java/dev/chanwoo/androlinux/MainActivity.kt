@@ -1936,7 +1936,13 @@ class MainActivity : Activity() {
         // adb-push'd to /data/local/tmp; the base rootfs already ships the GTK/X/font
         // stack. No GPU shim / toolkit / GIMP overlays here (lean).
         Thread {
-            for (name in listOf("interpose", "nss", "chromium-net", "xkb-gegl", "chromium-gui")) {
+            // CR-3 (chromium-gpu-child-plan): also stage gpushim — our Mali GLES/EGL
+            // marshalling shim (/usr/lib/androlinux/libEGL.so.1 + libGLESv2.so.2 +
+            // unversioned symlinks). chromium runs --use-gl=angle --use-angle=gles-egl,
+            // and ANGLE dlopen()s these as the "system" EGL/GLES; with the GPU ring
+            // attached (loader, gated on ALR_GPU_ACCEL=1) they drive the host Mali
+            // executor (the same shim that scored glmark2-es2 1074 on-device).
+            for (name in listOf("interpose", "nss", "chromium-net", "xkb-gegl", "gpushim", "chromium-gui")) {
                 try {
                     val tar = File("/data/local/tmp/$name-stage.tar")
                     val marker = File(rootfsDir, ".$name-staged-${tar.length()}")
@@ -2028,6 +2034,20 @@ class MainActivity : Activity() {
                         } catch (_: Throwable) {}
                         android.util.Log.i("alr_loader", "cronly: chromium bin=${chromiumBin.isFile} (waited ${waited}ms); launching ozone-wayland window")
                         android.system.Os.setenv("ALR_REEXEC_INPROC", "1", true)
+                        // CR-3 Mali GPU accel opt-in (chromium-gpu-child-plan §3.A-1).
+                        // This is the SOLE non-glmark2 trigger the loader checks
+                        // (runtime_report.cpp gpu_accel_requested): it makes the loader
+                        // GPU HARDWARE accel reverted to software (see --disable-gpu below):
+                        // do NOT set ALR_GPU_ACCEL, so the loader skips the Mali ring attach
+                        // and this is exactly the stable software-raster path that renders.
+                        // (The ANGLE-EGL-device + ring-attach scaffolding stays in the tree
+                        // for the dedicated GPU effort; it is simply not triggered here.)
+                        // CR-3 device diagnostics (temporary): trace the shim's EGL call
+                        // sequence (eglGetDisplay/eglGetPlatformDisplay/eglInitialize/
+                        // eglChooseConfig/eglCreateContext) to guest stderr → logcat
+                        // (alr_cr_out), so ANGLE's exact init path + failure point are
+                        // visible. Tag [alr-egl]. Safe to drop once GL_RENDERER=Mali holds.
+                        android.system.Os.setenv("ALR_SHIM_DIAG", "1", true)
                         // CR-4 live diagnostics: stream chromium stderr (--v=1) + the
                         // in-process re-map trampoline diag to logcat (tags alr_cr_out /
                         // alr_cr_diag) AS THEY ARRIVE, so a wedged GUI chromium's init
@@ -2097,6 +2117,16 @@ class MainActivity : Activity() {
                                 "\n--no-sandbox\n--disable-seccomp-filter-sandbox" +
                                 "\n--disable-setuid-sandbox\n--disable-namespace-sandbox" +
                                 "\n--disable-gpu-sandbox" +
+                                // GPU HARDWARE accel (Mali via the alr_gpu shim: --use-gl=angle
+                                // → libEGL/libGLESv2 shim → ring → Mali executor) was wired +
+                                // attempted, but chromium's GPU process FAILS to create its
+                                // shared/virtualized GL context ("Failed to create shared
+                                // context for virtualization" / "SharedImageStub: unable to
+                                // create context") — the glmark2-era shim does not yet implement
+                                // chromium's EGL context-sharing model, and the failure BLACKS
+                                // the page. Reverted to stable software raster so the standalone
+                                // browser keeps rendering; Mali accel is a dedicated shim effort
+                                // (the ANGLE EGL-device exts + ring-attach scaffolding stay in).
                                 "\n--single-process\n--no-zygote\n--disable-gpu" +
                                 "\n--in-process-gpu\n--disable-gpu-compositing" +
                                 "\n--disable-dev-shm-usage\n--user-data-dir=/tmp/cr4-profile" +
