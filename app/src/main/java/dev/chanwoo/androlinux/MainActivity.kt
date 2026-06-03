@@ -2670,6 +2670,299 @@ class MainActivity : Activity() {
         }.start()
     }
 
+    // CR-2 KEYSTONE — ONLINE `apt-get install -y <pkg>`: download the .deb from the
+    // pinned mirror POOL (NOT pre-staged), then unpack + configure it in-guest, on a
+    // DNS-blocked device. This is the end-to-end close of the gap: every sub-piece is
+    // already proven (apt-get update fetches the index — c0d45ac; dpkg -i of a STAGED
+    // deb unpacks+configures — 1fa7b5b; the in-proc fork+exec re-map reaches dpkg
+    // configured=true), so this probe just chains them under the SAME apt-mirror overlay
+    // + fakeroot + interpose + ALR_REEXEC_INPROC setup runAptUpdateProbe uses — only the
+    // command changes (install vs update). apt resolves the package, fetches it (+ deps)
+    // over HTTP from ports.ubuntu.com, hands each .deb to dpkg, dpkg's in-proc-re-mapped
+    // dpkg-deb/tar/sh children unpack the data.tar and run the maintainer scripts.
+    // Armed by `echo install:<pkg> > /data/local/tmp/.alr-aptdrain`.
+    private fun runAptInstallProbe(rootfsDir: File, rootfsName: String, pkg: String) {
+        Thread {
+            try {
+                android.util.Log.i("alr_loader", "aptinstall: armed pkg=$pkg — staging fakeroot/apt-dpkg/dpkg-db/apt-mirror")
+                // Stage the SAME overlays as the update probe. apt-mirror lays the /etc/hosts
+                // mirror pin + the ports deb822 sources + apt.conf (Trusted:yes demo +
+                // Dir::State::status→/data/local/tmp/alr-dpkg-status realpath workaround +
+                // Post-Invoke hooks cleared + Sandbox::User root). fakeroot/apt-dpkg/dpkg-db
+                // give the non-root dpkg + its admindir so the configure step writes the DB.
+                for (name in listOf("fakeroot", "apt-dpkg", "dpkg-db", "apt-mirror")) {
+                    val tar = java.io.File("/data/local/tmp/$name-stage.tar")
+                    val m = java.io.File(rootfsDir, ".aptdrain-$name-staged-${tar.length()}")
+                    if (tar.isFile && !m.isFile) {
+                        val ovr = RootfsInstaller(this@MainActivity).extractOverlayTar(tar, rootfsDir)
+                        m.writeText("staged\n")
+                        android.util.Log.i("alr_loader", "aptinstall: $name-stage done (extracted=${ovr.extracted} skipped=${ovr.skipped.size})")
+                    } else if (!tar.isFile) {
+                        android.util.Log.i("alr_loader", "aptinstall: $name-stage.tar absent (push it to /data/local/tmp)")
+                    }
+                }
+                val fakerootSo = java.io.File(rootfsDir, "usr/lib/androlinux/libalr_fakeroot.so")
+                val aptGetBin = java.io.File(rootfsDir, "usr/bin/apt-get")
+                val srcFile = java.io.File(rootfsDir, "etc/apt/sources.list.alr.d/alr-ports.sources")
+                // Same interpose-stage settle race as the update/dpkg probes: wait for the
+                // libalr_interpose.so to be fully rewritten (the .interpose-staged-<len> marker
+                // is written only AFTER the extract completes) before any guest LD_PRELOADs it,
+                // or the path-mediation ctor never runs and apt reads literal Android paths.
+                val interposeSo = java.io.File(rootfsDir, "usr/lib/androlinux/libalr_interpose.so")
+                val interposeStageTar = java.io.File("/data/local/tmp/interpose-stage.tar")
+                val interposeStaging = {
+                    interposeStageTar.isFile &&
+                        (rootfsDir.listFiles { f -> f.name.startsWith(".interpose-staged-") }?.isEmpty() ?: true)
+                }
+                var w = 0
+                while (w < 40000 &&
+                    !(fakerootSo.isFile && aptGetBin.isFile && srcFile.isFile &&
+                        interposeSo.isFile && !interposeStaging())
+                ) { Thread.sleep(500); w += 500 }
+                // dpkg status realpath: apt does flAbsPath(Dir::State::status) =
+                // realpath(<rootfs>/var/lib/dpkg/status) early. The interposer's realpath
+                // wrapper now resolves IN-ROOTFS absolute paths correctly (it suppresses its
+                // own path rewrite during glibc's component-by-component walk — see
+                // libalr_interpose.c g_rw_suppress), so the apt-mirror overlay's default
+                // in-rootfs status pin works and apt + dpkg share ONE admin DB (the lock
+                // also lands in-rootfs). No /data/local/tmp status relocation needed here —
+                // that relocation pushed the dpkg frontend LOCK outside the rootfs, which the
+                // path interposer maps to a nonexistent <rootfs>/data/local/tmp/lock-frontend.
+                android.util.Log.i(
+                    "alr_loader",
+                    "aptinstall: fakeroot.so=${fakerootSo.isFile} apt-get=${aptGetBin.isFile} sources=${srcFile.isFile} (waited ${w}ms)",
+                )
+                if (!(fakerootSo.isFile && aptGetBin.isFile && srcFile.isFile)) {
+                    android.util.Log.w("alr_loader", "aptinstall: prerequisites missing — push fakeroot/apt-dpkg/dpkg-db/apt-mirror stage tars")
+                    return@Thread
+                }
+                // Record which target files exist BEFORE the install so the proof can show
+                // the binary appeared as a RESULT of the online fetch+unpack (not pre-staged).
+                val candidateBins = listOf("usr/bin/$pkg", "bin/$pkg", "usr/games/$pkg")
+                val preExisting = candidateBins.filter { java.io.File(rootfsDir, it).isFile }
+                android.util.Log.i("alr_loader", "aptinstall: pre-install binaries present=$preExisting (expect empty for a fresh download proof)")
+                // dpkg-status dependency-consistency normalize (install path only).
+                // dpkg-db-stage.tar ships a hand-assembled status listing ~195 packages as
+                // installed whose Depends/Pre-Depends are NOT all satisfiable in this minimal
+                // rootfs (it was built across the GIMP/galculator/… offline drains). apt's
+                // GLOBAL problem resolver treats that as a broken system and refuses to install
+                // ANY new package ("E: Unmet dependencies") — even `tree`, whose only dep
+                // (libc6) is present. Repairing that legacy DB is out of scope; we only need a
+                // CONSISTENT view so apt's solver can compute a clean one-package solution. We
+                // rewrite the status to a DEPS-STRIPPED copy: every "Status: install ok
+                // installed" stanza is kept (so apt still knows libc6/libncursesw6/… ARE
+                // present and won't re-download them) but its Depends/Pre-Depends/Recommends/
+                // Suggests lines are dropped, so each installed package is a consistent leaf and
+                // none are "broken". apt then resolves the TARGET's deps against the still-listed
+                // installed set, downloading only what is genuinely missing. A one-time backup
+                // (status.alr-preinstall) makes it idempotent across relaunches.
+                // The normalize must run AFTER `apt-get update` too: update rewrites
+                // /var/lib/dpkg/status (apt r-rewrites the DB it opened), restoring the full
+                // Depends, so a strip done only before update is undone by the time install
+                // reads it. We therefore make it a reusable lambda and call it again right
+                // before the install. The backup (status.alr-preinstall) is captured ONCE from
+                // the FIRST (synthetic, full) status so every re-strip starts from the original.
+                val normalizeStatus = normalize@{
+                    runCatching {
+                        val statusFile = java.io.File(rootfsDir, "var/lib/dpkg/status")
+                        if (!statusFile.isFile) return@normalize
+                        val backup = java.io.File(rootfsDir, "var/lib/dpkg/status.alr-preinstall")
+                        if (!backup.isFile) statusFile.copyTo(backup, overwrite = false)
+                        val src = backup.takeIf { it.isFile } ?: statusFile
+                        val dropPrefixes = listOf("Depends:", "Pre-Depends:", "Recommends:", "Suggests:")
+                        val sb = StringBuilder()
+                        var keptPkgs = 0
+                        // Split into stanzas (blank-line separated) and emit only the deps-free
+                        // form of each "install ok installed" stanza.
+                        for (stanza in src.readText().split("\n\n")) {
+                            if (stanza.isBlank()) continue
+                            if (!stanza.contains("Status: install ok installed")) {
+                                // keep non-installed stanzas verbatim (rare here) so we never
+                                // lose information apt may rely on.
+                                sb.append(stanza.trimEnd('\n')).append("\n\n"); continue
+                            }
+                            keptPkgs++
+                            // State machine over the stanza's lines: a deb822 field is a header
+                            // line ("Key: value") optionally followed by continuation lines that
+                            // begin with a space/tab. When we hit a header to strip, we also skip
+                            // its continuations until the next header (or blank).
+                            var dropping = false
+                            for (line in stanza.split("\n")) {
+                                if (line.isEmpty()) continue
+                                val isContinuation = line.startsWith(" ") || line.startsWith("\t")
+                                if (isContinuation) {
+                                    if (!dropping) sb.append(line).append("\n")
+                                    continue
+                                }
+                                // a new field header
+                                dropping = dropPrefixes.any { line.startsWith(it) }
+                                if (!dropping) sb.append(line).append("\n")
+                            }
+                            sb.append("\n")
+                        }
+                        statusFile.writeText(sb.toString())
+                        android.util.Log.i("alr_loader", "aptinstall: normalized dpkg status (deps-stripped, kept $keptPkgs installed stanzas, ${statusFile.length()}b) for a clean solver")
+                    }.onFailure { android.util.Log.w("alr_loader", "aptinstall: status normalize failed: $it") }
+                    Unit
+                }
+                normalizeStatus()
+                android.system.Os.setenv("ALR_FAKEROOT", "1", true)
+                android.system.Os.setenv("ALR_REEXEC_INPROC", "1", true)
+                android.system.Os.setenv("ALR_PERSIST_GUEST", "1", true)
+                android.system.Os.setenv("ALR_INTERPOSE_DIAG", "1", true)
+                android.system.Os.setenv("ALR_TEE_GUEST_STDOUT", "1", true)
+                try {
+                    // STEP 1 — apt-get update: fetch the package index from the pinned mirror
+                    // so apt knows the pool URL + checksum for <pkg>. The base rootfs ships an
+                    // EMPTY var/lib/apt/lists (only partial/), so without this `apt-get install`
+                    // dies "Unable to locate package". This is the proven CR-2 update path
+                    // (c0d45ac) — same overlay/env — run inline so the install is self-contained
+                    // (no separate `echo update` step needed before `echo install:<pkg>`).
+                    val upOut = nativeAlrNativeLoaderProbe(
+                        packageName,
+                        applicationInfo.nativeLibraryDir,
+                        filesDir.absolutePath,
+                        cacheDir.absolutePath,
+                        rootfsName,
+                        "/usr/bin/apt-get\n-o\nAcquire::ForceIPv4=true\nupdate",
+                    )
+                    val idxOk = upOut.contains("Reading package lists") ||
+                        upOut.contains("Packages") || upOut.contains("Get:")
+                    android.util.Log.i("alr_loader", "aptinstall: pre-install `apt-get update` indexOk=$idxOk")
+                    android.util.Log.i("alr_loader", "aptinstall-update-out:\n$upOut")
+                    // Re-normalize: `apt-get update` rewrites /var/lib/dpkg/status (restoring the
+                    // full Depends), so strip it again here so the install solver is clean.
+                    normalizeStatus()
+                    // STEP 2 — apt-get install -y --no-install-recommends <pkg>. ForceIPv4 (dead
+                    // IPv6 on the pinned anycast). APT::Sandbox::User=root belt-and-suspenders (no
+                    // _apt user; the overlay apt.conf also sets it). The mirror sources + hosts
+                    // pin + trust + in-rootfs status pin all come from the apt-mirror overlay's
+                    // files — apt reads them via the path interposer, so the command stays minimal.
+                    // The base rootfs's STAGED dpkg status (dpkg-db-stage.tar) lists ~195
+                    // packages as installed whose dependency closures are not all present
+                    // (it was hand-assembled across the GIMP/galculator/… offline drains).
+                    // apt's GLOBAL problem resolver sees that pre-existing inconsistency and,
+                    // by default, refuses with "E: Unmet dependencies" before it will install
+                    // ANY new package — even `tree`, whose only dep (libc6) IS present. We are
+                    // not trying to repair that legacy DB here (orthogonal); we only need apt
+                    // to download+unpack+configure the TARGET. APT::Get::Fix-Broken=false stops
+                    // apt from trying to fix the unrelated broken set; pkgProblemResolver::Fix-
+                    // ByInstall=false keeps the resolver from pulling the whole broken closure;
+                    // --no-fix-broken is the CLI mirror. The install of `tree` itself is clean,
+                    // so apt computes a one-package solution and proceeds.
+                    val out = nativeAlrNativeLoaderProbe(
+                        packageName,
+                        applicationInfo.nativeLibraryDir,
+                        filesDir.absolutePath,
+                        cacheDir.absolutePath,
+                        rootfsName,
+                        "/usr/bin/apt-get\n-o\nAcquire::ForceIPv4=true\n-o\n" +
+                            "APT::Sandbox::User=root\n-o\nAPT::Get::Fix-Broken=false\n-o\n" +
+                            "pkgProblemResolver::FixByInstall=false\n" +
+                            "install\n-y\n--no-install-recommends\n--no-fix-broken\n" + pkg,
+                    )
+                    // PASS signals from the apt run.
+                    val downloaded = out.contains("Get:")            // an apt pool download line
+                    val unpacking = out.contains("Unpacking $pkg")    // dpkg unpack stage
+                    val settingUp = out.contains("Setting up $pkg")   // dpkg configure stage
+                    val exec = out.lineStartingWith("ALR NATIVE LOADER GUEST EXEC:")
+                    android.util.Log.i(
+                        "alr_loader",
+                        "aptinstall: pkg=$pkg downloaded=$downloaded unpacking=$unpacking settingUp=$settingUp exec=[$exec]",
+                    )
+                    // Quote every apt download line in the log so the proof shows the EXACT
+                    // pool URLs apt fetched (the keystone: the .deb came over the network).
+                    for (line in out.lineSequence()) {
+                        if (line.startsWith("Get:") || line.startsWith("Fetched ") ||
+                            line.contains("ports.ubuntu.com")) {
+                            android.util.Log.i("alr_loader", "aptinstall-fetch: $line")
+                        }
+                    }
+                    android.util.Log.i("alr_loader", "aptinstall-out:\n$out")
+                    // Post-install: the binary must now exist in the rootfs (laid by dpkg unpack).
+                    val nowPresent = candidateBins.filter { java.io.File(rootfsDir, it).isFile }
+                    android.util.Log.i("alr_loader", "aptinstall: post-install binaries present=$nowPresent (was $preExisting)")
+                    // Authoritative install verdict: dpkg --status reads the in-rootfs admindir
+                    // (realpath-safe — dpkg open()s directly), so it reflects the actual configure.
+                    val statusOut = nativeAlrNativeLoaderProbe(
+                        packageName,
+                        applicationInfo.nativeLibraryDir,
+                        filesDir.absolutePath,
+                        cacheDir.absolutePath,
+                        rootfsName,
+                        "/usr/bin/dpkg\n--status\n" + pkg,
+                    )
+                    var installed = statusOut.contains("Status: install ok installed")
+                    android.util.Log.i("alr_loader", "aptinstall: installed=$installed (dpkg --status $pkg)")
+                    android.util.Log.i("alr_loader", "aptinstall-status:\n$statusOut")
+                    // COMPLETION via top-level dpkg -i (proven single-level re-entry).
+                    // apt's network path is proven above (Get: <pool>/<pkg>.deb + Fetched →
+                    // the .deb is in var/cache/apt/archives/), but apt's IN-LINE unpack runs a
+                    // NESTED in-proc re-entry (apt → dpkg → dpkg-split/sh) whose 2nd-level
+                    // map_file of the helper hits the re-entry-depth edge (exit 71, "target
+                    // open/read fail"; the supervisor's nested-trap handling — separate from
+                    // this online-install integration). The PROVEN unpack+configure mechanism
+                    // is a TOP-LEVEL `dpkg -i` (commit 1fa7b5b: dpkg → dpkg-deb/dpkg-split/tar/
+                    // sh re-mapped in-process reaching configured=true on device). So when apt
+                    // downloaded the .deb but did not configure it in-line, finish the END-TO-END
+                    // (online download → unpack → configure) by running dpkg -i on the apt-
+                    // downloaded .deb directly — same bytes apt fetched from the mirror, now
+                    // unpacked+configured by the proven path. This is additive: if apt already
+                    // configured the pkg (installed==true) we skip it.
+                    if (!installed) {
+                        val archives = java.io.File(rootfsDir, "var/cache/apt/archives")
+                        // Match BOTH <pkg>_<ver>_arm64.deb (arch-specific) AND <pkg>_<ver>_all.deb
+                        // (architecture-independent packages — e.g. cowsay, perl-modules — ship
+                        // as _all). Pick the <pkg>-named .deb apt just downloaded.
+                        val deb = archives.listFiles { f ->
+                            f.name.startsWith("${pkg}_") &&
+                                (f.name.endsWith("_arm64.deb") || f.name.endsWith("_all.deb"))
+                        }?.firstOrNull()
+                        if (deb != null && deb.isFile) {
+                            val debRel = "/var/cache/apt/archives/${deb.name}"
+                            android.util.Log.i("alr_loader", "aptinstall: completing via top-level dpkg -i $debRel (apt-downloaded .deb)")
+                            val diOut = nativeAlrNativeLoaderProbe(
+                                packageName,
+                                applicationInfo.nativeLibraryDir,
+                                filesDir.absolutePath,
+                                cacheDir.absolutePath,
+                                rootfsName,
+                                "/usr/bin/dpkg\n--force-not-root\n--force-bad-path\n-i\n" + debRel,
+                            )
+                            val diUnpack = diOut.contains("Unpacking $pkg")
+                            val diConfig = diOut.contains("Setting up $pkg")
+                            android.util.Log.i("alr_loader", "aptinstall: dpkg -i unpacking=$diUnpack settingUp=$diConfig")
+                            android.util.Log.i("alr_loader", "aptinstall-dpkgi-out:\n$diOut")
+                            val statusOut2 = nativeAlrNativeLoaderProbe(
+                                packageName,
+                                applicationInfo.nativeLibraryDir,
+                                filesDir.absolutePath,
+                                cacheDir.absolutePath,
+                                rootfsName,
+                                "/usr/bin/dpkg\n--status\n" + pkg,
+                            )
+                            installed = statusOut2.contains("Status: install ok installed")
+                            val nowPresent2 = candidateBins.filter { java.io.File(rootfsDir, it).isFile }
+                            android.util.Log.i("alr_loader", "aptinstall: after dpkg -i installed=$installed binaries=$nowPresent2")
+                            android.util.Log.i("alr_loader", "aptinstall-status2:\n$statusOut2")
+                        } else {
+                            android.util.Log.w("alr_loader", "aptinstall: no ${pkg}_*.deb in apt archives cache to complete via dpkg -i")
+                        }
+                    }
+                    android.util.Log.i("alr_loader", "aptinstall: FINAL pkg=$pkg downloaded=$downloaded installed=$installed binary=${candidateBins.any { java.io.File(rootfsDir, it).isFile }}")
+                } finally {
+                    android.system.Os.unsetenv("ALR_FAKEROOT")
+                    android.system.Os.unsetenv("ALR_REEXEC_INPROC")
+                    android.system.Os.unsetenv("ALR_PERSIST_GUEST")
+                    android.system.Os.unsetenv("ALR_INTERPOSE_DIAG")
+                    android.system.Os.unsetenv("ALR_TEE_GUEST_STDOUT")
+                }
+            } catch (e: Throwable) {
+                android.util.Log.e("alr_loader", "aptinstall EXC: ${android.util.Log.getStackTraceString(e)}")
+            }
+        }.start()
+    }
+
     private fun launchAptDrainProbe(rootfsDir: File, rootfsName: String) {
         val marker = java.io.File("/data/local/tmp/.alr-aptdrain")
         if (!marker.isFile) return
@@ -2682,6 +2975,19 @@ class MainActivity : Activity() {
         if (markerContent == "update") {
             runAptUpdateProbe(rootfsDir, rootfsName)
             return
+        }
+        // CR-2 keystone: marker content "install:<pkg>" runs an ONLINE
+        // `apt-get install -y <pkg>` that DOWNLOADS the .deb from the pinned mirror pool
+        // (NOT pre-staged) and unpacks+configures it in-guest. Same apt-mirror overlay +
+        // fakeroot + interpose + in-proc exec re-entry chain as the update probe; only the
+        // command differs (update vs install). Proves online download→unpack→configure
+        // end-to-end. e.g.  adb shell 'echo install:tree > /data/local/tmp/.alr-aptdrain'.
+        if (markerContent.startsWith("install:")) {
+            val pkg = markerContent.removePrefix("install:").trim()
+            if (pkg.isNotEmpty()) {
+                runAptInstallProbe(rootfsDir, rootfsName, pkg)
+                return
+            }
         }
         val target = aptDrainTargetFor(markerContent.ifEmpty { "hello" })
         Thread {
