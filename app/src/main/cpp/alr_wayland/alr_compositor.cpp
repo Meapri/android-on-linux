@@ -36,6 +36,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -218,6 +219,10 @@ public:
     }
 
     struct wl_display* display() { return display_; }
+    // Compositor-thread accessor used by the clipboard pipe reader/writer to fold
+    // an anonymous pipe fd into the same reactor (no extra threads). Valid only on
+    // the compositor thread.
+    struct wl_event_loop* loop() { return loop_; }
 
 private:
     // ----- lifecycle -----
@@ -226,6 +231,7 @@ private:
     void reactor();
     void drain_input_queue();  // compositor thread: queue -> wl input protocol
     void drain_gpu_queue();    // compositor thread: bind submitted AHB frames (§5-C)
+    void drain_clipboard_queue();  // compositor thread: apply Android->guest selections
     bool register_globals();
     bool make_socket();
 
@@ -1804,44 +1810,105 @@ void subcompositor_get_subsurface(struct wl_client* client, struct wl_resource* 
 const struct wl_subcompositor_interface kSubcompositorImpl = {
     subcompositor_destroy, subcompositor_get_subsurface};
 
-// =================== wl_data_device_manager (clipboard/DnD stub) ===================
+// =================== wl_data_device_manager (clipboard selection) ===================
 // CRITICAL for GTK/GIMP input: GDK 3.24's Wayland backend POSTPONES binding
 // wl_seat until BOTH wl_compositor AND wl_data_device_manager are advertised
 // (required_device_manager_globals[] in gdkdisplay-wayland.c). Without this
-// global GDK never binds the seat and receives NO input — even though a bare C
-// wl client binds the same seat fine. A no-op stub is sufficient: GDK only needs
-// the objects to exist and a wl_data_device to add a listener to; an empty
-// clipboard (no selection / data_offer events) is valid. Mirrors the minimal
-// wl_subcompositor template above.
-void data_source_offer(struct wl_client*, struct wl_resource*, const char* /*mime*/) {}
+// global GDK never binds the seat and receives NO input.
+//
+// Beyond satisfying that bind requirement, this is now a REAL selection
+// (Ctrl-C / Ctrl-V) clipboard bridged to the Android host's ClipboardManager —
+// see docs/design/android-clipboard-bridge.md. Drag-and-drop stays stubbed
+// (start_drag / set_actions are no-ops); only the *selection* is wired.
+//
+// Two directions share one compositor-thread model (g_clip_* state below):
+//   GUEST -> ANDROID: guest wl_data_source.offer(mimes)+set_selection records the
+//     source; we pull its bytes lazily over a pipe and hand them to Android.
+//   ANDROID -> GUEST: Android clip changes -> alr_wayland_set_android_selection
+//     caches the payloads + synthesizes a server-owned wl_data_offer on each
+//     guest's wl_data_device; the guest pastes via wl_data_offer.receive.
+// ALL wl_* sends happen on the compositor thread (see clipboard.* helpers).
+
+// Per-source mime accumulator: the user_data of a guest-created wl_data_source.
+// Lives in the guest client; freed by data_source_destroyed.
+struct DataSourceState {
+    std::vector<std::string> mimes;
+};
+
+void data_source_offer(struct wl_client*, struct wl_resource* src, const char* mime) {
+    if (!mime) return;
+    auto* st = static_cast<DataSourceState*>(wl_resource_get_user_data(src));
+    if (st) st->mimes.emplace_back(mime);
+}
 void data_source_destroy(struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); }
 void data_source_set_actions(struct wl_client*, struct wl_resource*, uint32_t /*dnd*/) {}
 const struct wl_data_source_interface kDataSourceImpl = {
     data_source_offer, data_source_destroy, data_source_set_actions};
 
+// Forward decls (defined in the clipboard section just below).
+void clip_on_guest_set_selection(struct wl_resource* source, uint32_t serial);
+void clip_on_data_source_destroyed(struct wl_resource* source);
+void clip_on_data_device_created(struct wl_resource* dev);
+void clip_on_data_device_destroyed(struct wl_resource* dev);
+void clip_data_offer_receive(struct wl_resource* offer, const char* mime, int fd);
+void clip_data_offer_destroyed(struct wl_resource* offer);
+
+void data_source_destroyed(struct wl_resource* r) {
+    clip_on_data_source_destroyed(r);
+    auto* st = static_cast<DataSourceState*>(wl_resource_get_user_data(r));
+    delete st;  // frees the mime accumulator (UAF discipline: nothing else owns it)
+}
+
 void data_device_start_drag(struct wl_client*, struct wl_resource*,
                             struct wl_resource* /*source*/, struct wl_resource* /*origin*/,
                             struct wl_resource* /*icon*/, uint32_t /*serial*/) {}
 void data_device_set_selection(struct wl_client*, struct wl_resource*,
-                               struct wl_resource* /*source*/, uint32_t /*serial*/) {}
+                               struct wl_resource* source, uint32_t serial) {
+    clip_on_guest_set_selection(source, serial);
+}
 void data_device_release(struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); }
 const struct wl_data_device_interface kDataDeviceImpl = {
     data_device_start_drag, data_device_set_selection, data_device_release};
+
+// NEW: server-owned wl_data_offer (the Android selection presented to a guest).
+// `accept`/`set_actions` are no-ops for a selection; `receive` writes the cached
+// Android bytes into the guest's pipe (§3b); `finish`/`destroy` clean up.
+void data_offer_accept(struct wl_client*, struct wl_resource*, uint32_t /*serial*/,
+                       const char* /*mime*/) {}
+void data_offer_receive(struct wl_client*, struct wl_resource* offer, const char* mime,
+                        int32_t fd) {
+    clip_data_offer_receive(offer, mime, fd);
+}
+void data_offer_destroy(struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); }
+void data_offer_finish(struct wl_client*, struct wl_resource*) {}
+void data_offer_set_actions(struct wl_client*, struct wl_resource*, uint32_t /*dnd*/,
+                            uint32_t /*pref*/) {}
+const struct wl_data_offer_interface kDataOfferImpl = {
+    data_offer_accept, data_offer_receive, data_offer_destroy, data_offer_finish,
+    data_offer_set_actions};
+void data_offer_destroyed(struct wl_resource* r) { clip_data_offer_destroyed(r); }
+
+void data_device_destroyed(struct wl_resource* r) { clip_on_data_device_destroyed(r); }
 
 void ddm_create_data_source(struct wl_client* client, struct wl_resource* mgr,
                             uint32_t id) {
     struct wl_resource* res = wl_resource_create(
         client, &wl_data_source_interface, wl_resource_get_version(mgr), id);
     if (!res) { wl_client_post_no_memory(client); return; }
-    wl_resource_set_implementation(res, &kDataSourceImpl, nullptr, nullptr);
+    // user_data = the per-source mime accumulator; destroy listener frees it AND
+    // clears the selection if this source currently owns it.
+    auto* st = new DataSourceState();
+    wl_resource_set_implementation(res, &kDataSourceImpl, st, data_source_destroyed);
 }
 void ddm_get_data_device(struct wl_client* client, struct wl_resource* mgr,
                          uint32_t id, struct wl_resource* /*seat*/) {
     struct wl_resource* res = wl_resource_create(
         client, &wl_data_device_interface, wl_resource_get_version(mgr), id);
     if (!res) { wl_client_post_no_memory(client); return; }
-    wl_resource_set_implementation(res, &kDataDeviceImpl, nullptr, nullptr);
-    // No wl_data_device.selection / data_offer sent: an empty clipboard is valid.
+    wl_resource_set_implementation(res, &kDataDeviceImpl, nullptr, data_device_destroyed);
+    // Track the device + (if Android currently owns the selection) push the
+    // current offer so a guest started after the copy still sees it.
+    clip_on_data_device_created(res);
 }
 void ddm_release(struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); }
 const struct wl_data_device_manager_interface kDataDeviceManagerImpl = {
@@ -2016,6 +2083,319 @@ void tim_get_text_input(struct wl_client* client, struct wl_resource* mgr,
 void tim_destroy(struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); }
 const struct zwp_text_input_manager_v3_interface kTextInputManagerImpl = {
     tim_destroy, tim_get_text_input};
+
+// ===================== clipboard selection model (impl) =====================
+// All state + helpers below run ONLY on the compositor thread, except the
+// inbound queue (g_clip_queue) + the sink registry (g_clip_sink_*), which are
+// mutex-guarded because Kotlin/JNI calls them from other threads.
+
+enum class SelOwner : uint8_t { None, Guest, Android };
+SelOwner g_clip_owner = SelOwner::None;               // compositor thread
+struct wl_resource* g_clip_guest_source = nullptr;    // current guest wl_data_source
+std::vector<std::string> g_clip_guest_mimes;          // its advertised mimes
+uint32_t g_clip_sel_serial = 0;
+std::vector<struct wl_resource*> g_clip_data_devices; // all bound wl_data_device
+// Cached Android payloads (compositor thread): what data_offer_receive writes.
+std::string g_clip_android_text;   // UTF-8 text (for text/plain* + UTF8_STRING)
+std::string g_clip_android_html;   // UTF-8 text/html
+std::string g_clip_android_png;    // raw image/png bytes
+std::vector<std::string> g_clip_android_mimes;        // mimes we advertise to guests
+// Server-owned offers we synthesized (so we can prune on destroy). Compositor thread.
+std::vector<struct wl_resource*> g_clip_server_offers;
+// Loop-guard: hash of the last bytes WE pushed to Android (guest->android), so an
+// echoed Android push (android->guest of our own copy) is dropped (§7).
+uint64_t g_clip_last_guest_hash = 0;
+
+// Sinks installed by runtime_report.cpp (JNI up-calls). Guarded: the setter runs
+// off-thread; reads copy under the lock then invoke outside it.
+std::mutex g_clip_sink_mutex;
+ClipboardGuestOfferCb g_clip_on_offer;
+ClipboardGuestTextCb  g_clip_on_text;
+ClipboardGuestImageCb g_clip_on_image;
+
+// Inbound (Android->guest) queue, drained on the compositor thread (mirrors
+// g_inject_queue / enqueue_inject).
+struct AndroidSelection {
+    std::vector<std::string> mimes;
+    std::string text, html, png;
+};
+std::mutex g_clip_queue_mutex;
+std::vector<AndroidSelection> g_clip_queue;  // guarded by g_clip_queue_mutex
+
+// In-flight pipe reads (guest->android): one per outstanding wl_data_source.send.
+// Registered with the wl_event_loop so the read never blocks the reactor (§3a).
+struct ClipReadCtx {
+    struct wl_event_source* src = nullptr;
+    int fd = -1;
+    std::string mime;
+    std::string buf;
+    bool is_image = false;
+};
+// In-flight pipe writes (android->guest): drains a cached payload into the
+// guest's receive() fd without blocking (§3b).
+struct ClipWriteCtx {
+    struct wl_event_source* src = nullptr;
+    int fd = -1;
+    std::string data;   // OWN copy so a mid-paste clip change can't free it
+    size_t off = 0;
+};
+
+constexpr size_t kClipMaxBytes = 8u * 1024u * 1024u;  // cap (image) — §3a/§6c
+
+uint64_t clip_fnv1a(const std::string& s) {
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : (const std::string&)s) { h ^= c; h *= 1099511628211ull; }
+    return h;
+}
+
+// Pick the richest guest mime we can map to Android (§2 priority order).
+const char* clip_pick_guest_mime(const std::vector<std::string>& mimes, bool* out_is_image) {
+    auto has = [&](const char* m) -> const char* {
+        for (const auto& s : mimes) if (s == m) return s.c_str();
+        return nullptr;
+    };
+    *out_is_image = false;
+    if (const char* m = has("image/png")) { *out_is_image = true; return m; }
+    if (const char* m = has("text/html")) return m;
+    if (const char* m = has("text/plain;charset=utf-8")) return m;
+    if (const char* m = has("text/plain")) return m;
+    if (const char* m = has("UTF8_STRING")) return m;
+    return nullptr;
+}
+
+// ---- guest -> Android: pull bytes out of a guest source over a pipe (§3a) ----
+// wl_event_loop callback: append readable bytes; on EOF deliver to Android.
+int clip_on_pipe_readable(int fd, uint32_t mask, void* data) {
+    auto* ctx = static_cast<ClipReadCtx*>(data);
+    for (;;) {
+        char tmp[4096];
+        ssize_t n = ::read(fd, tmp, sizeof(tmp));
+        if (n > 0) {
+            if (ctx->buf.size() + static_cast<size_t>(n) > kClipMaxBytes) {
+                ctx->buf.append(tmp, kClipMaxBytes - ctx->buf.size());
+                ALR_WL_LOGW("clipboard guest read hit %zu cap, truncating", kClipMaxBytes);
+                break;  // treat as done
+            }
+            ctx->buf.append(tmp, static_cast<size_t>(n));
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            // Not done yet; wait for the next readable wake — unless the writer
+            // hung up (HANGUP without readable data means EOF on some kernels).
+            if (!(mask & WL_EVENT_HANGUP)) return 0;
+        }
+        break;  // n==0 (EOF), real error, or hangup-with-no-data => finished
+    }
+    // Finished: deliver to Android, then tear down this transfer.
+    ClipboardGuestTextCb on_text;
+    ClipboardGuestImageCb on_image;
+    {
+        std::lock_guard<std::mutex> lk(g_clip_sink_mutex);
+        on_text = g_clip_on_text;
+        on_image = g_clip_on_image;
+    }
+    g_clip_last_guest_hash = clip_fnv1a(ctx->buf);
+    if (ctx->is_image) {
+        if (on_image) on_image(ctx->buf);
+    } else {
+        if (on_text) on_text(ctx->mime, ctx->buf);
+    }
+    if (ctx->src) wl_event_source_remove(ctx->src);
+    if (ctx->fd >= 0) ::close(ctx->fd);
+    delete ctx;
+    return 0;
+}
+
+// Compositor thread: ask the current guest source for its richest mime, fold the
+// pipe read end into the reactor. Idempotent-safe: a guest with no source is a no-op.
+void clip_pull_guest_bytes() {
+    if (g_clip_owner != SelOwner::Guest || !g_clip_guest_source) return;
+    Compositor* comp = instance();
+    if (!comp) return;
+    bool is_image = false;
+    const char* mime = clip_pick_guest_mime(g_clip_guest_mimes, &is_image);
+    if (!mime) return;
+    int fds[2];
+    if (::pipe2(fds, O_CLOEXEC | O_NONBLOCK) != 0) {
+        ALR_WL_LOGE("clipboard pipe2 failed: %s", std::strerror(errno));
+        return;
+    }
+    // Guest receives the WRITE end; compositor keeps the READ end.
+    wl_data_source_send_send(g_clip_guest_source, mime, fds[1]);
+    ::close(fds[1]);
+    struct wl_client* gc = wl_resource_get_client(g_clip_guest_source);
+    if (gc) wl_client_flush(gc);  // push the .send event now so the guest writes
+    auto* ctx = new ClipReadCtx();
+    ctx->fd = fds[0];
+    ctx->mime = mime;
+    ctx->is_image = is_image;
+    ctx->src = wl_event_loop_add_fd(comp->loop(), fds[0],
+                                    WL_EVENT_READABLE, clip_on_pipe_readable, ctx);
+    if (!ctx->src) {
+        ::close(fds[0]);
+        delete ctx;
+        ALR_WL_LOGE("clipboard wl_event_loop_add_fd(read) failed");
+    }
+}
+
+// Compositor thread: guest set/cleared its selection (data_device.set_selection).
+void clip_on_guest_set_selection(struct wl_resource* source, uint32_t serial) {
+    if (source == nullptr) {
+        // Guest cleared. We do NOT clobber the Android clipboard on a guest clear
+        // (§7): only drop our guest-owned state.
+        if (g_clip_owner == SelOwner::Guest) {
+            g_clip_owner = SelOwner::None;
+            g_clip_guest_source = nullptr;
+            g_clip_guest_mimes.clear();
+        }
+        return;
+    }
+    // Cancel a previous guest source so the old client drops its stale selection.
+    if (g_clip_guest_source && g_clip_guest_source != source)
+        wl_data_source_send_cancelled(g_clip_guest_source);
+    g_clip_guest_source = source;
+    g_clip_owner = SelOwner::Guest;
+    g_clip_sel_serial = serial;
+    g_clip_guest_mimes.clear();
+    if (auto* st = static_cast<DataSourceState*>(wl_resource_get_user_data(source)))
+        g_clip_guest_mimes = st->mimes;
+    ALR_WL_LOGI("clipboard: guest selection (%zu mimes, serial=%u)",
+                g_clip_guest_mimes.size(), serial);
+    // Notify Android (optional sink) then pull eagerly so the bytes are ready.
+    ClipboardGuestOfferCb on_offer;
+    { std::lock_guard<std::mutex> lk(g_clip_sink_mutex); on_offer = g_clip_on_offer; }
+    if (on_offer) on_offer(g_clip_guest_mimes);
+    clip_pull_guest_bytes();
+}
+
+void clip_on_data_source_destroyed(struct wl_resource* source) {
+    if (g_clip_guest_source == source) {  // never deref after destroy (UAF discipline)
+        g_clip_guest_source = nullptr;
+        g_clip_guest_mimes.clear();
+        if (g_clip_owner == SelOwner::Guest) g_clip_owner = SelOwner::None;
+    }
+}
+
+// ---- Android -> guest: synthesize a server-owned offer on a data_device ----
+void clip_send_android_offer(struct wl_resource* dev) {
+    if (g_clip_owner != SelOwner::Android || g_clip_android_mimes.empty()) return;
+    struct wl_client* c = wl_resource_get_client(dev);
+    struct wl_resource* offer = wl_resource_create(
+        c, &wl_data_offer_interface, wl_resource_get_version(dev), 0 /*server id*/);
+    if (!offer) return;
+    wl_resource_set_implementation(offer, &kDataOfferImpl, nullptr, data_offer_destroyed);
+    g_clip_server_offers.push_back(offer);
+    wl_data_device_send_data_offer(dev, offer);
+    for (const auto& m : g_clip_android_mimes)
+        wl_data_offer_send_offer(offer, m.c_str());
+    wl_data_device_send_selection(dev, offer);
+    if (c) wl_client_flush(c);
+}
+
+void clip_on_data_device_created(struct wl_resource* dev) {
+    g_clip_data_devices.push_back(dev);
+    // A guest that connects after an Android copy still sees the current selection.
+    if (g_clip_owner == SelOwner::Android) clip_send_android_offer(dev);
+}
+void clip_on_data_device_destroyed(struct wl_resource* dev) {
+    drop_resource(g_clip_data_devices, dev);
+}
+void clip_data_offer_destroyed(struct wl_resource* offer) {
+    drop_resource(g_clip_server_offers, offer);
+}
+
+// wl_event_loop callback: drain a cached Android payload into the guest's fd (§3b).
+int clip_on_pipe_writable(int fd, uint32_t mask, void* data) {
+    auto* ctx = static_cast<ClipWriteCtx*>(data);
+    if (mask & WL_EVENT_HANGUP) { ctx->off = ctx->data.size(); }  // guest gave up
+    while (ctx->off < ctx->data.size()) {
+        ssize_t n = ::write(fd, ctx->data.data() + ctx->off, ctx->data.size() - ctx->off);
+        if (n > 0) { ctx->off += static_cast<size_t>(n); continue; }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;  // wait
+        break;  // error or 0 => stop
+    }
+    if (ctx->src) wl_event_source_remove(ctx->src);
+    if (ctx->fd >= 0) ::close(ctx->fd);
+    delete ctx;
+    return 0;
+}
+
+// Compositor thread: a guest pasted (wl_data_offer.receive) against our server
+// offer. Answer with the cached Android bytes for `mime`.
+void clip_data_offer_receive(struct wl_resource* /*offer*/, const char* mime, int fd) {
+    if (fd < 0) return;
+    if (!mime || g_clip_owner != SelOwner::Android) { ::close(fd); return; }
+    const std::string m(mime);
+    const std::string* payload = nullptr;
+    if (m == "text/html") payload = &g_clip_android_html;
+    else if (m == "image/png") payload = &g_clip_android_png;
+    else if (m == "text/plain;charset=utf-8" || m == "text/plain" || m == "UTF8_STRING")
+        payload = &g_clip_android_text;
+    if (!payload) { ::close(fd); return; }
+    Compositor* comp = instance();
+    // Make the fd non-blocking so a full pipe never wedges the reactor.
+    int fl = ::fcntl(fd, F_GETFL, 0);
+    if (fl >= 0) ::fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    auto* ctx = new ClipWriteCtx();
+    ctx->fd = fd;
+    ctx->data = *payload;  // OWN copy (mid-paste clip change can't free it)
+    // Try a fast direct write first (text usually fits one pipe buffer).
+    while (ctx->off < ctx->data.size()) {
+        ssize_t n = ::write(fd, ctx->data.data() + ctx->off, ctx->data.size() - ctx->off);
+        if (n > 0) { ctx->off += static_cast<size_t>(n); continue; }
+        break;
+    }
+    if (ctx->off >= ctx->data.size() || !comp) {
+        ::close(fd);
+        delete ctx;
+        return;
+    }
+    // Didn't finish: fold the write end into the reactor and drain on WRITABLE.
+    ctx->src = wl_event_loop_add_fd(comp->loop(), fd, WL_EVENT_WRITABLE,
+                                    clip_on_pipe_writable, ctx);
+    if (!ctx->src) { ::close(fd); delete ctx; }
+}
+
+// Compositor thread: apply a queued Android selection (broadcast to all guests).
+void clip_apply_android_selection(const AndroidSelection& sel) {
+    // Loop-guard (§7): if a guest currently owns the selection and this push is the
+    // echo of the guest's OWN copy (same text hash), ignore it.
+    if (g_clip_owner == SelOwner::Guest && !sel.text.empty() &&
+        clip_fnv1a(sel.text) == g_clip_last_guest_hash) {
+        return;
+    }
+    if (sel.mimes.empty()) {
+        // Android cleared. Drop Android ownership; cancel nothing on the guest.
+        if (g_clip_owner == SelOwner::Android) {
+            g_clip_owner = SelOwner::None;
+            g_clip_android_mimes.clear();
+            g_clip_android_text.clear();
+            g_clip_android_html.clear();
+            g_clip_android_png.clear();
+            for (auto* dev : g_clip_data_devices) {
+                wl_data_device_send_selection(dev, nullptr);
+                struct wl_client* c = wl_resource_get_client(dev);
+                if (c) wl_client_flush(c);
+            }
+        }
+        return;
+    }
+    // The user genuinely copied in an Android app: flip ownership to Android and
+    // cancel any guest source so the guest drops its stale selection.
+    if (g_clip_guest_source) {
+        wl_data_source_send_cancelled(g_clip_guest_source);
+        g_clip_guest_source = nullptr;
+        g_clip_guest_mimes.clear();
+    }
+    g_clip_owner = SelOwner::Android;
+    g_clip_android_mimes = sel.mimes;
+    g_clip_android_text = sel.text;
+    g_clip_android_html = sel.html;
+    g_clip_android_png = sel.png;
+    ALR_WL_LOGI("clipboard: android selection (%zu mimes, text=%zuB html=%zuB png=%zuB)",
+                sel.mimes.size(), sel.text.size(), sel.html.size(), sel.png.size());
+    for (auto* dev : g_clip_data_devices) clip_send_android_offer(dev);
+}
 
 }  // namespace
 
@@ -2718,6 +3098,18 @@ void Compositor::drain_gpu_queue() {
     g_scene_dirty = true;  // present on the next frame-timer tick
 }
 
+// Apply any Android->guest clipboard selections pushed from Kotlin/JNI. Runs on
+// the compositor thread, where all wl_data_* sends are legal (mirrors
+// drain_input_queue / drain_gpu_queue). See clip_apply_android_selection.
+void Compositor::drain_clipboard_queue() {
+    std::vector<AndroidSelection> local;
+    {
+        std::lock_guard<std::mutex> lk(g_clip_queue_mutex);
+        local.swap(g_clip_queue);
+    }
+    for (const AndroidSelection& sel : local) clip_apply_android_selection(sel);
+}
+
 void Compositor::reactor() {
     ALR_WL_LOGI("compositor reactor entering epoll loop (loop_fd=%d)", loop_fd_);
     constexpr int kMaxEvents = 8;
@@ -2738,6 +3130,7 @@ void Compositor::reactor() {
                 (void)r;  // drain; loop condition handles stop
                 drain_input_queue();  // deliver any injected input events
                 drain_gpu_queue();    // bind any submitted §5-C GPU (AHB) frames
+                drain_clipboard_queue();  // apply any Android->guest selection pushes
             } else if (events[i].data.fd == frame_timer_fd_) {
                 uint64_t v = 0;
                 ssize_t r = ::read(frame_timer_fd_, &v, sizeof(v));
@@ -2792,6 +3185,20 @@ void Compositor::teardown() {
     g_keyboard_entered = false;
     g_mods_depressed = 0;  // don't leak held mods / CapsLock into a re-created compositor
     g_mods_locked = 0;
+    // Clipboard selection model: drop all resource pointers (the wl_display teardown
+    // below frees the resources themselves) so a re-created compositor starts clean.
+    // UAF discipline: never deref these stale pointers after the display is gone.
+    g_clip_owner = SelOwner::None;
+    g_clip_guest_source = nullptr;
+    g_clip_guest_mimes.clear();
+    g_clip_data_devices.clear();
+    g_clip_server_offers.clear();
+    g_clip_android_mimes.clear();
+    g_clip_android_text.clear();
+    g_clip_android_html.clear();
+    g_clip_android_png.clear();
+    g_clip_last_guest_hash = 0;
+    { std::lock_guard<std::mutex> lk(g_clip_queue_mutex); g_clip_queue.clear(); }
     // §5-C fullscreen GPU fallback: release the retained AHB ref (one acquire held in
     // drain_gpu_queue) and null the globals. Without this a stop while a headless GPU
     // app (glmark2) is presenting leaks the buffer, and a re-created compositor would
@@ -3042,6 +3449,38 @@ int alr_wayland_inject_selftest(double x, double y) {
     alr_wayland_inject_key(kKeyA, 1);
     alr_wayland_inject_key(kKeyA, 0);
     return 7;
+}
+
+// ---------------------------------------------------------------------------
+// Clipboard bridge public API (see alr_compositor.hpp + the design). The sink
+// registry is set once by runtime_report.cpp; the selection setter enqueues onto
+// the clipboard queue + wakes the reactor (mirroring enqueue_inject). All wl_*
+// work happens later on the compositor thread in drain_clipboard_queue.
+// ---------------------------------------------------------------------------
+void alr_wayland_set_clipboard_sink(ClipboardGuestOfferCb on_offer,
+                                    ClipboardGuestTextCb on_text,
+                                    ClipboardGuestImageCb on_image) {
+    std::lock_guard<std::mutex> lk(g_clip_sink_mutex);
+    g_clip_on_offer = std::move(on_offer);
+    g_clip_on_text = std::move(on_text);
+    g_clip_on_image = std::move(on_image);
+}
+
+void alr_wayland_set_android_selection(const std::vector<std::string>& mimes,
+                                       const std::string& text,
+                                       const std::string& html,
+                                       const std::string& png) {
+    AndroidSelection sel;
+    sel.mimes = mimes;
+    sel.text = text;
+    sel.html = html;
+    sel.png = png;
+    {
+        std::lock_guard<std::mutex> lk(g_clip_queue_mutex);
+        g_clip_queue.push_back(std::move(sel));
+    }
+    Compositor* c = instance();
+    if (c) c->wake();
 }
 
 // ---------------------------------------------------------------------------

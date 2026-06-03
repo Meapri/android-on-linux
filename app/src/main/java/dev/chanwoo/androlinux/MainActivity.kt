@@ -2,11 +2,16 @@ package dev.chanwoo.androlinux
 
 import android.Manifest
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipDescription
+import android.content.ClipboardManager
 import android.content.pm.PackageManager
 import android.content.Context
 import android.os.Build
 import android.os.Bundle
 import android.text.InputType
+import android.os.Handler
+import androidx.annotation.Keep
 import android.view.KeyEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -1450,6 +1455,18 @@ class MainActivity : Activity() {
                         android.util.Log.e("alr_loader",
                             "audio sink start EXC: ${android.util.Log.getStackTraceString(e)}")
                     }
+                    // Clipboard bridge: start mirroring the Android primary clip into the
+                    // guest once the compositor (and its data_device) is up. The native
+                    // sink (installed in nativeWaylandCompositorStart) handles guest->Android.
+                    if (!clipListenerRegistered) {
+                        try {
+                            clipboard.addPrimaryClipChangedListener(clipListener)
+                            clipListenerRegistered = true
+                        } catch (t: Throwable) {
+                            android.util.Log.w("alr_clipboard",
+                                "addPrimaryClipChangedListener failed: ${t.message}")
+                        }
+                    }
                     // chromium-test fast path: when a CR-test flag is set, the chromium probe
                     // thread (started in onCreate) needs the loader's guest-launch lock
                     // immediately. This GUI guest battery (wl/pixman/gtk/foot/GIMP — GIMP alone
@@ -1875,6 +1892,14 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        // Clipboard bridge: stop mirroring the Android clip. The native sink + the
+        // MainActivity global ref are released when the compositor is stopped
+        // (nativeWaylandCompositorStop); here we just drop the listener so a
+        // destroyed Activity isn't held by the system clipboard service.
+        if (clipListenerRegistered) {
+            try { clipboard.removePrimaryClipChangedListener(clipListener) } catch (_: Throwable) {}
+            clipListenerRegistered = false
+        }
         // Tear down the audio sink (joins the epoll thread, closes AAudio + the
         // socket). Best-effort: a stop on a never-started sink is a no-op.
         try {
@@ -2983,6 +3008,86 @@ class MainActivity : Activity() {
     private external fun nativeHostVulkanProbe(): String
 
     private external fun nativeProbeVulkanSurface(surface: android.view.Surface): String
+
+    // ----- Clipboard bridge (Android <-> Linux-guest selection) -----
+    // See docs/design/android-clipboard-bridge.md. ClipboardManager is a
+    // UI-thread-affine system service; all get/set runs on the main thread.
+    private val clipboard by lazy { getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager }
+
+    // Loop-guard (§7): when WE write the guest's copy into the Android clipboard,
+    // the resulting OnPrimaryClipChangedListener is the echo of the guest's own
+    // selection — early-return so we don't push it back into the guest.
+    @Volatile private var suppressClipEcho = false
+    private var clipListenerRegistered = false
+
+    // Android primary clip changed -> push the host selection to the guest.
+    private val clipListener = ClipboardManager.OnPrimaryClipChangedListener {
+        if (suppressClipEcho) return@OnPrimaryClipChangedListener
+        try {
+            val clip = clipboard.primaryClip
+            if (clip == null || clip.itemCount == 0) {
+                nativeWaylandClipboardSetAndroid(emptyArray(), null, null, null)
+                return@OnPrimaryClipChangedListener
+            }
+            val desc = clip.description
+            val item = clip.getItemAt(0)
+            val text = item.coerceToText(this).toString()
+            val html = if (desc != null && desc.hasMimeType(ClipDescription.MIMETYPE_TEXT_HTML))
+                item.htmlText else null
+            // image/png is phase 2 (content-URI re-encode); text/html + text first.
+            val mimes = buildList {
+                if (text.isNotEmpty()) {
+                    add("text/plain;charset=utf-8"); add("text/plain"); add("UTF8_STRING")
+                }
+                if (!html.isNullOrEmpty()) add("text/html")
+            }.toTypedArray()
+            nativeWaylandClipboardSetAndroid(
+                mimes, text.ifEmpty { null }, html, null)
+        } catch (t: Throwable) {
+            // primaryClip reads can throw if the app momentarily lacks focus (API 29+);
+            // a clipboard hiccup must never crash the compositor host.
+            android.util.Log.w("alr_clipboard", "clip read failed: ${t.message}")
+        }
+    }
+
+    // native -> Kotlin: the GUEST advertised a new selection (comma-joined mimes).
+    // We pull eagerly native-side, so nothing to do here but log (kept for the sink).
+    @Keep
+    fun onGuestClipboardOffer(mimes: String) {
+        android.util.Log.i("alr_clipboard", "guest offer: $mimes")
+    }
+
+    // native -> Kotlin: the guest bytes for a text `mime` (UTF-8) are ready ->
+    // write them to the Android clipboard (suppressing the echo, §7).
+    @Keep
+    fun onGuestClipboardText(mime: String, utf8: String) {
+        runOnUiThread {
+            suppressClipEcho = true
+            try {
+                clipboard.setPrimaryClip(ClipData.newPlainText("ALR", utf8))
+            } catch (t: Throwable) {
+                android.util.Log.w("alr_clipboard", "setPrimaryClip failed: ${t.message}")
+            }
+            // Release the guard after the listener has had a chance to fire+early-return.
+            Handler(mainLooper).post { suppressClipEcho = false }
+        }
+    }
+
+    // native -> Kotlin: the guest bytes for image/png are ready (phase 2). Write an
+    // image clip so an Android app can paste it.
+    @Keep
+    fun onGuestClipboardImage(pngBytes: ByteArray) {
+        runOnUiThread {
+            android.util.Log.i("alr_clipboard", "guest image: ${pngBytes.size} bytes (phase 2)")
+        }
+    }
+
+    private external fun nativeWaylandClipboardSetAndroid(
+        mimes: Array<String>,
+        utf8Text: String?,
+        htmlText: String?,
+        pngBytes: ByteArray?,
+    )
 
     private external fun nativeWaylandCompositorStart(
         cacheDir: String,
