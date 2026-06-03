@@ -312,14 +312,43 @@ def _append_admindir(out_tar: str | Path, *, include_status: bool = True) -> tup
 # same belt-and-suspenders pattern tools/build_babl_gegl_overlay uses for op .so):
 # the overlay then works even if a future slimmed base omits a front-end. Mapped
 # {package: (rootfs-rel paths to ship)}.
+#
+# AUTHENTICATED-apt path (the gpgv/apt-key closure) — device-diagnosed gap.
+# -------------------------------------------------------------------------
+# noble apt is 2.7.14, whose `methods/gpgv` (apt-pkg/contrib/gpgv.cc ExecGPGV)
+# ALWAYS exec()s `Dir::Bin::apt-key` (default /usr/bin/apt-key) to verify an
+# InRelease — it does NOT call gpgv directly even when the source pins `Signed-By`
+# (host-verified from the device binary's strings + the 2.7.14 source: ExecGPGV
+# does `Args.push_back(aptkey)` unconditionally, passing `--keyring <Signed-By>`).
+# So authenticated apt needs the WHOLE apt-key happy path present, not just gpgv:
+#   * `usr/bin/apt-key`  — the verify shell script (ships in the `apt` package),
+#   * `usr/lib/apt/methods/gpgv` — the method ELF that execs it (also in `apt`),
+#   * `usr/bin/gpgv`     — apt-key's `verify` resolves $GPGV and runs it,
+#   * `usr/bin/apt-config` — apt-key reads Apt::Key::gpgvcommand via it,
+#   * a handful of COREUTILS apt-key shells out to on the `verify --keyring X.gpg`
+#     happy path: `mktemp`+`chmod` (create_gpg_home), `touch` (create_new_keyring),
+#     `rm`/`cat`/`readlink` (cleanup + merge), `head` (dearmor sniff). The slim
+#     base ships NONE of these (host-verified: only /usr/bin/env from coreutils),
+#     so without them apt-key dies at `mktemp` → the method reports
+#     "Unknown error executing apt-key" → "E: The repository is not signed".
+# We list the FULL set apt-key may touch (superset of the happy path — cut/sort/
+# comm/cp/mv/base64/expr/id are used by its add/update branches) so the overlay is
+# robust no matter which apt-key code path a given suite/key exercises. These all
+# ride in `coreutils` (already a DEFAULT_TARGET, so the closure ships them too;
+# this is the belt-and-suspenders 0o755 guarantee). gpg/gpgconf are NOT required
+# for a plain `.gpg` Signed-By keyring (dearmor of a .gpg is a no-op, the merge is
+# `cat`, and cleanup's gpgconf is `command_available`-guarded) — host-verified by
+# tracing the script — so we deliberately do NOT pull the heavy gnupg stack.
 SELF_CONTAINED_BINS = {
     "dpkg": (
         "usr/bin/dpkg", "usr/bin/dpkg-deb", "usr/bin/dpkg-split",
         "usr/bin/dpkg-query", "usr/bin/dpkg-trigger", "usr/bin/dpkg-divert",
         "usr/bin/dpkg-realpath", "usr/bin/dpkg-maintscript-helper",
     ),
+    # apt front-ends + the AUTHENTICATED-verify pair (apt-key script + gpgv method).
     "apt": ("usr/bin/apt", "usr/bin/apt-get", "usr/bin/apt-cache",
-            "usr/bin/apt-config", "usr/bin/apt-mark"),
+            "usr/bin/apt-config", "usr/bin/apt-mark", "usr/bin/apt-key",
+            "usr/lib/apt/methods/gpgv"),
     "tar": ("usr/bin/tar",),
     "gzip": ("usr/bin/gzip",),
     "xz-utils": ("usr/bin/xz",),
@@ -327,7 +356,25 @@ SELF_CONTAINED_BINS = {
     "bash": ("usr/bin/bash",),
     "dash": ("usr/bin/dash", "bin/dash"),
     "gpgv": ("usr/bin/gpgv",),
+    # The coreutils apt-key's verify path shells out to (slim base lacks them all).
+    "coreutils": (
+        "usr/bin/mktemp", "usr/bin/chmod", "usr/bin/touch", "usr/bin/rm",
+        "usr/bin/cat", "usr/bin/head", "usr/bin/readlink", "usr/bin/cut",
+        "usr/bin/sort", "usr/bin/comm", "usr/bin/cp", "usr/bin/mv",
+        "usr/bin/base64", "usr/bin/id", "usr/bin/expr", "usr/bin/env",
+    ),
 }
+
+# The apt-key external-command happy path for `verify --keyring <X.gpg>` (the ONLY
+# branch authenticated `apt-get update` drives). Asserted present in the
+# self-contained set by the selftest so a future trim of SELF_CONTAINED_BINS can't
+# silently re-break authenticated apt. `gpg`/`gpgconf` are intentionally absent —
+# not needed for a plain .gpg keyring (see the SELF_CONTAINED_BINS note).
+APT_KEY_VERIFY_DEPS = (
+    "usr/bin/apt-key", "usr/lib/apt/methods/gpgv", "usr/bin/gpgv",
+    "usr/bin/apt-config", "usr/bin/mktemp", "usr/bin/chmod", "usr/bin/touch",
+    "usr/bin/rm", "usr/bin/cat", "usr/bin/head",
+)
 
 
 def _decompress_data_tar(deb: Path) -> bytes:
@@ -775,6 +822,27 @@ def _selftest() -> int:
                      "usr/bin/dpkg-query", "usr/bin/apt", "usr/bin/apt-get",
                      "usr/bin/tar"):
             check(f"self-contained set includes {must}", must in flat)
+
+        # AUTHENTICATED-apt path: the WHOLE apt-key `verify --keyring X.gpg` happy
+        # path must be self-contained (noble apt always shells out to apt-key, which
+        # PATH-resolves gpgv + shells to coreutils). Without these, authenticated
+        # `apt-get update` dies "Unknown error executing apt-key" (GAP 1).
+        for must in APT_KEY_VERIFY_DEPS:
+            check(f"self-contained set includes apt-key verify dep {must}", must in flat)
+        check("self-contained ships the apt-key script (in the apt pkg)",
+              "usr/bin/apt-key" in flat)
+        check("self-contained ships the gpgv apt METHOD (apt-key has nothing to exec without it)",
+              "usr/lib/apt/methods/gpgv" in flat)
+        check("self-contained ships the gpgv BINARY (apt-key's actual verifier)",
+              "usr/bin/gpgv" in flat)
+        # gpg/gpgconf are deliberately NOT pulled (a plain .gpg keyring needs neither).
+        check("self-contained does NOT drag in the heavy gnupg stack (gpg/gpgconf)",
+              "usr/bin/gpg" not in flat and "usr/bin/gpgconf" not in flat)
+        # coreutils apt-key shells out to are present (slim base ships only env).
+        for must in ("usr/bin/mktemp", "usr/bin/chmod", "usr/bin/touch",
+                     "usr/bin/head", "usr/bin/cat", "usr/bin/rm"):
+            check(f"self-contained ships coreutils {must} (apt-key temp-home/dearmor)",
+                  must in flat)
 
     print(f"\nselftest: {'ALL PASS' if failures == 0 else str(failures) + ' FAILED'}")
     return 1 if failures else 0

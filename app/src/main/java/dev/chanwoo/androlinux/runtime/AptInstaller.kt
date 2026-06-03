@@ -17,10 +17,15 @@
  *     global solver does not refuse on the pre-existing broken closure,
  *   - set the apt env (ALR_FAKEROOT/ALR_REEXEC_INPROC/ALR_PERSIST_GUEST/ALR_TEE_GUEST_STDOUT),
  *   - `apt-get -o Acquire::ForceIPv4=true update` (fetch the pinned-mirror index), re-normalize,
- *   - `apt-get install -y --no-install-recommends <pkg>` (download .deb from the pool pool),
- *   - if apt's in-line unpack hit the nested re-entry edge, COMPLETE via a top-level
- *     `dpkg -i <apt-downloaded .deb>` (the proven single-level re-entry unpack+configure),
- *   - verify via `dpkg --status <pkg>` ("Status: install ok installed").
+ *   - `apt-get install -y --no-install-recommends <pkg>` (download the .deb CLOSURE from
+ *     the pool into var/cache/apt/archives),
+ *   - if apt's in-line unpack hit the nested re-entry edge (apt→dpkg→dpkg-split, exit 71),
+ *     COMPLETE the whole closure OUTSIDE apt: one top-level `dpkg -i <every archived .deb>`
+ *     (dpkg unpacks all, then configures in dependency order) + `dpkg --configure -a` to
+ *     flush any deferred configure — so a MULTI-DEP app (not just a single leaf) installs
+ *     end-to-end without relying on apt's blocked in-line unpack (GAP 2),
+ *   - verify via `dpkg --status <pkg>` ("Status: install ok installed"), and log any dep
+ *     that did not reach "installed" so a partial closure is honestly visible.
  *
  * Host abstraction: the two callers differ only in WHICH JNI symbol runs the guest
  * (MainActivity's mangled export vs the runtime AlrNative export) and in their Context for
@@ -29,8 +34,14 @@
  * Progress: [onProgress] receives coarse [Phase] transitions parsed from apt's stdout so the
  * UI can show a monotonic percent. The marker path passes a no-op (it logs instead).
  *
- * Demo-trust apt: the apt-mirror overlay ships `Trusted: yes` (no gpgv). Authenticated apt
- * (Signed-By keyring + gpgv) is a separate, spawn-tasked gap — NOT blocked on here.
+ * Signature mode: this pipeline drives whatever the staged apt-mirror overlay configures.
+ * With `--demo-trust` the overlay ships `Trusted: yes` (verification SKIPPED). With the
+ * AUTHENTICATED default it ships `Signed-By: <staged keyring>` + pins Dir::Bin::apt-key and
+ * Apt::Key::gpgvcommand; noble apt 2.7.14 then verifies the InRelease by exec'ing apt-key →
+ * gpgv (a 2-deep fork chain), which needs the apt+dpkg `--self-contained` overlay staged
+ * (it ships apt-key + methods/gpgv + gpgv + the coreutils apt-key shells out to). This
+ * helper is signature-mode-agnostic — it just runs `apt-get update`/`install`; whether that
+ * update is authenticated is decided by the overlays, not here.
  */
 package dev.chanwoo.androlinux.runtime
 
@@ -232,33 +243,91 @@ object AptInstaller {
             Log.i(TAG, "aptinstall: installed=$installed (dpkg --status $pkg)")
             Log.i(TAG, "aptinstall-status:\n$statusOut")
 
-            // COMPLETION via top-level dpkg -i on the apt-downloaded .deb (proven re-entry).
+            // COMPLETION via top-level dpkg on the apt-downloaded .deb SET (proven re-entry).
+            //
+            // GAP 2 — MULTI-DEP closures. apt's own in-line unpack hits the nested re-entry
+            // DEPTH edge (apt → dpkg → dpkg-split, exit 71), so we finish OUTSIDE apt with a
+            // single top-level dpkg, which is the proven ONE-level re-entry shape. For a leaf
+            // package (tree/galculator) one `.deb` sufficed; a package with deps not already
+            // in the base (e.g. a GTK app pulling several libs) has apt download the WHOLE
+            // closure into var/cache/apt/archives, so we must install ALL of them, in
+            // dependency order. dpkg does that ITSELF: given many .debs on one command line it
+            // unpacks them all first, then configures in topological dependency order (it
+            // defers a Setting-up until that package's Depends are configured). So one
+            // `dpkg -i <every archived .deb>` installs+configures a multi-dep set end-to-end
+            // without relying on apt's blocked in-line unpack. A trailing `dpkg --configure -a`
+            // then flushes any package left half-configured (deferred by an ordering or a
+            // re-entry hiccup), so the closure ends fully "install ok installed".
             if (!installed) {
                 onProgress(Phase.UNPACKING)
                 val archives = File(rootfsDir, "var/cache/apt/archives")
-                val deb = archives.listFiles { f ->
-                    f.name.startsWith("${pkg}_") &&
-                        (f.name.endsWith("_arm64.deb") || f.name.endsWith("_all.deb"))
-                }?.firstOrNull()
-                if (deb != null && deb.isFile) {
-                    val debRel = "/var/cache/apt/archives/${deb.name}"
-                    Log.i(TAG, "aptinstall: completing via top-level dpkg -i $debRel (apt-downloaded .deb)")
-                    val diOut = host.loaderProbe(
-                        rootfsName,
-                        "/usr/bin/dpkg\n--force-not-root\n--force-bad-path\n-i\n" + debRel,
-                    )
+                // Every .deb apt downloaded for THIS install (the closure), target first so a
+                // single-leaf install is byte-identical to the old behavior. apt names them
+                // <pkg>_<ver>_<arch>.deb in the flat archives dir; _arm64 (native) + _all
+                // (arch-independent data pkgs) are the two arches a noble arm64 closure uses.
+                val allDebs = archives.listFiles { f ->
+                    f.isFile && (f.name.endsWith("_arm64.deb") || f.name.endsWith("_all.deb"))
+                }?.sortedBy { it.name } ?: emptyList()
+                val target = allDebs.filter { it.name.startsWith("${pkg}_") }
+                val deps = allDebs.filter { !it.name.startsWith("${pkg}_") }
+                // Configure order on the COMMAND LINE doesn't matter (dpkg reorders configure
+                // by Depends), but list the target last so its Setting-up is the final line —
+                // easier to assert. dpkg still unpacks all before configuring any.
+                val debSet = deps + target
+                if (debSet.isNotEmpty()) {
+                    val debRels = debSet.map { "/var/cache/apt/archives/${it.name}" }
+                    Log.i(TAG, "aptinstall: completing via top-level dpkg -i on ${debSet.size} apt-downloaded .deb(s) " +
+                        "(target=${target.map { it.name }}, deps=${deps.size}): ${debSet.map { it.name }}")
+                    // `dpkg -i deb1 deb2 …`: unpack-all-then-configure-in-dep-order. NEWLINE-
+                    // delimited argv (loaderProbe contract). --force-not-root/--force-bad-path
+                    // are the same forces the leaf path used (fakeroot uid=0 + rootfs paths).
+                    val diArgv = buildString {
+                        append("/usr/bin/dpkg\n--force-not-root\n--force-bad-path\n-i")
+                        for (r in debRels) { append('\n'); append(r) }
+                    }
+                    val diOut = host.loaderProbe(rootfsName, diArgv)
                     val diUnpack = diOut.contains("Unpacking $pkg")
                     val diConfig = diOut.contains("Setting up $pkg")
-                    Log.i(TAG, "aptinstall: dpkg -i unpacking=$diUnpack settingUp=$diConfig")
+                    Log.i(TAG, "aptinstall: dpkg -i (set) unpacking=$diUnpack settingUp=$diConfig")
                     Log.i(TAG, "aptinstall-dpkgi-out:\n$diOut")
                     if (diConfig) onProgress(Phase.CONFIGURING)
+
+                    // Flush any half-configured package (deferred Setting-up). For a multi-dep
+                    // set a dep may be unpacked-but-not-yet-configured if its own deps weren't
+                    // ready on the first pass; `dpkg --configure -a` (a)ll re-runs every
+                    // pending configure in dependency order until none remain. No-op (exit 0,
+                    // nothing to configure) for a fully-configured single leaf, so it's safe to
+                    // always run.
+                    val cfgOut = host.loaderProbe(
+                        rootfsName,
+                        "/usr/bin/dpkg\n--force-not-root\n--force-bad-path\n--configure\n-a",
+                    )
+                    val cfgConfiguredTarget = cfgOut.contains("Setting up $pkg")
+                    Log.i(TAG, "aptinstall: dpkg --configure -a (flush) settingUpTarget=$cfgConfiguredTarget")
+                    Log.i(TAG, "aptinstall-dpkgconfig-out:\n$cfgOut")
+                    if (cfgConfiguredTarget) onProgress(Phase.CONFIGURING)
+
                     val statusOut2 = host.loaderProbe(rootfsName, "/usr/bin/dpkg\n--status\n" + pkg)
                     installed = statusOut2.contains("Status: install ok installed")
                     val nowPresent2 = candidateBins.filter { File(rootfsDir, it).isFile }
-                    Log.i(TAG, "aptinstall: after dpkg -i installed=$installed binaries=$nowPresent2")
+                    Log.i(TAG, "aptinstall: after dpkg -i(set)+configure-a installed=$installed binaries=$nowPresent2")
                     Log.i(TAG, "aptinstall-status2:\n$statusOut2")
+                    // Honesty: report any dep that did NOT reach "installed" so a partial
+                    // closure is visible, not silently treated as success on the leaf alone.
+                    if (installed && deps.isNotEmpty()) {
+                        val depNames = deps.map { it.name.substringBefore('_') }.distinct()
+                        val unconfigured = depNames.filter { dn ->
+                            val s = host.loaderProbe(rootfsName, "/usr/bin/dpkg\n--status\n" + dn)
+                            !s.contains("Status: install ok installed")
+                        }
+                        if (unconfigured.isNotEmpty()) {
+                            Log.w(TAG, "aptinstall: closure target installed but these deps are NOT configured: $unconfigured")
+                        } else {
+                            Log.i(TAG, "aptinstall: full closure configured (${depNames.size} deps + target)")
+                        }
+                    }
                 } else {
-                    Log.w(TAG, "aptinstall: no ${pkg}_*.deb in apt archives cache to complete via dpkg -i")
+                    Log.w(TAG, "aptinstall: no *.deb in apt archives cache to complete via dpkg -i")
                 }
             }
             val binaryPresent = candidateBins.any { File(rootfsDir, it).isFile }

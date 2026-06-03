@@ -49,7 +49,7 @@ it is strictly heavier than HTTP here.
      curl                              https://172.66.152.176/…/InRelease       -> TLS handshake FAIL
    i.e. hostname-via-/etc/hosts works over both; raw-IP HTTPS fails the cert.)
 
-Authenticated by default — gpgv + Signed-By keyring (NOT apt-key)
+Authenticated by default — gpgv via apt-key + a Signed-By keyring
 ----------------------------------------------------------------
 Integrity is only real if apt **verifies the signature** on that ``InRelease``.
 The overlay therefore ships an honest, authenticated path by default:
@@ -57,10 +57,36 @@ The overlay therefore ships an honest, authenticated path by default:
   * It stages the **Ubuntu archive signing key** into the rootfs at
     ``/usr/share/keyrings/ubuntu-archive-keyring.gpg`` (a dearmored binary
     OpenPGP keyring) and sets ``Signed-By: <that path>`` on the deb822 stanza.
-    apt then runs ``/usr/lib/apt/methods/gpgv`` → the ``gpgv`` binary against the
-    pinned keyring — the modern keyring path that does **NOT** touch ``apt-key``
-    (whose ``apt-key`` shell-out is what dies "Unknown error executing apt-key"
-    on the device). ``AllowUnauthenticated`` is OFF in this mode.
+    ``AllowUnauthenticated`` is OFF in this mode.
+  * HOW noble apt verifies it (the device-diagnosed crux of GAP 1).
+    ``ports``'s base is **noble**, whose apt is **2.7.14**. In that apt the
+    ``gpgv`` *method* (``apt-pkg/contrib/gpgv.cc`` ``ExecGPGV``) does **NOT** run
+    ``gpgv`` directly — even with a per-source ``Signed-By`` it ALWAYS exec()s
+    ``Dir::Bin::apt-key`` (default ``/usr/bin/apt-key``), passing ``--keyring
+    <Signed-By>`` (host-verified: the device method binary's strings carry
+    "Unknown error executing apt-key"; the 2.7.14 source does
+    ``Args.push_back(aptkey)`` unconditionally). The ``apt-key verify`` *script*
+    then (a) resolves its verifier from ``Apt::Key::gpgvcommand`` or a bare-name
+    ``gpgv`` PATH lookup and runs it against the keyring, and (b) shells out to a
+    handful of **coreutils** (``mktemp``/``chmod``/``touch``/``rm``/``cat``/
+    ``head`` …) for its temp gpg home. So "authenticated" needs the WHOLE apt-key
+    happy path, not just gpgv — and the slim base ships **none** of it
+    (host-verified: no ``/usr/bin/gpgv``, and of coreutils only ``/usr/bin/env``).
+    That is exactly why the device died "Unknown error executing apt-key" → "E:
+    The repository is not signed": apt-key was reached but could not run.
+    The FIX is split across the two overlays:
+      - THIS overlay's apt.conf pins ``Dir::Bin::apt-key`` → ``/usr/bin/apt-key``
+        and ``Apt::Key::gpgvcommand`` → ``/usr/bin/gpgv`` (absolute, so the guest's
+        PATH is irrelevant) — see :func:`build_apt_conf_body` concern (5);
+      - the apt+dpkg overlay (``tools/build_apt_dpkg_overlay.py --self-contained``)
+        STAGES ``apt-key`` + ``methods/gpgv`` (both ride in the ``apt`` package),
+        ``gpgv``, and the coreutils apt-key shells out to.
+    NB: a plain ``.gpg`` Signed-By keyring needs **no** ``gpg``/``gpgconf`` (the
+    apt-key dearmor of a ``.gpg`` is a no-op, the merge is ``cat``, and cleanup's
+    ``gpgconf`` is ``command_available``-guarded — script-traced), so we do not pull
+    the heavy gnupg stack. RESIDUAL (if it still fails after both halves land):
+    ``apt → apt-key → gpgv`` is a 2-deep fork/exec chain, so any remaining failure
+    is a native exec-re-entry-depth issue for the loader track, NOT this tooling.
   * The key bytes are the **exact** ones the base rootfs already ships in
     ``etc/apt/trusted.gpg.d/`` — the **Ubuntu Archive Automatic Signing Key
     (2018)**, fingerprint ``F6ECB3762474EDA9D21B7022871920D1991BC93C`` (plus the
@@ -73,12 +99,11 @@ The overlay therefore ships an honest, authenticated path by default:
     their sha256 asserted in the selftest; ``--keyring-from-rootfs <tar|dir>``
     re-extracts them from a live base rootfs instead, and ``--demo-trust`` falls
     back to the old unauthenticated ``Trusted: yes`` shim.
-  * DEVICE PREREQ: gpgv must actually be present. The base rootfs ships the apt
-    ``gpgv`` *method* but **not** the ``/usr/bin/gpgv`` *binary*; the apt+dpkg
-    closure overlay (``tools/build_apt_dpkg_overlay.py``, ``gpgv`` in
-    DEFAULT_TARGETS / SELF_CONTAINED_BINS) supplies it. Stage that overlay too,
-    or ``apt-get update`` fails closed ("Could not execute 'gpgv'"). This is the
-    honest trade: authenticated mode refuses everything if the verifier is
+  * DEVICE PREREQ: stage ``tools/build_apt_dpkg_overlay.py --self-contained`` too.
+    The base rootfs ships the apt ``gpgv`` *method* but **not** ``/usr/bin/gpgv``,
+    nor ``apt-key``'s coreutils, so without that overlay authenticated
+    ``apt-get update`` fails closed ("Unknown error executing apt-key"). This is
+    the honest trade: authenticated mode refuses everything if the verifier is
     missing, which is exactly what a security boundary should do.
 
 Mirror choice & IP stability (the crux)
@@ -312,6 +337,17 @@ HOSTS_PATH = "etc/hosts"
 SOURCES_PATH_TMPL = "etc/apt/sources.list.d/alr-{key}.sources"
 APT_CONF_PATH = "etc/apt/apt.conf.d/99alr-mirror-ip"
 
+# Absolute rootfs paths of the two binaries apt's signature verification execs.
+# noble apt 2.7.14's `methods/gpgv` ALWAYS shells out to `Dir::Bin::apt-key`, and
+# that apt-key script resolves its verifier from `Apt::Key::gpgvcommand` (else a
+# bare-name PATH lookup). In-guest PATH is not guaranteed, so we PIN both to their
+# absolute rootfs paths. The binaries are staged by build_apt_dpkg_overlay
+# --self-contained (apt-key + methods/gpgv ride in `apt`; gpgv in `gpgv`); without
+# that overlay these point at absent files and authenticated update fails closed —
+# the honest behaviour for a missing verifier.
+GPGV_BIN_PATH = "/usr/bin/gpgv"
+APT_KEY_BIN_PATH = "/usr/bin/apt-key"
+
 # An ALR-only sources directory. apt.conf below repoints Dir::Etc::sourceparts at
 # THIS dir (and Dir::Etc::sourcelist at /dev/null), so apt reads ONLY this stanza
 # and ignores every base file in /etc/apt/sources.list.d (the cloud-init
@@ -396,6 +432,28 @@ def build_apt_conf_body(
        the minimal rootfs lacks → ``W: No sandbox user '_apt'``); ``APT::Sandbox::
        User "root"`` keeps apt as the fakeroot uid=0 instead of warning/erroring.
 
+    5. **Verifier path pins (AUTHENTICATED mode — gpgv + apt-key).** noble apt is
+       2.7.14, whose ``methods/gpgv`` (``apt-pkg/contrib/gpgv.cc`` ``ExecGPGV``)
+       ALWAYS exec()s ``Dir::Bin::apt-key`` to check an ``InRelease`` — it never
+       calls ``gpgv`` directly, even with a per-source ``Signed-By`` (host-verified
+       from the device binary's strings + the 2.7.14 source: ``ExecGPGV`` does
+       ``Args.push_back(aptkey)`` unconditionally and passes ``--keyring
+       <Signed-By>``). The ``apt-key verify`` script then resolves its verifier from
+       ``Apt::Key::gpgvcommand`` (falling back to a **bare-name PATH** lookup of
+       ``gpgv``). In the guest, neither ``apt-key`` nor ``gpgv`` is guaranteed on
+       ``PATH``, so we PIN both absolutely: ``Dir::Bin::apt-key`` →
+       ``/usr/bin/apt-key`` and ``Apt::Key::gpgvcommand`` → ``/usr/bin/gpgv``. With
+       these (and the apt+dpkg ``--self-contained`` overlay that actually stages
+       ``apt-key``/``methods/gpgv``/``gpgv`` + the coreutils apt-key shells out to),
+       authenticated ``apt-get update`` runs the verifier against the staged
+       ``Signed-By`` keyring with NO ``apt-key`` "Unknown error" and NO ``gpg``
+       dependency. Emitted ONLY in authenticated mode (``--demo-trust`` skips
+       verification, so the verifier path is irrelevant there). This is the
+       eliminate-the-apt-key-failure half of GAP 1; the staging half is the
+       overlay's. If a RESIDUAL failure persists after both pins + staging, it is a
+       native exec-re-entry issue (apt→apt-key→gpgv is a 2-deep fork/exec chain) —
+       documented for the loader track, NOT patched here.
+
     ``Languages "none"`` + ``ForceIPv4`` are retained (trim round-trips; avoid a
     dead IPv6 path on the pinned IPv4 anycast).
     """
@@ -407,7 +465,9 @@ def build_apt_conf_body(
         "//     via --demo-trust. (3) Dir::State::status pins the dpkg DB to its absolute rootfs path.",
         "//     (4) Blank the PackageKit/c-n-f Post-Invoke hooks + run as root (no _apt user):",
         "//     those hooks exec gdbus/dbus that this headless rootfs lacks, which otherwise",
-        "//     fails apt-get update AFTER a clean fetch.",
+        "//     fails apt-get update AFTER a clean fetch. (5) AUTHENTICATED only: pin",
+        "//     Dir::Bin::apt-key + Apt::Key::gpgvcommand to absolute rootfs paths (noble apt",
+        "//     2.7.14 always shells out to apt-key, which then PATH-looks-up gpgv).",
         'Acquire::Languages "none";',
         'Acquire::ForceIPv4 "true";',
         # (4) Device-environment hygiene — always (independent of trust / rootfs).
@@ -447,6 +507,14 @@ def build_apt_conf_body(
             lines.append(f'Dir::State::status "{status_path}";')
     if trusted:
         lines.append('APT::Get::AllowUnauthenticated "true";')
+    else:
+        # (5) AUTHENTICATED verifier pins. noble apt's gpgv method always execs
+        # apt-key, which PATH-resolves gpgv; pin both to absolute rootfs paths so a
+        # bare-PATH miss in the guest can't surface as "Unknown error executing
+        # apt-key" / "The repository is not signed". (Staging of these binaries is
+        # the apt+dpkg --self-contained overlay's job; these are just the paths.)
+        lines.append(f'Dir::Bin::apt-key "{APT_KEY_BIN_PATH}";')
+        lines.append(f'Apt::Key::gpgvcommand "{GPGV_BIN_PATH}";')
     return "\n".join(lines) + "\n"
 
 
@@ -1287,6 +1355,12 @@ def _selftest() -> int:
           "sources.list.alr.d" in APT_CONF_BODY and "Dir::Etc::sourceparts" in APT_CONF_BODY)
     check("apt.conf (authenticated default) does NOT set AllowUnauthenticated",
           'APT::Get::AllowUnauthenticated' not in APT_CONF_BODY)
+    # (5) authenticated mode pins the apt-key + gpgv verifier paths absolutely
+    # (noble apt 2.7.14 always shells to apt-key, which PATH-resolves gpgv).
+    check("apt.conf (authenticated) pins Dir::Bin::apt-key to the absolute rootfs path",
+          f'Dir::Bin::apt-key "{APT_KEY_BIN_PATH}";' in APT_CONF_BODY)
+    check("apt.conf (authenticated) pins Apt::Key::gpgvcommand to the absolute gpgv",
+          f'Apt::Key::gpgvcommand "{GPGV_BIN_PATH}";' in APT_CONF_BODY)
     check("apt.conf default bakes the device rootfs status pin (Dir::State::status)",
           "Dir::State::status" in APT_CONF_BODY and DEFAULT_ROOTFS_ABS in APT_CONF_BODY)
     check("apt.conf #clears the PackageKit Post-Invoke-Success hook list",
@@ -1299,6 +1373,12 @@ def _selftest() -> int:
     conf_demo = build_apt_conf_body(trusted=True)
     check("apt.conf demo-trust sets AllowUnauthenticated",
           'APT::Get::AllowUnauthenticated "true";' in conf_demo)
+    # demo-trust SKIPS verification entirely, so it must NOT EMIT the verifier
+    # directives (the header comment still DESCRIBES concern (5), so match the real
+    # `<knob> "<path>";` directive line, not the comment prose).
+    check("apt.conf demo-trust does NOT pin apt-key/gpgv (verification skipped)",
+          f'Dir::Bin::apt-key "{APT_KEY_BIN_PATH}";' not in conf_demo
+          and f'Apt::Key::gpgvcommand "{GPGV_BIN_PATH}";' not in conf_demo)
     conf_norootfs = build_apt_conf_body(rootfs_abs=None)
     check("apt.conf rootfs_abs=None drops the absolute status pin directive",
           'Dir::State::status "' not in conf_norootfs)

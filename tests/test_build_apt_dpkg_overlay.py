@@ -30,6 +30,7 @@ import pytest
 
 from tools.build_apt_dpkg_overlay import (
     ADMINDIR_DIRS,
+    APT_KEY_VERIFY_DEPS,
     DEFAULT_TARGETS,
     SELF_CONTAINED_BINS,
     TEST_DEB,
@@ -164,6 +165,50 @@ def test_self_contained_set_covers_load_bearing_frontends():
                  "usr/bin/dpkg-query", "usr/bin/apt", "usr/bin/apt-get",
                  "usr/bin/tar"):
         assert must in flat, must
+
+
+# --------------------------------------------------------------------------- #
+# AUTHENTICATED-apt path (GAP 1) — the apt-key `verify` happy path is self-contained
+# --------------------------------------------------------------------------- #
+
+def test_self_contained_set_ships_the_whole_apt_key_verify_path():
+    """noble apt 2.7.14 verifies an InRelease by exec'ing apt-key → gpgv, and
+    apt-key shells out to several coreutils for its temp gpg home. The slim base
+    ships NONE of these, so --self-contained must stage the WHOLE happy path or
+    authenticated `apt-get update` dies "Unknown error executing apt-key"."""
+    flat = {p for ps in SELF_CONTAINED_BINS.values() for p in ps}
+    for must in APT_KEY_VERIFY_DEPS:
+        assert must in flat, f"apt-key verify dep {must} missing from self-contained set"
+    # the load-bearing trio: the apt-key script, the gpgv METHOD it runs from, and
+    # the gpgv BINARY the method/apt-key actually verifies with.
+    assert "usr/bin/apt-key" in flat
+    assert "usr/lib/apt/methods/gpgv" in flat
+    assert "usr/bin/gpgv" in flat
+
+
+def test_apt_key_verify_deps_include_the_required_coreutils():
+    """The specific coreutils apt-key's `verify --keyring X.gpg` path needs:
+    mktemp/chmod (create_gpg_home), touch (create_new_keyring), head (dearmor
+    sniff), rm/cat (cleanup). All ride in coreutils."""
+    for must in ("usr/bin/mktemp", "usr/bin/chmod", "usr/bin/touch",
+                 "usr/bin/head", "usr/bin/rm", "usr/bin/cat"):
+        assert must in APT_KEY_VERIFY_DEPS, must
+
+
+def test_self_contained_does_not_drag_in_heavy_gnupg():
+    """A plain `.gpg` Signed-By keyring needs NO gpg/gpgconf (dearmor of a .gpg is a
+    no-op, the merge is `cat`, cleanup's gpgconf is command_available-guarded), so
+    the overlay must NOT pull the heavy gnupg stack."""
+    flat = {p for ps in SELF_CONTAINED_BINS.values() for p in ps}
+    assert "usr/bin/gpg" not in flat
+    assert "usr/bin/gpgconf" not in flat
+    assert "usr/bin/gpg-agent" not in flat
+
+
+def test_coreutils_is_a_default_target_so_the_closure_ships_apt_key_deps():
+    """The self-contained set is belt-and-suspenders; the closure itself ships the
+    coreutils (and thus apt-key's deps) because coreutils is a DEFAULT_TARGET."""
+    assert "coreutils" in DEFAULT_TARGETS
 
 
 # --------------------------------------------------------------------------- #

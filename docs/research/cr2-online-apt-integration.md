@@ -389,3 +389,137 @@ the `.deb` from the mirror pool over the network, ending in
 - **ESTIMATE:** `ALR_DOH=0` on the update sub-step is the simplest way to keep the pin
   authoritative; the durable "files dns then DoH" inversion in the shim is the cleaner
   long-term shape but is the shim owner's change, not required for this drain.
+
+---
+
+## (e) Two follow-on gaps — AUTHENTICATED `apt-get update` + MULTI-DEP install
+
+The (a)–(d) path was device-proven with **DEMO-TRUST** (`--demo-trust`: `Trusted: yes`,
+verification SKIPPED) for single-leaf packages (`tree`, `galculator`). Two gaps remained;
+both are now closed host-side (this section = root cause + the exact device-test plan).
+
+### (e.1) GAP 1 — AUTHENTICATED apt: "Unknown error executing apt-key" — ROOT CAUSE
+
+**Symptom (device):** with the authenticated apt-mirror overlay (`Signed-By` keyring +
+gpgv, the builder default), `apt-get update` failed
+`W: … Unknown error executing apt-key` / `E: The repository is not signed`. The gpgv
+*method* was reached (worker target=`…/methods/gpgv`).
+
+**Root cause (host-verified from the device binaries + apt 2.7.14 source):**
+1. The base is **Ubuntu noble**, whose apt is **2.7.14**. In that apt the gpgv *method*
+   (`apt-pkg/contrib/gpgv.cc` `ExecGPGV`) does **NOT** run `gpgv` directly even when the
+   source pins `Signed-By` — it **ALWAYS** `exec()`s `Dir::Bin::apt-key` (default
+   `/usr/bin/apt-key`), passing `--keyring <Signed-By>`. *(Evidence: the device
+   `usr/lib/apt/methods/gpgv` ELF's strings carry `Unknown error executing apt-key` +
+   `Could not execute 'apt-key'`; the 2.7.14 source does `Args.push_back(aptkey)`
+   unconditionally.)* The newer apt (`main`) DID drop this, but noble has not.
+2. `apt-key verify --keyring X.gpg` (a shell script) then (a) resolves its verifier from
+   `Apt::Key::gpgvcommand` or a **bare-name `gpgv` PATH** lookup and runs it, and
+   (b) shells out to a handful of **coreutils** (`mktemp`+`chmod` for `create_gpg_home`,
+   `touch` for `create_new_keyring`, `head` for the dearmor sniff, `rm`/`cat` for
+   cleanup) for its temp gpg home.
+3. The **slim base ships NONE of that machinery**: no `/usr/bin/gpgv` (only the apt
+   *method* `usr/lib/apt/methods/gpgv`), and of coreutils only `/usr/bin/env` (no
+   `mktemp`/`chmod`/`touch`/`head`…). *(Host-verified by listing `rootfs/tiny-rootfs.tar`.)*
+   So apt-key was reached but immediately failed (at `mktemp`, or at the bare-name `gpgv`
+   lookup) → the method reported "Unknown error executing apt-key" → "not signed".
+
+   The prior overlay docstring's claim that authenticated mode "does NOT touch apt-key"
+   was the misconception that left this open: for noble apt it ALWAYS touches apt-key.
+
+**NOT a native exec-re-entry bug per se** — the chain is reached and runs; it failed on
+**missing files + an unpinned PATH**, both fixable in tooling. (The residual re-entry
+caveat is below.)
+
+**Fix (tooling, host-green):**
+- `tools/build_apt_dpkg_overlay.py` — extend `SELF_CONTAINED_BINS` so `--self-contained`
+  stages the WHOLE apt-key happy path: `usr/bin/apt-key` + `usr/lib/apt/methods/gpgv`
+  (both ride in the `apt` pkg), `usr/bin/gpgv`, `usr/bin/apt-config`, and the coreutils
+  apt-key shells out to (`mktemp`/`chmod`/`touch`/`rm`/`cat`/`head`/`readlink`/`cut`/
+  `sort`/`comm`/`cp`/`mv`/`base64`/`id`/`expr`). `coreutils` is already a DEFAULT_TARGET,
+  so the closure ships them too — this is the belt-and-suspenders 0o755 guarantee.
+  `gpg`/`gpgconf` are **deliberately NOT** pulled: a plain `.gpg` keyring needs neither
+  (dearmor of a `.gpg` is a no-op, the merge is `cat`, cleanup's `gpgconf` is
+  `command_available`-guarded — script-traced). New `APT_KEY_VERIFY_DEPS` + selftest
+  assert the happy-path set stays present.
+- `tools/build_apt_mirror_overlay.py` — in AUTHENTICATED mode the apt.conf now pins both
+  `Dir::Bin::apt-key "/usr/bin/apt-key";` and `Apt::Key::gpgvcommand "/usr/bin/gpgv";`
+  (absolute → the guest PATH is irrelevant). Emitted only when authenticated
+  (`--demo-trust` skips verification, so the pins are omitted there).
+
+**Device-test plan — authenticated `apt-get update`:**
+1. Build BOTH overlays authenticated:
+   ```sh
+   python3 -m tools.build_apt_dpkg_overlay --out /tmp/apt-dpkg-stage.tar \
+       --base rootfs/tiny-rootfs.tar --self-contained     # ships apt-key+gpgv+coreutils
+   python3 -m tools.build_apt_mirror_overlay --out /tmp/apt-mirror-stage.tar  # authenticated default
+   # confirm the InRelease is signed by the staged key (host, NETWORK):
+   python3 -m tools.build_apt_mirror_overlay --verify-fetch    # expects signer F6EC…C93C
+   ```
+2. Push both stage tars to `/data/local/tmp/` (plus fakeroot/dpkg-db/interpose as in
+   Step 1) and arm the online apt drain.
+3. Drain `apt-get -o Acquire::ForceIPv4=true update` (NO `--demo-trust`,
+   `AllowUnauthenticated` OFF).
+4. **PASS:** `apt-get update` exits 0, fetches `InRelease`+`Packages`, and logcat shows
+   the gpgv method + `apt-key succeeded` (or simply no `apt-key` error and no
+   `repository is not signed`). `apt-key`'s temp-home is created (mktemp present) and
+   `gpgv` verifies against `/usr/share/keyrings/ubuntu-archive-keyring.gpg`.
+5. **Confirm the security boundary:** flip ONE byte of the staged keyring (or point
+   `Signed-By` at a wrong key) and re-run — `apt-get update` MUST fail closed
+   (`NO_PUBKEY` / `not signed`), proving verification is real, not bypassed.
+
+**Residual (DOCUMENTED for the loader track, not patched in tooling):** authenticated
+verification adds depth to the exec-re-entry tree — `apt → apt-key (dash) → gpgv`, and
+`apt-key` itself forks `mktemp`/`chmod`/`head`/… children. That is a **deeper** fork/exec
+chain than the `--demo-trust` path (which skips apt-key entirely). If, with both overlays
+staged + the pins, `apt-get update` STILL fails — but now with a re-entry signature
+(`GUEST EXEC FAIL`, a re-map storm, or a child SIGKILLed mid-verify) rather than
+"Unknown error executing apt-key" — then the residual is the SAME re-entry-DEPTH edge the
+multi-supervisor wall / `dpkg→dpkg-split` exit-71 edge exposes, and belongs to the
+exec-re-entry/supervisor owner (`runtime_report.cpp`), NOT here. Diagnostic to attach:
+`ALR_TEE_GUEST_STDOUT=1` + `ALR_INTERPOSE_DIAG=1`, and grep logcat for
+`ALR-INPROC: worker target=…/apt-key` and `…/gpgv` (proves how deep the re-map got).
+
+### (e.2) GAP 2 — MULTI-DEP install: configure the whole closure outside apt
+
+**Gap:** apt's in-line nested unpack (`apt → dpkg → dpkg-split`) hits a re-entry-DEPTH edge
+(exit 71), so the shared `AptInstaller` finishes via a top-level `dpkg` instead. That was
+proven for a **single leaf** (`tree`/`galculator` = one `.deb`); a package whose deps are
+not already in the base needs **several** `.deb`s unpacked+configured **in dependency
+order**, which the single-`.deb` fallback did not cover.
+
+**Fix (`app/src/main/java/dev/chanwoo/androlinux/runtime/AptInstaller.kt`):** after
+`apt-get install` downloads the whole closure into `var/cache/apt/archives`, the completion
+fallback now hands dpkg **every** archived `.deb` on ONE command line
+(`dpkg -i deb1 deb2 …`) and then runs `dpkg --configure -a`. dpkg itself unpacks all first,
+then configures in **topological dependency order** (it defers a `Setting up` until that
+package's intra-closure `Depends` are configured); `--configure -a` flushes any deferred
+configure. So a multi-dep app installs+configures end-to-end without relying on apt's
+blocked in-line unpack. A single leaf is byte-identical to the old behavior (the set is
+just one `.deb`). The fallback also logs any dep left unconfigured (honest partial-closure
+visibility). The strategy is modeled+tested host-side in
+`tools/apt_install_e2e_model.py` (`complete_closure_via_dpkg`,
+`DEMO_MULTIDEP_CLOSURE`): topological configure order, single-leaf base case,
+base-provided-dep no-block, and the cyclic-deps honest edge.
+
+**Device-test plan — a multi-dep GUI app:**
+1. Pick a small GTK/X11 app whose runtime libs are NOT all in the base — e.g. **`xcalc`**
+   (pulls `libxaw7`, `libxmu6`, `libxt6`, `libxpm4` … several not-in-base X libs) or a
+   themed GTK tool. Confirm the closure shape host-side first:
+   ```sh
+   python3 -m tools.build_apt_dpkg_overlay --list --target xcalc   # see the dep count
+   ```
+   (`galculator` stays the single-leaf control; `xcalc` is the multi-dep vehicle.)
+2. Stage the overlays (authenticated or demo-trust — GAP 2 is orthogonal to GAP 1) and
+   run the in-app install of the chosen app through `AptInstaller.install(...)`.
+3. Watch logcat: `aptinstall: completing via top-level dpkg -i on N apt-downloaded .deb(s)`
+   with `N > 1`, then `dpkg -i (set) … settingUp=true`, then
+   `dpkg --configure -a (flush)`, then `aptinstall: full closure configured (… deps + target)`.
+4. **PASS:** `dpkg --status <app>` = `Status: install ok installed`, every dep also
+   `install ok installed` (the fallback logs any that are not), the app's binary is present
+   under `usr/bin/`, and (bonus) it launches under the compositor.
+5. **Residual (same caveat as GAP 1):** if the **leaf** `dpkg -i <set>` itself hits the
+   re-entry-depth wall while unpacking many `.deb`s (a deeper fork tree than one `.deb`),
+   that is again the exec-re-entry owner's edge — attach the same `ALR-INPROC: worker
+   target=…/dpkg-split` diagnostic. The Kotlin strategy is correct; only the loader's
+   re-entry depth could gate it.

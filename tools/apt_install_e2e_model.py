@@ -551,6 +551,128 @@ def metadata_stages_host_proof() -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# GAP 2 — MULTI-DEP closure completion via ONE top-level dpkg (the AptInstaller
+# fallback). Model that `dpkg -i <every archived .deb>` + `dpkg --configure -a`
+# installs+configures a whole dependency closure IN ORDER, outside apt's blocked
+# in-line unpack.
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class ClosurePackage:
+    """One package in an install closure: its name and the names (within the
+    closure) it Depends on. The base-provided deps are NOT listed (they are already
+    configured), so ``depends`` are only the OTHER closure members this one needs
+    configured before its own postinst can run."""
+
+    name: str
+    depends: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ClosureCompletion:
+    """The modeled outcome of finishing a closure with ONE top-level dpkg call set
+    (the AptInstaller GAP-2 fallback): the order dpkg unpacks, the order it
+    configures (topological by intra-closure Depends), and whether EVERY package
+    reaches ``install ok installed``."""
+
+    target: str
+    unpack_order: tuple[str, ...]      # dpkg unpacks ALL before configuring any
+    configure_order: tuple[str, ...]   # dpkg orders configure by Depends
+    all_installed: bool                # did the whole closure reach installed?
+    cyclic: bool                       # a dependency cycle dpkg would need to break
+    note: str = ""
+
+    def as_dict(self) -> dict:
+        return {
+            "target": self.target,
+            "unpack_order": list(self.unpack_order),
+            "configure_order": list(self.configure_order),
+            "all_installed": self.all_installed,
+            "cyclic": self.cyclic,
+            "note": self.note,
+        }
+
+
+def complete_closure_via_dpkg(
+    packages: tuple[ClosurePackage, ...], target: str
+) -> ClosureCompletion:
+    """Model the AptInstaller GAP-2 completion: hand dpkg the WHOLE set of archived
+    ``.deb``s on one command line (``dpkg -i deb1 deb2 …``) followed by
+    ``dpkg --configure -a``, and compute the result.
+
+    dpkg's real behaviour (modeled here): it UNPACKS every package on the command
+    line first (order doesn't matter — unpack is per-package independent), then
+    CONFIGURES them in dependency order, deferring a package's ``postinst``
+    (``Setting up``) until every intra-closure package it Depends on is already
+    configured. ``dpkg --configure -a`` then re-drives any still-pending configure.
+    So a closure with a valid (acyclic) intra-set dependency order reaches
+    ``install ok installed`` for ALL members from one top-level dpkg invocation —
+    which is exactly why AptInstaller can finish a multi-dep app outside apt's
+    blocked in-line unpack.
+
+    The configure order is a Kahn topological sort over the intra-closure Depends
+    edges (deterministic: ties broken by name). If the intra-set graph is cyclic,
+    no pure topological order exists; dpkg would have to break the cycle with a
+    ``--configure`` retry pass (we surface ``cyclic=True`` and still return the best
+    partial order, with ``all_installed`` reflecting that the simple model can't
+    guarantee it — a real cycle is rare among library deps and is the honest edge)."""
+    by_name = {p.name: p for p in packages}
+    names = [p.name for p in packages]
+    # Unpack order: dpkg unpacks all first; model it as the given (sorted) order.
+    unpack_order = tuple(sorted(names))
+
+    # Kahn topological sort over intra-closure Depends (edge dep -> pkg, i.e. dep
+    # must be configured before pkg). Only edges to packages WITHIN the closure
+    # count (base-provided deps are already configured).
+    indeg: dict[str, int] = {n: 0 for n in names}
+    radj: dict[str, list[str]] = {n: [] for n in names}
+    for p in packages:
+        for d in p.depends:
+            if d in by_name:                  # intra-closure edge only
+                indeg[p.name] += 1
+                radj[d].append(p.name)
+    ready = sorted(n for n in names if indeg[n] == 0)
+    configure_order: list[str] = []
+    while ready:
+        n = ready.pop(0)
+        configure_order.append(n)
+        for m in sorted(radj[n]):
+            indeg[m] -= 1
+            if indeg[m] == 0:
+                ready.append(m)
+        ready.sort()
+    cyclic = len(configure_order) != len(names)
+    all_installed = (not cyclic) and target in configure_order
+    note = (
+        "acyclic intra-closure deps → one `dpkg -i <set>` + `--configure -a` "
+        "configures every package in dependency order → whole closure installed"
+        if not cyclic else
+        "intra-closure dependency CYCLE — dpkg needs a --configure retry to break "
+        "it; the simple model cannot guarantee single-pass completion (rare edge)"
+    )
+    return ClosureCompletion(
+        target=target,
+        unpack_order=unpack_order,
+        configure_order=tuple(configure_order),
+        all_installed=all_installed,
+        cyclic=cyclic,
+        note=note,
+    )
+
+
+# A representative MULTI-DEP GUI closure for the device-test plan: a small GTK app
+# whose runtime libs are NOT all in the base. `galculator` is a single-leaf already
+# proven; for the multi-dep proof we model an app like `xcalc` or a themed GTK tool
+# that pulls a couple of not-in-base libs. The exact package is chosen at device
+# time (see the device-test plan); this is the SHAPE: target depends on two libs,
+# one of which depends on the other → a non-trivial configure order.
+DEMO_MULTIDEP_CLOSURE = (
+    ClosurePackage(name="libsomedep0", depends=()),
+    ClosurePackage(name="libgtkapp-helper0", depends=("libsomedep0",)),
+    ClosurePackage(name="gtk-demo-app", depends=("libgtkapp-helper0", "libsomedep0")),
+)
+
+
+# --------------------------------------------------------------------------- #
 # CLI / selftest
 # --------------------------------------------------------------------------- #
 def _render_table(dec: GateDecision) -> str:
@@ -607,6 +729,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         out = dec.as_dict()
         out["metadata_stages_host_proof"] = metadata_stages_host_proof()
+        # GAP 2: the multi-dep closure-completion model (AptInstaller's fallback).
+        out["multidep_closure_completion"] = complete_closure_via_dpkg(
+            DEMO_MULTIDEP_CLOSURE, target="gtk-demo-app").as_dict()
         print(json.dumps(out, indent=2))
     else:
         print(_render_table(dec))
@@ -733,6 +858,34 @@ def _selftest() -> int:
     check("G2 host proof: with fakeroot the meta-sequence passes + consistent",
           proof["with_fakeroot_unpacked"] is True
           and proof["with_fakeroot_self_consistent"] is True)
+
+    # --- GAP 2: multi-dep closure completion via one top-level dpkg --------- #
+    comp = complete_closure_via_dpkg(DEMO_MULTIDEP_CLOSURE, target="gtk-demo-app")
+    check("closure: dpkg unpacks ALL members (set size preserved)",
+          len(comp.unpack_order) == len(DEMO_MULTIDEP_CLOSURE))
+    check("closure: configure order is dependency-topological "
+          "(libsomedep0 before its dependents)",
+          comp.configure_order.index("libsomedep0")
+          < comp.configure_order.index("libgtkapp-helper0")
+          < comp.configure_order.index("gtk-demo-app"))
+    check("closure: the WHOLE set reaches installed from one dpkg -i+configure-a",
+          comp.all_installed is True and not comp.cyclic)
+    # the target alone (single leaf, no intra-closure deps) is the proven base case
+    single = complete_closure_via_dpkg((ClosurePackage("tree"),), target="tree")
+    check("closure: a single leaf (tree/galculator) trivially completes",
+          single.all_installed and single.configure_order == ("tree",))
+    # honest edge: an intra-closure dependency CYCLE is flagged, not silently 'ok'
+    cyc = complete_closure_via_dpkg(
+        (ClosurePackage("a", ("b",)), ClosurePackage("b", ("a",))), target="a")
+    check("closure: a dependency CYCLE is surfaced (cyclic=True, not false-ok)",
+          cyc.cyclic is True and cyc.all_installed is False)
+    # base-provided deps (NOT in the closure) impose no intra-set edge → no block
+    base_dep = complete_closure_via_dpkg(
+        (ClosurePackage("app", ("libc6",)),), target="app")  # libc6 not in set
+    check("closure: a base-provided dep (outside the set) does not block configure",
+          base_dep.all_installed is True and base_dep.configure_order == ("app",))
+    check("closure completion as_dict is JSON-serialisable",
+          json.dumps(comp.as_dict()) is not None)
 
     # --- JSON round-trips --------------------------------------------------- #
     d = hello.as_dict()
