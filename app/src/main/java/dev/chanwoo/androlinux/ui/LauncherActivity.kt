@@ -16,21 +16,59 @@ package dev.chanwoo.androlinux.ui
 
 import android.content.Intent
 import android.os.Bundle
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.lifecycle.lifecycleScope
 import dev.chanwoo.androlinux.runtime.AlrRuntime
 import dev.chanwoo.androlinux.runtime.AlrRuntimeHolder
+import dev.chanwoo.androlinux.runtime.InstallProgress
 import dev.chanwoo.androlinux.runtime.LaunchRequest
+import java.io.File
+import kotlinx.coroutines.launch
 
 class LauncherActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val runtime: AlrRuntime = AlrRuntimeHolder.get(applicationContext)
+        maybeRunInstallTestHook(runtime)
         setContent {
             AlrApp(
                 runtime = runtime,
                 onLaunchApp = { req -> startRunningSurface(req) },
             )
+        }
+    }
+
+    /**
+     * DEBUG-only device test hook for the in-app install loop. When
+     * `/data/local/tmp/.alr-install-test` is present (content = pkg, default "galculator"),
+     * drive `runtime.install(pkg)` EXACTLY as the catalog's Install button does
+     * (CatalogViewModel.requestInstall → runtime.install(appId).collect) — same Flow, same
+     * AptInstaller pipeline, same refreshInstalledApps() that publishes the new tile to the
+     * launcher grid. Logs each InstallProgress to logcat (tag "alr_install_test") so the
+     * device run can prove install→rescan→tile WITHOUT GUI-automating Compose taps. Removes
+     * the marker after firing so a relaunch does not re-install. No-op when the marker is
+     * absent, so normal launches are unaffected.
+     */
+    private fun maybeRunInstallTestHook(runtime: AlrRuntime) {
+        val marker = File("/data/local/tmp/.alr-install-test")
+        if (!marker.isFile) return
+        val appId = runCatching { marker.readText().trim() }.getOrDefault("").ifEmpty { "galculator" }
+        runCatching { marker.delete() }
+        Log.i("alr_install_test", "hook armed → runtime.install(\"$appId\")")
+        lifecycleScope.launch {
+            runtime.install(appId).collect { p ->
+                when (p) {
+                    is InstallProgress.Running ->
+                        Log.i("alr_install_test", "progress $appId ${p.percent}% ${p.stage.name} (${p.stage.label})")
+                    is InstallProgress.Done ->
+                        Log.i("alr_install_test", "DONE $appId — installedApps now lists: " +
+                            runtime.installedApps.value.joinToString { it.appId })
+                    is InstallProgress.Failed ->
+                        Log.w("alr_install_test", "FAILED $appId: ${p.message}")
+                }
+            }
         }
     }
 
