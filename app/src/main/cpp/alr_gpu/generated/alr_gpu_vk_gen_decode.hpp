@@ -46,6 +46,11 @@ struct VkGenTables {
     std::map<uint32_t, VkSemaphore> semaphores; // vsem    -> real
     std::map<uint32_t, VkEvent> events;         // vevent  -> real
     std::map<uint32_t, VkQueryPool> query_pools; // vqpool  -> real
+    // WAVE B descriptor/layout handle tables.
+    std::map<uint32_t, VkDescriptorSetLayout> dsl;      // vdsl     -> real
+    std::map<uint32_t, VkPipelineLayout> pipeline_layouts; // vplayout -> real
+    std::map<uint32_t, VkDescriptorPool> descriptor_pools; // vdpool  -> real
+    std::map<uint32_t, VkDescriptorSet> descriptor_sets;   // vdset   -> real
 #endif
     // Arena offset assigned to each device-memory virtual id (HOST_VISIBLE only).
     // UINT64_MAX == not arena-backed (e.g. a DEVICE_LOCAL alloc). Tracked even in
@@ -56,6 +61,52 @@ struct VkGenTables {
 inline VkGenTables& gen_tables(VkDecodeState& st) {
     static std::map<const VkDecodeState*, VkGenTables> g;
     return g[&st];
+}
+
+// ---- Wire-side element/struct PODs for the array-bearing generated ops (create_struct,
+// alloc_sets, update_sets). All-scalar so they need no Vulkan headers; the real-Mali
+// bodies translate the virtual handle fields (vbuffer/vimageview/vsampler/...) to real
+// Mali handles via VkGenTables when rebuilding the typed CreateInfo/array. ----
+struct VkGenElem_create_descriptor_set_layout_bindings {  // one VkDescriptorSetLayoutBinding
+    uint32_t binding = 0;
+    uint32_t descriptorType = 0;
+    uint32_t descriptorCount = 0;
+    uint32_t stageFlags = 0;
+};
+struct VkGenElem_create_pipeline_layout_setLayouts {  // one VkDescriptorSetLayout
+    uint32_t self = 0;
+};
+struct VkGenElem_create_pipeline_layout_pushConstantRanges {  // one VkPushConstantRange
+    uint32_t stageFlags = 0;
+    uint32_t offset = 0;
+    uint32_t size = 0;
+};
+struct VkGenElem_create_descriptor_pool_poolSizes {  // one VkDescriptorPoolSize
+    uint32_t type = 0;
+    uint32_t descriptorCount = 0;
+};
+struct VkGenBufferInfo { uint32_t vbuffer = 0; uint64_t offset = 0; uint64_t range = 0; };
+struct VkGenImageInfo  { uint32_t vsampler = 0; uint32_t vimageview = 0; uint32_t image_layout = 0; };
+struct VkGenDescWrite {
+    uint32_t vdstset = 0, binding = 0, array_element = 0;
+    uint32_t descriptor_type = 0, descriptor_count = 0;
+    std::vector<VkGenBufferInfo> buffers;  // for buffer-class descriptors
+    std::vector<VkGenImageInfo> images;    // for image/sampler-class descriptors
+};
+// Image-class descriptor types (sampler / sampled-image / storage-image / combined /
+// input-attachment) ship an image-info triple per descriptor; the rest ship a buffer
+// triple. Matches the VkDescriptorType enum values (stable wire numbers).
+inline bool vk_gen_desc_is_image(uint32_t t) {
+    switch (t) {
+        case 0:  // VK_DESCRIPTOR_TYPE_SAMPLER
+        case 1:  // COMBINED_IMAGE_SAMPLER
+        case 2:  // SAMPLED_IMAGE
+        case 3:  // STORAGE_IMAGE
+        case 10: // INPUT_ATTACHMENT
+            return true;
+        default:
+            return false;  // UNIFORM_BUFFER / STORAGE_BUFFER / *_DYNAMIC / texel buffers
+    }
 }
 
 }  // namespace alr::gpu (block 1)
@@ -831,6 +882,273 @@ inline bool decode_vk_gen_op(uint8_t op, VkReader& r, VkDecodeState& st,
 #endif
             if (gp && gp->destroy_handle)
                 gp->destroy_handle(gp->ctx, ALR_VK_GEN_OP_DESTROY_QUERY_POOL, vdev, vhandle);
+            st.decoded++;
+            return true;
+        }
+        case ALR_VK_GEN_OP_CREATE_DESCRIPTOR_SET_LAYOUT: {  // vkCreateDescriptorSetLayout
+            uint32_t vdev = 0, vhandle = 0;
+            if (!r.u32(vdev) || !r.u32(vhandle)) { st.ok = false; return true; }
+            uint32_t flags = 0;
+            if (!(r.u32(flags))) { st.ok = false; return true; }
+            uint32_t bindings_count = 0;
+            if (!r.u32(bindings_count)) { st.ok = false; return true; }
+            if (bindings_count > 4096) { st.ok = false; return true; }
+            std::vector<VkGenElem_create_descriptor_set_layout_bindings> bindings;
+            bindings.reserve(bindings_count);
+            for (uint32_t i = 0; i < bindings_count; ++i) {
+                VkGenElem_create_descriptor_set_layout_bindings el{};
+                if (!(r.u32(el.binding) && r.u32(el.descriptorType) && r.u32(el.descriptorCount) && r.u32(el.stageFlags))) { st.ok = false; return true; }
+                bindings.push_back(el);
+            }
+            uint32_t pnext_count = 0;
+            std::vector<uint32_t> pnext_types;
+            std::vector<std::vector<uint8_t>> pnext_bytes;
+            if (!r.u32(pnext_count)) { st.ok = false; return true; }
+            if (pnext_count > 32) { st.ok = false; return true; }
+            for (uint32_t i = 0; i < pnext_count; ++i) {
+                uint32_t stype = 0; const uint8_t* d = nullptr; uint32_t n = 0;
+                if (!r.u32(stype) || !r.blob(d, n)) { st.ok = false; return true; }
+                if (n > 1024) { st.ok = false; return true; }
+                pnext_types.push_back(stype);
+                pnext_bytes.emplace_back(d, d + n);
+            }
+            (void)pnext_count;
+            int res = -1;
+#ifdef ALR_VK_DECODE_REAL
+            if (!gp) {
+                res = static_cast<int>(vk_gen_real_create_descriptor_set_layout(
+                    st, vdev, vhandle, flags, bindings, pnext_types, pnext_bytes));
+            }
+#endif
+            if (gp && gp->create_handle)
+                res = gp->create_handle(gp->ctx, ALR_VK_GEN_OP_CREATE_DESCRIPTOR_SET_LAYOUT, vdev, vhandle, 0, 0);
+            reply.u8(static_cast<uint8_t>(ALR_VK_REPLY_GEN_ESCAPE));
+            reply.u16(static_cast<uint16_t>(ALR_VK_GEN_REPLY_CREATE_DESCRIPTOR_SET_LAYOUT));
+            reply.u32(vhandle);
+            reply.i32(res);
+            st.decoded++;
+            return true;
+        }
+        case ALR_VK_GEN_OP_DESTROY_DESCRIPTOR_SET_LAYOUT: {  // vkDestroyDescriptorSetLayout
+            uint32_t vdev = 0, vhandle = 0;
+            if (!r.u32(vdev) || !r.u32(vhandle)) { st.ok = false; return true; }
+            (void)vdev;
+#ifdef ALR_VK_DECODE_REAL
+            if (!gp) {
+                vk_gen_real_destroy_descriptor_set_layout(st, vdev, vhandle);
+            }
+#endif
+            if (gp && gp->destroy_handle)
+                gp->destroy_handle(gp->ctx, ALR_VK_GEN_OP_DESTROY_DESCRIPTOR_SET_LAYOUT, vdev, vhandle);
+            st.decoded++;
+            return true;
+        }
+        case ALR_VK_GEN_OP_CREATE_PIPELINE_LAYOUT: {  // vkCreatePipelineLayout
+            uint32_t vdev = 0, vhandle = 0;
+            if (!r.u32(vdev) || !r.u32(vhandle)) { st.ok = false; return true; }
+            uint32_t flags = 0;
+            if (!(r.u32(flags))) { st.ok = false; return true; }
+            uint32_t setLayouts_count = 0;
+            if (!r.u32(setLayouts_count)) { st.ok = false; return true; }
+            if (setLayouts_count > 4096) { st.ok = false; return true; }
+            std::vector<VkGenElem_create_pipeline_layout_setLayouts> setLayouts;
+            setLayouts.reserve(setLayouts_count);
+            for (uint32_t i = 0; i < setLayouts_count; ++i) {
+                VkGenElem_create_pipeline_layout_setLayouts el{};
+                if (!(r.u32(el.self))) { st.ok = false; return true; }
+                setLayouts.push_back(el);
+            }
+            uint32_t pushConstantRanges_count = 0;
+            if (!r.u32(pushConstantRanges_count)) { st.ok = false; return true; }
+            if (pushConstantRanges_count > 4096) { st.ok = false; return true; }
+            std::vector<VkGenElem_create_pipeline_layout_pushConstantRanges> pushConstantRanges;
+            pushConstantRanges.reserve(pushConstantRanges_count);
+            for (uint32_t i = 0; i < pushConstantRanges_count; ++i) {
+                VkGenElem_create_pipeline_layout_pushConstantRanges el{};
+                if (!(r.u32(el.stageFlags) && r.u32(el.offset) && r.u32(el.size))) { st.ok = false; return true; }
+                pushConstantRanges.push_back(el);
+            }
+            uint32_t pnext_count = 0;
+            std::vector<uint32_t> pnext_types;
+            std::vector<std::vector<uint8_t>> pnext_bytes;
+            if (!r.u32(pnext_count)) { st.ok = false; return true; }
+            if (pnext_count > 32) { st.ok = false; return true; }
+            for (uint32_t i = 0; i < pnext_count; ++i) {
+                uint32_t stype = 0; const uint8_t* d = nullptr; uint32_t n = 0;
+                if (!r.u32(stype) || !r.blob(d, n)) { st.ok = false; return true; }
+                if (n > 1024) { st.ok = false; return true; }
+                pnext_types.push_back(stype);
+                pnext_bytes.emplace_back(d, d + n);
+            }
+            (void)pnext_count;
+            int res = -1;
+#ifdef ALR_VK_DECODE_REAL
+            if (!gp) {
+                res = static_cast<int>(vk_gen_real_create_pipeline_layout(
+                    st, vdev, vhandle, flags, setLayouts, pushConstantRanges, pnext_types, pnext_bytes));
+            }
+#endif
+            if (gp && gp->create_handle)
+                res = gp->create_handle(gp->ctx, ALR_VK_GEN_OP_CREATE_PIPELINE_LAYOUT, vdev, vhandle, 0, 0);
+            reply.u8(static_cast<uint8_t>(ALR_VK_REPLY_GEN_ESCAPE));
+            reply.u16(static_cast<uint16_t>(ALR_VK_GEN_REPLY_CREATE_PIPELINE_LAYOUT));
+            reply.u32(vhandle);
+            reply.i32(res);
+            st.decoded++;
+            return true;
+        }
+        case ALR_VK_GEN_OP_DESTROY_PIPELINE_LAYOUT: {  // vkDestroyPipelineLayout
+            uint32_t vdev = 0, vhandle = 0;
+            if (!r.u32(vdev) || !r.u32(vhandle)) { st.ok = false; return true; }
+            (void)vdev;
+#ifdef ALR_VK_DECODE_REAL
+            if (!gp) {
+                vk_gen_real_destroy_pipeline_layout(st, vdev, vhandle);
+            }
+#endif
+            if (gp && gp->destroy_handle)
+                gp->destroy_handle(gp->ctx, ALR_VK_GEN_OP_DESTROY_PIPELINE_LAYOUT, vdev, vhandle);
+            st.decoded++;
+            return true;
+        }
+        case ALR_VK_GEN_OP_CREATE_DESCRIPTOR_POOL: {  // vkCreateDescriptorPool
+            uint32_t vdev = 0, vhandle = 0;
+            if (!r.u32(vdev) || !r.u32(vhandle)) { st.ok = false; return true; }
+            uint32_t flags = 0; uint32_t maxSets = 0;
+            if (!(r.u32(flags) && r.u32(maxSets))) { st.ok = false; return true; }
+            uint32_t poolSizes_count = 0;
+            if (!r.u32(poolSizes_count)) { st.ok = false; return true; }
+            if (poolSizes_count > 4096) { st.ok = false; return true; }
+            std::vector<VkGenElem_create_descriptor_pool_poolSizes> poolSizes;
+            poolSizes.reserve(poolSizes_count);
+            for (uint32_t i = 0; i < poolSizes_count; ++i) {
+                VkGenElem_create_descriptor_pool_poolSizes el{};
+                if (!(r.u32(el.type) && r.u32(el.descriptorCount))) { st.ok = false; return true; }
+                poolSizes.push_back(el);
+            }
+            uint32_t pnext_count = 0;
+            std::vector<uint32_t> pnext_types;
+            std::vector<std::vector<uint8_t>> pnext_bytes;
+            if (!r.u32(pnext_count)) { st.ok = false; return true; }
+            if (pnext_count > 32) { st.ok = false; return true; }
+            for (uint32_t i = 0; i < pnext_count; ++i) {
+                uint32_t stype = 0; const uint8_t* d = nullptr; uint32_t n = 0;
+                if (!r.u32(stype) || !r.blob(d, n)) { st.ok = false; return true; }
+                if (n > 1024) { st.ok = false; return true; }
+                pnext_types.push_back(stype);
+                pnext_bytes.emplace_back(d, d + n);
+            }
+            (void)pnext_count;
+            int res = -1;
+#ifdef ALR_VK_DECODE_REAL
+            if (!gp) {
+                res = static_cast<int>(vk_gen_real_create_descriptor_pool(
+                    st, vdev, vhandle, flags, maxSets, poolSizes, pnext_types, pnext_bytes));
+            }
+#endif
+            if (gp && gp->create_handle)
+                res = gp->create_handle(gp->ctx, ALR_VK_GEN_OP_CREATE_DESCRIPTOR_POOL, vdev, vhandle, 0, 0);
+            reply.u8(static_cast<uint8_t>(ALR_VK_REPLY_GEN_ESCAPE));
+            reply.u16(static_cast<uint16_t>(ALR_VK_GEN_REPLY_CREATE_DESCRIPTOR_POOL));
+            reply.u32(vhandle);
+            reply.i32(res);
+            st.decoded++;
+            return true;
+        }
+        case ALR_VK_GEN_OP_DESTROY_DESCRIPTOR_POOL: {  // vkDestroyDescriptorPool
+            uint32_t vdev = 0, vhandle = 0;
+            if (!r.u32(vdev) || !r.u32(vhandle)) { st.ok = false; return true; }
+            (void)vdev;
+#ifdef ALR_VK_DECODE_REAL
+            if (!gp) {
+                vk_gen_real_destroy_descriptor_pool(st, vdev, vhandle);
+            }
+#endif
+            if (gp && gp->destroy_handle)
+                gp->destroy_handle(gp->ctx, ALR_VK_GEN_OP_DESTROY_DESCRIPTOR_POOL, vdev, vhandle);
+            st.decoded++;
+            return true;
+        }
+        case ALR_VK_GEN_OP_ALLOCATE_DESCRIPTOR_SETS: {  // vkAllocateDescriptorSets
+            uint32_t vdev = 0, vpool = 0, set_count = 0;
+            if (!r.u32(vdev) || !r.u32(vpool) || !r.u32(set_count)) {
+                st.ok = false; return true; }
+            if (set_count > 4096) { st.ok = false; return true; }
+            std::vector<uint32_t> vlayouts, vsets;
+            vlayouts.reserve(set_count); vsets.reserve(set_count);
+            for (uint32_t i = 0; i < set_count; ++i) {
+                uint32_t vl = 0, vs = 0;
+                if (!r.u32(vl) || !r.u32(vs)) { st.ok = false; return true; }
+                vlayouts.push_back(vl); vsets.push_back(vs);
+            }
+            int res = -1;
+#ifdef ALR_VK_DECODE_REAL
+            if (!gp) {
+                res = static_cast<int>(vk_gen_real_allocate_descriptor_sets(
+                    st, vdev, vpool, vlayouts, vsets));
+            }
+#endif
+            if (gp && gp->create_handle)
+                res = gp->create_handle(gp->ctx, ALR_VK_GEN_OP_ALLOCATE_DESCRIPTOR_SETS, vdev,
+                                        set_count ? vsets[0] : 0, set_count, vpool);
+            reply.u8(static_cast<uint8_t>(ALR_VK_REPLY_GEN_ESCAPE));
+            reply.u16(static_cast<uint16_t>(ALR_VK_GEN_REPLY_ALLOCATE_DESCRIPTOR_SETS));
+            reply.u32(set_count);
+            reply.i32(res);
+            st.decoded++;
+            return true;
+        }
+        case ALR_VK_GEN_OP_FREE_DESCRIPTOR_SETS: {  // vkFreeDescriptorSets
+            uint32_t vdev = 0, vpool = 0, set_count = 0;
+            if (!r.u32(vdev) || !r.u32(vpool) || !r.u32(set_count)) {
+                st.ok = false; return true; }
+            if (set_count > 4096) { st.ok = false; return true; }
+            std::vector<uint32_t> vsets;
+            vsets.reserve(set_count);
+            for (uint32_t i = 0; i < set_count; ++i) {
+                uint32_t vs = 0; if (!r.u32(vs)) { st.ok = false; return true; }
+                vsets.push_back(vs);
+            }
+#ifdef ALR_VK_DECODE_REAL
+            if (!gp) vk_gen_real_free_descriptor_sets(st, vdev, vpool, vsets);
+#endif
+            if (gp && gp->destroy_handle)
+                gp->destroy_handle(gp->ctx, ALR_VK_GEN_OP_FREE_DESCRIPTOR_SETS, vdev, set_count);
+            st.decoded++;
+            return true;
+        }
+        case ALR_VK_GEN_OP_UPDATE_DESCRIPTOR_SETS: {  // vkUpdateDescriptorSets
+            uint32_t vdev = 0, write_count = 0;
+            if (!r.u32(vdev) || !r.u32(write_count)) { st.ok = false; return true; }
+            if (write_count > 4096) { st.ok = false; return true; }
+            std::vector<VkGenDescWrite> writes;
+            writes.reserve(write_count);
+            for (uint32_t i = 0; i < write_count; ++i) {
+                VkGenDescWrite w{};
+                if (!r.u32(w.vdstset) || !r.u32(w.binding) || !r.u32(w.array_element) ||
+                    !r.u32(w.descriptor_type) || !r.u32(w.descriptor_count)) {
+                    st.ok = false; return true; }
+                if (w.descriptor_count > 4096) { st.ok = false; return true; }
+                bool is_image = vk_gen_desc_is_image(w.descriptor_type);
+                for (uint32_t d = 0; d < w.descriptor_count; ++d) {
+                    if (is_image) {
+                        VkGenImageInfo ii{};
+                        if (!r.u32(ii.vsampler) || !r.u32(ii.vimageview) ||
+                            !r.u32(ii.image_layout)) { st.ok = false; return true; }
+                        w.images.push_back(ii);
+                    } else {
+                        VkGenBufferInfo bi{};
+                        if (!r.u32(bi.vbuffer) || !r.u64(bi.offset) || !r.u64(bi.range)) {
+                            st.ok = false; return true; }
+                        w.buffers.push_back(bi);
+                    }
+                }
+                writes.push_back(std::move(w));
+            }
+#ifdef ALR_VK_DECODE_REAL
+            if (!gp) vk_gen_real_update_descriptor_sets(st, vdev, writes);
+#endif
+            (void)vdev;
             st.decoded++;
             return true;
         }

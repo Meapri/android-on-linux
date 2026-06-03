@@ -57,6 +57,15 @@ enum AlrVkGenOp {
     ALR_VK_GEN_OP_DESTROY_EVENT = 29,  // vkDestroyEvent
     ALR_VK_GEN_OP_CREATE_QUERY_POOL = 30,  // vkCreateQueryPool
     ALR_VK_GEN_OP_DESTROY_QUERY_POOL = 31,  // vkDestroyQueryPool
+    ALR_VK_GEN_OP_CREATE_DESCRIPTOR_SET_LAYOUT = 32,  // vkCreateDescriptorSetLayout
+    ALR_VK_GEN_OP_DESTROY_DESCRIPTOR_SET_LAYOUT = 33,  // vkDestroyDescriptorSetLayout
+    ALR_VK_GEN_OP_CREATE_PIPELINE_LAYOUT = 34,  // vkCreatePipelineLayout
+    ALR_VK_GEN_OP_DESTROY_PIPELINE_LAYOUT = 35,  // vkDestroyPipelineLayout
+    ALR_VK_GEN_OP_CREATE_DESCRIPTOR_POOL = 36,  // vkCreateDescriptorPool
+    ALR_VK_GEN_OP_DESTROY_DESCRIPTOR_POOL = 37,  // vkDestroyDescriptorPool
+    ALR_VK_GEN_OP_ALLOCATE_DESCRIPTOR_SETS = 38,  // vkAllocateDescriptorSets
+    ALR_VK_GEN_OP_FREE_DESCRIPTOR_SETS = 39,  // vkFreeDescriptorSets
+    ALR_VK_GEN_OP_UPDATE_DESCRIPTOR_SETS = 40,  // vkUpdateDescriptorSets
 };
 
 // ---- Generated reply SUB-opcodes (u16; ride the reply escape). ----
@@ -78,6 +87,10 @@ enum AlrVkGenReply {
     ALR_VK_GEN_REPLY_CREATE_SEMAPHORE = 15,  // reply of vkCreateSemaphore
     ALR_VK_GEN_REPLY_CREATE_EVENT = 16,  // reply of vkCreateEvent
     ALR_VK_GEN_REPLY_CREATE_QUERY_POOL = 17,  // reply of vkCreateQueryPool
+    ALR_VK_GEN_REPLY_CREATE_DESCRIPTOR_SET_LAYOUT = 18,  // reply of vkCreateDescriptorSetLayout
+    ALR_VK_GEN_REPLY_CREATE_PIPELINE_LAYOUT = 19,  // reply of vkCreatePipelineLayout
+    ALR_VK_GEN_REPLY_CREATE_DESCRIPTOR_POOL = 20,  // reply of vkCreateDescriptorPool
+    ALR_VK_GEN_REPLY_ALLOCATE_DESCRIPTOR_SETS = 21,  // reply of vkAllocateDescriptorSets
 };
 
 // A u16 little-endian field (the generated sub-opcode width). The hand-written
@@ -436,6 +449,143 @@ static inline void alr_vk_enc_gen_destroy_query_pool(AlrVkEncoder *e, uint32_t v
     alr_vk_gen_op_begin(e, ALR_VK_GEN_OP_DESTROY_QUERY_POOL);
     alr_vk_enc_u32(e, vdev);
     alr_vk_enc_u32(e, vqpool);
+}
+
+// Encoder for vkCreateDescriptorSetLayout (VkDescriptorSetLayoutCreateInfo with array members). _begin ships the scalar POD
+// prefix; then per array call _<array>_count + _<array>_elem; then the pNext chain.
+static inline void alr_vk_enc_gen_create_descriptor_set_layout_begin(AlrVkEncoder *e, uint32_t vdev, uint32_t vdsl, uint32_t flags) {
+    alr_vk_gen_op_begin(e, ALR_VK_GEN_OP_CREATE_DESCRIPTOR_SET_LAYOUT);
+    alr_vk_enc_u32(e, vdev);
+    alr_vk_enc_u32(e, vdsl);
+    alr_vk_enc_u32(e, flags);
+}
+static inline void alr_vk_enc_gen_create_descriptor_set_layout_bindings_count(AlrVkEncoder *e, uint32_t count) {
+    alr_vk_enc_u32(e, count);
+}
+static inline void alr_vk_enc_gen_create_descriptor_set_layout_bindings_elem(AlrVkEncoder *e, uint32_t binding, uint32_t descriptorType, uint32_t descriptorCount, uint32_t stageFlags) {
+    alr_vk_enc_u32(e, binding);
+    alr_vk_enc_u32(e, descriptorType);
+    alr_vk_enc_u32(e, descriptorCount);
+    alr_vk_enc_u32(e, stageFlags);
+}
+
+// Encoder for vkDestroyDescriptorSetLayout (forwards a destroy; no reply).
+static inline void alr_vk_enc_gen_destroy_descriptor_set_layout(AlrVkEncoder *e, uint32_t vdev, uint32_t vdsl) {
+    alr_vk_gen_op_begin(e, ALR_VK_GEN_OP_DESTROY_DESCRIPTOR_SET_LAYOUT);
+    alr_vk_enc_u32(e, vdev);
+    alr_vk_enc_u32(e, vdsl);
+}
+
+// Encoder for vkCreatePipelineLayout (VkPipelineLayoutCreateInfo with array members). _begin ships the scalar POD
+// prefix; then per array call _<array>_count + _<array>_elem; then the pNext chain.
+static inline void alr_vk_enc_gen_create_pipeline_layout_begin(AlrVkEncoder *e, uint32_t vdev, uint32_t vplayout, uint32_t flags) {
+    alr_vk_gen_op_begin(e, ALR_VK_GEN_OP_CREATE_PIPELINE_LAYOUT);
+    alr_vk_enc_u32(e, vdev);
+    alr_vk_enc_u32(e, vplayout);
+    alr_vk_enc_u32(e, flags);
+}
+static inline void alr_vk_enc_gen_create_pipeline_layout_setLayouts_count(AlrVkEncoder *e, uint32_t count) {
+    alr_vk_enc_u32(e, count);
+}
+static inline void alr_vk_enc_gen_create_pipeline_layout_setLayouts_elem(AlrVkEncoder *e, uint32_t self) {
+    alr_vk_enc_u32(e, self);
+}
+static inline void alr_vk_enc_gen_create_pipeline_layout_pushConstantRanges_count(AlrVkEncoder *e, uint32_t count) {
+    alr_vk_enc_u32(e, count);
+}
+static inline void alr_vk_enc_gen_create_pipeline_layout_pushConstantRanges_elem(AlrVkEncoder *e, uint32_t stageFlags, uint32_t offset, uint32_t size) {
+    alr_vk_enc_u32(e, stageFlags);
+    alr_vk_enc_u32(e, offset);
+    alr_vk_enc_u32(e, size);
+}
+
+// Encoder for vkDestroyPipelineLayout (forwards a destroy; no reply).
+static inline void alr_vk_enc_gen_destroy_pipeline_layout(AlrVkEncoder *e, uint32_t vdev, uint32_t vplayout) {
+    alr_vk_gen_op_begin(e, ALR_VK_GEN_OP_DESTROY_PIPELINE_LAYOUT);
+    alr_vk_enc_u32(e, vdev);
+    alr_vk_enc_u32(e, vplayout);
+}
+
+// Encoder for vkCreateDescriptorPool (VkDescriptorPoolCreateInfo with array members). _begin ships the scalar POD
+// prefix; then per array call _<array>_count + _<array>_elem; then the pNext chain.
+static inline void alr_vk_enc_gen_create_descriptor_pool_begin(AlrVkEncoder *e, uint32_t vdev, uint32_t vdpool, uint32_t flags, uint32_t maxSets) {
+    alr_vk_gen_op_begin(e, ALR_VK_GEN_OP_CREATE_DESCRIPTOR_POOL);
+    alr_vk_enc_u32(e, vdev);
+    alr_vk_enc_u32(e, vdpool);
+    alr_vk_enc_u32(e, flags);
+    alr_vk_enc_u32(e, maxSets);
+}
+static inline void alr_vk_enc_gen_create_descriptor_pool_poolSizes_count(AlrVkEncoder *e, uint32_t count) {
+    alr_vk_enc_u32(e, count);
+}
+static inline void alr_vk_enc_gen_create_descriptor_pool_poolSizes_elem(AlrVkEncoder *e, uint32_t type, uint32_t descriptorCount) {
+    alr_vk_enc_u32(e, type);
+    alr_vk_enc_u32(e, descriptorCount);
+}
+
+// Encoder for vkDestroyDescriptorPool (forwards a destroy; no reply).
+static inline void alr_vk_enc_gen_destroy_descriptor_pool(AlrVkEncoder *e, uint32_t vdev, uint32_t vdpool) {
+    alr_vk_gen_op_begin(e, ALR_VK_GEN_OP_DESTROY_DESCRIPTOR_POOL);
+    alr_vk_enc_u32(e, vdev);
+    alr_vk_enc_u32(e, vdpool);
+}
+
+// Encoder for vkAllocateDescriptorSets. Ships the device + descriptor pool (virtual) + the set count;
+// then per set call _layout (the set's layout virtual handle) and _vset (the guest's
+// virtual id for that set). The host allocates the real sets + returns the result.
+static inline void alr_vk_enc_gen_allocate_descriptor_sets_begin(AlrVkEncoder *e, uint32_t vdev, uint32_t vpool,
+                          uint32_t set_count) {
+    alr_vk_gen_op_begin(e, ALR_VK_GEN_OP_ALLOCATE_DESCRIPTOR_SETS);
+    alr_vk_enc_u32(e, vdev);
+    alr_vk_enc_u32(e, vpool);
+    alr_vk_enc_u32(e, set_count);
+}
+static inline void alr_vk_enc_gen_allocate_descriptor_sets_set(AlrVkEncoder *e, uint32_t vlayout, uint32_t vset) {
+    alr_vk_enc_u32(e, vlayout);
+    alr_vk_enc_u32(e, vset);
+}
+
+// Encoder for vkFreeDescriptorSets. Ships the device + the pool + the set count + each set's
+// virtual id; the host frees the real sets back to the real pool (no reply).
+static inline void alr_vk_enc_gen_free_descriptor_sets_begin(AlrVkEncoder *e, uint32_t vdev, uint32_t vpool,
+                          uint32_t set_count) {
+    alr_vk_gen_op_begin(e, ALR_VK_GEN_OP_FREE_DESCRIPTOR_SETS);
+    alr_vk_enc_u32(e, vdev);
+    alr_vk_enc_u32(e, vpool);
+    alr_vk_enc_u32(e, set_count);
+}
+static inline void alr_vk_enc_gen_free_descriptor_sets_set(AlrVkEncoder *e, uint32_t vset) {
+    alr_vk_enc_u32(e, vset);
+}
+
+// Encoder for vkUpdateDescriptorSets. _begin ships device + writeCount; per write call _write
+// (dst set + binding + arrayElement + descriptorType + descriptorCount) then, per
+// descriptor, _buffer_info OR _image_info matching the descriptor type. No reply.
+static inline void alr_vk_enc_gen_update_descriptor_sets_begin(AlrVkEncoder *e, uint32_t vdev, uint32_t write_count) {
+    alr_vk_gen_op_begin(e, ALR_VK_GEN_OP_UPDATE_DESCRIPTOR_SETS);
+    alr_vk_enc_u32(e, vdev);
+    alr_vk_enc_u32(e, write_count);
+}
+static inline void alr_vk_enc_gen_update_descriptor_sets_write(AlrVkEncoder *e, uint32_t vdstset, uint32_t binding,
+                          uint32_t array_element, uint32_t descriptor_type,
+                          uint32_t descriptor_count) {
+    alr_vk_enc_u32(e, vdstset);
+    alr_vk_enc_u32(e, binding);
+    alr_vk_enc_u32(e, array_element);
+    alr_vk_enc_u32(e, descriptor_type);
+    alr_vk_enc_u32(e, descriptor_count);
+}
+static inline void alr_vk_enc_gen_update_descriptor_sets_buffer_info(AlrVkEncoder *e, uint32_t vbuffer,
+                          uint64_t offset, uint64_t range) {
+    alr_vk_enc_u32(e, vbuffer);
+    alr_vk_enc_u64(e, offset);
+    alr_vk_enc_u64(e, range);
+}
+static inline void alr_vk_enc_gen_update_descriptor_sets_image_info(AlrVkEncoder *e, uint32_t vsampler,
+                          uint32_t vimageview, uint32_t image_layout) {
+    alr_vk_enc_u32(e, vsampler);
+    alr_vk_enc_u32(e, vimageview);
+    alr_vk_enc_u32(e, image_layout);
 }
 
 #ifdef __cplusplus

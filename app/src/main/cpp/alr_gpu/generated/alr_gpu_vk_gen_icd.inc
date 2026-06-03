@@ -546,6 +546,243 @@ static void VKAPI_CALL alr_vkDestroyQueryPool(VkDevice device, VkQueryPool query
     if (!e.overflow) (void)alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
 }
 
+static VkResult VKAPI_CALL alr_vkCreateDescriptorSetLayout(VkDevice device, const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
+                          const VkAllocationCallbacks *pAllocator, VkDescriptorSetLayout *pHandle) {
+    (void)pAllocator;
+    AlrIcdDevice *dev = (AlrIcdDevice *)device;
+    uint32_t vid; int32_t res = 0; uint32_t ai;
+    if (!dev || !pCreateInfo || !pHandle) return VK_ERROR_INITIALIZATION_FAILED;
+    vid = alr_alloc(&g_next_vdsl, 1);
+    if (alr_icd_ring_ok()) {
+        AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
+        size_t cap = 256;
+        cap += (size_t)pCreateInfo->bindingCount * 24;
+        uint8_t *req = (uint8_t *)malloc(cap);
+        if (!req) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        alr_vk_enc_init(&e, req, cap);
+        alr_vk_enc_gen_create_descriptor_set_layout_begin(&e, dev->vdev, vid, (uint32_t)pCreateInfo->flags);
+        { uint32_t n = pCreateInfo->bindingCount; if (n > 4096) n = 4096;
+          alr_vk_enc_gen_create_descriptor_set_layout_bindings_count(&e, n);
+          for (ai = 0; ai < n; ++ai) {
+              alr_vk_enc_gen_create_descriptor_set_layout_bindings_elem(&e, (uint32_t)pCreateInfo->pBindings[ai].binding, (uint32_t)pCreateInfo->pBindings[ai].descriptorType, (uint32_t)pCreateInfo->pBindings[ai].descriptorCount, (uint32_t)pCreateInfo->pBindings[ai].stageFlags); } }
+        alr_vk_gen_pnext_count(&e, 0);
+        alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
+        if (!e.overflow) {
+            uint32_t rlen = alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
+            if (rlen) (void)alr_icd_gen_scan_result(reply, rlen, (uint16_t)ALR_VK_GEN_REPLY_CREATE_DESCRIPTOR_SET_LAYOUT, &res);
+            else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;
+        } else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;
+        free(req);
+    }
+    if (res != 0) return (VkResult)res;
+    *pHandle = (VkDescriptorSetLayout)(uintptr_t)vid;
+    return VK_SUCCESS;
+}
+
+static void VKAPI_CALL alr_vkDestroyDescriptorSetLayout(VkDevice device, VkDescriptorSetLayout descriptorSetLayout,
+                          const VkAllocationCallbacks *pAllocator) {
+    (void)pAllocator;
+    AlrIcdDevice *dev = (AlrIcdDevice *)device;
+    uint32_t vh = (uint32_t)(uintptr_t)descriptorSetLayout;
+    if (!dev || descriptorSetLayout == 0 || !alr_icd_ring_ok()) return;
+    uint8_t req[24]; AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
+    alr_vk_enc_init(&e, req, sizeof(req));
+    alr_vk_enc_gen_destroy_descriptor_set_layout(&e, dev->vdev, vh);
+    alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
+    if (!e.overflow) (void)alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
+}
+
+static VkResult VKAPI_CALL alr_vkCreatePipelineLayout(VkDevice device, const VkPipelineLayoutCreateInfo *pCreateInfo,
+                          const VkAllocationCallbacks *pAllocator, VkPipelineLayout *pHandle) {
+    (void)pAllocator;
+    AlrIcdDevice *dev = (AlrIcdDevice *)device;
+    uint32_t vid; int32_t res = 0; uint32_t ai;
+    if (!dev || !pCreateInfo || !pHandle) return VK_ERROR_INITIALIZATION_FAILED;
+    vid = alr_alloc(&g_next_vplayout, 1);
+    if (alr_icd_ring_ok()) {
+        AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
+        size_t cap = 256;
+        cap += (size_t)pCreateInfo->setLayoutCount * 24;
+        cap += (size_t)pCreateInfo->pushConstantRangeCount * 24;
+        uint8_t *req = (uint8_t *)malloc(cap);
+        if (!req) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        alr_vk_enc_init(&e, req, cap);
+        alr_vk_enc_gen_create_pipeline_layout_begin(&e, dev->vdev, vid, (uint32_t)pCreateInfo->flags);
+        { uint32_t n = pCreateInfo->setLayoutCount; if (n > 4096) n = 4096;
+          alr_vk_enc_gen_create_pipeline_layout_setLayouts_count(&e, n);
+          for (ai = 0; ai < n; ++ai) {
+              alr_vk_enc_gen_create_pipeline_layout_setLayouts_elem(&e, (uint32_t)(uintptr_t)pCreateInfo->pSetLayouts[ai]); } }
+        { uint32_t n = pCreateInfo->pushConstantRangeCount; if (n > 4096) n = 4096;
+          alr_vk_enc_gen_create_pipeline_layout_pushConstantRanges_count(&e, n);
+          for (ai = 0; ai < n; ++ai) {
+              alr_vk_enc_gen_create_pipeline_layout_pushConstantRanges_elem(&e, (uint32_t)pCreateInfo->pPushConstantRanges[ai].stageFlags, (uint32_t)pCreateInfo->pPushConstantRanges[ai].offset, (uint32_t)pCreateInfo->pPushConstantRanges[ai].size); } }
+        alr_vk_gen_pnext_count(&e, 0);
+        alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
+        if (!e.overflow) {
+            uint32_t rlen = alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
+            if (rlen) (void)alr_icd_gen_scan_result(reply, rlen, (uint16_t)ALR_VK_GEN_REPLY_CREATE_PIPELINE_LAYOUT, &res);
+            else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;
+        } else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;
+        free(req);
+    }
+    if (res != 0) return (VkResult)res;
+    *pHandle = (VkPipelineLayout)(uintptr_t)vid;
+    return VK_SUCCESS;
+}
+
+static void VKAPI_CALL alr_vkDestroyPipelineLayout(VkDevice device, VkPipelineLayout pipelineLayout,
+                          const VkAllocationCallbacks *pAllocator) {
+    (void)pAllocator;
+    AlrIcdDevice *dev = (AlrIcdDevice *)device;
+    uint32_t vh = (uint32_t)(uintptr_t)pipelineLayout;
+    if (!dev || pipelineLayout == 0 || !alr_icd_ring_ok()) return;
+    uint8_t req[24]; AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
+    alr_vk_enc_init(&e, req, sizeof(req));
+    alr_vk_enc_gen_destroy_pipeline_layout(&e, dev->vdev, vh);
+    alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
+    if (!e.overflow) (void)alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
+}
+
+static VkResult VKAPI_CALL alr_vkCreateDescriptorPool(VkDevice device, const VkDescriptorPoolCreateInfo *pCreateInfo,
+                          const VkAllocationCallbacks *pAllocator, VkDescriptorPool *pHandle) {
+    (void)pAllocator;
+    AlrIcdDevice *dev = (AlrIcdDevice *)device;
+    uint32_t vid; int32_t res = 0; uint32_t ai;
+    if (!dev || !pCreateInfo || !pHandle) return VK_ERROR_INITIALIZATION_FAILED;
+    vid = alr_alloc(&g_next_vdpool, 1);
+    if (alr_icd_ring_ok()) {
+        AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
+        size_t cap = 256;
+        cap += (size_t)pCreateInfo->poolSizeCount * 24;
+        uint8_t *req = (uint8_t *)malloc(cap);
+        if (!req) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        alr_vk_enc_init(&e, req, cap);
+        alr_vk_enc_gen_create_descriptor_pool_begin(&e, dev->vdev, vid, (uint32_t)pCreateInfo->flags, (uint32_t)pCreateInfo->maxSets);
+        { uint32_t n = pCreateInfo->poolSizeCount; if (n > 4096) n = 4096;
+          alr_vk_enc_gen_create_descriptor_pool_poolSizes_count(&e, n);
+          for (ai = 0; ai < n; ++ai) {
+              alr_vk_enc_gen_create_descriptor_pool_poolSizes_elem(&e, (uint32_t)pCreateInfo->pPoolSizes[ai].type, (uint32_t)pCreateInfo->pPoolSizes[ai].descriptorCount); } }
+        alr_vk_gen_pnext_count(&e, 0);
+        alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
+        if (!e.overflow) {
+            uint32_t rlen = alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
+            if (rlen) (void)alr_icd_gen_scan_result(reply, rlen, (uint16_t)ALR_VK_GEN_REPLY_CREATE_DESCRIPTOR_POOL, &res);
+            else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;
+        } else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;
+        free(req);
+    }
+    if (res != 0) return (VkResult)res;
+    *pHandle = (VkDescriptorPool)(uintptr_t)vid;
+    return VK_SUCCESS;
+}
+
+static void VKAPI_CALL alr_vkDestroyDescriptorPool(VkDevice device, VkDescriptorPool descriptorPool,
+                          const VkAllocationCallbacks *pAllocator) {
+    (void)pAllocator;
+    AlrIcdDevice *dev = (AlrIcdDevice *)device;
+    uint32_t vh = (uint32_t)(uintptr_t)descriptorPool;
+    if (!dev || descriptorPool == 0 || !alr_icd_ring_ok()) return;
+    uint8_t req[24]; AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
+    alr_vk_enc_init(&e, req, sizeof(req));
+    alr_vk_enc_gen_destroy_descriptor_pool(&e, dev->vdev, vh);
+    alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
+    if (!e.overflow) (void)alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
+}
+
+static VkResult VKAPI_CALL alr_vkAllocateDescriptorSets(VkDevice device,
+                          const VkDescriptorSetAllocateInfo *pAllocateInfo,
+                          VkDescriptorSet *pDescriptorSets) {
+    AlrIcdDevice *dev = (AlrIcdDevice *)device; uint32_t i; int32_t res = 0;
+    if (!dev || !pAllocateInfo || !pDescriptorSets) return VK_ERROR_INITIALIZATION_FAILED;
+    uint32_t n = pAllocateInfo->descriptorSetCount; if (n > 4096) n = 4096;
+    /* Pre-assign a virtual id per set (client-side, monotonic) and write them out;
+     * the host maps each to a real descriptor set allocated from the real pool. */
+    for (i = 0; i < n; ++i)
+        pDescriptorSets[i] = (VkDescriptorSet)(uintptr_t)alr_alloc(&g_next_vdset, 1);
+    if (alr_icd_ring_ok()) {
+        AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
+        size_t cap = 64 + (size_t)n * 8; uint8_t *req = (uint8_t *)malloc(cap);
+        if (!req) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        alr_vk_enc_init(&e, req, cap);
+        alr_vk_enc_gen_allocate_descriptor_sets_begin(&e, dev->vdev,
+                          (uint32_t)(uintptr_t)pAllocateInfo->descriptorPool, n);
+        for (i = 0; i < n; ++i)
+            alr_vk_enc_gen_allocate_descriptor_sets_set(&e, (uint32_t)(uintptr_t)pAllocateInfo->pSetLayouts[i],
+                              (uint32_t)(uintptr_t)pDescriptorSets[i]);
+        alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
+        if (!e.overflow) {
+            uint32_t rlen = alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
+            if (rlen) (void)alr_icd_gen_scan_result(reply, rlen, (uint16_t)ALR_VK_GEN_REPLY_ALLOCATE_DESCRIPTOR_SETS, &res);
+            else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;
+        } else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;
+        free(req);
+    }
+    return (VkResult)res;
+}
+
+static VkResult VKAPI_CALL alr_vkFreeDescriptorSets(VkDevice device, VkDescriptorPool descriptorPool,
+                          uint32_t descriptorSetCount,
+                          const VkDescriptorSet *pDescriptorSets) {
+    AlrIcdDevice *dev = (AlrIcdDevice *)device; uint32_t i;
+    if (!dev) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!alr_icd_ring_ok() || descriptorSetCount == 0 || !pDescriptorSets) return VK_SUCCESS;
+    {
+        AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
+        uint32_t n = descriptorSetCount > 4096 ? 4096 : descriptorSetCount;
+        size_t cap = 32 + (size_t)n * 4; uint8_t *req = (uint8_t *)malloc(cap);
+        if (!req) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        alr_vk_enc_init(&e, req, cap);
+        alr_vk_enc_gen_free_descriptor_sets_begin(&e, dev->vdev, (uint32_t)(uintptr_t)descriptorPool, n);
+        for (i = 0; i < n; ++i)
+            alr_vk_enc_gen_free_descriptor_sets_set(&e, (uint32_t)(uintptr_t)pDescriptorSets[i]);
+        alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
+        if (!e.overflow) (void)alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
+        free(req);
+    }
+    return VK_SUCCESS;
+}
+
+static void VKAPI_CALL alr_vkUpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
+                          const VkWriteDescriptorSet *pDescriptorWrites,
+                          uint32_t descriptorCopyCount,
+                          const VkCopyDescriptorSet *pDescriptorCopies) {
+    AlrIcdDevice *dev = (AlrIcdDevice *)device; uint32_t i, d;
+    (void)descriptorCopyCount; (void)pDescriptorCopies;  /* copies deferred */
+    if (!dev || !alr_icd_ring_ok() || descriptorWriteCount == 0 || !pDescriptorWrites) return;
+    {
+        AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
+        uint32_t wn = descriptorWriteCount > 4096 ? 4096 : descriptorWriteCount;
+        size_t cap = 64; for (i = 0; i < wn; ++i) cap += 24 + (size_t)pDescriptorWrites[i].descriptorCount * 24;
+        uint8_t *req = (uint8_t *)malloc(cap);
+        if (!req) return;
+        alr_vk_enc_init(&e, req, cap);
+        alr_vk_enc_gen_update_descriptor_sets_begin(&e, dev->vdev, wn);
+        for (i = 0; i < wn; ++i) {
+            const VkWriteDescriptorSet *w = &pDescriptorWrites[i];
+            uint32_t dc = w->descriptorCount > 4096 ? 4096 : w->descriptorCount;
+            alr_vk_enc_gen_update_descriptor_sets_write(&e, (uint32_t)(uintptr_t)w->dstSet, w->dstBinding,
+                              w->dstArrayElement, (uint32_t)w->descriptorType, dc);
+            int is_image = alr_vk_desc_type_is_image((uint32_t)w->descriptorType);
+            for (d = 0; d < dc; ++d) {
+                if (is_image) {
+                    uint32_t vsamp = w->pImageInfo ? (uint32_t)(uintptr_t)w->pImageInfo[d].sampler : 0;
+                    uint32_t vview = w->pImageInfo ? (uint32_t)(uintptr_t)w->pImageInfo[d].imageView : 0;
+                    uint32_t lay   = w->pImageInfo ? (uint32_t)w->pImageInfo[d].imageLayout : 0;
+                    alr_vk_enc_gen_update_descriptor_sets_image_info(&e, vsamp, vview, lay);
+                } else {
+                    uint32_t vbuf = w->pBufferInfo ? (uint32_t)(uintptr_t)w->pBufferInfo[d].buffer : 0;
+                    uint64_t off  = w->pBufferInfo ? (uint64_t)w->pBufferInfo[d].offset : 0;
+                    uint64_t rng  = w->pBufferInfo ? (uint64_t)w->pBufferInfo[d].range : 0;
+                    alr_vk_enc_gen_update_descriptor_sets_buffer_info(&e, vbuf, off, rng);
+                }
+            }
+        }
+        alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
+        if (!e.overflow) (void)alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
+        free(req);
+    }
+}
+
 #endif  // ALR_ICD_GEN_DEFINE
 
 #ifdef ALR_ICD_GEN_TABLE
@@ -576,4 +813,13 @@ static void VKAPI_CALL alr_vkDestroyQueryPool(VkDevice device, VkQueryPool query
     ALR_ENTRY("vkDestroyEvent", alr_vkDestroyEvent),
     ALR_ENTRY("vkCreateQueryPool", alr_vkCreateQueryPool),
     ALR_ENTRY("vkDestroyQueryPool", alr_vkDestroyQueryPool),
+    ALR_ENTRY("vkCreateDescriptorSetLayout", alr_vkCreateDescriptorSetLayout),
+    ALR_ENTRY("vkDestroyDescriptorSetLayout", alr_vkDestroyDescriptorSetLayout),
+    ALR_ENTRY("vkCreatePipelineLayout", alr_vkCreatePipelineLayout),
+    ALR_ENTRY("vkDestroyPipelineLayout", alr_vkDestroyPipelineLayout),
+    ALR_ENTRY("vkCreateDescriptorPool", alr_vkCreateDescriptorPool),
+    ALR_ENTRY("vkDestroyDescriptorPool", alr_vkDestroyDescriptorPool),
+    ALR_ENTRY("vkAllocateDescriptorSets", alr_vkAllocateDescriptorSets),
+    ALR_ENTRY("vkFreeDescriptorSets", alr_vkFreeDescriptorSets),
+    ALR_ENTRY("vkUpdateDescriptorSets", alr_vkUpdateDescriptorSets),
 #endif  // ALR_ICD_GEN_TABLE

@@ -372,6 +372,92 @@ SPECS = [
         "name": "vkDestroyQueryPool", "kind": "destroy_handle",
         "handle_param": ("queryPool", "VkQueryPool"),
     },
+    # =======================================================================
+    # WAVE B — the descriptor + layout + render-pass + framebuffer create family ANGLE's
+    # RendererVk hits next (the device-iterate trap proved ANGLE reaches descriptor-set
+    # management immediately after device/queue setup: its first unimplemented call is
+    # vkFreeDescriptorSets). These CreateInfos carry count+array members, so they use the
+    # `create_struct` kind: the SPEC declares the scalar POD prefix (`ci_fields`) PLUS named
+    # `arrays`, each a { count_field, elem fields }. The generated encoder ships the scalars
+    # then each array as a u32 count + count×{elem fields}; the host decode reads them back
+    # and a hand-written real-Mali body (alr_gpu_vk_gen_real.hpp) rebuilds the CreateInfo +
+    # its arrays (translating any handle-typed element via VkGenTables) and calls real Mali.
+    # A handle element is wire-typed "vhandle" (a u32 virtual id translated host-side).
+    # =======================================================================
+    # ---- descriptor set layout (pBindings[]: binding/type/count/stageFlags; immutable
+    #      samplers are NOT shipped for the bring-up — ANGLE uses dynamic samplers here) ----
+    {
+        "name": "vkCreateDescriptorSetLayout", "kind": "create_struct",
+        "ci": "VkDescriptorSetLayoutCreateInfo",
+        "ci_fields": [("flags", "u32")],
+        "arrays": [
+            {"count_field": "bindingCount", "ptr_field": "pBindings",
+             "elem": "VkDescriptorSetLayoutBinding",
+             "fields": [("binding", "u32"), ("descriptorType", "u32"),
+                        ("descriptorCount", "u32"), ("stageFlags", "u32")],
+             # pImmutableSamplers (a sampler-handle array per binding) is deferred: ANGLE's
+             # texture path uses separate (non-immutable) samplers, so the binding's
+             # immutable-sampler pointer is null for the bring-up. Honest scope note.
+             "note": "pImmutableSamplers deferred (ANGLE uses non-immutable samplers)"},
+        ],
+        "out": "VkDescriptorSetLayout",
+    },
+    {
+        "name": "vkDestroyDescriptorSetLayout", "kind": "destroy_handle",
+        "handle_param": ("descriptorSetLayout", "VkDescriptorSetLayout"),
+    },
+    # ---- pipeline layout (pSetLayouts[]: descriptor-set-layout HANDLES; pPushConstant
+    #      Ranges[]: stageFlags/offset/size) ----
+    {
+        "name": "vkCreatePipelineLayout", "kind": "create_struct",
+        "ci": "VkPipelineLayoutCreateInfo",
+        "ci_fields": [("flags", "u32")],
+        "arrays": [
+            {"count_field": "setLayoutCount", "ptr_field": "pSetLayouts",
+             "elem": "VkDescriptorSetLayout", "handle_elem": "VkDescriptorSetLayout",
+             "fields": [("@self:VkDescriptorSetLayout", "vhandle")]},
+            {"count_field": "pushConstantRangeCount", "ptr_field": "pPushConstantRanges",
+             "elem": "VkPushConstantRange",
+             "fields": [("stageFlags", "u32"), ("offset", "u32"), ("size", "u32")]},
+        ],
+        "out": "VkPipelineLayout",
+    },
+    {
+        "name": "vkDestroyPipelineLayout", "kind": "destroy_handle",
+        "handle_param": ("pipelineLayout", "VkPipelineLayout"),
+    },
+    # ---- descriptor pool (maxSets + pPoolSizes[]: type/descriptorCount) ----
+    {
+        "name": "vkCreateDescriptorPool", "kind": "create_struct",
+        "ci": "VkDescriptorPoolCreateInfo",
+        "ci_fields": [("flags", "u32"), ("maxSets", "u32")],
+        "arrays": [
+            {"count_field": "poolSizeCount", "ptr_field": "pPoolSizes",
+             "elem": "VkDescriptorPoolSize",
+             "fields": [("type", "u32"), ("descriptorCount", "u32")]},
+        ],
+        "out": "VkDescriptorPool",
+    },
+    {
+        "name": "vkDestroyDescriptorPool", "kind": "destroy_handle",
+        "handle_param": ("descriptorPool", "VkDescriptorPool"),
+    },
+    # ---- descriptor sets: allocate N from a pool against N layouts (the alloc_sets kind:
+    #      VkDescriptorSetAllocateInfo carries the pool HANDLE + a setLayout-HANDLE array; the
+    #      host allocates the real sets + returns N virtual ids the guest pre-assigned). ----
+    {
+        "name": "vkAllocateDescriptorSets", "kind": "alloc_sets",
+        "out": "VkDescriptorSet",
+    },
+    {
+        "name": "vkFreeDescriptorSets", "kind": "free_sets",
+    },
+    # ---- descriptor set writes: bind buffers/images/samplers into sets (the update_sets
+    #      kind: an array of VkWriteDescriptorSet, each referencing a destination set HANDLE
+    #      and, per descriptor, buffer/image-view/sampler HANDLES). Copies are deferred. ----
+    {
+        "name": "vkUpdateDescriptorSets", "kind": "update_sets",
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -645,6 +731,98 @@ def gen_proto_encoder(op):
         a("    alr_vk_enc_u32(e, vdev);")
         a(f"    alr_vk_enc_u32(e, {op['vhandle']});")
         a("}")
+    elif k == "create_struct":
+        # _begin: escape + subop + vdev + vout + scalar CI fields. Then per array a
+        # _<array>_count + _<array>_elem appender (same shape as flush_ranges' _begin/_range).
+        # The caller appends each array's count + elements, then the pNext chain.
+        params = ["AlrVkEncoder *e", "uint32_t vdev", f"uint32_t {op['vout']}"]
+        for fname, wt in op["ci_wire_fields"]:
+            params.append(f"{ctype_for(wt)} {wire_var(fname)}")
+        a(f"// Encoder for {name} ({op['ci']} with array members). _begin ships the scalar POD")
+        a("// prefix; then per array call _<array>_count + _<array>_elem; then the pNext chain.")
+        a(f"static inline void {enc}_begin({', '.join(params)}) {{")
+        a(f"    alr_vk_gen_op_begin(e, {op['op_enum']});")
+        a("    alr_vk_enc_u32(e, vdev);")
+        a(f"    alr_vk_enc_u32(e, {op['vout']});")
+        for fname, wt in op["ci_wire_fields"]:
+            a(f"    {wire_enc_call(wt, wire_var(fname))}")
+        a("}")
+        for arr in op["arrays"]:
+            an = arr["array_name"]
+            a(f"static inline void {enc}_{an}_count(AlrVkEncoder *e, uint32_t count) {{")
+            a("    alr_vk_enc_u32(e, count);")
+            a("}")
+            ep = ["AlrVkEncoder *e"]
+            for fname, wt in arr["fields"]:
+                ep.append(f"{ctype_for(wt)} {wire_var(fname)}")
+            a(f"static inline void {enc}_{an}_elem({', '.join(ep)}) {{")
+            for fname, wt in arr["fields"]:
+                a(f"    {wire_enc_call(wt, wire_var(fname))}")
+            a("}")
+    elif k == "alloc_sets":
+        # vkAllocateDescriptorSets: ship the device + the pool HANDLE + N (the set count) +
+        # N setLayout HANDLES + N guest-assigned virtual set ids. Round-trips a per-set result.
+        a(f"// Encoder for {name}. Ships the device + descriptor pool (virtual) + the set count;")
+        a("// then per set call _layout (the set's layout virtual handle) and _vset (the guest's")
+        a("// virtual id for that set). The host allocates the real sets + returns the result.")
+        a(f"static inline void {enc}_begin(AlrVkEncoder *e, uint32_t vdev, uint32_t vpool,")
+        a("                          uint32_t set_count) {")
+        a(f"    alr_vk_gen_op_begin(e, {op['op_enum']});")
+        a("    alr_vk_enc_u32(e, vdev);")
+        a("    alr_vk_enc_u32(e, vpool);")
+        a("    alr_vk_enc_u32(e, set_count);")
+        a("}")
+        a(f"static inline void {enc}_set(AlrVkEncoder *e, uint32_t vlayout, uint32_t vset) {{")
+        a("    alr_vk_enc_u32(e, vlayout);")
+        a("    alr_vk_enc_u32(e, vset);")
+        a("}")
+    elif k == "free_sets":
+        a(f"// Encoder for {name}. Ships the device + the pool + the set count + each set's")
+        a("// virtual id; the host frees the real sets back to the real pool (no reply).")
+        a(f"static inline void {enc}_begin(AlrVkEncoder *e, uint32_t vdev, uint32_t vpool,")
+        a("                          uint32_t set_count) {")
+        a(f"    alr_vk_gen_op_begin(e, {op['op_enum']});")
+        a("    alr_vk_enc_u32(e, vdev);")
+        a("    alr_vk_enc_u32(e, vpool);")
+        a("    alr_vk_enc_u32(e, set_count);")
+        a("}")
+        a(f"static inline void {enc}_set(AlrVkEncoder *e, uint32_t vset) {{")
+        a("    alr_vk_enc_u32(e, vset);")
+        a("}")
+    elif k == "update_sets":
+        # vkUpdateDescriptorSets: ship the device + write count; then per write the dst set
+        # HANDLE, binding, arrayElement, descriptorType, and a descriptor count + per
+        # descriptor a (vbuffer/voffset/vrange) OR (vimageview/vsampler/imagelayout) triple,
+        # tagged by whether the type is a buffer or image/sampler descriptor. Copies deferred.
+        a(f"// Encoder for {name}. _begin ships device + writeCount; per write call _write")
+        a("// (dst set + binding + arrayElement + descriptorType + descriptorCount) then, per")
+        a("// descriptor, _buffer_info OR _image_info matching the descriptor type. No reply.")
+        a(f"static inline void {enc}_begin(AlrVkEncoder *e, uint32_t vdev, uint32_t write_count) {{")
+        a(f"    alr_vk_gen_op_begin(e, {op['op_enum']});")
+        a("    alr_vk_enc_u32(e, vdev);")
+        a("    alr_vk_enc_u32(e, write_count);")
+        a("}")
+        a(f"static inline void {enc}_write(AlrVkEncoder *e, uint32_t vdstset, uint32_t binding,")
+        a("                          uint32_t array_element, uint32_t descriptor_type,")
+        a("                          uint32_t descriptor_count) {")
+        a("    alr_vk_enc_u32(e, vdstset);")
+        a("    alr_vk_enc_u32(e, binding);")
+        a("    alr_vk_enc_u32(e, array_element);")
+        a("    alr_vk_enc_u32(e, descriptor_type);")
+        a("    alr_vk_enc_u32(e, descriptor_count);")
+        a("}")
+        a(f"static inline void {enc}_buffer_info(AlrVkEncoder *e, uint32_t vbuffer,")
+        a("                          uint64_t offset, uint64_t range) {")
+        a("    alr_vk_enc_u32(e, vbuffer);")
+        a("    alr_vk_enc_u64(e, offset);")
+        a("    alr_vk_enc_u64(e, range);")
+        a("}")
+        a(f"static inline void {enc}_image_info(AlrVkEncoder *e, uint32_t vsampler,")
+        a("                          uint32_t vimageview, uint32_t image_layout) {")
+        a("    alr_vk_enc_u32(e, vsampler);")
+        a("    alr_vk_enc_u32(e, vimageview);")
+        a("    alr_vk_enc_u32(e, image_layout);")
+        a("}")
     return "\n".join(L)
 
 
@@ -674,6 +852,8 @@ def gen_decode(reg, ops):
     a("namespace alr::gpu {")
     a("")
     a(gen_decode_state_ext())
+    a("")
+    a(gen_struct_helpers(ops))
     a("")
     a("}  // namespace alr::gpu (block 1)")
     a("")
@@ -733,6 +913,59 @@ def gen_decode(reg, ops):
     return "\n".join(L) + "\n"
 
 
+def gen_struct_helpers(ops):
+    """Wire-side POD structs the create_struct/alloc_sets/update_sets decode reads into and
+    the hand-written real bodies consume. Plain u32/u64 fields (no Vulkan types), so they
+    live in block 1 (visible to both the decode cases and the real bodies). Defined for ALL
+    builds (the no-SDK wire test reads into them too)."""
+    L = []
+    a = L.append
+    a("// ---- Wire-side element/struct PODs for the array-bearing generated ops "
+      "(create_struct,")
+    a("// alloc_sets, update_sets). All-scalar so they need no Vulkan headers; the real-Mali")
+    a("// bodies translate the virtual handle fields (vbuffer/vimageview/vsampler/...) to real")
+    a("// Mali handles via VkGenTables when rebuilding the typed CreateInfo/array. ----")
+    seen = set()
+    for op in ops:
+        if op["kind"] != "create_struct":
+            continue
+        for arr in op["arrays"]:
+            tname = f"VkGenElem_{op['short']}_{arr['array_name']}"
+            if tname in seen:
+                continue
+            seen.add(tname)
+            a(f"struct {tname} {{  // one {arr['elem']}")
+            for fname, wt in arr["fields"]:
+                a(f"    {ctype_for(wt)} {wire_var(fname)} = 0;")
+            a("};")
+    # The descriptor-write PODs (update_sets) — fixed shape, emitted once.
+    a("struct VkGenBufferInfo { uint32_t vbuffer = 0; uint64_t offset = 0; uint64_t range = 0; };")
+    a("struct VkGenImageInfo  { uint32_t vsampler = 0; uint32_t vimageview = 0; "
+      "uint32_t image_layout = 0; };")
+    a("struct VkGenDescWrite {")
+    a("    uint32_t vdstset = 0, binding = 0, array_element = 0;")
+    a("    uint32_t descriptor_type = 0, descriptor_count = 0;")
+    a("    std::vector<VkGenBufferInfo> buffers;  // for buffer-class descriptors")
+    a("    std::vector<VkGenImageInfo> images;    // for image/sampler-class descriptors")
+    a("};")
+    a("// Image-class descriptor types (sampler / sampled-image / storage-image / combined /")
+    a("// input-attachment) ship an image-info triple per descriptor; the rest ship a buffer")
+    a("// triple. Matches the VkDescriptorType enum values (stable wire numbers).")
+    a("inline bool vk_gen_desc_is_image(uint32_t t) {")
+    a("    switch (t) {")
+    a("        case 0:  // VK_DESCRIPTOR_TYPE_SAMPLER")
+    a("        case 1:  // COMBINED_IMAGE_SAMPLER")
+    a("        case 2:  // SAMPLED_IMAGE")
+    a("        case 3:  // STORAGE_IMAGE")
+    a("        case 10: // INPUT_ATTACHMENT")
+    a("            return true;")
+    a("        default:")
+    a("            return false;  // UNIFORM_BUFFER / STORAGE_BUFFER / *_DYNAMIC / texel buffers")
+    a("    }")
+    a("}")
+    return "\n".join(L)
+
+
 def gen_decode_state_ext():
     L = []
     a = L.append
@@ -755,6 +988,11 @@ def gen_decode_state_ext():
     a("    std::map<uint32_t, VkSemaphore> semaphores; // vsem    -> real")
     a("    std::map<uint32_t, VkEvent> events;         // vevent  -> real")
     a("    std::map<uint32_t, VkQueryPool> query_pools; // vqpool  -> real")
+    a("    // WAVE B descriptor/layout handle tables.")
+    a("    std::map<uint32_t, VkDescriptorSetLayout> dsl;      // vdsl     -> real")
+    a("    std::map<uint32_t, VkPipelineLayout> pipeline_layouts; // vplayout -> real")
+    a("    std::map<uint32_t, VkDescriptorPool> descriptor_pools; // vdpool  -> real")
+    a("    std::map<uint32_t, VkDescriptorSet> descriptor_sets;   // vdset   -> real")
     a("#endif")
     a("    // Arena offset assigned to each device-memory virtual id (HOST_VISIBLE only).")
     a("    // UINT64_MAX == not arena-backed (e.g. a DEVICE_LOCAL alloc). Tracked even in")
@@ -968,6 +1206,133 @@ def gen_decode_case(op):
         a("#endif")
         a("            if (gp && gp->destroy_handle)")
         a(f"                gp->destroy_handle(gp->ctx, {op['op_enum']}, vdev, vhandle);")
+        a("            st.decoded++;")
+        a("            return true;")
+    elif k == "create_struct":
+        a("            uint32_t vdev = 0, vhandle = 0;")
+        a("            if (!r.u32(vdev) || !r.u32(vhandle)) { st.ok = false; return true; }")
+        decls, reads = [], []
+        for fname, wt in op["ci_wire_fields"]:
+            v = wire_var(fname)
+            decls.append(f"{ctype_for(wt)} {v} = 0;")
+            reads.append(reader_call(wt, v))
+        if decls:
+            a("            " + " ".join(decls))
+            a("            if (!(" + " && ".join(reads) + ")) { st.ok = false; return true; }")
+        # Each array: read u32 count (bounded), then count×{elem fields} into a flat vector
+        # of a small POD struct per element. The real body rebuilds the typed array.
+        for arr in op["arrays"]:
+            an = arr["array_name"]
+            a(f"            uint32_t {an}_count = 0;")
+            a(f"            if (!r.u32({an}_count)) {{ st.ok = false; return true; }}")
+            a(f"            if ({an}_count > 4096) {{ st.ok = false; return true; }}")
+            a(f"            std::vector<VkGenElem_{op['short']}_{an}> {an};")
+            a(f"            {an}.reserve({an}_count);")
+            a(f"            for (uint32_t i = 0; i < {an}_count; ++i) {{")
+            a(f"                VkGenElem_{op['short']}_{an} el{{}};")
+            er = []
+            for fname, wt in arr["fields"]:
+                er.append(reader_call(wt, "el." + wire_var(fname)))
+            a("                if (!(" + " && ".join(er) + ")) { st.ok = false; return true; }")
+            a(f"                {an}.push_back(el);")
+            a("            }")
+        a(gen_pnext_read())
+        a("            int res = -1;")
+        a("#ifdef ALR_VK_DECODE_REAL")
+        a("            if (!gp) {")
+        call_args = ["st", "vdev", "vhandle"]
+        call_args += [wire_var(f) for f, _ in op["ci_wire_fields"]]
+        call_args += [arr["array_name"] for arr in op["arrays"]]
+        a(f"                res = static_cast<int>(vk_gen_real_{op['short']}(")
+        a("                    " + ", ".join(call_args) + ", pnext_types, pnext_bytes));")
+        a("            }")
+        a("#endif")
+        a("            if (gp && gp->create_handle)")
+        a(f"                res = gp->create_handle(gp->ctx, {op['op_enum']}, vdev, vhandle, 0, 0);")
+        a("            reply.u8(static_cast<uint8_t>(ALR_VK_REPLY_GEN_ESCAPE));")
+        a(f"            reply.u16(static_cast<uint16_t>({op['reply_enum']}));")
+        a("            reply.u32(vhandle);")
+        a("            reply.i32(res);")
+        a("            st.decoded++;")
+        a("            return true;")
+    elif k == "alloc_sets":
+        a("            uint32_t vdev = 0, vpool = 0, set_count = 0;")
+        a("            if (!r.u32(vdev) || !r.u32(vpool) || !r.u32(set_count)) {")
+        a("                st.ok = false; return true; }")
+        a("            if (set_count > 4096) { st.ok = false; return true; }")
+        a("            std::vector<uint32_t> vlayouts, vsets;")
+        a("            vlayouts.reserve(set_count); vsets.reserve(set_count);")
+        a("            for (uint32_t i = 0; i < set_count; ++i) {")
+        a("                uint32_t vl = 0, vs = 0;")
+        a("                if (!r.u32(vl) || !r.u32(vs)) { st.ok = false; return true; }")
+        a("                vlayouts.push_back(vl); vsets.push_back(vs);")
+        a("            }")
+        a("            int res = -1;")
+        a("#ifdef ALR_VK_DECODE_REAL")
+        a("            if (!gp) {")
+        a("                res = static_cast<int>(vk_gen_real_allocate_descriptor_sets(")
+        a("                    st, vdev, vpool, vlayouts, vsets));")
+        a("            }")
+        a("#endif")
+        a("            if (gp && gp->create_handle)")
+        a(f"                res = gp->create_handle(gp->ctx, {op['op_enum']}, vdev,")
+        a("                                        set_count ? vsets[0] : 0, set_count, vpool);")
+        a("            reply.u8(static_cast<uint8_t>(ALR_VK_REPLY_GEN_ESCAPE));")
+        a(f"            reply.u16(static_cast<uint16_t>({op['reply_enum']}));")
+        a("            reply.u32(set_count);")
+        a("            reply.i32(res);")
+        a("            st.decoded++;")
+        a("            return true;")
+    elif k == "free_sets":
+        a("            uint32_t vdev = 0, vpool = 0, set_count = 0;")
+        a("            if (!r.u32(vdev) || !r.u32(vpool) || !r.u32(set_count)) {")
+        a("                st.ok = false; return true; }")
+        a("            if (set_count > 4096) { st.ok = false; return true; }")
+        a("            std::vector<uint32_t> vsets;")
+        a("            vsets.reserve(set_count);")
+        a("            for (uint32_t i = 0; i < set_count; ++i) {")
+        a("                uint32_t vs = 0; if (!r.u32(vs)) { st.ok = false; return true; }")
+        a("                vsets.push_back(vs);")
+        a("            }")
+        a("#ifdef ALR_VK_DECODE_REAL")
+        a("            if (!gp) vk_gen_real_free_descriptor_sets(st, vdev, vpool, vsets);")
+        a("#endif")
+        a("            if (gp && gp->destroy_handle)")
+        a(f"                gp->destroy_handle(gp->ctx, {op['op_enum']}, vdev, set_count);")
+        a("            st.decoded++;")
+        a("            return true;")
+    elif k == "update_sets":
+        a("            uint32_t vdev = 0, write_count = 0;")
+        a("            if (!r.u32(vdev) || !r.u32(write_count)) { st.ok = false; return true; }")
+        a("            if (write_count > 4096) { st.ok = false; return true; }")
+        a("            std::vector<VkGenDescWrite> writes;")
+        a("            writes.reserve(write_count);")
+        a("            for (uint32_t i = 0; i < write_count; ++i) {")
+        a("                VkGenDescWrite w{};")
+        a("                if (!r.u32(w.vdstset) || !r.u32(w.binding) || !r.u32(w.array_element) ||")
+        a("                    !r.u32(w.descriptor_type) || !r.u32(w.descriptor_count)) {")
+        a("                    st.ok = false; return true; }")
+        a("                if (w.descriptor_count > 4096) { st.ok = false; return true; }")
+        a("                bool is_image = vk_gen_desc_is_image(w.descriptor_type);")
+        a("                for (uint32_t d = 0; d < w.descriptor_count; ++d) {")
+        a("                    if (is_image) {")
+        a("                        VkGenImageInfo ii{};")
+        a("                        if (!r.u32(ii.vsampler) || !r.u32(ii.vimageview) ||")
+        a("                            !r.u32(ii.image_layout)) { st.ok = false; return true; }")
+        a("                        w.images.push_back(ii);")
+        a("                    } else {")
+        a("                        VkGenBufferInfo bi{};")
+        a("                        if (!r.u32(bi.vbuffer) || !r.u64(bi.offset) || !r.u64(bi.range)) {")
+        a("                            st.ok = false; return true; }")
+        a("                        w.buffers.push_back(bi);")
+        a("                    }")
+        a("                }")
+        a("                writes.push_back(std::move(w));")
+        a("            }")
+        a("#ifdef ALR_VK_DECODE_REAL")
+        a("            if (!gp) vk_gen_real_update_descriptor_sets(st, vdev, writes);")
+        a("#endif")
+        a("            (void)vdev;")
         a("            st.decoded++;")
         a("            return true;")
     a("        }")
@@ -1209,6 +1574,150 @@ def gen_icd_fn(op):
         a("    alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);")
         a("    if (!e.overflow) (void)alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));")
         a("}")
+    elif k == "create_struct":
+        out_ty = op["out"]
+        a(f"static VkResult VKAPI_CALL {fn}(VkDevice device, const {op['ci']} *pCreateInfo,")
+        a(f"                          const VkAllocationCallbacks *pAllocator, {out_ty} *pHandle) {{")
+        a("    (void)pAllocator;")
+        a("    AlrIcdDevice *dev = (AlrIcdDevice *)device;")
+        a("    uint32_t vid; int32_t res = 0; uint32_t ai;")
+        a("    if (!dev || !pCreateInfo || !pHandle) return VK_ERROR_INITIALIZATION_FAILED;")
+        a(f"    vid = alr_alloc(&{op['counter']}, 1);")
+        a("    if (alr_icd_ring_ok()) {")
+        # Heap request buffer sized generously for the arrays (each element <= 16 bytes; the
+        # counts are bounded by the host decode at 4096, but we cap our own loop too).
+        a("        AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];")
+        a("        size_t cap = 256;")
+        for arr in op["arrays"]:
+            a(f"        cap += (size_t)pCreateInfo->{arr['count_field']} * 24;")
+        a("        uint8_t *req = (uint8_t *)malloc(cap);")
+        a("        if (!req) return VK_ERROR_OUT_OF_HOST_MEMORY;")
+        a("        alr_vk_enc_init(&e, req, cap);")
+        a(f"        {op['enc_name']}_begin(&e, dev->vdev, vid{op['icd_ci_args']});")
+        for arr in op["arrays"]:
+            an = arr["array_name"]
+            cf = arr["count_field"]
+            pf = arr["ptr_field"]
+            a(f"        {{ uint32_t n = pCreateInfo->{cf}; if (n > 4096) n = 4096;")
+            a(f"          {op['enc_name']}_{an}_count(&e, n);")
+            a(f"          for (ai = 0; ai < n; ++ai) {{")
+            # Build the per-element encode args from the real array element.
+            elem_args = []
+            for fname, wt in arr["fields"]:
+                if fname.startswith("@self"):
+                    # The element IS a handle (e.g. pSetLayouts[ai] is a VkDescriptorSetLayout);
+                    # ship its virtual id (the handle carries it in its low bits).
+                    elem_args.append(f"(uint32_t)(uintptr_t)pCreateInfo->{pf}[ai]")
+                else:
+                    elem_args.append(f"(uint32_t)pCreateInfo->{pf}[ai].{fname}")
+            a(f"              {op['enc_name']}_{an}_elem(&e, {', '.join(elem_args)}); }} }}")
+        a("        alr_vk_gen_pnext_count(&e, 0);")
+        a("        alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);")
+        a("        if (!e.overflow) {")
+        a("            uint32_t rlen = alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));")
+        a(f"            if (rlen) (void)alr_icd_gen_scan_result(reply, rlen, (uint16_t){op['reply_enum']}, &res);")
+        a("            else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;")
+        a("        } else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;")
+        a("        free(req);")
+        a("    }")
+        a("    if (res != 0) return (VkResult)res;")
+        a(f"    *pHandle = ({out_ty})(uintptr_t)vid;")
+        a("    return VK_SUCCESS;")
+        a("}")
+    elif k == "alloc_sets":
+        a(f"static VkResult VKAPI_CALL {fn}(VkDevice device,")
+        a("                          const VkDescriptorSetAllocateInfo *pAllocateInfo,")
+        a("                          VkDescriptorSet *pDescriptorSets) {")
+        a("    AlrIcdDevice *dev = (AlrIcdDevice *)device; uint32_t i; int32_t res = 0;")
+        a("    if (!dev || !pAllocateInfo || !pDescriptorSets) return VK_ERROR_INITIALIZATION_FAILED;")
+        a("    uint32_t n = pAllocateInfo->descriptorSetCount; if (n > 4096) n = 4096;")
+        a("    /* Pre-assign a virtual id per set (client-side, monotonic) and write them out;")
+        a("     * the host maps each to a real descriptor set allocated from the real pool. */")
+        a("    for (i = 0; i < n; ++i)")
+        a(f"        pDescriptorSets[i] = (VkDescriptorSet)(uintptr_t)alr_alloc(&{op['counter']}, 1);")
+        a("    if (alr_icd_ring_ok()) {")
+        a("        AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];")
+        a("        size_t cap = 64 + (size_t)n * 8; uint8_t *req = (uint8_t *)malloc(cap);")
+        a("        if (!req) return VK_ERROR_OUT_OF_HOST_MEMORY;")
+        a("        alr_vk_enc_init(&e, req, cap);")
+        a(f"        {op['enc_name']}_begin(&e, dev->vdev,")
+        a("                          (uint32_t)(uintptr_t)pAllocateInfo->descriptorPool, n);")
+        a("        for (i = 0; i < n; ++i)")
+        a(f"            {op['enc_name']}_set(&e, (uint32_t)(uintptr_t)pAllocateInfo->pSetLayouts[i],")
+        a("                              (uint32_t)(uintptr_t)pDescriptorSets[i]);")
+        a("        alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);")
+        a("        if (!e.overflow) {")
+        a("            uint32_t rlen = alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));")
+        a(f"            if (rlen) (void)alr_icd_gen_scan_result(reply, rlen, (uint16_t){op['reply_enum']}, &res);")
+        a("            else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;")
+        a("        } else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;")
+        a("        free(req);")
+        a("    }")
+        a("    return (VkResult)res;")
+        a("}")
+    elif k == "free_sets":
+        a(f"static VkResult VKAPI_CALL {fn}(VkDevice device, VkDescriptorPool descriptorPool,")
+        a("                          uint32_t descriptorSetCount,")
+        a("                          const VkDescriptorSet *pDescriptorSets) {")
+        a("    AlrIcdDevice *dev = (AlrIcdDevice *)device; uint32_t i;")
+        a("    if (!dev) return VK_ERROR_INITIALIZATION_FAILED;")
+        a("    if (!alr_icd_ring_ok() || descriptorSetCount == 0 || !pDescriptorSets) return VK_SUCCESS;")
+        a("    {")
+        a("        AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];")
+        a("        uint32_t n = descriptorSetCount > 4096 ? 4096 : descriptorSetCount;")
+        a("        size_t cap = 32 + (size_t)n * 4; uint8_t *req = (uint8_t *)malloc(cap);")
+        a("        if (!req) return VK_ERROR_OUT_OF_HOST_MEMORY;")
+        a("        alr_vk_enc_init(&e, req, cap);")
+        a(f"        {op['enc_name']}_begin(&e, dev->vdev, (uint32_t)(uintptr_t)descriptorPool, n);")
+        a("        for (i = 0; i < n; ++i)")
+        a(f"            {op['enc_name']}_set(&e, (uint32_t)(uintptr_t)pDescriptorSets[i]);")
+        a("        alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);")
+        a("        if (!e.overflow) (void)alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));")
+        a("        free(req);")
+        a("    }")
+        a("    return VK_SUCCESS;")
+        a("}")
+    elif k == "update_sets":
+        a(f"static void VKAPI_CALL {fn}(VkDevice device, uint32_t descriptorWriteCount,")
+        a("                          const VkWriteDescriptorSet *pDescriptorWrites,")
+        a("                          uint32_t descriptorCopyCount,")
+        a("                          const VkCopyDescriptorSet *pDescriptorCopies) {")
+        a("    AlrIcdDevice *dev = (AlrIcdDevice *)device; uint32_t i, d;")
+        a("    (void)descriptorCopyCount; (void)pDescriptorCopies;  /* copies deferred */")
+        a("    if (!dev || !alr_icd_ring_ok() || descriptorWriteCount == 0 || !pDescriptorWrites) return;")
+        a("    {")
+        a("        AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];")
+        a("        uint32_t wn = descriptorWriteCount > 4096 ? 4096 : descriptorWriteCount;")
+        a("        size_t cap = 64; for (i = 0; i < wn; ++i) cap += 24 + (size_t)pDescriptorWrites[i].descriptorCount * 24;")
+        a("        uint8_t *req = (uint8_t *)malloc(cap);")
+        a("        if (!req) return;")
+        a("        alr_vk_enc_init(&e, req, cap);")
+        a(f"        {op['enc_name']}_begin(&e, dev->vdev, wn);")
+        a("        for (i = 0; i < wn; ++i) {")
+        a("            const VkWriteDescriptorSet *w = &pDescriptorWrites[i];")
+        a("            uint32_t dc = w->descriptorCount > 4096 ? 4096 : w->descriptorCount;")
+        a(f"            {op['enc_name']}_write(&e, (uint32_t)(uintptr_t)w->dstSet, w->dstBinding,")
+        a("                              w->dstArrayElement, (uint32_t)w->descriptorType, dc);")
+        a("            int is_image = alr_vk_desc_type_is_image((uint32_t)w->descriptorType);")
+        a("            for (d = 0; d < dc; ++d) {")
+        a("                if (is_image) {")
+        a("                    uint32_t vsamp = w->pImageInfo ? (uint32_t)(uintptr_t)w->pImageInfo[d].sampler : 0;")
+        a("                    uint32_t vview = w->pImageInfo ? (uint32_t)(uintptr_t)w->pImageInfo[d].imageView : 0;")
+        a("                    uint32_t lay   = w->pImageInfo ? (uint32_t)w->pImageInfo[d].imageLayout : 0;")
+        a(f"                    {op['enc_name']}_image_info(&e, vsamp, vview, lay);")
+        a("                } else {")
+        a("                    uint32_t vbuf = w->pBufferInfo ? (uint32_t)(uintptr_t)w->pBufferInfo[d].buffer : 0;")
+        a("                    uint64_t off  = w->pBufferInfo ? (uint64_t)w->pBufferInfo[d].offset : 0;")
+        a("                    uint64_t rng  = w->pBufferInfo ? (uint64_t)w->pBufferInfo[d].range : 0;")
+        a(f"                    {op['enc_name']}_buffer_info(&e, vbuf, off, rng);")
+        a("                }")
+        a("            }")
+        a("        }")
+        a("        alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);")
+        a("        if (!e.overflow) (void)alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));")
+        a("        free(req);")
+        a("    }")
+        a("}")
     return "\n".join(L)
 
 
@@ -1336,6 +1845,11 @@ COUNTERS = {
     "VkSemaphore": "g_next_vsem",
     "VkEvent": "g_next_vevent",
     "VkQueryPool": "g_next_vqpool",
+    # WAVE B descriptor/layout virtual-id pools.
+    "VkDescriptorSetLayout": "g_next_vdsl",
+    "VkPipelineLayout": "g_next_vplayout",
+    "VkDescriptorPool": "g_next_vdpool",
+    "VkDescriptorSet": "g_next_vdset",
 }
 VHANDLE_VAR = {
     "VkCommandPool": "vpool",
@@ -1350,6 +1864,10 @@ VHANDLE_VAR = {
     "VkSemaphore": "vsem",
     "VkEvent": "vevent",
     "VkQueryPool": "vqpool",
+    "VkDescriptorSetLayout": "vdsl",
+    "VkPipelineLayout": "vplayout",
+    "VkDescriptorPool": "vdpool",
+    "VkDescriptorSet": "vdset",
 }
 SHORT = {
     "vkCreateCommandPool": "create_command_pool",
@@ -1380,6 +1898,16 @@ SHORT = {
     "vkDestroyEvent": "destroy_event",
     "vkCreateQueryPool": "create_query_pool",
     "vkDestroyQueryPool": "destroy_query_pool",
+    # WAVE B.
+    "vkCreateDescriptorSetLayout": "create_descriptor_set_layout",
+    "vkDestroyDescriptorSetLayout": "destroy_descriptor_set_layout",
+    "vkCreatePipelineLayout": "create_pipeline_layout",
+    "vkDestroyPipelineLayout": "destroy_pipeline_layout",
+    "vkCreateDescriptorPool": "create_descriptor_pool",
+    "vkDestroyDescriptorPool": "destroy_descriptor_pool",
+    "vkAllocateDescriptorSets": "allocate_descriptor_sets",
+    "vkFreeDescriptorSets": "free_descriptor_sets",
+    "vkUpdateDescriptorSets": "update_descriptor_sets",
 }
 # Reply-record payload sizes (after the u8 opcode) for the ICD skip table.
 REPLY_SKIP = {
@@ -1417,7 +1945,7 @@ def resolve_ops(reg):
         op_num += 1
         k = spec["kind"]
         has_reply = k in ("create_handle", "create_pool", "alloc_memory", "map_memory",
-                          "get_reqs", "bind_memory")
+                          "get_reqs", "bind_memory", "create_struct", "alloc_sets")
         if has_reply:
             op["reply_enum"] = "ALR_VK_GEN_REPLY_" + out_snake.upper()
             op["reply_num"] = reply_num
@@ -1426,11 +1954,15 @@ def resolve_ops(reg):
                 "create_handle": REPLY_SKIP["result"], "create_pool": REPLY_SKIP["result"],
                 "bind_memory": REPLY_SKIP["result"], "alloc_memory": REPLY_SKIP["alloc"],
                 "map_memory": REPLY_SKIP["map"], "get_reqs": REPLY_SKIP["reqs"],
+                # create_struct reply is { u32 vid, i32 result }; alloc_sets is
+                # { u32 set_count, i32 result } — same two-field shape as "result".
+                "create_struct": REPLY_SKIP["result"], "alloc_sets": REPLY_SKIP["result"],
             }[k]
         else:
             op["reply_enum"] = None
             op["reply_num"] = None
-        if k in ("create_handle", "create_pool", "alloc_memory"):
+        # create_struct / alloc_sets need an out handle type (counter + vout) like create_*.
+        if k in ("create_handle", "create_pool", "alloc_memory", "create_struct", "alloc_sets"):
             out_ty = spec["out"]
             op["counter"] = COUNTERS[out_ty]
             op["vout"] = VHANDLE_VAR[out_ty]
@@ -1455,6 +1987,24 @@ def resolve_ops(reg):
                 while len(scal) < 2:
                     scal.append("0")
                 op["ci_first_two"] = f"(uint64_t){scal[0]}, (uint64_t){scal[1]}"
+        if k == "create_struct":
+            op["ci_wire_fields"] = list(spec["ci_fields"])
+            # ICD-side scalar args for _begin (same per-field cast as create_handle).
+            _cast = {"u32": "(uint32_t)", "u64": "(uint64_t)", "i32": "(int32_t)",
+                     "f32": "(float)", "vhandle": "(uint32_t)(uintptr_t)"}
+            icd_args = []
+            for fname, wt in spec["ci_fields"]:
+                if fname.startswith("@"):
+                    member = fname[1:].split(":", 1)[0]
+                    icd_args.append(f"(uint32_t)(uintptr_t)pCreateInfo->{member}")
+                else:
+                    icd_args.append(f"{_cast[wt]}pCreateInfo->{fname}")
+            op["icd_ci_args"] = ("" if not icd_args else ", " + ", ".join(icd_args))
+            # Give each array a stable C identifier (its ptr_field minus a leading 'p').
+            for arr in op["arrays"]:
+                pf = arr["ptr_field"]
+                arr["array_name"] = (pf[1:] if pf.startswith("p") else pf)
+                arr["array_name"] = arr["array_name"][0].lower() + arr["array_name"][1:]
         if k in ("get_reqs", "bind_memory", "destroy_handle", "map_memory", "unmap_memory"):
             if "handle_param" in spec:
                 hp_name, hp_ty = spec["handle_param"]

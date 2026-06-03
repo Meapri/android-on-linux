@@ -108,6 +108,17 @@ typedef int32_t  VkCompareOp;
 typedef int32_t  VkBorderColor;
 typedef int32_t  VkQueryType;
 
+/* ---- WAVE B (descriptor/layout create family) ABI additions. ---- */
+typedef uint64_t VkDescriptorSetLayout;
+typedef uint64_t VkPipelineLayout;
+typedef uint64_t VkDescriptorPool;
+typedef uint64_t VkDescriptorSet;
+typedef uint64_t VkBufferView;  /* texel-buffer view (pTexelBufferView; not shipped — null) */
+typedef uint32_t VkDescriptorSetLayoutCreateFlags;
+typedef uint32_t VkPipelineLayoutCreateFlags;
+typedef uint32_t VkDescriptorPoolCreateFlags;
+typedef int32_t  VkDescriptorType;
+
 typedef enum VkResult {
     VK_SUCCESS = 0,
     VK_NOT_READY = 1,
@@ -654,6 +665,100 @@ typedef struct VkQueryPoolCreateInfo {
     uint32_t                      queryCount;
     VkQueryPipelineStatisticFlags pipelineStatistics;
 } VkQueryPoolCreateInfo;
+
+/* ---- WAVE B CreateInfo / array-element / write structs (full ABI layout). The generated
+ * ICD forwarders read the array members the codegen SPEC lists + ship them on the wire;
+ * the host rebuilds the real structs + translates handles. ---- */
+typedef struct VkDescriptorSetLayoutBinding {
+    uint32_t           binding;
+    VkDescriptorType   descriptorType;
+    uint32_t           descriptorCount;
+    VkShaderStageFlags stageFlags;
+    const VkSampler   *pImmutableSamplers;
+} VkDescriptorSetLayoutBinding;
+
+typedef struct VkDescriptorSetLayoutCreateInfo {
+    VkStructureType                     sType;
+    const void                         *pNext;
+    VkDescriptorSetLayoutCreateFlags    flags;
+    uint32_t                            bindingCount;
+    const VkDescriptorSetLayoutBinding *pBindings;
+} VkDescriptorSetLayoutCreateInfo;
+
+typedef struct VkPushConstantRange {
+    VkShaderStageFlags stageFlags;
+    uint32_t           offset;
+    uint32_t           size;
+} VkPushConstantRange;
+
+typedef struct VkPipelineLayoutCreateInfo {
+    VkStructureType              sType;
+    const void                 *pNext;
+    VkPipelineLayoutCreateFlags flags;
+    uint32_t                    setLayoutCount;
+    const VkDescriptorSetLayout *pSetLayouts;
+    uint32_t                    pushConstantRangeCount;
+    const VkPushConstantRange  *pPushConstantRanges;
+} VkPipelineLayoutCreateInfo;
+
+typedef struct VkDescriptorPoolSize {
+    VkDescriptorType type;
+    uint32_t         descriptorCount;
+} VkDescriptorPoolSize;
+
+typedef struct VkDescriptorPoolCreateInfo {
+    VkStructureType             sType;
+    const void                *pNext;
+    VkDescriptorPoolCreateFlags flags;
+    uint32_t                    maxSets;
+    uint32_t                    poolSizeCount;
+    const VkDescriptorPoolSize *pPoolSizes;
+} VkDescriptorPoolCreateInfo;
+
+typedef struct VkDescriptorSetAllocateInfo {
+    VkStructureType              sType;
+    const void                 *pNext;
+    VkDescriptorPool            descriptorPool;
+    uint32_t                    descriptorSetCount;
+    const VkDescriptorSetLayout *pSetLayouts;
+} VkDescriptorSetAllocateInfo;
+
+typedef struct VkDescriptorImageInfo {
+    VkSampler     sampler;
+    VkImageView   imageView;
+    VkImageLayout imageLayout;
+} VkDescriptorImageInfo;
+
+typedef struct VkDescriptorBufferInfo {
+    VkBuffer     buffer;
+    VkDeviceSize offset;
+    VkDeviceSize range;
+} VkDescriptorBufferInfo;
+
+typedef struct VkWriteDescriptorSet {
+    VkStructureType               sType;
+    const void                   *pNext;
+    VkDescriptorSet               dstSet;
+    uint32_t                      dstBinding;
+    uint32_t                      dstArrayElement;
+    uint32_t                      descriptorCount;
+    VkDescriptorType              descriptorType;
+    const VkDescriptorImageInfo  *pImageInfo;
+    const VkDescriptorBufferInfo *pBufferInfo;
+    const VkBufferView           *pTexelBufferView;
+} VkWriteDescriptorSet;
+
+typedef struct VkCopyDescriptorSet {
+    VkStructureType sType;
+    const void     *pNext;
+    VkDescriptorSet srcSet;
+    uint32_t        srcBinding;
+    uint32_t        srcArrayElement;
+    VkDescriptorSet dstSet;
+    uint32_t        dstBinding;
+    uint32_t        dstArrayElement;
+    uint32_t        descriptorCount;
+} VkCopyDescriptorSet;
 
 /* The "2" sType values (official Vulkan constants). */
 #define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 1000059000

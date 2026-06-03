@@ -52,6 +52,23 @@ static inline int alr_vk_reader_u32(AlrVkReader *r, uint32_t *v){ return alr_vk_
 static inline int alr_vk_reader_u64(AlrVkReader *r, uint64_t *v){ return alr_vk_reader_take(r, v, 8); }
 static inline int alr_vk_reader_i32(AlrVkReader *r, int32_t *v) { return alr_vk_reader_take(r, v, 4); }
 
+/* Image-class VkDescriptorType -> ships an image-info triple per descriptor (else a buffer
+ * triple). MUST match the host-side vk_gen_desc_is_image (alr_gpu_vk_gen_decode.hpp) so the
+ * encode/decode agree on each descriptor's wire shape. Used by the generated
+ * vkUpdateDescriptorSets ICD forwarder (alr_gpu_vk_gen_icd.inc). */
+static inline int alr_vk_desc_type_is_image(uint32_t t) {
+    switch (t) {
+        case 0:  /* VK_DESCRIPTOR_TYPE_SAMPLER */
+        case 1:  /* COMBINED_IMAGE_SAMPLER */
+        case 2:  /* SAMPLED_IMAGE */
+        case 3:  /* STORAGE_IMAGE */
+        case 10: /* INPUT_ATTACHMENT */
+            return 1;
+        default:
+            return 0;
+    }
+}
+
 /* ---- The same-process arena (guest side): map the inherited memfd MAP_SHARED. ---- */
 typedef struct AlrIcdArena {
     int      ok;        /* 1 if mapped */

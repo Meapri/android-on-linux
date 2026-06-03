@@ -592,6 +592,275 @@ inline void vk_gen_real_destroy_query_pool(VkDecodeState& st, uint32_t vdev,
     t.query_pools.erase(vqpool);
 }
 
+// ===========================================================================
+// WAVE B — descriptor set layout / pipeline layout / descriptor pool + allocate/free/update
+// descriptor sets. These reconstruct an array-bearing CreateInfo (or write/alloc info) from
+// the wire element vectors the generated decode read, TRANSLATING every handle-typed element
+// (set-layout / image-view / sampler / buffer / descriptor-set virtual id) to its real Mali
+// handle via VkGenTables, then call real Mali. Device-iterate target: ANGLE's RendererVk
+// reaches descriptor-set management immediately after device setup (the trap proved its first
+// unimplemented call is vkFreeDescriptorSets).
+// ===========================================================================
+
+// ---- descriptor set layout (pBindings: binding/type/count/stageFlags; immutable samplers
+//      deferred — the binding's pImmutableSamplers is null) ----
+inline VkResult vk_gen_real_create_descriptor_set_layout(
+    VkDecodeState& st, uint32_t vdev, uint32_t vdsl, uint32_t flags,
+    const std::vector<VkGenElem_create_descriptor_set_layout_bindings>& bindings,
+    const std::vector<uint32_t>& pnext_types,
+    const std::vector<std::vector<uint8_t>>& pnext_bytes) {
+    (void)pnext_types; (void)pnext_bytes;
+    auto dit = st.real_dev.find(vdev);
+    if (dit == st.real_dev.end()) return VK_ERROR_INITIALIZATION_FAILED;
+    std::vector<VkDescriptorSetLayoutBinding> vb;
+    vb.reserve(bindings.size());
+    for (const auto& b : bindings) {
+        VkDescriptorSetLayoutBinding lb{};
+        lb.binding = b.binding;
+        lb.descriptorType = static_cast<VkDescriptorType>(b.descriptorType);
+        lb.descriptorCount = b.descriptorCount;
+        lb.stageFlags = b.stageFlags;
+        lb.pImmutableSamplers = nullptr;  // non-immutable samplers (ANGLE's path)
+        vb.push_back(lb);
+    }
+    VkDescriptorSetLayoutCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    ci.flags = flags;
+    ci.bindingCount = static_cast<uint32_t>(vb.size());
+    ci.pBindings = vb.empty() ? nullptr : vb.data();
+    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+    VkResult r = vkCreateDescriptorSetLayout(dit->second.dev, &ci, nullptr, &layout);
+    if (r == VK_SUCCESS) gen_tables(st).dsl[vdsl] = layout;
+    return r;
+}
+
+inline void vk_gen_real_destroy_descriptor_set_layout(VkDecodeState& st, uint32_t vdev,
+                                                      uint32_t vdsl) {
+    auto& t = gen_tables(st);
+    auto it = t.dsl.find(vdsl);
+    auto dit = st.real_dev.find(vdev);
+    if (it != t.dsl.end() && dit != st.real_dev.end() && it->second != VK_NULL_HANDLE)
+        vkDestroyDescriptorSetLayout(dit->second.dev, it->second, nullptr);
+    t.dsl.erase(vdsl);
+}
+
+// ---- pipeline layout (pSetLayouts: set-layout HANDLES translated via VkGenTables;
+//      pPushConstantRanges: stageFlags/offset/size) ----
+inline VkResult vk_gen_real_create_pipeline_layout(
+    VkDecodeState& st, uint32_t vdev, uint32_t vplayout, uint32_t flags,
+    const std::vector<VkGenElem_create_pipeline_layout_setLayouts>& setLayouts,
+    const std::vector<VkGenElem_create_pipeline_layout_pushConstantRanges>& pushConstantRanges,
+    const std::vector<uint32_t>& pnext_types,
+    const std::vector<std::vector<uint8_t>>& pnext_bytes) {
+    (void)pnext_types; (void)pnext_bytes;
+    auto dit = st.real_dev.find(vdev);
+    if (dit == st.real_dev.end()) return VK_ERROR_INITIALIZATION_FAILED;
+    auto& t = gen_tables(st);
+    std::vector<VkDescriptorSetLayout> real_sets;
+    real_sets.reserve(setLayouts.size());
+    for (const auto& s : setLayouts) {
+        auto it = t.dsl.find(s.self);
+        if (it == t.dsl.end()) return VK_ERROR_INITIALIZATION_FAILED;  // unknown layout id
+        real_sets.push_back(it->second);
+    }
+    std::vector<VkPushConstantRange> ranges;
+    ranges.reserve(pushConstantRanges.size());
+    for (const auto& p : pushConstantRanges) {
+        VkPushConstantRange pr{};
+        pr.stageFlags = p.stageFlags;
+        pr.offset = p.offset;
+        pr.size = p.size;
+        ranges.push_back(pr);
+    }
+    VkPipelineLayoutCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    ci.flags = flags;
+    ci.setLayoutCount = static_cast<uint32_t>(real_sets.size());
+    ci.pSetLayouts = real_sets.empty() ? nullptr : real_sets.data();
+    ci.pushConstantRangeCount = static_cast<uint32_t>(ranges.size());
+    ci.pPushConstantRanges = ranges.empty() ? nullptr : ranges.data();
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkResult r = vkCreatePipelineLayout(dit->second.dev, &ci, nullptr, &layout);
+    if (r == VK_SUCCESS) gen_tables(st).pipeline_layouts[vplayout] = layout;
+    return r;
+}
+
+inline void vk_gen_real_destroy_pipeline_layout(VkDecodeState& st, uint32_t vdev,
+                                                uint32_t vplayout) {
+    auto& t = gen_tables(st);
+    auto it = t.pipeline_layouts.find(vplayout);
+    auto dit = st.real_dev.find(vdev);
+    if (it != t.pipeline_layouts.end() && dit != st.real_dev.end() &&
+        it->second != VK_NULL_HANDLE)
+        vkDestroyPipelineLayout(dit->second.dev, it->second, nullptr);
+    t.pipeline_layouts.erase(vplayout);
+}
+
+// ---- descriptor pool (maxSets + pPoolSizes: type/descriptorCount). FREE_DESCRIPTOR_SET_BIT
+//      is forced on so our generated vkFreeDescriptorSets can return sets to the pool. ----
+inline VkResult vk_gen_real_create_descriptor_pool(
+    VkDecodeState& st, uint32_t vdev, uint32_t vdpool, uint32_t flags, uint32_t maxSets,
+    const std::vector<VkGenElem_create_descriptor_pool_poolSizes>& poolSizes,
+    const std::vector<uint32_t>& pnext_types,
+    const std::vector<std::vector<uint8_t>>& pnext_bytes) {
+    (void)pnext_types; (void)pnext_bytes;
+    auto dit = st.real_dev.find(vdev);
+    if (dit == st.real_dev.end()) return VK_ERROR_INITIALIZATION_FAILED;
+    std::vector<VkDescriptorPoolSize> sizes;
+    sizes.reserve(poolSizes.size());
+    for (const auto& p : poolSizes) {
+        VkDescriptorPoolSize ps{};
+        ps.type = static_cast<VkDescriptorType>(p.type);
+        ps.descriptorCount = p.descriptorCount ? p.descriptorCount : 1;
+        sizes.push_back(ps);
+    }
+    VkDescriptorPoolCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    // Honor the guest's flags + ensure FREE_DESCRIPTOR_SET so per-set free works (ANGLE may
+    // or may not set it; our free path needs it and it is always valid to enable).
+    ci.flags = flags | VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    ci.maxSets = maxSets ? maxSets : 1;
+    ci.poolSizeCount = static_cast<uint32_t>(sizes.size());
+    ci.pPoolSizes = sizes.empty() ? nullptr : sizes.data();
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkResult r = vkCreateDescriptorPool(dit->second.dev, &ci, nullptr, &pool);
+    if (r == VK_SUCCESS) gen_tables(st).descriptor_pools[vdpool] = pool;
+    return r;
+}
+
+inline void vk_gen_real_destroy_descriptor_pool(VkDecodeState& st, uint32_t vdev,
+                                                uint32_t vdpool) {
+    auto& t = gen_tables(st);
+    auto it = t.descriptor_pools.find(vdpool);
+    auto dit = st.real_dev.find(vdev);
+    if (it != t.descriptor_pools.end() && dit != st.real_dev.end() &&
+        it->second != VK_NULL_HANDLE)
+        vkDestroyDescriptorPool(dit->second.dev, it->second, nullptr);
+    t.descriptor_pools.erase(vdpool);
+    // The sets allocated from this pool are implicitly freed by the driver; drop any of our
+    // virtual-id mappings that pointed into it would require a reverse index — instead we
+    // leave stale vset entries (harmless: a freed set's id is never reused, monotonic).
+}
+
+// ---- allocate descriptor sets: N sets from the (virtual) pool against N (virtual) layouts;
+//      store each real set under the guest's pre-assigned virtual id. ----
+inline VkResult vk_gen_real_allocate_descriptor_sets(
+    VkDecodeState& st, uint32_t vdev, uint32_t vpool,
+    const std::vector<uint32_t>& vlayouts, const std::vector<uint32_t>& vsets) {
+    auto dit = st.real_dev.find(vdev);
+    if (dit == st.real_dev.end()) return VK_ERROR_INITIALIZATION_FAILED;
+    auto& t = gen_tables(st);
+    auto pit = t.descriptor_pools.find(vpool);
+    if (pit == t.descriptor_pools.end()) return VK_ERROR_INITIALIZATION_FAILED;
+    if (vlayouts.size() != vsets.size() || vsets.empty()) return VK_ERROR_INITIALIZATION_FAILED;
+    std::vector<VkDescriptorSetLayout> real_layouts;
+    real_layouts.reserve(vlayouts.size());
+    for (uint32_t vl : vlayouts) {
+        auto lit = t.dsl.find(vl);
+        if (lit == t.dsl.end()) return VK_ERROR_INITIALIZATION_FAILED;
+        real_layouts.push_back(lit->second);
+    }
+    VkDescriptorSetAllocateInfo ai{};
+    ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    ai.descriptorPool = pit->second;
+    ai.descriptorSetCount = static_cast<uint32_t>(real_layouts.size());
+    ai.pSetLayouts = real_layouts.data();
+    std::vector<VkDescriptorSet> real_sets(real_layouts.size(), VK_NULL_HANDLE);
+    VkResult r = vkAllocateDescriptorSets(dit->second.dev, &ai, real_sets.data());
+    if (r != VK_SUCCESS) return r;
+    for (size_t i = 0; i < vsets.size(); ++i)
+        t.descriptor_sets[vsets[i]] = real_sets[i];
+    return VK_SUCCESS;
+}
+
+// ---- free descriptor sets back to their pool ----
+inline void vk_gen_real_free_descriptor_sets(VkDecodeState& st, uint32_t vdev, uint32_t vpool,
+                                             const std::vector<uint32_t>& vsets) {
+    auto dit = st.real_dev.find(vdev);
+    if (dit == st.real_dev.end()) return;
+    auto& t = gen_tables(st);
+    auto pit = t.descriptor_pools.find(vpool);
+    if (pit == t.descriptor_pools.end()) return;
+    std::vector<VkDescriptorSet> real_sets;
+    real_sets.reserve(vsets.size());
+    for (uint32_t vs : vsets) {
+        auto sit = t.descriptor_sets.find(vs);
+        if (sit != t.descriptor_sets.end() && sit->second != VK_NULL_HANDLE)
+            real_sets.push_back(sit->second);
+    }
+    if (!real_sets.empty())
+        vkFreeDescriptorSets(dit->second.dev, pit->second,
+                             static_cast<uint32_t>(real_sets.size()), real_sets.data());
+    for (uint32_t vs : vsets) t.descriptor_sets.erase(vs);
+}
+
+// ---- update descriptor sets: bind buffers/images/samplers into the (virtual) destination
+//      sets. Each write's per-descriptor handles are translated to real Mali handles. ----
+inline void vk_gen_real_update_descriptor_sets(VkDecodeState& st, uint32_t vdev,
+                                               const std::vector<VkGenDescWrite>& writes) {
+    auto dit = st.real_dev.find(vdev);
+    if (dit == st.real_dev.end()) return;
+    auto& t = gen_tables(st);
+    // Storage for the per-write info arrays must outlive the vkUpdateDescriptorSets call.
+    std::vector<VkWriteDescriptorSet> vw;
+    std::vector<std::vector<VkDescriptorBufferInfo>> buf_store;
+    std::vector<std::vector<VkDescriptorImageInfo>> img_store;
+    vw.reserve(writes.size());
+    buf_store.reserve(writes.size());
+    img_store.reserve(writes.size());
+    for (const auto& w : writes) {
+        auto dsit = t.descriptor_sets.find(w.vdstset);
+        if (dsit == t.descriptor_sets.end() || dsit->second == VK_NULL_HANDLE)
+            continue;  // unknown destination set: skip (don't feed the driver a bad handle)
+        VkWriteDescriptorSet wd{};
+        wd.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wd.dstSet = dsit->second;
+        wd.dstBinding = w.binding;
+        wd.dstArrayElement = w.array_element;
+        wd.descriptorType = static_cast<VkDescriptorType>(w.descriptor_type);
+        if (!w.images.empty()) {
+            std::vector<VkDescriptorImageInfo> infos;
+            infos.reserve(w.images.size());
+            for (const auto& ii : w.images) {
+                VkDescriptorImageInfo di{};
+                if (ii.vsampler) {
+                    auto sit = t.samplers.find(ii.vsampler);
+                    di.sampler = (sit != t.samplers.end()) ? sit->second : VK_NULL_HANDLE;
+                }
+                if (ii.vimageview) {
+                    auto vit = t.views.find(ii.vimageview);
+                    di.imageView = (vit != t.views.end()) ? vit->second : VK_NULL_HANDLE;
+                }
+                di.imageLayout = static_cast<VkImageLayout>(ii.image_layout);
+                infos.push_back(di);
+            }
+            img_store.push_back(std::move(infos));
+            wd.descriptorCount = static_cast<uint32_t>(img_store.back().size());
+            wd.pImageInfo = img_store.back().data();
+        } else {
+            std::vector<VkDescriptorBufferInfo> infos;
+            infos.reserve(w.buffers.size());
+            for (const auto& bi : w.buffers) {
+                VkDescriptorBufferInfo db{};
+                if (bi.vbuffer) {
+                    auto bit = t.buffers.find(bi.vbuffer);
+                    db.buffer = (bit != t.buffers.end()) ? bit->second : VK_NULL_HANDLE;
+                }
+                db.offset = bi.offset;
+                db.range = bi.range ? bi.range : VK_WHOLE_SIZE;
+                infos.push_back(db);
+            }
+            buf_store.push_back(std::move(infos));
+            wd.descriptorCount = static_cast<uint32_t>(buf_store.back().size());
+            wd.pBufferInfo = buf_store.back().data();
+        }
+        if (wd.descriptorCount) vw.push_back(wd);
+    }
+    if (!vw.empty())
+        vkUpdateDescriptorSets(dit->second.dev, static_cast<uint32_t>(vw.size()), vw.data(),
+                               0, nullptr);
+}
+
 }  // namespace alr::gpu
 
 #endif  // ALR_VK_DECODE_REAL

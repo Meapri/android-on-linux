@@ -151,6 +151,11 @@ static uint32_t g_next_vfence  = 13000000;
 static uint32_t g_next_vsem    = 14000000;
 static uint32_t g_next_vevent  = 15000000;
 static uint32_t g_next_vqpool  = 16000000;
+/* WAVE B generated descriptor/layout virtual-id pools. */
+static uint32_t g_next_vdsl     = 17000000;
+static uint32_t g_next_vplayout = 18000000;
+static uint32_t g_next_vdpool   = 19000000;
+static uint32_t g_next_vdset    = 20000000;
 /* The vcmd of the most recent coarse draw-record (alrVkCmdDrawTriangleModules). The
  * single-surface bring-up records then presents, so QUEUE_PRESENT (which keys the host's
  * recorded draw by vcmd) uses this. A multi-surface breadth rung carries vcmd explicitly
