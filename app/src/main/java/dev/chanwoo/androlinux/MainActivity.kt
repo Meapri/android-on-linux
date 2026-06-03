@@ -727,6 +727,15 @@ class MainActivity : Activity() {
         val alrVkDrawPassed =
             alrVkDrawProbe.lineStartingWith("ALR VK DRAW MARSHAL:") ==
                 "ALR VK DRAW MARSHAL: PASS"
+        // VK-M3 (guest Vulkan ICD): host-side self-test of the ICD servicer + dual-ring
+        // transport — a host producer speaks the same wire the guest libvulkan.so.1 ICD
+        // emits, the servicer replays it on real Mali + writes the reply ring, asserting
+        // "Mali-G615" surfaced. logcat tag "vk-icd-service:". (Guest-ICD end-to-end is
+        // the alr-vk-enum device test, run via the loader with ALR_VK_ICD=1.)
+        val alrVkIcdServiceProbe = nativeAlrGpuVkIcdServiceProbe()
+        val alrVkIcdServicePassed =
+            alrVkIcdServiceProbe.lineStartingWith("ALR VK ICD SERVICE:") ==
+                "ALR VK ICD SERVICE: PASS"
         // Goal-2 (Chromium) prep: V8-style iterative W^X executable memory. PASS => V8
         // JIT runs without --jitless on this untrusted_app domain.
         val jitWxProbe = nativeJitWxProbe()
@@ -954,6 +963,7 @@ class MainActivity : Activity() {
             "\nALR VK ENUM MARSHAL (guest Vulkan enumerate/props -> ring -> real Mali libvulkan): ${if (alrVkMarshalPassed) "PASS" else "FAIL"}" +
             "\nALR VK RENDER MARSHAL (guest Vulkan device+queue+cmdbuf+clear -> real Mali -> AHB readback): ${if (alrVkRenderPassed) "PASS" else "FAIL"}" +
             "\nALR VK DRAW MARSHAL (guest Vulkan graphics-pipeline vkCmdDraw -> real Mali -> AHB readback): ${if (alrVkDrawPassed) "PASS" else "FAIL"}" +
+            "\nALR VK ICD SERVICE (guest libvulkan.so.1 ICD path: servicer drains ring -> real Mali enum -> reply ring): ${if (alrVkIcdServicePassed) "PASS" else "FAIL"}" +
             "\nALR JIT WX CYCLE (V8-style iterative RW<->RX exec memory; PASS => Chromium V8 needs no --jitless): ${if (jitWxPassed) "PASS" else "FAIL"}" +
             "\nHOST GPU EGL/GLES EXECUTION: ${if (hostGpuHardwareCandidate) "PASS" else "FAIL"}" +
             "\nANDROID HOST VULKAN PROBE EXECUTION: ${if (hostVulkanHardwareCandidate) "PASS" else "FAIL"}" +
@@ -2057,7 +2067,12 @@ class MainActivity : Activity() {
             // and ANGLE dlopen()s these as the "system" EGL/GLES; with the GPU ring
             // attached (loader, gated on ALR_GPU_ACCEL=1) they drive the host Mali
             // executor (the same shim that scored glmark2-es2 1074 on-device).
-            for (name in listOf("interpose", "nss", "chromium-net", "xkb-gegl", "gpushim", "chromium-gui")) {
+            // vk-icd: the guest Vulkan ICD overlay (/usr/lib/androlinux/libvulkan.so.1 +
+            // unversioned symlink + alr_icd.json manifest). A guest launched with
+            // ALR_VK_ICD=1 binds it as libvulkan and marshals to real Mali over the VK
+            // ring (alr_gpu/guest_icd/, host servicer alr_gpu_vk_host_service.hpp). Built
+            // by tools/build_vk_icd_overlay.py -> /data/local/tmp/vk-icd-stage.tar.
+            for (name in listOf("interpose", "nss", "chromium-net", "xkb-gegl", "gpushim", "vk-icd", "chromium-gui")) {
                 try {
                     val tar = File("/data/local/tmp/$name-stage.tar")
                     val marker = File(rootfsDir, ".$name-staged-${tar.length()}")
@@ -3911,6 +3926,7 @@ class MainActivity : Activity() {
     private external fun nativeAlrGpuVkMarshalProbe(): String
     private external fun nativeAlrGpuVkRenderProbe(): String
     private external fun nativeAlrGpuVkDrawProbe(): String
+    private external fun nativeAlrGpuVkIcdServiceProbe(): String
 
     private external fun nativeJitWxProbe(): String
 
