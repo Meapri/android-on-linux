@@ -82,6 +82,15 @@ void alr_ime_commit_text(const char* utf8, int32_t len);
 // guest is focused.
 void alr_ime_delete_surrounding(uint32_t before_bytes, uint32_t after_bytes);
 
+// Composing (pre-edit) text from a CJK/glide IME (InputConnection.setComposingText).
+// Sends zwp_text_input_v3.preedit_string(utf8, cursor_byte, cursor_byte) + done so the
+// guest widget shows the underlined composing run live; finishComposingText/commitText
+// clear it (alr_ime_commit_text sends an empty preedit before the commit_string). utf8
+// is real UTF-8 of length `len` bytes (empty => clear preedit); cursor_byte is the
+// caret's UTF-8 byte offset within utf8. No-op if no text-input guest is focused.
+// (This is the §6 "composing text" path the design routes alongside commit/delete.)
+void alr_ime_preedit(const char* utf8, int32_t len, int32_t cursor_byte);
+
 // Keysym/keymap path (the FALLBACK + the only path for guests that don't bind
 // zwp_text_input_v3, e.g. foot terminal, SDL games, raw xkb apps): inject one
 // committed Unicode code point as a synthesized wl_keyboard key press+release on

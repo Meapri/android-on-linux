@@ -1,6 +1,11 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- USB Host: enumerate + open physical USB devices over OTG/USB-C for the
+         Linux guest's libusb shim (docs/design/android-usb-host.md §2.1). No
+         runtime permission is needed — access is granted per-device by the
+         system USB dialog. required=false keeps the APK installable without OTG. -->
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
     <application
         android:allowBackup="false"
         android:label="AndroLinux Runtime Lab"
@@ -18,11 +23,23 @@
 
         <!-- 게스트 실행화면 (내부 진입 — LauncherActivity 가 띄움). SurfaceView +
              컴포지터가 surface 재생성에 민감하므로 회전/리사이즈를 자체 처리. -->
+        <!-- exported=true is required ONLY because the optional USB_DEVICE_ATTACHED
+             intent-filter below makes the system able to route a USB-attach to it;
+             internal launches still come from LauncherActivity. The auto-grant
+             filter is optional polish (docs/design/android-usb-host.md §2.1) — the
+             system USB-permission dialog path works without it. -->
         <activity
             android:name=".ui.RunningSurfaceActivity"
-            android:exported="false"
+            android:exported="true"
             android:configChanges="orientation|screenSize|keyboardHidden|density"
-            android:theme="@style/AppTheme" />
+            android:theme="@style/AppTheme">
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/usb_device_filter" />
+        </activity>
 
         <!-- 기존 probe 하니스 — LAUNCHER 강등(진단 전용, 외부 진입 불요).
              Standalone Chromium 경로(activity-alias .ui.ChromiumStandalone)가 이

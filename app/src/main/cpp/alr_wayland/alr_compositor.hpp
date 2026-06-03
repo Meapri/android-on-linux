@@ -160,10 +160,59 @@ void alr_wayland_inject_pointer_motion(double x, double y);
 void alr_wayland_inject_pointer_button(uint32_t evdev_button, uint32_t pressed);
 void alr_wayland_inject_pointer_axis(double value, int32_t axis);  // axis: 0=vertical 1=horizontal
 void alr_wayland_inject_touch(int32_t id, double x, double y, int32_t phase);  // 0=down 1=move 2=up
+// Multi-contact touch (real touch, NOT mouse-emulated). Forward each contact of one
+// Android MotionEvent with _touch_point (no implicit frame), then close the atomic set
+// once with _touch_frame. _touch_cancel drives wl_touch.cancel (Android ACTION_CANCEL).
+// Single-finger pointer emulation for pointer-only clients is decided compositor-side.
+void alr_wayland_inject_touch_point(int32_t id, double x, double y, int32_t phase);  // 0=down 1=move 2=up
+void alr_wayland_inject_touch_frame();
+void alr_wayland_inject_touch_cancel();
 void alr_wayland_inject_key(uint32_t evdev_key, uint32_t pressed);
 // Inject a synthetic burst (motion+click+touch+key) at the given point for
 // verifying the input path end to end. Returns the number of events queued.
 int alr_wayland_inject_selftest(double x, double y);
+
+// ---------------------------------------------------------------------------
+// Clipboard bridge (Android <-> Linux-guest selection). See
+// docs/design/android-clipboard-bridge.md. The compositor owns the
+// wl_data_device selection model; this header exposes only std::function sinks
+// and plain-data setters so alr_compositor.cpp stays free of any <jni.h>
+// dependency (the JNI glue lives in runtime_report.cpp, exactly like `present`).
+//
+// Threading: the sinks are invoked on the compositor thread (a raw pthread); a
+// JNI sink installed by runtime_report.cpp must AttachCurrentThread. The setter
+// (alr_wayland_set_android_selection) is callable from any thread — it enqueues
+// onto a clipboard queue and wakes the reactor.
+// ---------------------------------------------------------------------------
+
+// Native -> Android: the GUEST published a new selection advertising `mimes`.
+// Android decides whether/what to pull (we pull eagerly, then the text/image
+// sinks below deliver the bytes). Called on the compositor thread.
+using ClipboardGuestOfferCb =
+    std::function<void(const std::vector<std::string>& mimes)>;
+// Native -> Android: the guest bytes for a text `mime` (UTF-8) are ready.
+using ClipboardGuestTextCb =
+    std::function<void(const std::string& mime, const std::string& utf8)>;
+// Native -> Android: the guest bytes for image/png are ready.
+using ClipboardGuestImageCb =
+    std::function<void(const std::string& png_bytes)>;
+
+// Install the Android-side sinks. Pass empty std::functions to clear. Copies
+// the std::functions; callable from any thread (stored under a mutex).
+void alr_wayland_set_clipboard_sink(ClipboardGuestOfferCb on_offer,
+                                    ClipboardGuestTextCb on_text,
+                                    ClipboardGuestImageCb on_image);
+
+// Android -> guest: the Android primary clip changed. `mimes` is the set the
+// host can satisfy (e.g. {"text/plain;charset=utf-8","text/plain","UTF8_STRING"}
+// and/or "text/html"/"image/png"). `text`/`html` are UTF-8 (empty if absent);
+// `png` is raw PNG bytes (empty if absent). Empty `mimes` clears the Android
+// selection. Enqueues + wakes the reactor; the compositor synthesizes a
+// server-owned wl_data_offer on each guest data_device. Callable from any thread.
+void alr_wayland_set_android_selection(const std::vector<std::string>& mimes,
+                                       const std::string& text,
+                                       const std::string& html,
+                                       const std::string& png);
 
 }  // namespace alr::wayland
 

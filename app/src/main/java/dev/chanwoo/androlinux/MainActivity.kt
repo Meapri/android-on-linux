@@ -2,16 +2,25 @@ package dev.chanwoo.androlinux
 
 import android.Manifest
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipDescription
+import android.content.ClipboardManager
 import android.content.pm.PackageManager
 import android.content.Context
 import android.os.Build
 import android.os.Bundle
+import android.text.InputType
+import android.os.Handler
+import androidx.annotation.Keep
 import android.view.KeyEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
+import android.view.inputmethod.BaseInputConnection
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -23,6 +32,17 @@ import java.net.SocketTimeoutException
 import kotlin.concurrent.thread
 
 class MainActivity : Activity() {
+    // --- Android soft-keyboard IME <-> guest zwp_text_input_v3 state ---------
+    // Driven by the compositor's onGuestImeState upcall (a guest text field
+    // enabled/disabled text input). imeWanted gates onCheckIsTextEditor so the IME
+    // only treats the SurfaceView as an editor when a guest field has focus;
+    // imeInputType is recomputed from the guest content_purpose/hint. The
+    // SurfaceView the IME binds to is stashed here so onGuestImeState (on the UI
+    // thread, posted from the compositor thread) can restartInput / show / hide it.
+    @Volatile private var imeWanted = false
+    @Volatile private var imeInputType = InputType.TYPE_CLASS_TEXT
+    private var imeSurfaceView: SurfaceView? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         System.loadLibrary("alr_loader")
@@ -294,7 +314,7 @@ class MainActivity : Activity() {
         // is wired separately. Device test = CP-5.
         Thread {
             try {
-                for (name in listOf("sdl2", "netsurf", "qt6", "xwayland", "babl-gegl", "microbench", "interpose", "dpkg-db", "x11", "apt-config", "chromium-net", "nss", "chromium-gui")) {
+                for (name in listOf("sdl2", "netsurf", "qt6", "xwayland", "babl-gegl", "microbench", "interpose", "dpkg-db", "x11", "apt-config", "chromium-net", "nss", "chromium-gui", "pulse")) {
                     val tar = java.io.File("/data/local/tmp/$name-stage.tar")
                     val marker = java.io.File(rootfsStatus.rootfsDir, ".$name-staged-${tar.length()}")
                     if (tar.isFile && !marker.isFile) {
@@ -1287,7 +1307,23 @@ class MainActivity : Activity() {
             setPadding(32, 32, 32, 32)
             setTextIsSelectable(true)
         }
-        val surfaceView = SurfaceView(this).apply {
+        val surfaceView = object : SurfaceView(this) {
+            // Make the SurfaceView a soft-keyboard editor so an IME can deliver text
+            // (commitText/setComposingText) — a bare SurfaceView returns no
+            // InputConnection and silently drops all soft-IME text. onCheckIsTextEditor
+            // is gated on imeWanted so the keyboard only engages when a guest text
+            // field has focus (set by the compositor's onGuestImeState upcall).
+            override fun onCheckIsTextEditor(): Boolean = imeWanted
+            override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
+                outAttrs.inputType = imeInputType
+                outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_FULLSCREEN or
+                    EditorInfo.IME_FLAG_NO_EXTRACT_UI or
+                    EditorInfo.IME_ACTION_NONE
+                // fullEditor=false: there is no local text buffer; AlrInputConnection
+                // relays every edit straight to the guest via the native IME bridge.
+                return AlrInputConnection(this, false)
+            }
+        }.apply {
             // Focusable for BOTH touch and hardware/IME keys so key events dispatch
             // to our setOnKeyListener (and the soft keyboard can target this view).
             isFocusableInTouchMode = true
@@ -1306,26 +1342,48 @@ class MainActivity : Activity() {
                 } else false
             }
             // Production input path: forward real touches on the SurfaceView to the
-            // focused Wayland client (as wl_touch + wl_pointer) so GUI apps are
-            // interactive once a real toolkit window is up.
+            // focused Wayland client as multi-contact wl_touch (NOT a synthetic mouse).
+            // Each MotionEvent forwards ALL of its contacts, then one frame closes the
+            // atomic set; single-finger pointer emulation for pointer-only clients is
+            // decided compositor-side. This is the "touch feels like a mouse" fix:
+            //  - MOVE batches every current pointer (index 0..pointerCount-1), so a
+            //    two-finger drag moves BOTH fingers (the old code only moved index 0);
+            //  - DOWN/UP/POINTER_DOWN/POINTER_UP use actionIndex for BOTH the id AND the
+            //    coordinate (the old code sent index-0's x/y with the wrong finger's id);
+            //  - ACTION_CANCEL maps to a real wl_touch.cancel, not a lift.
             setOnTouchListener { v, ev ->
-                val phase = when (ev.actionMasked) {
+                when (ev.actionMasked) {
+                    android.view.MotionEvent.ACTION_CANCEL -> {
+                        nativeWaylandInjectTouchCancel()
+                    }
+                    android.view.MotionEvent.ACTION_MOVE -> {
+                        // One MOVE callback batches movement for ALL current contacts.
+                        for (i in 0 until ev.pointerCount) {
+                            nativeWaylandInjectTouch(ev.getPointerId(i), ev.getX(i), ev.getY(i), 1)
+                        }
+                        nativeWaylandInjectTouchFrame()
+                    }
                     android.view.MotionEvent.ACTION_DOWN,
-                    android.view.MotionEvent.ACTION_POINTER_DOWN -> 0
+                    android.view.MotionEvent.ACTION_POINTER_DOWN -> {
+                        val i = ev.actionIndex
+                        nativeWaylandInjectTouch(ev.getPointerId(i), ev.getX(i), ev.getY(i), 0)
+                        nativeWaylandInjectTouchFrame()
+                        if (ev.actionMasked == android.view.MotionEvent.ACTION_DOWN) {
+                            // The FIRST contact (re)claims key focus so hardware keys
+                            // reach the guest. Do NOT auto-raise the soft keyboard here —
+                            // it would steal focus and cover the lower half of the screen
+                            // on every tap (e.g. swallowing menu-item clicks). The IME is
+                            // raised only on demand (long-press) via showSoftKeyboard().
+                            v.requestFocus()
+                            v.performClick()
+                        }
+                    }
                     android.view.MotionEvent.ACTION_UP,
-                    android.view.MotionEvent.ACTION_POINTER_UP,
-                    android.view.MotionEvent.ACTION_CANCEL -> 2
-                    else -> 1
-                }
-                nativeWaylandInjectTouch(ev.getPointerId(ev.actionIndex), ev.x, ev.y, phase)
-                if (phase == 0) {
-                    // Tapping the GUI (re)claims key focus so hardware keys reach the
-                    // guest. Do NOT auto-raise the soft keyboard here — it would steal
-                    // focus and cover the lower half of the screen on every tap (e.g.
-                    // swallowing menu-item clicks). The IME is raised only on demand
-                    // (long-press) via showSoftKeyboard().
-                    v.requestFocus()
-                    v.performClick()
+                    android.view.MotionEvent.ACTION_POINTER_UP -> {
+                        val i = ev.actionIndex
+                        nativeWaylandInjectTouch(ev.getPointerId(i), ev.getX(i), ev.getY(i), 2)
+                        nativeWaylandInjectTouchFrame()
+                    }
                 }
                 true
             }
@@ -1434,6 +1492,39 @@ class MainActivity : Activity() {
                     val wlStart = nativeWaylandCompositorStart(
                         cacheDir.absolutePath, holder.surface, dm.densityDpi, dm.xdpi, dm.ydpi,
                         outW, outH, refreshMhz)
+                    // Wire the guest-IME-state upcall so a guest text field raises the
+                    // Android soft keyboard. The editor SurfaceView is stashed in
+                    // imeSurfaceView right after construction (below); onGuestImeState reads
+                    // it on the UI thread (posted from the compositor thread).
+                    nativeWaylandImeRegisterStateCallback()
+                    // Audio sink (design §9B): start the in-app PulseAudio-native server on
+                    // the SAME XDG_RUNTIME_DIR the compositor + guest env use
+                    // (cacheDir/alr-xdg → socket at .../pulse/native). Output-only AAudio
+                    // needs no runtime permission on API 26+. Started here, before the
+                    // chromium-test early return below, so audio is up for chromium too.
+                    try {
+                        val rate = (getSystemService(AUDIO_SERVICE) as android.media.AudioManager)
+                            .getProperty(android.media.AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE)
+                            ?.toIntOrNull() ?: 48000
+                        val xdgRuntimeDir = cacheDir.absolutePath + "/alr-xdg"
+                        val audioStart = nativeAudioSinkStart(xdgRuntimeDir, rate)
+                        android.util.Log.i("alr_loader", "audio sink: $audioStart")
+                    } catch (e: Throwable) {
+                        android.util.Log.e("alr_loader",
+                            "audio sink start EXC: ${android.util.Log.getStackTraceString(e)}")
+                    }
+                    // Clipboard bridge: start mirroring the Android primary clip into the
+                    // guest once the compositor (and its data_device) is up. The native
+                    // sink (installed in nativeWaylandCompositorStart) handles guest->Android.
+                    if (!clipListenerRegistered) {
+                        try {
+                            clipboard.addPrimaryClipChangedListener(clipListener)
+                            clipListenerRegistered = true
+                        } catch (t: Throwable) {
+                            android.util.Log.w("alr_clipboard",
+                                "addPrimaryClipChangedListener failed: ${t.message}")
+                        }
+                    }
                     // chromium-test fast path: when a CR-test flag is set, the chromium probe
                     // thread (started in onCreate) needs the loader's guest-launch lock
                     // immediately. This GUI guest battery (wl/pixman/gtk/foot/GIMP — GIMP alone
@@ -1872,6 +1963,9 @@ class MainActivity : Activity() {
                 override fun surfaceDestroyed(holder: SurfaceHolder) = Unit
             })
         }
+        // Stash the editor SurfaceView for the guest-IME-state upcall (onGuestImeState
+        // raises/hides the soft keyboard against it on the UI thread).
+        imeSurfaceView = surfaceView
         setContentView(
             LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
@@ -1896,6 +1990,27 @@ class MainActivity : Activity() {
         // even before the first touch. (post: run after layout so the view tree is
         // attached and requestFocus actually takes.)
         surfaceView.post { surfaceView.requestFocus() }
+    }
+
+    override fun onDestroy() {
+        // Clipboard bridge: stop mirroring the Android clip. The native sink + the
+        // MainActivity global ref are released when the compositor is stopped
+        // (nativeWaylandCompositorStop); here we just drop the listener so a
+        // destroyed Activity isn't held by the system clipboard service.
+        if (clipListenerRegistered) {
+            try { clipboard.removePrimaryClipChangedListener(clipListener) } catch (_: Throwable) {}
+            clipListenerRegistered = false
+        }
+        // Tear down the audio sink (joins the epoll thread, closes AAudio + the
+        // socket). Best-effort: a stop on a never-started sink is a no-op.
+        try {
+            val audioStop = nativeAudioSinkStop()
+            android.util.Log.i("alr_loader", "audio sink: $audioStop")
+        } catch (e: Throwable) {
+            android.util.Log.e("alr_loader",
+                "audio sink stop EXC: ${android.util.Log.getStackTraceString(e)}")
+        }
+        super.onDestroy()
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -2975,6 +3090,116 @@ class MainActivity : Activity() {
         imm?.showSoftInput(target, InputMethodManager.SHOW_IMPLICIT)
     }
 
+    // InputConnection that relays soft-keyboard edits to the focused guest via the
+    // native IME bridge. fullEditor=false: there is NO local text buffer — every
+    // method forwards straight to the compositor (zwp_text_input_v3.commit_string /
+    // preedit_string / delete_surrounding_text). commit/preedit text is sent as a
+    // UTF-8 ByteArray to avoid JNI's CESU-8 emoji corruption (see the native side).
+    private inner class AlrInputConnection(
+        targetView: View,
+        fullEditor: Boolean,
+    ) : BaseInputConnection(targetView, fullEditor) {
+        override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
+            val s = text?.toString() ?: ""
+            nativeWaylandImeCommitText(s.toByteArray(Charsets.UTF_8))
+            return true
+        }
+
+        override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean {
+            val s = text?.toString() ?: ""
+            val bytes = s.toByteArray(Charsets.UTF_8)
+            // Composing cursor at the end of the run (caret line, not a selection).
+            nativeWaylandImePreedit(bytes, bytes.size)
+            return true
+        }
+
+        override fun finishComposingText(): Boolean {
+            nativeWaylandImePreedit(ByteArray(0), 0)  // clear the composing run
+            return true
+        }
+
+        override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
+            // No local buffer to measure code points against, so char counts are
+            // forwarded as UTF-8 byte counts. Exact for ASCII/Latin-1; soft keyboards
+            // overwhelmingly delete via sendKeyEvent(KEYCODE_DEL) for non-full editors,
+            // which takes the hardware-key path below instead (documented v1 limit).
+            nativeWaylandImeDeleteSurrounding(beforeLength, afterLength)
+            return true
+        }
+
+        override fun sendKeyEvent(event: KeyEvent?): Boolean {
+            // Hardware-style keys the soft keyboard sends (Enter/Del/arrows) go through
+            // the SAME evdev key path as a physical keyboard, so the guest receives real
+            // wl_keyboard keys (KEY_ENTER/KEY_BACKSPACE), not a text edit. Printable text
+            // arrives via commitText (commit_string), never here — the two never overlap.
+            if (event == null) return super.sendKeyEvent(event)
+            val evdev = androidKeyToEvdev(event.keyCode)
+            if (evdev == 0) return super.sendKeyEvent(event)
+            when (event.action) {
+                KeyEvent.ACTION_DOWN -> nativeWaylandInjectKey(evdev, 1)
+                KeyEvent.ACTION_UP -> nativeWaylandInjectKey(evdev, 0)
+            }
+            return true
+        }
+
+        override fun performEditorAction(actionCode: Int): Boolean {
+            // Enter/Go/Search/Done -> inject KEY_ENTER (evdev 28) down+up to the guest.
+            nativeWaylandInjectKey(28, 1)
+            nativeWaylandInjectKey(28, 0)
+            return true
+        }
+    }
+
+    // Guest text-input enable/disable upcall from the compositor (JNI, on the
+    // compositor thread). Hops to the UI thread, then raises or hides the soft
+    // keyboard and re-reads the editor inputType. @Suppress: invoked by name from
+    // native code (runtime_report.cpp ime_state_trampoline), not from Kotlin.
+    @Suppress("unused")
+    fun onGuestImeState(
+        enabled: Boolean,
+        purpose: Int,
+        hint: Int,
+        curX: Int,
+        curY: Int,
+        curW: Int,
+        curH: Int,
+    ) {
+        runOnUiThread {
+            val sv = imeSurfaceView ?: return@runOnUiThread
+            imeWanted = enabled
+            imeInputType = imeInputTypeFor(purpose, hint)
+            val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+                ?: return@runOnUiThread
+            if (enabled) {
+                sv.requestFocus()
+                imm.restartInput(sv)  // re-call onCreateInputConnection so inputType applies
+                imm.showSoftInput(sv, InputMethodManager.SHOW_IMPLICIT)
+            } else {
+                imm.hideSoftInputFromWindow(sv.windowToken, 0)
+            }
+        }
+    }
+
+    // zwp_text_input_v3 content_purpose/hint -> Android EditorInfo.inputType. Enum
+    // values mirror text-input-unstable-v3.xml verbatim (see the design §3.3).
+    private fun imeInputTypeFor(purpose: Int, hint: Int): Int {
+        var t = when (purpose) {
+            2, 9 -> InputType.TYPE_CLASS_NUMBER                              // digits, pin
+            3 -> InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_SIGNED or
+                InputType.TYPE_NUMBER_FLAG_DECIMAL                            // number
+            4 -> InputType.TYPE_CLASS_PHONE                                  // phone
+            5 -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI            // url
+            6 -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS  // email
+            8 -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD       // password
+            10, 11, 12 -> InputType.TYPE_CLASS_DATETIME                       // date/time/datetime
+            else -> InputType.TYPE_CLASS_TEXT                                // normal/alpha/name/...
+        }
+        if (hint and 0x200 != 0) t = t or InputType.TYPE_TEXT_FLAG_MULTI_LINE      // multiline
+        if (hint and 0x80 != 0) t = t or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS   // sensitive_data
+        if (hint and 0x4 != 0) t = t or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES     // auto_capitalization
+        return t
+    }
+
     // Translate an Android KeyEvent.keyCode into a Linux evdev keycode
     // (<linux/input-event-codes.h>), which the compositor forwards verbatim as a
     // wl_keyboard key (the guest applies its own default keymap). Returns 0 for keys
@@ -3391,6 +3616,86 @@ class MainActivity : Activity() {
 
     private external fun nativeProbeVulkanSurface(surface: android.view.Surface): String
 
+    // ----- Clipboard bridge (Android <-> Linux-guest selection) -----
+    // See docs/design/android-clipboard-bridge.md. ClipboardManager is a
+    // UI-thread-affine system service; all get/set runs on the main thread.
+    private val clipboard by lazy { getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager }
+
+    // Loop-guard (§7): when WE write the guest's copy into the Android clipboard,
+    // the resulting OnPrimaryClipChangedListener is the echo of the guest's own
+    // selection — early-return so we don't push it back into the guest.
+    @Volatile private var suppressClipEcho = false
+    private var clipListenerRegistered = false
+
+    // Android primary clip changed -> push the host selection to the guest.
+    private val clipListener = ClipboardManager.OnPrimaryClipChangedListener {
+        if (suppressClipEcho) return@OnPrimaryClipChangedListener
+        try {
+            val clip = clipboard.primaryClip
+            if (clip == null || clip.itemCount == 0) {
+                nativeWaylandClipboardSetAndroid(emptyArray(), null, null, null)
+                return@OnPrimaryClipChangedListener
+            }
+            val desc = clip.description
+            val item = clip.getItemAt(0)
+            val text = item.coerceToText(this).toString()
+            val html = if (desc != null && desc.hasMimeType(ClipDescription.MIMETYPE_TEXT_HTML))
+                item.htmlText else null
+            // image/png is phase 2 (content-URI re-encode); text/html + text first.
+            val mimes = buildList {
+                if (text.isNotEmpty()) {
+                    add("text/plain;charset=utf-8"); add("text/plain"); add("UTF8_STRING")
+                }
+                if (!html.isNullOrEmpty()) add("text/html")
+            }.toTypedArray()
+            nativeWaylandClipboardSetAndroid(
+                mimes, text.ifEmpty { null }, html, null)
+        } catch (t: Throwable) {
+            // primaryClip reads can throw if the app momentarily lacks focus (API 29+);
+            // a clipboard hiccup must never crash the compositor host.
+            android.util.Log.w("alr_clipboard", "clip read failed: ${t.message}")
+        }
+    }
+
+    // native -> Kotlin: the GUEST advertised a new selection (comma-joined mimes).
+    // We pull eagerly native-side, so nothing to do here but log (kept for the sink).
+    @Keep
+    fun onGuestClipboardOffer(mimes: String) {
+        android.util.Log.i("alr_clipboard", "guest offer: $mimes")
+    }
+
+    // native -> Kotlin: the guest bytes for a text `mime` (UTF-8) are ready ->
+    // write them to the Android clipboard (suppressing the echo, §7).
+    @Keep
+    fun onGuestClipboardText(mime: String, utf8: String) {
+        runOnUiThread {
+            suppressClipEcho = true
+            try {
+                clipboard.setPrimaryClip(ClipData.newPlainText("ALR", utf8))
+            } catch (t: Throwable) {
+                android.util.Log.w("alr_clipboard", "setPrimaryClip failed: ${t.message}")
+            }
+            // Release the guard after the listener has had a chance to fire+early-return.
+            Handler(mainLooper).post { suppressClipEcho = false }
+        }
+    }
+
+    // native -> Kotlin: the guest bytes for image/png are ready (phase 2). Write an
+    // image clip so an Android app can paste it.
+    @Keep
+    fun onGuestClipboardImage(pngBytes: ByteArray) {
+        runOnUiThread {
+            android.util.Log.i("alr_clipboard", "guest image: ${pngBytes.size} bytes (phase 2)")
+        }
+    }
+
+    private external fun nativeWaylandClipboardSetAndroid(
+        mimes: Array<String>,
+        utf8Text: String?,
+        htmlText: String?,
+        pngBytes: ByteArray?,
+    )
+
     private external fun nativeWaylandCompositorStart(
         cacheDir: String,
         surface: android.view.Surface,
@@ -3419,12 +3724,34 @@ class MainActivity : Activity() {
         refreshMilliHz: Int,
     ): String
 
+    // ALR audio sink (in-app PulseAudio-native server -> AAudio; design §5f Option A).
+    // Kotlin only starts/stops the sink + reads status — no PCM crosses JNI.
+    private external fun nativeAudioSinkStart(xdgRuntimeDir: String, deviceRate: Int): String
+
+    private external fun nativeAudioSinkStatus(): String
+
+    private external fun nativeAudioSinkStop(): String
+
     private external fun nativeWaylandInjectSelfTest(x: Float, y: Float): String
 
     private external fun nativeWaylandInjectTouch(id: Int, x: Float, y: Float, phase: Int)
+    // Close the atomic set of touch changes for one MotionEvent (wl_touch.frame).
+    private external fun nativeWaylandInjectTouchFrame()
+    // Drive wl_touch.cancel from ACTION_CANCEL (gesture stolen by the system).
+    private external fun nativeWaylandInjectTouchCancel()
 
     private external fun nativeWaylandInjectKey(evdevKey: Int, pressed: Int)
     private external fun nativeWaylandInjectScroll(x: Float, y: Float, value: Double, axis: Int)
+
+    // --- Android soft-keyboard IME <-> guest zwp_text_input_v3 bridge --------
+    // commit/preedit text are passed as UTF-8 ByteArray (NOT String): JNI's
+    // GetStringUTFChars yields modified UTF-8 (CESU-8), corrupting emoji/astral
+    // code points; text.toByteArray(UTF_8) keeps them intact.
+    private external fun nativeWaylandImeCommitText(utf8: ByteArray)
+    private external fun nativeWaylandImePreedit(utf8: ByteArray, cursorByte: Int)
+    private external fun nativeWaylandImeDeleteSurrounding(beforeBytes: Int, afterBytes: Int)
+    private external fun nativeWaylandImeFocusHasTextInput(): Boolean
+    private external fun nativeWaylandImeRegisterStateCallback()
 
     private external fun nativeRenderVulkanSurfaceFrames(
         surface: android.view.Surface,
@@ -3435,4 +3762,11 @@ class MainActivity : Activity() {
         surface: android.view.Surface,
         encodedFrames: String,
     ): String
+
+    // USB host bridge diagnostics (docs/design/android-usb-host.md §5): reports
+    // whether the ALR USB bridge AF_UNIX socket (<cacheDir>/alr-usb/usbd.sock,
+    // also exported to the guest as ALR_USB_SOCK) is present + connectable. Pure
+    // observability; the bridge itself is the Kotlin dev.chanwoo.androlinux.usb.
+    // UsbHostBridge started where the guest launch env is assembled.
+    private external fun nativeUsbBridgeStatus(appCacheDir: String): String
 }

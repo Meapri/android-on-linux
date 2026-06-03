@@ -24,6 +24,7 @@
 
 #include "alr_wayland/alr_compositor.hpp"
 #include "alr_wayland/alr_present_source.hpp"  // §5-C GPU present contract
+#include "alr_wayland/alr_text_input.hpp"      // Android IME <-> guest text-input boundary
 #include "alr_wayland/alr_xkb_keymap_us.h"     // embedded self-contained XKB keymap
 
 #include <android/log.h>
@@ -35,6 +36,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -57,6 +59,7 @@ extern "C" {
 // Generated server glue (checked in under third_party/wayland_generated).
 #include "wayland-server-protocol.h"
 #include "xdg-shell-server-protocol.h"
+#include "text-input-unstable-v3-server-protocol.h"  // zwp_text_input_v3 (IME)
 }
 
 #define ALR_WL_TAG "alr_wayland"
@@ -133,6 +136,19 @@ struct SurfaceState {
     uint64_t sub_parent_key = 0;
     int32_t sub_x = 0;
     int32_t sub_y = 0;
+
+    // --- zwp_text_input_v3 per-surface state (IME / soft-keyboard) ---------
+    // Double-buffered: the pending_* fields collect enable/disable/content_type/
+    // cursor_rectangle changes; .commit atomically copies them into the current
+    // ti_* fields and fires the Android IME-show/hide upcall. State lives on the
+    // FOCUSED surface so it travels with the window and is cleared on unmap.
+    bool     ti_enabled = false;
+    bool     ti_pending_enabled = false;
+    uint32_t ti_purpose = 0,  ti_hint = 0;            // current (applied)
+    uint32_t ti_pending_purpose = 0, ti_pending_hint = 0;
+    int32_t  ti_cur_x = -1, ti_cur_y = -1, ti_cur_w = -1, ti_cur_h = -1;        // current
+    int32_t  ti_pending_cur_x = -1, ti_pending_cur_y = -1,
+             ti_pending_cur_w = -1, ti_pending_cur_h = -1;                       // pending
 };
 
 }  // namespace
@@ -211,6 +227,10 @@ public:
     }
 
     struct wl_display* display() { return display_; }
+    // Compositor-thread accessor used by the clipboard pipe reader/writer to fold
+    // an anonymous pipe fd into the same reactor (no extra threads). Valid only on
+    // the compositor thread.
+    struct wl_event_loop* loop() { return loop_; }
 
 private:
     // ----- lifecycle -----
@@ -219,6 +239,7 @@ private:
     void reactor();
     void drain_input_queue();  // compositor thread: queue -> wl input protocol
     void drain_gpu_queue();    // compositor thread: bind submitted AHB frames (§5-C)
+    void drain_clipboard_queue();  // compositor thread: apply Android->guest selections
     bool register_globals();
     bool make_socket();
 
@@ -229,6 +250,7 @@ private:
     static void bind_xdg_wm_base(struct wl_client*, void*, uint32_t, uint32_t);
     static void bind_subcompositor(struct wl_client*, void*, uint32_t, uint32_t);
     static void bind_data_device_manager(struct wl_client*, void*, uint32_t, uint32_t);
+    static void bind_text_input_manager(struct wl_client*, void*, uint32_t, uint32_t);
 
     CompositorConfig config_;
     std::string status_;
@@ -240,6 +262,7 @@ private:
     struct wl_global* g_xdg_wm_base_ = nullptr;
     struct wl_global* g_subcompositor_ = nullptr;
     struct wl_global* g_data_device_manager_ = nullptr;
+    struct wl_global* g_text_input_manager_ = nullptr;  // zwp_text_input_manager_v3
 
     int epoll_fd_ = -1;
     int wakeup_fd_ = -1;
@@ -270,7 +293,12 @@ Compositor* instance() {
 // compositor thread (wl_resource sends must happen there). ----
 enum class InjectKind : uint8_t {
     PointerMotion, PointerButton, PointerAxis,
-    TouchDown, TouchMotion, TouchUp, TouchFrame, Key,
+    TouchDown, TouchMotion, TouchUp, TouchFrame, TouchCancel,
+    // zwp_text_input_v3 (Android soft-keyboard IME). Enqueued from the UI thread
+    // via alr_ime_*; drained on the compositor thread into the focused client's
+    // text-input objects (commit_string / preedit_string / delete_surrounding_text
+    // each followed by a done — see drain_input_queue).
+    ImeCommit, ImePreedit, ImeDelete, Key,
 };
 struct InjectEvent {
     InjectKind kind;
@@ -281,6 +309,12 @@ struct InjectEvent {
     int32_t axis = 0;       // 0=vertical, 1=horizontal
     double axis_value = 0;
     uint32_t time_ms = 0;
+    // IME payload (ImeCommit/ImePreedit/ImeDelete): `text` is real UTF-8;
+    // before_bytes/after_bytes are the delete_surrounding_text byte counts;
+    // preedit_cursor is the preedit cursor BYTE offset (ImePreedit).
+    std::string text;
+    uint32_t before_bytes = 0, after_bytes = 0;
+    int32_t preedit_cursor = 0;
 };
 std::mutex g_inject_mutex;
 std::vector<InjectEvent> g_inject_queue;  // guarded by g_inject_mutex
@@ -337,6 +371,28 @@ inline void clear_momentary_mods() { g_mods_depressed = 0; }
 std::vector<struct wl_resource*> g_pointers;
 std::vector<struct wl_resource*> g_keyboards;
 std::vector<struct wl_resource*> g_touches;
+// zwp_text_input_v3 objects (one per client; chromium/GTK/Qt each create one).
+// enter/leave/commit_string/preedit_string/done are sent to the text-inputs whose
+// client owns the focused surface. Entries are dropped in ti_resource_destroy.
+std::vector<struct wl_resource*> g_text_inputs;
+// IME-state upcall to Android (alr_text_input.hpp): invoked ON THE COMPOSITOR
+// THREAD from the text_input_commit handler / focus transitions. The JNI side
+// (runtime_report.cpp) must AttachCurrentThread + hop to the UI looper itself.
+AlrImeStateFn g_ime_state_cb = nullptr;
+void*         g_ime_state_ud = nullptr;
+// Per-zwp_text_input_v3-object commit-request counter. The protocol REQUIRES the
+// done.serial to equal the number of commit requests already issued on THAT object
+// (else GTK ignores the batch), so it is tracked per resource, not globally.
+struct TextInputState { uint32_t commit_serial = 0; };
+// Forward decls: the IME focus helper is DEFINED in the zwp_text_input_v3 block
+// (far below, near the data_device_manager glue) but CALLED from the keyboard-focus
+// transitions above it (focus_follow_to_toplevel / toplevel_destroy / the lazy key
+// enter). ti_set_focus sends zwp_text_input_v3.leave(old)+enter(new) to the focused
+// client's text-inputs and, when focus leaves an enabled field, upcalls an IME hide.
+void ti_set_focus(struct wl_resource* new_surface, struct wl_resource* old_surface);
+// Fire the Android IME show/hide upcall for the focused surface. enabled_override<0
+// => use the focused surface's ti_enabled; 0/1 => force hide/show.
+void ti_emit_state(int enabled_override);
 struct wl_resource* g_focus_surface = nullptr;
 bool g_pointer_entered = false;
 bool g_keyboard_entered = false;
@@ -365,6 +421,20 @@ uint64_t g_next_map_serial = 1;
 // it — no up will ever arrive) and clear these. Compositor-thread-only.
 struct wl_resource* g_touch_target = nullptr;
 int g_touch_active = 0;
+
+// §3d single-finger pointer emulation. Many pointer-only toolkits (xterm, some SDL
+// games, legacy GTK2) bind ONLY wl_pointer. To keep them usable WITHOUT the old
+// broken per-touch-event pointer co-injection (which teleported one pointer between
+// fingers), the compositor emits a synthetic wl_pointer stream for a LONE single
+// finger only — and stops the moment a second finger joins (real multitouch must
+// flow through wl_touch alone, the weston/desktop model). g_touch_emulating is true
+// while we are driving the pointer for g_touch_emul_id; both are cleared on up/cancel
+// or when a 2nd contact arrives. Gated by g_touch_pointer_emulation so it can be
+// disabled per-client later. Compositor-thread-only (set/read only in drain_input_queue
+// and the teardown helpers), so no atomic/mutex needed.
+bool g_touch_pointer_emulation = true;
+bool g_touch_emulating = false;
+int32_t g_touch_emul_id = -1;
 
 uint32_t now_ms() {
     struct timespec ts{};
@@ -407,7 +477,10 @@ void release_buffer(struct wl_resource* buffer) {
 // surface goes away. No-op if `surface` isn't the current touch target.
 void cancel_touch_if_targeting(struct wl_resource* surface) {
     if (!surface || g_touch_target != surface || g_touch_active <= 0) {
-        if (g_touch_target == surface) { g_touch_target = nullptr; g_touch_active = 0; }
+        if (g_touch_target == surface) {
+            g_touch_target = nullptr; g_touch_active = 0;
+            g_touch_emulating = false; g_touch_emul_id = -1;
+        }
         return;
     }
     for (auto* t : g_touches) {
@@ -417,6 +490,11 @@ void cancel_touch_if_targeting(struct wl_resource* surface) {
     }
     g_touch_target = nullptr;
     g_touch_active = 0;
+    // §3d: the grabbed surface is being torn down under the finger — end any
+    // single-finger pointer emulation too (no up will arrive). The pointer's own
+    // leave is handled by the surface-destroy pointer-leave paths elsewhere.
+    g_touch_emulating = false;
+    g_touch_emul_id = -1;
 }
 
 // ---- multi-surface compositing: forward declarations (definitions below, after
@@ -516,7 +594,11 @@ void surface_commit(struct wl_client*, struct wl_resource* resource) {
                                     g_focus_surface);
                         }
                         clear_momentary_mods();  // fresh mods for the new toplevel/dialog
+                        struct wl_resource* prev_focus = g_focus_surface;
                         g_focus_surface = s->surface;
+                        // Move zwp_text_input_v3 focus to the freshly-mapped toplevel and
+                        // hide a soft keyboard that was up over the previous window.
+                        ti_set_focus(g_focus_surface, prev_focus);
                         g_pointer_entered = false;
                         g_keyboard_entered = false;
                     } else if (s->is_popup) {
@@ -639,9 +721,14 @@ void surface_resource_destroy(struct wl_resource* resource) {
         // to a destroyed surface (a use-after-free when a client exits — common
         // once multiple toplevels/popups come and go, e.g. GTK dialogs/menus).
         if (g_focus_surface == s->surface) {
+            // If the dying focus surface had an enabled text input, hide the soft
+            // keyboard (no zwp_text_input_v3.leave: the surface is being destroyed, so
+            // sending to it would be a UAF — the client is tearing down anyway).
+            const bool had_ime = s->ti_enabled;
             g_focus_surface = nullptr;
             g_pointer_entered = false;
             g_keyboard_entered = false;
+            if (had_ime) ti_emit_state(/*enabled_override=*/0);
         }
         // Same UAF guard for the pointer/touch target (which may be a popup, i.e.
         // NOT g_focus_surface): never leave it pointing at a freed wl_surface.
@@ -1175,7 +1262,9 @@ void focus_follow_to_toplevel(SurfaceState* tgt) {
                                    g_focus_surface);
     }
     clear_momentary_mods();      // don't leak held Shift/Ctrl/Alt into the new focus
+    struct wl_resource* prev_focus = g_focus_surface;
     g_focus_surface = tgt->surface;
+    ti_set_focus(g_focus_surface, prev_focus);  // move zwp_text_input_v3 focus + hide IME if needed
     g_keyboard_entered = false;  // force a fresh wl_keyboard.enter on the next key
     zorder_raise(tgt);           // most-recently-activated window is on top
     g_scene_dirty = true;        // repaint: the raised window draws above the others
@@ -1274,10 +1363,14 @@ void toplevel_destroy(struct wl_client*, struct wl_resource* resource) {
         zorder_remove(s);
         if (g_focus_surface == s->surface) {
             clear_momentary_mods();  // destroyed toplevel: don't leak held mods onward
+            struct wl_resource* prev_focus = g_focus_surface;
             g_focus_surface = nullptr;
             g_pointer_entered = false;
             g_keyboard_entered = false;
             if (SurfaceState* nt = zorder_top()) g_focus_surface = nt->surface;
+            // Move text-input focus off the gone window (its wl_surface is still alive
+            // here) onto the new top toplevel (or null); hide the IME if it was up.
+            ti_set_focus(g_focus_surface, prev_focus);
         }
         // The xdg_toplevel ROLE is gone but s->surface is still ALIVE here (GTK can
         // destroy the role and reuse the wl_surface). If this surface was the pointer
@@ -1787,48 +1880,592 @@ void subcompositor_get_subsurface(struct wl_client* client, struct wl_resource* 
 const struct wl_subcompositor_interface kSubcompositorImpl = {
     subcompositor_destroy, subcompositor_get_subsurface};
 
-// =================== wl_data_device_manager (clipboard/DnD stub) ===================
+// =================== wl_data_device_manager (clipboard selection) ===================
 // CRITICAL for GTK/GIMP input: GDK 3.24's Wayland backend POSTPONES binding
 // wl_seat until BOTH wl_compositor AND wl_data_device_manager are advertised
 // (required_device_manager_globals[] in gdkdisplay-wayland.c). Without this
-// global GDK never binds the seat and receives NO input — even though a bare C
-// wl client binds the same seat fine. A no-op stub is sufficient: GDK only needs
-// the objects to exist and a wl_data_device to add a listener to; an empty
-// clipboard (no selection / data_offer events) is valid. Mirrors the minimal
-// wl_subcompositor template above.
-void data_source_offer(struct wl_client*, struct wl_resource*, const char* /*mime*/) {}
+// global GDK never binds the seat and receives NO input.
+//
+// Beyond satisfying that bind requirement, this is now a REAL selection
+// (Ctrl-C / Ctrl-V) clipboard bridged to the Android host's ClipboardManager —
+// see docs/design/android-clipboard-bridge.md. Drag-and-drop stays stubbed
+// (start_drag / set_actions are no-ops); only the *selection* is wired.
+//
+// Two directions share one compositor-thread model (g_clip_* state below):
+//   GUEST -> ANDROID: guest wl_data_source.offer(mimes)+set_selection records the
+//     source; we pull its bytes lazily over a pipe and hand them to Android.
+//   ANDROID -> GUEST: Android clip changes -> alr_wayland_set_android_selection
+//     caches the payloads + synthesizes a server-owned wl_data_offer on each
+//     guest's wl_data_device; the guest pastes via wl_data_offer.receive.
+// ALL wl_* sends happen on the compositor thread (see clipboard.* helpers).
+
+// Per-source mime accumulator: the user_data of a guest-created wl_data_source.
+// Lives in the guest client; freed by data_source_destroyed.
+struct DataSourceState {
+    std::vector<std::string> mimes;
+};
+
+void data_source_offer(struct wl_client*, struct wl_resource* src, const char* mime) {
+    if (!mime) return;
+    auto* st = static_cast<DataSourceState*>(wl_resource_get_user_data(src));
+    if (st) st->mimes.emplace_back(mime);
+}
 void data_source_destroy(struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); }
 void data_source_set_actions(struct wl_client*, struct wl_resource*, uint32_t /*dnd*/) {}
 const struct wl_data_source_interface kDataSourceImpl = {
     data_source_offer, data_source_destroy, data_source_set_actions};
 
+// Forward decls (defined in the clipboard section just below).
+void clip_on_guest_set_selection(struct wl_resource* source, uint32_t serial);
+void clip_on_data_source_destroyed(struct wl_resource* source);
+void clip_on_data_device_created(struct wl_resource* dev);
+void clip_on_data_device_destroyed(struct wl_resource* dev);
+void clip_data_offer_receive(struct wl_resource* offer, const char* mime, int fd);
+void clip_data_offer_destroyed(struct wl_resource* offer);
+
+void data_source_destroyed(struct wl_resource* r) {
+    clip_on_data_source_destroyed(r);
+    auto* st = static_cast<DataSourceState*>(wl_resource_get_user_data(r));
+    delete st;  // frees the mime accumulator (UAF discipline: nothing else owns it)
+}
+
 void data_device_start_drag(struct wl_client*, struct wl_resource*,
                             struct wl_resource* /*source*/, struct wl_resource* /*origin*/,
                             struct wl_resource* /*icon*/, uint32_t /*serial*/) {}
 void data_device_set_selection(struct wl_client*, struct wl_resource*,
-                               struct wl_resource* /*source*/, uint32_t /*serial*/) {}
+                               struct wl_resource* source, uint32_t serial) {
+    clip_on_guest_set_selection(source, serial);
+}
 void data_device_release(struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); }
 const struct wl_data_device_interface kDataDeviceImpl = {
     data_device_start_drag, data_device_set_selection, data_device_release};
+
+// NEW: server-owned wl_data_offer (the Android selection presented to a guest).
+// `accept`/`set_actions` are no-ops for a selection; `receive` writes the cached
+// Android bytes into the guest's pipe (§3b); `finish`/`destroy` clean up.
+void data_offer_accept(struct wl_client*, struct wl_resource*, uint32_t /*serial*/,
+                       const char* /*mime*/) {}
+void data_offer_receive(struct wl_client*, struct wl_resource* offer, const char* mime,
+                        int32_t fd) {
+    clip_data_offer_receive(offer, mime, fd);
+}
+void data_offer_destroy(struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); }
+void data_offer_finish(struct wl_client*, struct wl_resource*) {}
+void data_offer_set_actions(struct wl_client*, struct wl_resource*, uint32_t /*dnd*/,
+                            uint32_t /*pref*/) {}
+const struct wl_data_offer_interface kDataOfferImpl = {
+    data_offer_accept, data_offer_receive, data_offer_destroy, data_offer_finish,
+    data_offer_set_actions};
+void data_offer_destroyed(struct wl_resource* r) { clip_data_offer_destroyed(r); }
+
+void data_device_destroyed(struct wl_resource* r) { clip_on_data_device_destroyed(r); }
 
 void ddm_create_data_source(struct wl_client* client, struct wl_resource* mgr,
                             uint32_t id) {
     struct wl_resource* res = wl_resource_create(
         client, &wl_data_source_interface, wl_resource_get_version(mgr), id);
     if (!res) { wl_client_post_no_memory(client); return; }
-    wl_resource_set_implementation(res, &kDataSourceImpl, nullptr, nullptr);
+    // user_data = the per-source mime accumulator; destroy listener frees it AND
+    // clears the selection if this source currently owns it.
+    auto* st = new DataSourceState();
+    wl_resource_set_implementation(res, &kDataSourceImpl, st, data_source_destroyed);
 }
 void ddm_get_data_device(struct wl_client* client, struct wl_resource* mgr,
                          uint32_t id, struct wl_resource* /*seat*/) {
     struct wl_resource* res = wl_resource_create(
         client, &wl_data_device_interface, wl_resource_get_version(mgr), id);
     if (!res) { wl_client_post_no_memory(client); return; }
-    wl_resource_set_implementation(res, &kDataDeviceImpl, nullptr, nullptr);
-    // No wl_data_device.selection / data_offer sent: an empty clipboard is valid.
+    wl_resource_set_implementation(res, &kDataDeviceImpl, nullptr, data_device_destroyed);
+    // Track the device + (if Android currently owns the selection) push the
+    // current offer so a guest started after the copy still sees it.
+    clip_on_data_device_created(res);
 }
 void ddm_release(struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); }
 const struct wl_data_device_manager_interface kDataDeviceManagerImpl = {
     ddm_create_data_source, ddm_get_data_device, ddm_release};
+
+// =================== zwp_text_input_v3 (Android soft-keyboard IME) ===================
+// Models wl_data_device_manager above: a manager global hands out per-seat
+// zwp_text_input_v3 objects. Each object collects double-buffered enable/disable/
+// content_type/cursor_rectangle requests; .commit applies them to the FOCUSED
+// SurfaceState, sends .done(serial) where serial == that object's commit count
+// (protocol requirement — GTK ignores a batch whose serial != its commit count),
+// and upcalls Android (g_ime_state_cb) to raise/hide the soft keyboard.
+//
+// The return text channel (commit_string / preedit_string / delete_surrounding_text
+// + done) is driven from Android via the alr_ime_* functions (alr_text_input.hpp),
+// enqueued on g_inject_queue and emitted in drain_input_queue.
+
+// The SurfaceState that currently holds keyboard focus (where text-input state
+// lives), or null. Single source of truth used by both the commit handler and the
+// alr_ime_* drains so they agree on "the focused text field".
+SurfaceState* ti_focused_state() { return surface_state_for_wl(g_focus_surface); }
+
+// True iff `ti` belongs to the same client as the focused surface — only those
+// text-inputs receive enter/leave/commit_string/done.
+bool ti_owns_focus(struct wl_resource* ti) {
+    if (!ti || !g_focus_surface) return false;
+    return wl_resource_get_client(ti) == wl_resource_get_client(g_focus_surface);
+}
+
+// Build the AlrImeState for the focused surface and fire the Android upcall (runs
+// on the compositor thread). `enabled_override<0` => use the focused surface's
+// ti_enabled; otherwise force enabled(1)/disabled(0) (used by focus-leave to
+// synthesize a hide). Cursor rect is surface-local logical px from the guest; we
+// pass it through as-is (Android side may scale/ignore — the design allows v1 to
+// skip cursor placement). No-op if no callback registered.
+void ti_emit_state(int enabled_override) {
+    if (!g_ime_state_cb) return;
+    SurfaceState* s = ti_focused_state();
+    AlrImeState st{};
+    if (enabled_override >= 0) {
+        st.enabled = (enabled_override != 0);
+    } else {
+        st.enabled = (s && s->ti_enabled);
+    }
+    if (s && st.enabled) {
+        st.content_purpose = s->ti_purpose;
+        st.content_hint = s->ti_hint;
+        st.cursor_x = s->ti_cur_x;
+        st.cursor_y = s->ti_cur_y;
+        st.cursor_w = s->ti_cur_w;
+        st.cursor_h = s->ti_cur_h;
+    }
+    g_ime_state_cb(st, g_ime_state_ud);
+}
+
+// Move text-input focus from old_surface to new_surface (already-validated wl_surface
+// resources, either may be null). Sends zwp_text_input_v3.leave to the OLD surface's
+// text-inputs and enter to the NEW surface's text-inputs (per protocol: leave before
+// enter). When focus leaves a surface that had an ENABLED text input and the new
+// surface is not (yet) an enabled field, synthesize an IME-hide upcall so the soft
+// keyboard does not linger over the newly-focused window. Called from the three
+// keyboard-focus transitions. g_focus_surface must already be updated to new_surface
+// by the caller before this runs (so ti_owns_focus keys off the new focus for enter).
+void ti_set_focus(struct wl_resource* new_surface, struct wl_resource* old_surface) {
+    if (new_surface == old_surface) return;
+    bool left_enabled_field = false;
+    if (old_surface) {
+        struct wl_client* oc = wl_resource_get_client(old_surface);
+        if (SurfaceState* os = surface_state_for_wl(old_surface)) {
+            left_enabled_field = os->ti_enabled;
+            // The text-input enable state is per-surface; clear it as focus leaves so a
+            // stale enable doesn't re-raise the keyboard if the surface is refocused
+            // before the client re-commits enable.
+            os->ti_enabled = os->ti_pending_enabled = false;
+        }
+        for (struct wl_resource* ti : g_text_inputs)
+            if (wl_resource_get_client(ti) == oc)
+                zwp_text_input_v3_send_leave(ti, old_surface);
+    }
+    if (new_surface) {
+        struct wl_client* nc = wl_resource_get_client(new_surface);
+        for (struct wl_resource* ti : g_text_inputs)
+            if (wl_resource_get_client(ti) == nc)
+                zwp_text_input_v3_send_enter(ti, new_surface);
+    }
+    // If we left an enabled field, hide the IME (the new surface starts disabled; it
+    // re-raises via its own enable+commit if it focuses a text entry).
+    if (left_enabled_field) ti_emit_state(/*enabled_override=*/0);
+}
+
+void ti_destroy(struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); }
+void ti_enable(struct wl_client*, struct wl_resource* r) {
+    auto* st = static_cast<TextInputState*>(wl_resource_get_user_data(r));
+    (void)st;
+    // enable resets the pending state per the protocol (the prior content_type /
+    // cursor_rectangle from a previous enable are not carried over until re-set).
+    if (SurfaceState* s = ti_focused_state()) {
+        s->ti_pending_enabled = true;
+        s->ti_pending_purpose = 0;
+        s->ti_pending_hint = 0;
+        s->ti_pending_cur_x = s->ti_pending_cur_y = -1;
+        s->ti_pending_cur_w = s->ti_pending_cur_h = -1;
+    }
+}
+void ti_disable(struct wl_client*, struct wl_resource* r) {
+    (void)r;
+    if (SurfaceState* s = ti_focused_state()) s->ti_pending_enabled = false;
+}
+void ti_set_surrounding_text(struct wl_client*, struct wl_resource*,
+                             const char* /*text*/, int32_t /*cursor*/, int32_t /*anchor*/) {
+    // Stored for a future upgrade (feed Android InputConnection getTextBeforeCursor);
+    // v1 ignores it (the InputConnection is a non-full editor, see the design §3.1).
+}
+void ti_set_text_change_cause(struct wl_client*, struct wl_resource*, uint32_t /*cause*/) {}
+void ti_set_content_type(struct wl_client*, struct wl_resource*,
+                         uint32_t hint, uint32_t purpose) {
+    if (SurfaceState* s = ti_focused_state()) {
+        s->ti_pending_hint = hint;
+        s->ti_pending_purpose = purpose;
+    }
+}
+void ti_set_cursor_rectangle(struct wl_client*, struct wl_resource*,
+                             int32_t x, int32_t y, int32_t w, int32_t h) {
+    if (SurfaceState* s = ti_focused_state()) {
+        s->ti_pending_cur_x = x; s->ti_pending_cur_y = y;
+        s->ti_pending_cur_w = w; s->ti_pending_cur_h = h;
+    }
+}
+void ti_commit(struct wl_client*, struct wl_resource* r) {
+    auto* st = static_cast<TextInputState*>(wl_resource_get_user_data(r));
+    // Apply pending -> current on the focused surface.
+    SurfaceState* s = ti_focused_state();
+    if (s) {
+        s->ti_enabled = s->ti_pending_enabled;
+        s->ti_purpose = s->ti_pending_purpose;
+        s->ti_hint = s->ti_pending_hint;
+        s->ti_cur_x = s->ti_pending_cur_x; s->ti_cur_y = s->ti_pending_cur_y;
+        s->ti_cur_w = s->ti_pending_cur_w; s->ti_cur_h = s->ti_pending_cur_h;
+    }
+    // done.serial MUST equal the number of commit requests on THIS object.
+    const uint32_t serial = st ? ++st->commit_serial : 0;
+    zwp_text_input_v3_send_done(r, serial);
+    // Upcall Android to raise/hide the soft keyboard for the new enable state.
+    ti_emit_state(/*enabled_override=*/-1);
+}
+const struct zwp_text_input_v3_interface kTextInputImpl = {
+    ti_destroy, ti_enable, ti_disable, ti_set_surrounding_text,
+    ti_set_text_change_cause, ti_set_content_type, ti_set_cursor_rectangle,
+    ti_commit};
+
+void ti_resource_destroy(struct wl_resource* r) {
+    drop_resource(g_text_inputs, r);
+    if (auto* st = static_cast<TextInputState*>(wl_resource_get_user_data(r)))
+        delete st;
+}
+
+void tim_get_text_input(struct wl_client* client, struct wl_resource* mgr,
+                        uint32_t id, struct wl_resource* /*seat*/) {
+    struct wl_resource* res = wl_resource_create(
+        client, &zwp_text_input_v3_interface, wl_resource_get_version(mgr), id);
+    if (!res) { wl_client_post_no_memory(client); return; }
+    auto* st = new TextInputState();
+    wl_resource_set_implementation(res, &kTextInputImpl, st, ti_resource_destroy);
+    g_text_inputs.push_back(res);
+    // If this client already owns keyboard focus, send the initial enter so the
+    // object tracks the current focus surface (mirrors the protocol's focus model).
+    if (g_focus_surface && ti_owns_focus(res))
+        zwp_text_input_v3_send_enter(res, g_focus_surface);
+    ALR_WL_LOGI("zwp_text_input_manager_v3.get_text_input bound (now %zu)",
+                g_text_inputs.size());
+}
+void tim_destroy(struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); }
+const struct zwp_text_input_manager_v3_interface kTextInputManagerImpl = {
+    tim_destroy, tim_get_text_input};
+
+// ===================== clipboard selection model (impl) =====================
+// All state + helpers below run ONLY on the compositor thread, except the
+// inbound queue (g_clip_queue) + the sink registry (g_clip_sink_*), which are
+// mutex-guarded because Kotlin/JNI calls them from other threads.
+
+enum class SelOwner : uint8_t { None, Guest, Android };
+SelOwner g_clip_owner = SelOwner::None;               // compositor thread
+struct wl_resource* g_clip_guest_source = nullptr;    // current guest wl_data_source
+std::vector<std::string> g_clip_guest_mimes;          // its advertised mimes
+uint32_t g_clip_sel_serial = 0;
+std::vector<struct wl_resource*> g_clip_data_devices; // all bound wl_data_device
+// Cached Android payloads (compositor thread): what data_offer_receive writes.
+std::string g_clip_android_text;   // UTF-8 text (for text/plain* + UTF8_STRING)
+std::string g_clip_android_html;   // UTF-8 text/html
+std::string g_clip_android_png;    // raw image/png bytes
+std::vector<std::string> g_clip_android_mimes;        // mimes we advertise to guests
+// Server-owned offers we synthesized (so we can prune on destroy). Compositor thread.
+std::vector<struct wl_resource*> g_clip_server_offers;
+// Loop-guard: hash of the last bytes WE pushed to Android (guest->android), so an
+// echoed Android push (android->guest of our own copy) is dropped (§7).
+uint64_t g_clip_last_guest_hash = 0;
+
+// Sinks installed by runtime_report.cpp (JNI up-calls). Guarded: the setter runs
+// off-thread; reads copy under the lock then invoke outside it.
+std::mutex g_clip_sink_mutex;
+ClipboardGuestOfferCb g_clip_on_offer;
+ClipboardGuestTextCb  g_clip_on_text;
+ClipboardGuestImageCb g_clip_on_image;
+
+// Inbound (Android->guest) queue, drained on the compositor thread (mirrors
+// g_inject_queue / enqueue_inject).
+struct AndroidSelection {
+    std::vector<std::string> mimes;
+    std::string text, html, png;
+};
+std::mutex g_clip_queue_mutex;
+std::vector<AndroidSelection> g_clip_queue;  // guarded by g_clip_queue_mutex
+
+// In-flight pipe reads (guest->android): one per outstanding wl_data_source.send.
+// Registered with the wl_event_loop so the read never blocks the reactor (§3a).
+struct ClipReadCtx {
+    struct wl_event_source* src = nullptr;
+    int fd = -1;
+    std::string mime;
+    std::string buf;
+    bool is_image = false;
+};
+// In-flight pipe writes (android->guest): drains a cached payload into the
+// guest's receive() fd without blocking (§3b).
+struct ClipWriteCtx {
+    struct wl_event_source* src = nullptr;
+    int fd = -1;
+    std::string data;   // OWN copy so a mid-paste clip change can't free it
+    size_t off = 0;
+};
+
+constexpr size_t kClipMaxBytes = 8u * 1024u * 1024u;  // cap (image) — §3a/§6c
+
+uint64_t clip_fnv1a(const std::string& s) {
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : (const std::string&)s) { h ^= c; h *= 1099511628211ull; }
+    return h;
+}
+
+// Pick the richest guest mime we can map to Android (§2 priority order).
+const char* clip_pick_guest_mime(const std::vector<std::string>& mimes, bool* out_is_image) {
+    auto has = [&](const char* m) -> const char* {
+        for (const auto& s : mimes) if (s == m) return s.c_str();
+        return nullptr;
+    };
+    *out_is_image = false;
+    if (const char* m = has("image/png")) { *out_is_image = true; return m; }
+    if (const char* m = has("text/html")) return m;
+    if (const char* m = has("text/plain;charset=utf-8")) return m;
+    if (const char* m = has("text/plain")) return m;
+    if (const char* m = has("UTF8_STRING")) return m;
+    return nullptr;
+}
+
+// ---- guest -> Android: pull bytes out of a guest source over a pipe (§3a) ----
+// wl_event_loop callback: append readable bytes; on EOF deliver to Android.
+int clip_on_pipe_readable(int fd, uint32_t mask, void* data) {
+    auto* ctx = static_cast<ClipReadCtx*>(data);
+    for (;;) {
+        char tmp[4096];
+        ssize_t n = ::read(fd, tmp, sizeof(tmp));
+        if (n > 0) {
+            if (ctx->buf.size() + static_cast<size_t>(n) > kClipMaxBytes) {
+                ctx->buf.append(tmp, kClipMaxBytes - ctx->buf.size());
+                ALR_WL_LOGW("clipboard guest read hit %zu cap, truncating", kClipMaxBytes);
+                break;  // treat as done
+            }
+            ctx->buf.append(tmp, static_cast<size_t>(n));
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            // Not done yet; wait for the next readable wake — unless the writer
+            // hung up (HANGUP without readable data means EOF on some kernels).
+            if (!(mask & WL_EVENT_HANGUP)) return 0;
+        }
+        break;  // n==0 (EOF), real error, or hangup-with-no-data => finished
+    }
+    // Finished: deliver to Android, then tear down this transfer.
+    ClipboardGuestTextCb on_text;
+    ClipboardGuestImageCb on_image;
+    {
+        std::lock_guard<std::mutex> lk(g_clip_sink_mutex);
+        on_text = g_clip_on_text;
+        on_image = g_clip_on_image;
+    }
+    g_clip_last_guest_hash = clip_fnv1a(ctx->buf);
+    if (ctx->is_image) {
+        if (on_image) on_image(ctx->buf);
+    } else {
+        if (on_text) on_text(ctx->mime, ctx->buf);
+    }
+    if (ctx->src) wl_event_source_remove(ctx->src);
+    if (ctx->fd >= 0) ::close(ctx->fd);
+    delete ctx;
+    return 0;
+}
+
+// Compositor thread: ask the current guest source for its richest mime, fold the
+// pipe read end into the reactor. Idempotent-safe: a guest with no source is a no-op.
+void clip_pull_guest_bytes() {
+    if (g_clip_owner != SelOwner::Guest || !g_clip_guest_source) return;
+    Compositor* comp = instance();
+    if (!comp) return;
+    bool is_image = false;
+    const char* mime = clip_pick_guest_mime(g_clip_guest_mimes, &is_image);
+    if (!mime) return;
+    int fds[2];
+    if (::pipe2(fds, O_CLOEXEC | O_NONBLOCK) != 0) {
+        ALR_WL_LOGE("clipboard pipe2 failed: %s", std::strerror(errno));
+        return;
+    }
+    // Guest receives the WRITE end; compositor keeps the READ end.
+    wl_data_source_send_send(g_clip_guest_source, mime, fds[1]);
+    ::close(fds[1]);
+    struct wl_client* gc = wl_resource_get_client(g_clip_guest_source);
+    if (gc) wl_client_flush(gc);  // push the .send event now so the guest writes
+    auto* ctx = new ClipReadCtx();
+    ctx->fd = fds[0];
+    ctx->mime = mime;
+    ctx->is_image = is_image;
+    ctx->src = wl_event_loop_add_fd(comp->loop(), fds[0],
+                                    WL_EVENT_READABLE, clip_on_pipe_readable, ctx);
+    if (!ctx->src) {
+        ::close(fds[0]);
+        delete ctx;
+        ALR_WL_LOGE("clipboard wl_event_loop_add_fd(read) failed");
+    }
+}
+
+// Compositor thread: guest set/cleared its selection (data_device.set_selection).
+void clip_on_guest_set_selection(struct wl_resource* source, uint32_t serial) {
+    if (source == nullptr) {
+        // Guest cleared. We do NOT clobber the Android clipboard on a guest clear
+        // (§7): only drop our guest-owned state.
+        if (g_clip_owner == SelOwner::Guest) {
+            g_clip_owner = SelOwner::None;
+            g_clip_guest_source = nullptr;
+            g_clip_guest_mimes.clear();
+        }
+        return;
+    }
+    // Cancel a previous guest source so the old client drops its stale selection.
+    if (g_clip_guest_source && g_clip_guest_source != source)
+        wl_data_source_send_cancelled(g_clip_guest_source);
+    g_clip_guest_source = source;
+    g_clip_owner = SelOwner::Guest;
+    g_clip_sel_serial = serial;
+    g_clip_guest_mimes.clear();
+    if (auto* st = static_cast<DataSourceState*>(wl_resource_get_user_data(source)))
+        g_clip_guest_mimes = st->mimes;
+    ALR_WL_LOGI("clipboard: guest selection (%zu mimes, serial=%u)",
+                g_clip_guest_mimes.size(), serial);
+    // Notify Android (optional sink) then pull eagerly so the bytes are ready.
+    ClipboardGuestOfferCb on_offer;
+    { std::lock_guard<std::mutex> lk(g_clip_sink_mutex); on_offer = g_clip_on_offer; }
+    if (on_offer) on_offer(g_clip_guest_mimes);
+    clip_pull_guest_bytes();
+}
+
+void clip_on_data_source_destroyed(struct wl_resource* source) {
+    if (g_clip_guest_source == source) {  // never deref after destroy (UAF discipline)
+        g_clip_guest_source = nullptr;
+        g_clip_guest_mimes.clear();
+        if (g_clip_owner == SelOwner::Guest) g_clip_owner = SelOwner::None;
+    }
+}
+
+// ---- Android -> guest: synthesize a server-owned offer on a data_device ----
+void clip_send_android_offer(struct wl_resource* dev) {
+    if (g_clip_owner != SelOwner::Android || g_clip_android_mimes.empty()) return;
+    struct wl_client* c = wl_resource_get_client(dev);
+    struct wl_resource* offer = wl_resource_create(
+        c, &wl_data_offer_interface, wl_resource_get_version(dev), 0 /*server id*/);
+    if (!offer) return;
+    wl_resource_set_implementation(offer, &kDataOfferImpl, nullptr, data_offer_destroyed);
+    g_clip_server_offers.push_back(offer);
+    wl_data_device_send_data_offer(dev, offer);
+    for (const auto& m : g_clip_android_mimes)
+        wl_data_offer_send_offer(offer, m.c_str());
+    wl_data_device_send_selection(dev, offer);
+    if (c) wl_client_flush(c);
+}
+
+void clip_on_data_device_created(struct wl_resource* dev) {
+    g_clip_data_devices.push_back(dev);
+    // A guest that connects after an Android copy still sees the current selection.
+    if (g_clip_owner == SelOwner::Android) clip_send_android_offer(dev);
+}
+void clip_on_data_device_destroyed(struct wl_resource* dev) {
+    drop_resource(g_clip_data_devices, dev);
+}
+void clip_data_offer_destroyed(struct wl_resource* offer) {
+    drop_resource(g_clip_server_offers, offer);
+}
+
+// wl_event_loop callback: drain a cached Android payload into the guest's fd (§3b).
+int clip_on_pipe_writable(int fd, uint32_t mask, void* data) {
+    auto* ctx = static_cast<ClipWriteCtx*>(data);
+    if (mask & WL_EVENT_HANGUP) { ctx->off = ctx->data.size(); }  // guest gave up
+    while (ctx->off < ctx->data.size()) {
+        ssize_t n = ::write(fd, ctx->data.data() + ctx->off, ctx->data.size() - ctx->off);
+        if (n > 0) { ctx->off += static_cast<size_t>(n); continue; }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;  // wait
+        break;  // error or 0 => stop
+    }
+    if (ctx->src) wl_event_source_remove(ctx->src);
+    if (ctx->fd >= 0) ::close(ctx->fd);
+    delete ctx;
+    return 0;
+}
+
+// Compositor thread: a guest pasted (wl_data_offer.receive) against our server
+// offer. Answer with the cached Android bytes for `mime`.
+void clip_data_offer_receive(struct wl_resource* /*offer*/, const char* mime, int fd) {
+    if (fd < 0) return;
+    if (!mime || g_clip_owner != SelOwner::Android) { ::close(fd); return; }
+    const std::string m(mime);
+    const std::string* payload = nullptr;
+    if (m == "text/html") payload = &g_clip_android_html;
+    else if (m == "image/png") payload = &g_clip_android_png;
+    else if (m == "text/plain;charset=utf-8" || m == "text/plain" || m == "UTF8_STRING")
+        payload = &g_clip_android_text;
+    if (!payload) { ::close(fd); return; }
+    Compositor* comp = instance();
+    // Make the fd non-blocking so a full pipe never wedges the reactor.
+    int fl = ::fcntl(fd, F_GETFL, 0);
+    if (fl >= 0) ::fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    auto* ctx = new ClipWriteCtx();
+    ctx->fd = fd;
+    ctx->data = *payload;  // OWN copy (mid-paste clip change can't free it)
+    // Try a fast direct write first (text usually fits one pipe buffer).
+    while (ctx->off < ctx->data.size()) {
+        ssize_t n = ::write(fd, ctx->data.data() + ctx->off, ctx->data.size() - ctx->off);
+        if (n > 0) { ctx->off += static_cast<size_t>(n); continue; }
+        break;
+    }
+    if (ctx->off >= ctx->data.size() || !comp) {
+        ::close(fd);
+        delete ctx;
+        return;
+    }
+    // Didn't finish: fold the write end into the reactor and drain on WRITABLE.
+    ctx->src = wl_event_loop_add_fd(comp->loop(), fd, WL_EVENT_WRITABLE,
+                                    clip_on_pipe_writable, ctx);
+    if (!ctx->src) { ::close(fd); delete ctx; }
+}
+
+// Compositor thread: apply a queued Android selection (broadcast to all guests).
+void clip_apply_android_selection(const AndroidSelection& sel) {
+    // Loop-guard (§7): if a guest currently owns the selection and this push is the
+    // echo of the guest's OWN copy (same text hash), ignore it.
+    if (g_clip_owner == SelOwner::Guest && !sel.text.empty() &&
+        clip_fnv1a(sel.text) == g_clip_last_guest_hash) {
+        return;
+    }
+    if (sel.mimes.empty()) {
+        // Android cleared. Drop Android ownership; cancel nothing on the guest.
+        if (g_clip_owner == SelOwner::Android) {
+            g_clip_owner = SelOwner::None;
+            g_clip_android_mimes.clear();
+            g_clip_android_text.clear();
+            g_clip_android_html.clear();
+            g_clip_android_png.clear();
+            for (auto* dev : g_clip_data_devices) {
+                wl_data_device_send_selection(dev, nullptr);
+                struct wl_client* c = wl_resource_get_client(dev);
+                if (c) wl_client_flush(c);
+            }
+        }
+        return;
+    }
+    // The user genuinely copied in an Android app: flip ownership to Android and
+    // cancel any guest source so the guest drops its stale selection.
+    if (g_clip_guest_source) {
+        wl_data_source_send_cancelled(g_clip_guest_source);
+        g_clip_guest_source = nullptr;
+        g_clip_guest_mimes.clear();
+    }
+    g_clip_owner = SelOwner::Android;
+    g_clip_android_mimes = sel.mimes;
+    g_clip_android_text = sel.text;
+    g_clip_android_html = sel.html;
+    g_clip_android_png = sel.png;
+    ALR_WL_LOGI("clipboard: android selection (%zu mimes, text=%zuB html=%zuB png=%zuB)",
+                sel.mimes.size(), sel.text.size(), sel.html.size(), sel.png.size());
+    for (auto* dev : g_clip_data_devices) clip_send_android_offer(dev);
+}
 
 }  // namespace
 
@@ -1925,6 +2562,18 @@ void Compositor::bind_data_device_manager(struct wl_client* client, void* /*data
     ALR_WL_LOGI("client bound: wl_data_device_manager v%u", version);
 }
 
+void Compositor::bind_text_input_manager(struct wl_client* client, void* /*data*/,
+                                         uint32_t version, uint32_t id) {
+    struct wl_resource* r = wl_resource_create(
+        client, &zwp_text_input_manager_v3_interface, static_cast<int>(version), id);
+    if (!r) {
+        wl_client_post_no_memory(client);
+        return;
+    }
+    wl_resource_set_implementation(r, &kTextInputManagerImpl, nullptr, nullptr);
+    ALR_WL_LOGI("client bound: zwp_text_input_manager_v3 v%u", version);
+}
+
 // ---------------------------------------------------------------------------
 // CR-4 (chromium --ozone-platform=wayland) global-requirement audit.
 //
@@ -1977,9 +2626,14 @@ bool Compositor::register_globals() {
     // GDK 3.24 won't bind wl_seat until wl_data_device_manager is also present.
     g_data_device_manager_ = wl_global_create(
         display_, &wl_data_device_manager_interface, 3, this, bind_data_device_manager);
+    // zwp_text_input_manager_v3 (v1): GTK3/4, Qt6 and chromium/Ozone speak it on
+    // caret focus to raise the Android soft keyboard and receive composed/CJK/emoji
+    // text. Absent => those toolkits silently fall back to raw wl_keyboard (no IME).
+    g_text_input_manager_ = wl_global_create(
+        display_, &zwp_text_input_manager_v3_interface, 1, this, bind_text_input_manager);
     (void)kShmVersion;  // wl_shm is created by wl_display_init_shm().
     if (!g_compositor_ || !g_seat_ || !g_output_ || !g_xdg_wm_base_ ||
-        !g_subcompositor_ || !g_data_device_manager_) {
+        !g_subcompositor_ || !g_data_device_manager_ || !g_text_input_manager_) {
         ALR_WL_LOGE("wl_global_create failed for one or more globals");
         return false;
     }
@@ -2071,7 +2725,7 @@ bool Compositor::setup() {
     setup_ok_ = true;
     status_ = "ALR WAYLAND COMPOSITOR: started socket=" + config_.socket_path +
               " globals=wl_compositor,wl_shm,wl_seat,wl_output,xdg_wm_base,"
-              "wl_subcompositor,wl_data_device_manager";
+              "wl_subcompositor,wl_data_device_manager,zwp_text_input_manager_v3";
     ALR_WL_LOGI("%s", status_.c_str());
     return true;
 }
@@ -2220,6 +2874,61 @@ void Compositor::drain_input_queue() {
             for (auto* t : g_touches)
                 wl_touch_send_down(t, serial, e.time_ms, deliver, e.touch_id,
                                    wl_fixed_from_double(mx), wl_fixed_from_double(my));
+            // §3d single-finger pointer emulation. The down BEFORE this increment is
+            // the FIRST and only contact iff g_touch_active == 0. Emulate a lone
+            // finger as a pointer (enter + motion + BTN_LEFT press) so pointer-only
+            // toolkits stay usable; the moment a SECOND finger arrives, end emulation
+            // (release the button) so real multitouch flows through wl_touch alone and
+            // the pointer never teleports. Mirrors the PointerMotion/PointerButton
+            // cases but is driven entirely by the touch grab state (single source of
+            // truth) — the JNI layer feeds touch ONLY.
+            if (g_touch_pointer_emulation) {
+                if (g_touch_active == 0) {
+                    // First lone contact: begin emulating a pointer over the grabbed
+                    // surface. g_input_target_surface/g_pointer_entered are the same
+                    // state the PointerMotion path maintains, so reuse them.
+                    const wl_fixed_t pfx = wl_fixed_from_double(mx);
+                    const wl_fixed_t pfy = wl_fixed_from_double(my);
+                    if (g_pointer_entered && g_input_target_surface &&
+                        g_input_target_surface != deliver) {
+                        for (auto* p : g_pointers) {
+                            wl_pointer_send_leave(p, wl_display_next_serial(display_),
+                                                  g_input_target_surface);
+                            if (wl_resource_get_version(p) >= WL_POINTER_FRAME_SINCE_VERSION)
+                                wl_pointer_send_frame(p);
+                        }
+                        g_pointer_entered = false;
+                    }
+                    g_input_target_surface = deliver;
+                    for (auto* p : g_pointers) {
+                        if (!g_pointer_entered)
+                            wl_pointer_send_enter(p, wl_display_next_serial(display_),
+                                                  deliver, pfx, pfy);
+                        wl_pointer_send_motion(p, e.time_ms, pfx, pfy);
+                        const uint32_t bser = wl_display_next_serial(display_);
+                        wl_pointer_send_button(p, bser, e.time_ms, 0x110 /*BTN_LEFT*/,
+                                               WL_POINTER_BUTTON_STATE_PRESSED);
+                        if (wl_resource_get_version(p) >= WL_POINTER_FRAME_SINCE_VERSION)
+                            wl_pointer_send_frame(p);
+                    }
+                    g_pointer_entered = true;
+                    g_touch_emulating = true;
+                    g_touch_emul_id = e.touch_id;
+                } else if (g_touch_emulating) {
+                    // A second finger joined: the gesture is now multitouch. Release
+                    // the emulated button and stop emulating for the rest of the
+                    // sequence so the pointer doesn't interfere with the touch stream.
+                    const uint32_t bser = wl_display_next_serial(display_);
+                    for (auto* p : g_pointers) {
+                        wl_pointer_send_button(p, bser, e.time_ms, 0x110 /*BTN_LEFT*/,
+                                               WL_POINTER_BUTTON_STATE_RELEASED);
+                        if (wl_resource_get_version(p) >= WL_POINTER_FRAME_SINCE_VERSION)
+                            wl_pointer_send_frame(p);
+                    }
+                    g_touch_emulating = false;
+                    g_touch_emul_id = -1;
+                }
+            }
             ++g_touch_active;
             break;
         }
@@ -2233,17 +2942,67 @@ void Compositor::drain_input_queue() {
             for (auto* t : g_touches)
                 wl_touch_send_motion(t, e.time_ms, e.touch_id,
                                      wl_fixed_from_double(mx), wl_fixed_from_double(my));
+            // §3d: while emulating a lone finger, move the synthetic pointer with it
+            // (never teleporting — only the single emulated id drives the pointer).
+            if (g_touch_pointer_emulation && g_touch_emulating &&
+                e.touch_id == g_touch_emul_id && g_pointer_entered) {
+                const wl_fixed_t pfx = wl_fixed_from_double(mx);
+                const wl_fixed_t pfy = wl_fixed_from_double(my);
+                for (auto* p : g_pointers) {
+                    wl_pointer_send_motion(p, e.time_ms, pfx, pfy);
+                    if (wl_resource_get_version(p) >= WL_POINTER_FRAME_SINCE_VERSION)
+                        wl_pointer_send_frame(p);
+                }
+            }
             break;
         }
         case InjectKind::TouchUp: {
             const uint32_t serial = wl_display_next_serial(display_);
             for (auto* t : g_touches) wl_touch_send_up(t, serial, e.time_ms, e.touch_id);
+            // §3d: if the lifted finger is the emulated one, release BTN_LEFT and stop
+            // emulating (a tap by a lone finger becomes a pointer press+release).
+            if (g_touch_pointer_emulation && g_touch_emulating &&
+                e.touch_id == g_touch_emul_id) {
+                const uint32_t bser = wl_display_next_serial(display_);
+                for (auto* p : g_pointers) {
+                    wl_pointer_send_button(p, bser, e.time_ms, 0x110 /*BTN_LEFT*/,
+                                           WL_POINTER_BUTTON_STATE_RELEASED);
+                    if (wl_resource_get_version(p) >= WL_POINTER_FRAME_SINCE_VERSION)
+                        wl_pointer_send_frame(p);
+                }
+                g_touch_emulating = false;
+                g_touch_emul_id = -1;
+            }
             if (g_touch_active > 0 && --g_touch_active == 0)
                 g_touch_target = nullptr;  // last finger up: release the grab
             break;
         }
         case InjectKind::TouchFrame:
             for (auto* t : g_touches) wl_touch_send_frame(t);
+            break;
+        case InjectKind::TouchCancel:
+            // User-initiated cancel (Android ACTION_CANCEL: gesture stolen by the
+            // system). Per spec wl_touch.cancel ends ALL active touch points (no
+            // per-id arg) and is followed by a frame. Drop the grab and any pointer
+            // emulation in progress.
+            for (auto* t : g_touches) {
+                wl_touch_send_cancel(t);
+                if (wl_resource_get_version(t) >= WL_TOUCH_FRAME_SINCE_VERSION)
+                    wl_touch_send_frame(t);
+            }
+            if (g_touch_pointer_emulation && g_touch_emulating) {
+                const uint32_t bser = wl_display_next_serial(display_);
+                for (auto* p : g_pointers) {
+                    wl_pointer_send_button(p, bser, e.time_ms, 0x110 /*BTN_LEFT*/,
+                                           WL_POINTER_BUTTON_STATE_RELEASED);
+                    if (wl_resource_get_version(p) >= WL_POINTER_FRAME_SINCE_VERSION)
+                        wl_pointer_send_frame(p);
+                }
+            }
+            g_touch_target = nullptr;
+            g_touch_active = 0;
+            g_touch_emulating = false;
+            g_touch_emul_id = -1;
             break;
         case InjectKind::Key: {
             // P0-3: route keys to a grabbing popup (menu) if any, else the focused
@@ -2285,6 +3044,41 @@ void Compositor::drain_input_queue() {
                 }
             }
             g_keyboard_entered = true;
+            break;
+        }
+        case InjectKind::ImeCommit:
+        case InjectKind::ImePreedit:
+        case InjectKind::ImeDelete: {
+            // Route IME edits to the focused client's enabled zwp_text_input_v3
+            // objects via commit_string / preedit_string / delete_surrounding_text,
+            // each followed by a done. The done.serial echoes that object's commit
+            // count (TextInputState::commit_serial) so GTK applies the batch.
+            if (!g_focus_surface) break;
+            struct wl_client* fc = wl_resource_get_client(g_focus_surface);
+            for (struct wl_resource* ti : g_text_inputs) {
+                if (wl_resource_get_client(ti) != fc) continue;
+                switch (e.kind) {
+                case InjectKind::ImeCommit:
+                    // Clear any composing run first, then commit the literal text
+                    // (protocol §done evaluation order: preedit -> delete -> commit).
+                    zwp_text_input_v3_send_preedit_string(ti, "", 0, 0);
+                    zwp_text_input_v3_send_commit_string(ti, e.text.c_str());
+                    break;
+                case InjectKind::ImePreedit:
+                    // Live composing text; cursor at preedit_cursor (begin==end => a
+                    // caret line, not a selection highlight).
+                    zwp_text_input_v3_send_preedit_string(
+                        ti, e.text.c_str(), e.preedit_cursor, e.preedit_cursor);
+                    break;
+                case InjectKind::ImeDelete:
+                    zwp_text_input_v3_send_delete_surrounding_text(
+                        ti, e.before_bytes, e.after_bytes);
+                    break;
+                default: break;
+                }
+                auto* st = static_cast<TextInputState*>(wl_resource_get_user_data(ti));
+                zwp_text_input_v3_send_done(ti, st ? st->commit_serial : 0);
+            }
             break;
         }
         }
@@ -2418,6 +3212,18 @@ void Compositor::drain_gpu_queue() {
     g_scene_dirty = true;  // present on the next frame-timer tick
 }
 
+// Apply any Android->guest clipboard selections pushed from Kotlin/JNI. Runs on
+// the compositor thread, where all wl_data_* sends are legal (mirrors
+// drain_input_queue / drain_gpu_queue). See clip_apply_android_selection.
+void Compositor::drain_clipboard_queue() {
+    std::vector<AndroidSelection> local;
+    {
+        std::lock_guard<std::mutex> lk(g_clip_queue_mutex);
+        local.swap(g_clip_queue);
+    }
+    for (const AndroidSelection& sel : local) clip_apply_android_selection(sel);
+}
+
 void Compositor::reactor() {
     ALR_WL_LOGI("compositor reactor entering epoll loop (loop_fd=%d)", loop_fd_);
     constexpr int kMaxEvents = 8;
@@ -2439,6 +3245,7 @@ void Compositor::reactor() {
                 drain_resize_queue(); // apply any pending output resize (rotation/MW)
                 drain_input_queue();  // deliver any injected input events
                 drain_gpu_queue();    // bind any submitted §5-C GPU (AHB) frames
+                drain_clipboard_queue();  // apply any Android->guest selection pushes
             } else if (events[i].data.fd == frame_timer_fd_) {
                 uint64_t v = 0;
                 ssize_t r = ::read(frame_timer_fd_, &v, sizeof(v));
@@ -2489,10 +3296,26 @@ void Compositor::teardown() {
     g_keyboard_grab_surface = nullptr;  // stale-pointer guard on restart (UAF discipline)
     g_touch_target = nullptr;           // drop any in-flight touch grab on restart
     g_touch_active = 0;
+    g_touch_emulating = false;          // §3d: drop any in-flight pointer emulation
+    g_touch_emul_id = -1;
     g_pointer_entered = false;
     g_keyboard_entered = false;
     g_mods_depressed = 0;  // don't leak held mods / CapsLock into a re-created compositor
     g_mods_locked = 0;
+    // Clipboard selection model: drop all resource pointers (the wl_display teardown
+    // below frees the resources themselves) so a re-created compositor starts clean.
+    // UAF discipline: never deref these stale pointers after the display is gone.
+    g_clip_owner = SelOwner::None;
+    g_clip_guest_source = nullptr;
+    g_clip_guest_mimes.clear();
+    g_clip_data_devices.clear();
+    g_clip_server_offers.clear();
+    g_clip_android_mimes.clear();
+    g_clip_android_text.clear();
+    g_clip_android_html.clear();
+    g_clip_android_png.clear();
+    g_clip_last_guest_hash = 0;
+    { std::lock_guard<std::mutex> lk(g_clip_queue_mutex); g_clip_queue.clear(); }
     // §5-C fullscreen GPU fallback: release the retained AHB ref (one acquire held in
     // drain_gpu_queue) and null the globals. Without this a stop while a headless GPU
     // app (glmark2) is presenting leaks the buffer, and a re-created compositor would
@@ -2630,11 +3453,130 @@ void alr_wayland_inject_touch(int32_t id, double x, double y, int32_t phase) {
     f.kind = InjectKind::TouchFrame; f.time_ms = e.time_ms;
     enqueue_inject(f);
 }
+// §3c: enqueue ONE contact's down/motion/up WITHOUT a trailing frame, so the JNI
+// layer can forward every pointer of one Android MotionEvent and then close the
+// atomic set with a single alr_wayland_inject_touch_frame(). This is the touch-ONLY
+// path (no synthetic pointer here — single-finger pointer emulation, if any, is
+// decided compositor-side from the touch grab state, §3d).
+void alr_wayland_inject_touch_point(int32_t id, double x, double y, int32_t phase) {
+    InjectEvent e{};
+    e.kind = phase == 0 ? InjectKind::TouchDown
+           : phase == 2 ? InjectKind::TouchUp
+                        : InjectKind::TouchMotion;
+    e.touch_id = id; e.x = x; e.y = y; e.time_ms = now_ms();
+    enqueue_inject(e);
+}
+// §3c: close the atomic set of touch changes for one MotionEvent (wl_touch.frame).
+void alr_wayland_inject_touch_frame() {
+    InjectEvent f{};
+    f.kind = InjectKind::TouchFrame; f.time_ms = now_ms();
+    enqueue_inject(f);
+}
+// §3b: drive wl_touch.cancel from the UI (Android ACTION_CANCEL). Ends ALL active
+// touch points (the only correct way to terminate a grab when no up will arrive).
+void alr_wayland_inject_touch_cancel() {
+    InjectEvent e{};
+    e.kind = InjectKind::TouchCancel; e.time_ms = now_ms();
+    enqueue_inject(e);
+}
 void alr_wayland_inject_key(uint32_t evdev_key, uint32_t pressed) {
     InjectEvent e{};
     e.kind = InjectKind::Key;
     e.button = evdev_key; e.state = pressed; e.time_ms = now_ms();
     enqueue_inject(e);
+}
+
+// ---- Android IME -> guest text-input (alr_text_input.hpp) ----
+// These are the compositor-side IMPLEMENTATIONS of the boundary header. They are
+// callable from the Android UI thread: alr_ime_commit_text / *_delete_surrounding
+// enqueue onto g_inject_queue and wake the reactor, exactly like the inject_* path,
+// so the wl_resource sends happen on the compositor thread. The state callback +
+// focus-has-text-input query touch compositor-thread state without locks; they are
+// read by the JNI bridge during setup (set_state_callback, once) and from Android's
+// InputConnection (focus_has_text_input) where a benign stale read is acceptable.
+void alr_ime_set_state_callback(AlrImeStateFn fn, void* user_data) {
+    g_ime_state_cb = fn;
+    g_ime_state_ud = user_data;
+}
+
+void alr_ime_commit_text(const char* utf8, int32_t len) {
+    InjectEvent e{};
+    e.kind = InjectKind::ImeCommit;
+    if (utf8 && len > 0) e.text.assign(utf8, static_cast<size_t>(len));
+    else if (utf8)       e.text.assign(utf8);
+    e.time_ms = now_ms();
+    enqueue_inject(e);
+}
+
+void alr_ime_delete_surrounding(uint32_t before_bytes, uint32_t after_bytes) {
+    InjectEvent e{};
+    e.kind = InjectKind::ImeDelete;
+    e.before_bytes = before_bytes;
+    e.after_bytes = after_bytes;
+    e.time_ms = now_ms();
+    enqueue_inject(e);
+}
+
+void alr_ime_preedit(const char* utf8, int32_t len, int32_t cursor_byte) {
+    InjectEvent e{};
+    e.kind = InjectKind::ImePreedit;
+    if (utf8 && len > 0) e.text.assign(utf8, static_cast<size_t>(len));
+    else if (utf8)       e.text.assign(utf8);
+    e.preedit_cursor = cursor_byte;
+    e.time_ms = now_ms();
+    enqueue_inject(e);
+}
+
+bool alr_ime_inject_codepoint(uint32_t codepoint) {
+    // FALLBACK keysym/keymap path for guests that DON'T bind zwp_text_input_v3
+    // (foot/SDL/raw xkb). v1 supports the ASCII printable range reachable on the
+    // shipped US keymap (alr_xkb_keymap_us.h); a Shift level is synthesized for the
+    // upper-shift glyphs. Code points outside that set return false so the caller
+    // falls back to commit_string (if any v3 object exists) or drops the char (the
+    // documented dynamic-keymap upgrade is out of scope — see the design §5).
+    if (codepoint > 0x7f) return false;
+    // evdev keycode + whether Shift is needed, for each reachable ASCII char.
+    uint32_t key = 0; bool shift = false;
+    const auto base = [&](uint32_t c, uint32_t k) { if (codepoint == c) { key = k; } };
+    const auto sh   = [&](uint32_t c, uint32_t k) { if (codepoint == c) { key = k; shift = true; } };
+    // Letters: lowercase a..z -> KEY_A.., uppercase via Shift.
+    if (codepoint >= 'a' && codepoint <= 'z') {
+        static const uint8_t kRow[26] = {30,48,46,32,18,33,34,35,23,36,37,38,50,
+                                         49,24,25,16,19,31,20,22,47,17,45,21,44};
+        key = kRow[codepoint - 'a'];
+    } else if (codepoint >= 'A' && codepoint <= 'Z') {
+        static const uint8_t kRow[26] = {30,48,46,32,18,33,34,35,23,36,37,38,50,
+                                         49,24,25,16,19,31,20,22,47,17,45,21,44};
+        key = kRow[codepoint - 'A']; shift = true;
+    } else if (codepoint >= '1' && codepoint <= '9') {
+        key = 2 + (codepoint - '1');               // KEY_1..KEY_9
+    } else {
+        base('0', 11);                              base(' ', 57);
+        base('\n', 28); base('\t', 15); base('\b', 14);
+        base('-', 12);  sh('_', 12);   base('=', 13);  sh('+', 13);
+        base('[', 26);  sh('{', 26);   base(']', 27);  sh('}', 27);
+        base('\\', 43); sh('|', 43);   base(';', 39);  sh(':', 39);
+        base('\'', 40); sh('"', 40);   base('`', 41);  sh('~', 41);
+        base(',', 51);  sh('<', 51);   base('.', 52);  sh('>', 52);
+        base('/', 53);  sh('?', 53);
+        sh('!', 2); sh('@', 3); sh('#', 4); sh('$', 5); sh('%', 6);
+        sh('^', 7); sh('&', 8); sh('*', 9); sh('(', 10); sh(')', 11);
+    }
+    if (key == 0) return false;
+    constexpr uint32_t kKeyLeftShift = 42;
+    if (shift) alr_wayland_inject_key(kKeyLeftShift, 1);
+    alr_wayland_inject_key(key, 1);
+    alr_wayland_inject_key(key, 0);
+    if (shift) alr_wayland_inject_key(kKeyLeftShift, 0);
+    return true;
+}
+
+bool alr_ime_focus_has_text_input() {
+    // True iff the focused surface has an ENABLED zwp_text_input_v3. Read on the
+    // Android side to decide commit_string vs key synthesis (a stale read at most
+    // mis-routes one keystroke; the next commit corrects it). Compositor-thread state.
+    SurfaceState* s = ti_focused_state();
+    return s && s->ti_enabled;
 }
 int alr_wayland_inject_selftest(double x, double y) {
     // A synthetic burst exercising pointer + touch + keyboard, as a real tap at
@@ -2649,6 +3591,38 @@ int alr_wayland_inject_selftest(double x, double y) {
     alr_wayland_inject_key(kKeyA, 1);
     alr_wayland_inject_key(kKeyA, 0);
     return 7;
+}
+
+// ---------------------------------------------------------------------------
+// Clipboard bridge public API (see alr_compositor.hpp + the design). The sink
+// registry is set once by runtime_report.cpp; the selection setter enqueues onto
+// the clipboard queue + wakes the reactor (mirroring enqueue_inject). All wl_*
+// work happens later on the compositor thread in drain_clipboard_queue.
+// ---------------------------------------------------------------------------
+void alr_wayland_set_clipboard_sink(ClipboardGuestOfferCb on_offer,
+                                    ClipboardGuestTextCb on_text,
+                                    ClipboardGuestImageCb on_image) {
+    std::lock_guard<std::mutex> lk(g_clip_sink_mutex);
+    g_clip_on_offer = std::move(on_offer);
+    g_clip_on_text = std::move(on_text);
+    g_clip_on_image = std::move(on_image);
+}
+
+void alr_wayland_set_android_selection(const std::vector<std::string>& mimes,
+                                       const std::string& text,
+                                       const std::string& html,
+                                       const std::string& png) {
+    AndroidSelection sel;
+    sel.mimes = mimes;
+    sel.text = text;
+    sel.html = html;
+    sel.png = png;
+    {
+        std::lock_guard<std::mutex> lk(g_clip_queue_mutex);
+        g_clip_queue.push_back(std::move(sel));
+    }
+    Compositor* c = instance();
+    if (c) c->wake();
 }
 
 // ---------------------------------------------------------------------------

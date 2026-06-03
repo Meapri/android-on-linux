@@ -11,6 +11,7 @@
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/un.h>
@@ -85,6 +86,7 @@
 
 #ifdef ALR_HAVE_WAYLAND
 #include "alr_wayland/alr_compositor.hpp"
+#include "alr_wayland/alr_text_input.hpp"  // Android IME <-> guest text-input bridge
 #endif
 
 // GPU-native app track (Phase 4): host-side GLES command-stream decoder + probes.
@@ -1567,6 +1569,13 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     guest_env.push_back("TERM=xterm-256color");
     guest_env.push_back("XDG_RUNTIME_DIR=" + xdg_runtime_dir);
     guest_env.push_back("WAYLAND_DISPLAY=wayland-0");
+    // Audio (design android-audio-sink.md §4): point libpulse at the in-app
+    // PulseAudio-native server's AF_UNIX socket inside the SAME XDG_RUNTIME_DIR
+    // (bound by alr_audio at ${XDG_RUNTIME_DIR}/pulse/native). PULSE_SERVER beats
+    // client.conf, so this is the authoritative selector; harmless for non-audio
+    // guests. PULSE_CLIENTCONFIG makes the address explicit for tools that read it.
+    guest_env.push_back("PULSE_SERVER=unix:" + xdg_runtime_dir + "/pulse/native");
+    guest_env.push_back("PULSE_CLIENTCONFIG=/etc/pulse/client.conf");
     guest_env.push_back("GDK_BACKEND=wayland");
     guest_env.push_back("SDL_VIDEODRIVER=wayland");
     // Qt6 apps: select the wayland QPA plugin (libqwayland-generic.so, shipped 0755 in
@@ -1632,6 +1641,22 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     // the wrong directory. With this, DIR_MODULE resolves under the rootfs and normal
     // path mediation maps the asset open. Only used when guest_rel is absolute.
     guest_env.push_back("ALR_GUEST_EXE=" + guest_rel);
+    // ALR_USB_SOCK: the AF_UNIX socket the guest's libusb shim
+    // (alr_usb/guest_shim/libusb-1.0.so.0) connects to in order to forward
+    // libusb_* calls to the Android-side UsbHostBridge (Kotlin) which performs
+    // the real UsbManager/UsbDeviceConnection transfers. Path mirrors the
+    // Wayland socket: <cacheDir>/alr-usb/usbd.sock. The bridge is started by the
+    // owner (MainActivity/RunningSurfaceActivity) before launch; this only EXPORTS
+    // the env var so an unmodified libusb guest finds it. Harmless if the bridge
+    // is absent — the shim self-disables (LIBUSB_ERROR_OTHER from libusb_init) and
+    // a non-USB guest never connects. Design: docs/design/android-usb-host.md §3.
+    {
+        const std::string usb_sock =
+            (input.app_cache_dir.empty() ? std::string("/data/local/tmp")
+                                         : input.app_cache_dir) +
+            "/alr-usb/usbd.sock";
+        guest_env.push_back("ALR_USB_SOCK=" + usb_sock);
+    }
     // Two A/B gates, both read from the HOST (app) environment and decided here in
     // the parent. They are hoisted to function scope (not an inner block) so the
     // report lines below — including the path-mediation traps/rewrites line — can
@@ -6706,6 +6731,111 @@ struct WaylandPresenter {
 
 WaylandPresenter g_wl_presenter;
 
+// ===========================================================================
+// Clipboard bridge JNI glue (Android <-> Linux-guest selection). See
+// docs/design/android-clipboard-bridge.md §5/§10c. This keeps alr_compositor.cpp
+// free of any <jni.h> dependency: it only knows the std::function sinks declared
+// in alr_compositor.hpp; the native->Kotlin up-calls live here.
+//
+// The compositor thread is a raw pthread, so the up-call lambdas must
+// AttachCurrentThread before touching JNI. We cache the JavaVM* and a global ref
+// to the MainActivity (captured in nativeWaylandCompositorStart) + the callback
+// method IDs, and release them in nativeWaylandCompositorStop.
+// ===========================================================================
+JavaVM* g_clip_jvm = nullptr;
+jobject g_clip_activity = nullptr;       // global ref to MainActivity
+jmethodID g_clip_mid_offer = nullptr;    // onGuestClipboardOffer(String)
+jmethodID g_clip_mid_text = nullptr;     // onGuestClipboardText(String,String)
+jmethodID g_clip_mid_image = nullptr;    // onGuestClipboardImage(byte[])
+
+// Attach the (compositor) thread to the JVM if needed; returns the env + whether
+// the caller must DetachCurrentThread when done.
+JNIEnv* clip_attach_env(bool* out_must_detach) {
+    *out_must_detach = false;
+    if (g_clip_jvm == nullptr) return nullptr;
+    JNIEnv* env = nullptr;
+    jint st = g_clip_jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+    if (st == JNI_OK) return env;
+    if (st == JNI_EDETACHED) {
+        if (g_clip_jvm->AttachCurrentThread(&env, nullptr) == JNI_OK) {
+            *out_must_detach = true;
+            return env;
+        }
+    }
+    return nullptr;
+}
+
+// Install the alr::wayland clipboard sinks so the compositor can up-call Kotlin.
+// Captures the JVM + a global ref to `activity` + the three callback method IDs.
+void clip_install_sink(JNIEnv* env, jobject activity) {
+    if (env->GetJavaVM(&g_clip_jvm) != JNI_OK) g_clip_jvm = nullptr;
+    if (g_clip_activity != nullptr) { env->DeleteGlobalRef(g_clip_activity); g_clip_activity = nullptr; }
+    g_clip_activity = env->NewGlobalRef(activity);
+    jclass cls = env->GetObjectClass(activity);
+    g_clip_mid_offer = env->GetMethodID(cls, "onGuestClipboardOffer", "(Ljava/lang/String;)V");
+    g_clip_mid_text  = env->GetMethodID(cls, "onGuestClipboardText",
+                                        "(Ljava/lang/String;Ljava/lang/String;)V");
+    g_clip_mid_image = env->GetMethodID(cls, "onGuestClipboardImage", "([B)V");
+    if (env->ExceptionCheck()) env->ExceptionClear();  // tolerate a missing method
+    env->DeleteLocalRef(cls);
+
+    alr::wayland::alr_wayland_set_clipboard_sink(
+        // onGuestClipboardOffer(mimes joined by ',')
+        [](const std::vector<std::string>& mimes) {
+            if (g_clip_activity == nullptr || g_clip_mid_offer == nullptr) return;
+            bool detach = false;
+            JNIEnv* e = clip_attach_env(&detach);
+            if (e == nullptr) return;
+            std::string joined;
+            for (size_t i = 0; i < mimes.size(); ++i) {
+                if (i) joined += ",";
+                joined += mimes[i];
+            }
+            jstring js = e->NewStringUTF(joined.c_str());
+            e->CallVoidMethod(g_clip_activity, g_clip_mid_offer, js);
+            if (e->ExceptionCheck()) e->ExceptionClear();
+            if (js) e->DeleteLocalRef(js);
+            if (detach) g_clip_jvm->DetachCurrentThread();
+        },
+        // onGuestClipboardText(mime, utf8)
+        [](const std::string& mime, const std::string& utf8) {
+            if (g_clip_activity == nullptr || g_clip_mid_text == nullptr) return;
+            bool detach = false;
+            JNIEnv* e = clip_attach_env(&detach);
+            if (e == nullptr) return;
+            jstring jm = e->NewStringUTF(mime.c_str());
+            jstring jt = e->NewStringUTF(utf8.c_str());
+            e->CallVoidMethod(g_clip_activity, g_clip_mid_text, jm, jt);
+            if (e->ExceptionCheck()) e->ExceptionClear();
+            if (jm) e->DeleteLocalRef(jm);
+            if (jt) e->DeleteLocalRef(jt);
+            if (detach) g_clip_jvm->DetachCurrentThread();
+        },
+        // onGuestClipboardImage(pngBytes)
+        [](const std::string& png) {
+            if (g_clip_activity == nullptr || g_clip_mid_image == nullptr) return;
+            bool detach = false;
+            JNIEnv* e = clip_attach_env(&detach);
+            if (e == nullptr) return;
+            jbyteArray arr = e->NewByteArray(static_cast<jsize>(png.size()));
+            if (arr) {
+                e->SetByteArrayRegion(arr, 0, static_cast<jsize>(png.size()),
+                                      reinterpret_cast<const jbyte*>(png.data()));
+                e->CallVoidMethod(g_clip_activity, g_clip_mid_image, arr);
+                if (e->ExceptionCheck()) e->ExceptionClear();
+                e->DeleteLocalRef(arr);
+            }
+            if (detach) g_clip_jvm->DetachCurrentThread();
+        });
+}
+
+// Tear down the sink + drop the global ref (on compositor stop).
+void clip_uninstall_sink(JNIEnv* env) {
+    alr::wayland::alr_wayland_set_clipboard_sink({}, {}, {});
+    if (g_clip_activity != nullptr) { env->DeleteGlobalRef(g_clip_activity); g_clip_activity = nullptr; }
+    g_clip_mid_offer = g_clip_mid_text = g_clip_mid_image = nullptr;
+}
+
 #endif  // ALR_HAVE_WAYLAND
 
 }  // namespace
@@ -7206,7 +7336,7 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeRenderGpuSurfaceFrames(
 extern "C" JNIEXPORT jstring JNICALL
 Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandCompositorStart(
     JNIEnv* env,
-    jobject /* thiz */,
+    jobject thiz,
     jstring cache_dir,
     jobject surface,
     jint density_dpi,
@@ -7249,8 +7379,12 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandCompositorStart(
         g_wl_presenter.present_list(surfaces, out_w, out_h);
     };
     const std::string status = alr::wayland::alr_start_wayland_compositor(cfg);
+    // Clipboard bridge: install the native->Kotlin up-call sinks now that the
+    // compositor is up, capturing a global ref to MainActivity (released in stop).
+    clip_install_sink(env, thiz);
     return env->NewStringUTF(status.c_str());
 #else
+    (void)thiz;
     (void)env;
     (void)cache_dir;
     (void)surface;
@@ -7330,6 +7464,9 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandCompositorStop(
     jobject /* thiz */) {
 #ifdef ALR_HAVE_WAYLAND
     const std::string status = alr::wayland::alr_stop_wayland_compositor();
+    // Clear the clipboard sinks + drop the MainActivity global ref (the compositor
+    // thread is joined by alr_stop_wayland_compositor, so no up-call can race this).
+    clip_uninstall_sink(env);
     return env->NewStringUTF(status.c_str());
 #else
     return env->NewStringUTF("ALR WAYLAND COMPOSITOR: not-built");
@@ -7356,8 +7493,13 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandInjectSelfTest(
 #endif
 }
 
-// Forward a real Android touch (phase: 0=down, 1=move, 2=up) to the focused
-// client as BOTH wl_touch and wl_pointer events (toolkit-agnostic).
+// Forward ONE contact of a real Android touch (phase: 0=down, 1=move, 2=up) to the
+// focused client as a wl_touch event ONLY — NO synthetic mouse. (The old code
+// co-injected a wl_pointer per touch, which teleported one cursor between fingers and
+// made multitouch "feel like a mouse"; that pointer co-injection is removed.) Single-
+// finger pointer emulation for pointer-only clients is now decided compositor-side from
+// the touch grab state (§3d). The Kotlin side forwards every pointer of a MotionEvent
+// via this, then calls nativeWaylandInjectTouchFrame() once to close the atomic set.
 extern "C" JNIEXPORT void JNICALL
 Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandInjectTouch(
     JNIEnv* /* env */,
@@ -7367,18 +7509,35 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandInjectTouch(
     jfloat y,
     jint phase) {
 #ifdef ALR_HAVE_WAYLAND
-    alr::wayland::alr_wayland_inject_pointer_motion(x, y);
-    if (phase == 0) {
-        alr::wayland::alr_wayland_inject_pointer_button(0x110, 1);  // BTN_LEFT down
-    } else if (phase == 2) {
-        alr::wayland::alr_wayland_inject_pointer_button(0x110, 0);  // BTN_LEFT up
-    }
-    alr::wayland::alr_wayland_inject_touch(id, x, y, phase);
+    // touch ONLY; pointer (if any) is emulated compositor-side for a lone finger.
+    alr::wayland::alr_wayland_inject_touch_point(id, x, y, phase);
 #else
     (void)id;
     (void)x;
     (void)y;
     (void)phase;
+#endif
+}
+
+// Close the atomic set of touch changes for one Android MotionEvent (wl_touch.frame).
+// Call once after forwarding all of the event's contacts via nativeWaylandInjectTouch.
+extern "C" JNIEXPORT void JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandInjectTouchFrame(
+    JNIEnv* /* env */,
+    jobject /* thiz */) {
+#ifdef ALR_HAVE_WAYLAND
+    alr::wayland::alr_wayland_inject_touch_frame();
+#endif
+}
+
+// Drive wl_touch.cancel from the UI (Android ACTION_CANCEL: gesture stolen by the
+// system). Ends ALL active touch points and the single-finger pointer emulation.
+extern "C" JNIEXPORT void JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandInjectTouchCancel(
+    JNIEnv* /* env */,
+    jobject /* thiz */) {
+#ifdef ALR_HAVE_WAYLAND
+    alr::wayland::alr_wayland_inject_touch_cancel();
 #endif
 }
 
@@ -7416,5 +7575,221 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandInjectScroll(
     alr::wayland::alr_wayland_inject_pointer_axis(value, static_cast<int32_t>(axis));
 #else
     (void)x; (void)y; (void)value; (void)axis;
+#endif
+}
+
+// ===========================================================================
+// Android soft-keyboard IME <-> guest zwp_text_input_v3 (design: docs/design/
+// android-ime-text-input.md). Mirrors the inject bridges above: Android's
+// AlrInputConnection forwards committed/composing text + deletions here; this
+// file relays them into the compositor (alr_text_input.hpp), which sends
+// zwp_text_input_v3.commit_string/preedit_string/delete_surrounding_text to the
+// focused guest. The reverse direction (guest enables a text field) upcalls via
+// onGuestImeState so MainActivity raises/hides the soft keyboard.
+// ===========================================================================
+#ifdef ALR_HAVE_WAYLAND
+namespace {
+// State-callback plumbing. Cached once in nativeWaylandImeRegisterStateCallback and
+// used by ime_state_trampoline, which is invoked ON THE COMPOSITOR THREAD: it must
+// AttachCurrentThread before touching JNI, then call MainActivity.onGuestImeState
+// (the Kotlin side hops to the UI looper itself via runOnUiThread).
+JavaVM*   g_ime_jvm = nullptr;
+jobject   g_ime_activity = nullptr;   // global ref to the MainActivity
+jmethodID g_ime_on_state = nullptr;   // onGuestImeState(ZIIIIIII? -> see signature)
+
+void ime_state_trampoline(const alr::wayland::AlrImeState& st, void* /*ud*/) {
+    if (!g_ime_jvm || !g_ime_activity || !g_ime_on_state) return;
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    jint rc = g_ime_jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+    if (rc == JNI_EDETACHED) {
+        if (g_ime_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK || env == nullptr)
+            return;
+        attached = true;
+    } else if (rc != JNI_OK || env == nullptr) {
+        return;
+    }
+    env->CallVoidMethod(g_ime_activity, g_ime_on_state,
+                        static_cast<jboolean>(st.enabled ? JNI_TRUE : JNI_FALSE),
+                        static_cast<jint>(st.content_purpose),
+                        static_cast<jint>(st.content_hint),
+                        static_cast<jint>(st.cursor_x), static_cast<jint>(st.cursor_y),
+                        static_cast<jint>(st.cursor_w), static_cast<jint>(st.cursor_h));
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (attached) g_ime_jvm->DetachCurrentThread();
+}
+}  // namespace
+#endif  // ALR_HAVE_WAYLAND
+
+// Commit text from the soft keyboard. text is passed as a UTF-8 ByteArray (NOT a
+// jstring) on purpose: GetStringUTFChars yields *modified* UTF-8 (CESU-8) which
+// corrupts astral-plane code points (emoji -> surrogate pairs). The Kotlin side does
+// text.toByteArray(UTF_8); here we read the real bytes verbatim.
+extern "C" JNIEXPORT void JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandImeCommitText(
+    JNIEnv* env, jobject /* thiz */, jbyteArray utf8) {
+#ifdef ALR_HAVE_WAYLAND
+    if (!utf8) return;
+    const jsize len = env->GetArrayLength(utf8);
+    if (len <= 0) { alr::wayland::alr_ime_commit_text("", 0); return; }
+    jbyte* bytes = env->GetByteArrayElements(utf8, nullptr);
+    if (!bytes) return;
+    alr::wayland::alr_ime_commit_text(reinterpret_cast<const char*>(bytes),
+                                      static_cast<int32_t>(len));
+    env->ReleaseByteArrayElements(utf8, bytes, JNI_ABORT);  // read-only, no copy-back
+#else
+    (void)env; (void)utf8;
+#endif
+}
+
+// Composing (pre-edit) text from a CJK/glide IME. Same UTF-8 ByteArray route.
+// cursorByte is the preedit cursor as a UTF-8 BYTE offset.
+extern "C" JNIEXPORT void JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandImePreedit(
+    JNIEnv* env, jobject /* thiz */, jbyteArray utf8, jint cursorByte) {
+#ifdef ALR_HAVE_WAYLAND
+    const jsize len = utf8 ? env->GetArrayLength(utf8) : 0;
+    // Empty (or null) ByteArray => clear the composing run (finishComposingText).
+    jbyte* bytes = (utf8 && len > 0) ? env->GetByteArrayElements(utf8, nullptr) : nullptr;
+    alr::wayland::alr_ime_preedit(bytes ? reinterpret_cast<const char*>(bytes) : "",
+                                  bytes ? static_cast<int32_t>(len) : 0,
+                                  static_cast<int32_t>(cursorByte));
+    if (bytes) env->ReleaseByteArrayElements(utf8, bytes, JNI_ABORT);
+#else
+    (void)env; (void)utf8; (void)cursorByte;
+#endif
+}
+
+// deleteSurroundingText -> zwp_text_input_v3.delete_surrounding_text. The Kotlin side
+// converts char counts to UTF-8 byte counts before calling.
+extern "C" JNIEXPORT void JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandImeDeleteSurrounding(
+    JNIEnv* /* env */, jobject /* thiz */, jint beforeBytes, jint afterBytes) {
+#ifdef ALR_HAVE_WAYLAND
+    alr::wayland::alr_ime_delete_surrounding(
+        static_cast<uint32_t>(beforeBytes < 0 ? 0 : beforeBytes),
+        static_cast<uint32_t>(afterBytes < 0 ? 0 : afterBytes));
+#else
+    (void)beforeBytes; (void)afterBytes;
+#endif
+}
+
+// Whether the focused guest has an enabled zwp_text_input_v3 (InputConnection uses
+// this to choose commit_string vs key synthesis).
+extern "C" JNIEXPORT jboolean JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandImeFocusHasTextInput(
+    JNIEnv* /* env */, jobject /* thiz */) {
+#ifdef ALR_HAVE_WAYLAND
+    return alr::wayland::alr_ime_focus_has_text_input() ? JNI_TRUE : JNI_FALSE;
+#else
+    return JNI_FALSE;
+#endif
+}
+
+// Register the guest-IME-state upcall. Called once after the compositor starts. Caches
+// the JavaVM + a global ref to the MainActivity + the onGuestImeState methodID, then
+// installs ime_state_trampoline as the compositor's AlrImeStateFn.
+extern "C" JNIEXPORT void JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandImeRegisterStateCallback(
+    JNIEnv* env, jobject thiz) {
+#ifdef ALR_HAVE_WAYLAND
+    if (env->GetJavaVM(&g_ime_jvm) != JNI_OK || !g_ime_jvm) return;
+    if (g_ime_activity) { env->DeleteGlobalRef(g_ime_activity); g_ime_activity = nullptr; }
+    g_ime_activity = env->NewGlobalRef(thiz);
+    jclass cls = env->GetObjectClass(thiz);
+    if (cls) {
+        // void onGuestImeState(boolean enabled, int purpose, int hint,
+        //                      int curX, int curY, int curW, int curH)
+        g_ime_on_state = env->GetMethodID(cls, "onGuestImeState", "(ZIIIIII)V");
+        env->DeleteLocalRef(cls);
+    }
+    if (g_ime_activity && g_ime_on_state)
+        alr::wayland::alr_ime_set_state_callback(&ime_state_trampoline, nullptr);
+#else
+    (void)env; (void)thiz;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// nativeUsbBridgeStatus — pure diagnostics (docs/design/android-usb-host.md §5).
+// Reports whether the ALR USB host bridge's AF_UNIX socket exists at
+// <cacheDir>/alr-usb/usbd.sock (the path also exported to the guest as
+// ALR_USB_SOCK above) and whether it is currently connectable. This is the same
+// convention as nativeWaylandCompositorStatus: read-only observability for the
+// report screen; it neither starts nor owns the bridge (the bridge is pure
+// Kotlin — all USB host access is Java-only on Android). No transfers happen
+// here. APPEND-ONLY: added at the end of the JNI block by the USB owner.
+// ---------------------------------------------------------------------------
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeUsbBridgeStatus(
+    JNIEnv* env,
+    jobject /* thiz */,
+    jstring app_cache_dir) {
+    const std::string cache = jstring_to_string(env, app_cache_dir);
+    const std::string sock_path =
+        (cache.empty() ? std::string("/data/local/tmp") : cache) + "/alr-usb/usbd.sock";
+
+    std::string out = "alr usb bridge sock=" + sock_path;
+
+    struct stat st {};
+    const bool exists = (::stat(sock_path.c_str(), &st) == 0);
+    out += exists ? "\nalr usb bridge socket_present=yes"
+                  : "\nalr usb bridge socket_present=no";
+
+    bool connectable = false;
+    if (exists) {
+        const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd >= 0) {
+            struct sockaddr_un sa {};
+            sa.sun_family = AF_UNIX;
+            // truncate-safe copy into the fixed sun_path buffer
+            ::strncpy(sa.sun_path, sock_path.c_str(), sizeof(sa.sun_path) - 1);
+            connectable = (::connect(fd, reinterpret_cast<struct sockaddr*>(&sa),
+                                     sizeof(sa)) == 0);
+            ::close(fd);
+        }
+    }
+    out += connectable ? "\nalr usb bridge connectable=yes\nSTATUS: up"
+                       : "\nalr usb bridge connectable=no\nSTATUS: down";
+    return env->NewStringUTF(out.c_str());
+}
+
+// Android -> guest clipboard push. The Android primary clip changed; pass the
+// mimes the host can satisfy + the actual payloads (so native can answer
+// wl_data_offer.receive without re-entering the JVM). Empty `mimes` clears the
+// Android selection. See docs/design/android-clipboard-bridge.md §5b/§10c.
+extern "C" JNIEXPORT void JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandClipboardSetAndroid(
+    JNIEnv* env,
+    jobject /* thiz */,
+    jobjectArray mimes,
+    jstring utf8Text,
+    jstring htmlText,
+    jbyteArray pngBytes) {
+#ifdef ALR_HAVE_WAYLAND
+    std::vector<std::string> mime_list;
+    if (mimes != nullptr) {
+        const jsize n = env->GetArrayLength(mimes);
+        mime_list.reserve(static_cast<size_t>(n));
+        for (jsize i = 0; i < n; ++i) {
+            auto js = reinterpret_cast<jstring>(env->GetObjectArrayElement(mimes, i));
+            mime_list.push_back(jstring_to_string(env, js));
+            if (js) env->DeleteLocalRef(js);
+        }
+    }
+    const std::string text = jstring_to_string(env, utf8Text);
+    const std::string html = jstring_to_string(env, htmlText);
+    std::string png;
+    if (pngBytes != nullptr) {
+        const jsize len = env->GetArrayLength(pngBytes);
+        if (len > 0) {
+            png.resize(static_cast<size_t>(len));
+            env->GetByteArrayRegion(pngBytes, 0, len,
+                                    reinterpret_cast<jbyte*>(&png[0]));
+        }
+    }
+    alr::wayland::alr_wayland_set_android_selection(mime_list, text, html, png);
+#else
+    (void)env; (void)mimes; (void)utf8Text; (void)htmlText; (void)pngBytes;
 #endif
 }
