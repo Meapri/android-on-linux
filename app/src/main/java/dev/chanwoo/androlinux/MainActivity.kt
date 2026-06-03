@@ -2051,6 +2051,14 @@ class MainActivity : Activity() {
                                 "\n--disable-dev-shm-usage\n--user-data-dir=/tmp/cr4-profile" +
                                 "\n--no-first-run\n--no-default-browser-check" +
                                 "\n--disable-crash-reporter\n--disable-breakpad" +
+                                // demo.html is file:// (offline). content_shell still probes
+                                // DoH (https://dns.google) in the background → NSS init →
+                                // libsqlite3.so.0 (flat-path gap) → FATAL nss_error=-5925,
+                                // AFTER the window already painted. Kill ALL background net so
+                                // the offline window persists (no DNS/DoH/component/pings).
+                                "\n--disable-background-networking" +
+                                "\n--disable-features=DnsOverHttps,AsyncDns" +
+                                "\n--no-pings\n--disable-component-update" +
                                 "\n--content-shell-hide-toolbar\n--ozone-override-screen-size=1200,1920" +
                                 "\n--enable-logging=stderr\n--v=1" +
                                 "\nfile:///root/demo.html",
