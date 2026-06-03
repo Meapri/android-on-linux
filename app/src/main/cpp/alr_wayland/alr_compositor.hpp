@@ -146,6 +146,13 @@ void alr_wayland_inject_pointer_motion(double x, double y);
 void alr_wayland_inject_pointer_button(uint32_t evdev_button, uint32_t pressed);
 void alr_wayland_inject_pointer_axis(double value, int32_t axis);  // axis: 0=vertical 1=horizontal
 void alr_wayland_inject_touch(int32_t id, double x, double y, int32_t phase);  // 0=down 1=move 2=up
+// Multi-contact touch (real touch, NOT mouse-emulated). Forward each contact of one
+// Android MotionEvent with _touch_point (no implicit frame), then close the atomic set
+// once with _touch_frame. _touch_cancel drives wl_touch.cancel (Android ACTION_CANCEL).
+// Single-finger pointer emulation for pointer-only clients is decided compositor-side.
+void alr_wayland_inject_touch_point(int32_t id, double x, double y, int32_t phase);  // 0=down 1=move 2=up
+void alr_wayland_inject_touch_frame();
+void alr_wayland_inject_touch_cancel();
 void alr_wayland_inject_key(uint32_t evdev_key, uint32_t pressed);
 // Inject a synthetic burst (motion+click+touch+key) at the given point for
 // verifying the input path end to end. Returns the number of events queued.

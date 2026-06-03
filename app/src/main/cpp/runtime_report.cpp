@@ -6587,8 +6587,13 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandInjectSelfTest(
 #endif
 }
 
-// Forward a real Android touch (phase: 0=down, 1=move, 2=up) to the focused
-// client as BOTH wl_touch and wl_pointer events (toolkit-agnostic).
+// Forward ONE contact of a real Android touch (phase: 0=down, 1=move, 2=up) to the
+// focused client as a wl_touch event ONLY — NO synthetic mouse. (The old code
+// co-injected a wl_pointer per touch, which teleported one cursor between fingers and
+// made multitouch "feel like a mouse"; that pointer co-injection is removed.) Single-
+// finger pointer emulation for pointer-only clients is now decided compositor-side from
+// the touch grab state (§3d). The Kotlin side forwards every pointer of a MotionEvent
+// via this, then calls nativeWaylandInjectTouchFrame() once to close the atomic set.
 extern "C" JNIEXPORT void JNICALL
 Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandInjectTouch(
     JNIEnv* /* env */,
@@ -6598,18 +6603,35 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandInjectTouch(
     jfloat y,
     jint phase) {
 #ifdef ALR_HAVE_WAYLAND
-    alr::wayland::alr_wayland_inject_pointer_motion(x, y);
-    if (phase == 0) {
-        alr::wayland::alr_wayland_inject_pointer_button(0x110, 1);  // BTN_LEFT down
-    } else if (phase == 2) {
-        alr::wayland::alr_wayland_inject_pointer_button(0x110, 0);  // BTN_LEFT up
-    }
-    alr::wayland::alr_wayland_inject_touch(id, x, y, phase);
+    // touch ONLY; pointer (if any) is emulated compositor-side for a lone finger.
+    alr::wayland::alr_wayland_inject_touch_point(id, x, y, phase);
 #else
     (void)id;
     (void)x;
     (void)y;
     (void)phase;
+#endif
+}
+
+// Close the atomic set of touch changes for one Android MotionEvent (wl_touch.frame).
+// Call once after forwarding all of the event's contacts via nativeWaylandInjectTouch.
+extern "C" JNIEXPORT void JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandInjectTouchFrame(
+    JNIEnv* /* env */,
+    jobject /* thiz */) {
+#ifdef ALR_HAVE_WAYLAND
+    alr::wayland::alr_wayland_inject_touch_frame();
+#endif
+}
+
+// Drive wl_touch.cancel from the UI (Android ACTION_CANCEL: gesture stolen by the
+// system). Ends ALL active touch points and the single-finger pointer emulation.
+extern "C" JNIEXPORT void JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandInjectTouchCancel(
+    JNIEnv* /* env */,
+    jobject /* thiz */) {
+#ifdef ALR_HAVE_WAYLAND
+    alr::wayland::alr_wayland_inject_touch_cancel();
 #endif
 }
 

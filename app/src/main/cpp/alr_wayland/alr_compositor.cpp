@@ -262,7 +262,7 @@ Compositor* instance() {
 // compositor thread (wl_resource sends must happen there). ----
 enum class InjectKind : uint8_t {
     PointerMotion, PointerButton, PointerAxis,
-    TouchDown, TouchMotion, TouchUp, TouchFrame, Key,
+    TouchDown, TouchMotion, TouchUp, TouchFrame, TouchCancel, Key,
 };
 struct InjectEvent {
     InjectKind kind;
@@ -358,6 +358,20 @@ uint64_t g_next_map_serial = 1;
 struct wl_resource* g_touch_target = nullptr;
 int g_touch_active = 0;
 
+// §3d single-finger pointer emulation. Many pointer-only toolkits (xterm, some SDL
+// games, legacy GTK2) bind ONLY wl_pointer. To keep them usable WITHOUT the old
+// broken per-touch-event pointer co-injection (which teleported one pointer between
+// fingers), the compositor emits a synthetic wl_pointer stream for a LONE single
+// finger only — and stops the moment a second finger joins (real multitouch must
+// flow through wl_touch alone, the weston/desktop model). g_touch_emulating is true
+// while we are driving the pointer for g_touch_emul_id; both are cleared on up/cancel
+// or when a 2nd contact arrives. Gated by g_touch_pointer_emulation so it can be
+// disabled per-client later. Compositor-thread-only (set/read only in drain_input_queue
+// and the teardown helpers), so no atomic/mutex needed.
+bool g_touch_pointer_emulation = true;
+bool g_touch_emulating = false;
+int32_t g_touch_emul_id = -1;
+
 uint32_t now_ms() {
     struct timespec ts{};
     ::clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -399,7 +413,10 @@ void release_buffer(struct wl_resource* buffer) {
 // surface goes away. No-op if `surface` isn't the current touch target.
 void cancel_touch_if_targeting(struct wl_resource* surface) {
     if (!surface || g_touch_target != surface || g_touch_active <= 0) {
-        if (g_touch_target == surface) { g_touch_target = nullptr; g_touch_active = 0; }
+        if (g_touch_target == surface) {
+            g_touch_target = nullptr; g_touch_active = 0;
+            g_touch_emulating = false; g_touch_emul_id = -1;
+        }
         return;
     }
     for (auto* t : g_touches) {
@@ -409,6 +426,11 @@ void cancel_touch_if_targeting(struct wl_resource* surface) {
     }
     g_touch_target = nullptr;
     g_touch_active = 0;
+    // §3d: the grabbed surface is being torn down under the finger — end any
+    // single-finger pointer emulation too (no up will arrive). The pointer's own
+    // leave is handled by the surface-destroy pointer-leave paths elsewhere.
+    g_touch_emulating = false;
+    g_touch_emul_id = -1;
 }
 
 // ---- multi-surface compositing: forward declarations (definitions below, after
@@ -2175,6 +2197,61 @@ void Compositor::drain_input_queue() {
             for (auto* t : g_touches)
                 wl_touch_send_down(t, serial, e.time_ms, deliver, e.touch_id,
                                    wl_fixed_from_double(mx), wl_fixed_from_double(my));
+            // §3d single-finger pointer emulation. The down BEFORE this increment is
+            // the FIRST and only contact iff g_touch_active == 0. Emulate a lone
+            // finger as a pointer (enter + motion + BTN_LEFT press) so pointer-only
+            // toolkits stay usable; the moment a SECOND finger arrives, end emulation
+            // (release the button) so real multitouch flows through wl_touch alone and
+            // the pointer never teleports. Mirrors the PointerMotion/PointerButton
+            // cases but is driven entirely by the touch grab state (single source of
+            // truth) — the JNI layer feeds touch ONLY.
+            if (g_touch_pointer_emulation) {
+                if (g_touch_active == 0) {
+                    // First lone contact: begin emulating a pointer over the grabbed
+                    // surface. g_input_target_surface/g_pointer_entered are the same
+                    // state the PointerMotion path maintains, so reuse them.
+                    const wl_fixed_t pfx = wl_fixed_from_double(mx);
+                    const wl_fixed_t pfy = wl_fixed_from_double(my);
+                    if (g_pointer_entered && g_input_target_surface &&
+                        g_input_target_surface != deliver) {
+                        for (auto* p : g_pointers) {
+                            wl_pointer_send_leave(p, wl_display_next_serial(display_),
+                                                  g_input_target_surface);
+                            if (wl_resource_get_version(p) >= WL_POINTER_FRAME_SINCE_VERSION)
+                                wl_pointer_send_frame(p);
+                        }
+                        g_pointer_entered = false;
+                    }
+                    g_input_target_surface = deliver;
+                    for (auto* p : g_pointers) {
+                        if (!g_pointer_entered)
+                            wl_pointer_send_enter(p, wl_display_next_serial(display_),
+                                                  deliver, pfx, pfy);
+                        wl_pointer_send_motion(p, e.time_ms, pfx, pfy);
+                        const uint32_t bser = wl_display_next_serial(display_);
+                        wl_pointer_send_button(p, bser, e.time_ms, 0x110 /*BTN_LEFT*/,
+                                               WL_POINTER_BUTTON_STATE_PRESSED);
+                        if (wl_resource_get_version(p) >= WL_POINTER_FRAME_SINCE_VERSION)
+                            wl_pointer_send_frame(p);
+                    }
+                    g_pointer_entered = true;
+                    g_touch_emulating = true;
+                    g_touch_emul_id = e.touch_id;
+                } else if (g_touch_emulating) {
+                    // A second finger joined: the gesture is now multitouch. Release
+                    // the emulated button and stop emulating for the rest of the
+                    // sequence so the pointer doesn't interfere with the touch stream.
+                    const uint32_t bser = wl_display_next_serial(display_);
+                    for (auto* p : g_pointers) {
+                        wl_pointer_send_button(p, bser, e.time_ms, 0x110 /*BTN_LEFT*/,
+                                               WL_POINTER_BUTTON_STATE_RELEASED);
+                        if (wl_resource_get_version(p) >= WL_POINTER_FRAME_SINCE_VERSION)
+                            wl_pointer_send_frame(p);
+                    }
+                    g_touch_emulating = false;
+                    g_touch_emul_id = -1;
+                }
+            }
             ++g_touch_active;
             break;
         }
@@ -2188,17 +2265,67 @@ void Compositor::drain_input_queue() {
             for (auto* t : g_touches)
                 wl_touch_send_motion(t, e.time_ms, e.touch_id,
                                      wl_fixed_from_double(mx), wl_fixed_from_double(my));
+            // §3d: while emulating a lone finger, move the synthetic pointer with it
+            // (never teleporting — only the single emulated id drives the pointer).
+            if (g_touch_pointer_emulation && g_touch_emulating &&
+                e.touch_id == g_touch_emul_id && g_pointer_entered) {
+                const wl_fixed_t pfx = wl_fixed_from_double(mx);
+                const wl_fixed_t pfy = wl_fixed_from_double(my);
+                for (auto* p : g_pointers) {
+                    wl_pointer_send_motion(p, e.time_ms, pfx, pfy);
+                    if (wl_resource_get_version(p) >= WL_POINTER_FRAME_SINCE_VERSION)
+                        wl_pointer_send_frame(p);
+                }
+            }
             break;
         }
         case InjectKind::TouchUp: {
             const uint32_t serial = wl_display_next_serial(display_);
             for (auto* t : g_touches) wl_touch_send_up(t, serial, e.time_ms, e.touch_id);
+            // §3d: if the lifted finger is the emulated one, release BTN_LEFT and stop
+            // emulating (a tap by a lone finger becomes a pointer press+release).
+            if (g_touch_pointer_emulation && g_touch_emulating &&
+                e.touch_id == g_touch_emul_id) {
+                const uint32_t bser = wl_display_next_serial(display_);
+                for (auto* p : g_pointers) {
+                    wl_pointer_send_button(p, bser, e.time_ms, 0x110 /*BTN_LEFT*/,
+                                           WL_POINTER_BUTTON_STATE_RELEASED);
+                    if (wl_resource_get_version(p) >= WL_POINTER_FRAME_SINCE_VERSION)
+                        wl_pointer_send_frame(p);
+                }
+                g_touch_emulating = false;
+                g_touch_emul_id = -1;
+            }
             if (g_touch_active > 0 && --g_touch_active == 0)
                 g_touch_target = nullptr;  // last finger up: release the grab
             break;
         }
         case InjectKind::TouchFrame:
             for (auto* t : g_touches) wl_touch_send_frame(t);
+            break;
+        case InjectKind::TouchCancel:
+            // User-initiated cancel (Android ACTION_CANCEL: gesture stolen by the
+            // system). Per spec wl_touch.cancel ends ALL active touch points (no
+            // per-id arg) and is followed by a frame. Drop the grab and any pointer
+            // emulation in progress.
+            for (auto* t : g_touches) {
+                wl_touch_send_cancel(t);
+                if (wl_resource_get_version(t) >= WL_TOUCH_FRAME_SINCE_VERSION)
+                    wl_touch_send_frame(t);
+            }
+            if (g_touch_pointer_emulation && g_touch_emulating) {
+                const uint32_t bser = wl_display_next_serial(display_);
+                for (auto* p : g_pointers) {
+                    wl_pointer_send_button(p, bser, e.time_ms, 0x110 /*BTN_LEFT*/,
+                                           WL_POINTER_BUTTON_STATE_RELEASED);
+                    if (wl_resource_get_version(p) >= WL_POINTER_FRAME_SINCE_VERSION)
+                        wl_pointer_send_frame(p);
+                }
+            }
+            g_touch_target = nullptr;
+            g_touch_active = 0;
+            g_touch_emulating = false;
+            g_touch_emul_id = -1;
             break;
         case InjectKind::Key: {
             // P0-3: route keys to a grabbing popup (menu) if any, else the focused
@@ -2372,6 +2499,8 @@ void Compositor::teardown() {
     g_keyboard_grab_surface = nullptr;  // stale-pointer guard on restart (UAF discipline)
     g_touch_target = nullptr;           // drop any in-flight touch grab on restart
     g_touch_active = 0;
+    g_touch_emulating = false;          // §3d: drop any in-flight pointer emulation
+    g_touch_emul_id = -1;
     g_pointer_entered = false;
     g_keyboard_entered = false;
     g_mods_depressed = 0;  // don't leak held mods / CapsLock into a re-created compositor
@@ -2487,6 +2616,32 @@ void alr_wayland_inject_touch(int32_t id, double x, double y, int32_t phase) {
     InjectEvent f{};
     f.kind = InjectKind::TouchFrame; f.time_ms = e.time_ms;
     enqueue_inject(f);
+}
+// §3c: enqueue ONE contact's down/motion/up WITHOUT a trailing frame, so the JNI
+// layer can forward every pointer of one Android MotionEvent and then close the
+// atomic set with a single alr_wayland_inject_touch_frame(). This is the touch-ONLY
+// path (no synthetic pointer here — single-finger pointer emulation, if any, is
+// decided compositor-side from the touch grab state, §3d).
+void alr_wayland_inject_touch_point(int32_t id, double x, double y, int32_t phase) {
+    InjectEvent e{};
+    e.kind = phase == 0 ? InjectKind::TouchDown
+           : phase == 2 ? InjectKind::TouchUp
+                        : InjectKind::TouchMotion;
+    e.touch_id = id; e.x = x; e.y = y; e.time_ms = now_ms();
+    enqueue_inject(e);
+}
+// §3c: close the atomic set of touch changes for one MotionEvent (wl_touch.frame).
+void alr_wayland_inject_touch_frame() {
+    InjectEvent f{};
+    f.kind = InjectKind::TouchFrame; f.time_ms = now_ms();
+    enqueue_inject(f);
+}
+// §3b: drive wl_touch.cancel from the UI (Android ACTION_CANCEL). Ends ALL active
+// touch points (the only correct way to terminate a grab when no up will arrive).
+void alr_wayland_inject_touch_cancel() {
+    InjectEvent e{};
+    e.kind = InjectKind::TouchCancel; e.time_ms = now_ms();
+    enqueue_inject(e);
 }
 void alr_wayland_inject_key(uint32_t evdev_key, uint32_t pressed) {
     InjectEvent e{};
