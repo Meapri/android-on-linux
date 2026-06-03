@@ -22,6 +22,17 @@
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
+#include <linux/sched.h>   // CLONE_VM / CLONE_VFORK for the G1 vfork-strip fix
+// Fallbacks: keep building even if a header variant omits these (stable aarch64 ABI).
+#ifndef CLONE_VM
+#define CLONE_VM 0x00000100
+#endif
+#ifndef CLONE_VFORK
+#define CLONE_VFORK 0x00004000
+#endif
+#ifndef __NR_clone3
+#define __NR_clone3 435
+#endif
 
 #ifndef NT_PRSTATUS
 #define NT_PRSTATUS 1
@@ -1286,14 +1297,27 @@ static bool alr_install_path_trace_filter(int dg) {
 // 9-path-syscall filter above remains the ALR_PCGATE=="0" A/B baseline.
 static bool alr_install_execve_trace_filter(int dg) {
     ::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    // G1 vfork fix: ALSO RET_TRACE clone/clone3. A guest that g_spawn/posix_spawns a
+    // helper (GIMP-core launching a plug-in: vfork+execve) issues clone with
+    // CLONE_VM|CLONE_VFORK, which FREEZES the parent in the kernel (vfork wait, state D)
+    // until the child execs/exits. Under ALR the child's execve is cancelled and the
+    // target is re-mapped IN-PROCESS — so the real execve never happens, the vfork is
+    // never released, and the parent (GIMP-core) hangs forever at the plug-in scan
+    // (device-proven: PID frozen D, no PTRACE_EVENT_VFORK_DONE). The supervisor strips
+    // CLONE_VFORK|CLONE_VM at the clone seccomp-entry so the child becomes a plain fork
+    // (private COW mm, parent NOT frozen); the in-process re-map then runs safely in the
+    // child's own mm. We trace BOTH clone (flags in x0) and clone3 (flags in the
+    // clone_args struct x0 points at). 5 jumps now, so the offsets grow accordingly.
     struct sock_filter filter[] = {
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 1, 0),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),  // foreign arch -> allow
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_execve, 1, 0),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_execveat, 0, 1),
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE),  // execve/execveat -> tracer
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_execve, 3, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_execveat, 2, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_clone, 1, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_clone3, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE),  // execve/at + clone/clone3 -> tracer
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),  // everything else -> allow
     };
     struct sock_fprog prog = {
@@ -2349,6 +2373,7 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         return e != nullptr && e[0] == '1';
     }();
     int exec_inproc_redirected = 0;  // execs PC-redirected into the in-process trampoline
+    int vfork_stripped = 0;          // G1: clone/clone3 CLONE_VFORK|CLONE_VM stripped -> fork
     // CR-4 instrumentation + runaway guard. The GUI chromium re-map storm (this
     // session's wall): ozone-wayland spawns GPU/utility/renderer children, each a
     // fork()+execve("/proc/self/exe", ["--type=...", …]). GATE-1 below substitutes the
@@ -2785,6 +2810,76 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                 // x1/x2. The non-exec path-family branch is unchanged.
                 const uint64_t sysno = regs[8];
                 ++trace_hist[static_cast<int>(sysno)];  // M-R2 storm decomposition
+                // === G1 vfork-strip: clone/clone3 with CLONE_VFORK ===
+                // A guest g_spawn/posix_spawn issues clone(CLONE_VM|CLONE_VFORK) (or the
+                // clone3 equivalent). CLONE_VFORK freezes THIS (parent) thread in the
+                // kernel until the child execs/exits; the child's execve is then
+                // re-mapped IN-PROCESS (no real execve), so the vfork is NEVER released
+                // and the parent hangs in state D forever — the GIMP plug-in-scan wedge
+                // (device-root-caused: gimp-3.0 PID frozen D, zero PTRACE_EVENT_VFORK_DONE).
+                // FIX: clear CLONE_VFORK|CLONE_VM at the clone syscall-entry so the child
+                // is a plain fork (own COW mm; parent runs on immediately). The in-process
+                // re-map then executes safely in the child's PRIVATE mm. clone keeps flags
+                // in x0; clone3 keeps them as a u64 in the clone_args struct x0 points at.
+                // Only strips when CLONE_VFORK is actually set (a normal pthread CLONE_VM|
+                // CLONE_THREAD without VFORK is untouched — its parent isn't frozen).
+                {
+                    const bool is_clone  = (sysno == static_cast<uint64_t>(__NR_clone));
+                    const bool is_clone3 = (sysno == static_cast<uint64_t>(__NR_clone3));
+                    if (is_clone) {
+                        const uint64_t flags = regs[0];
+                        if (flags & static_cast<uint64_t>(CLONE_VFORK)) {
+                            regs[0] = flags & ~static_cast<uint64_t>(
+                                          CLONE_VFORK | CLONE_VM);
+                            if (::ptrace(PTRACE_SETREGSET, w,
+                                         reinterpret_cast<void*>(NT_PRSTATUS), &io) == 0) {
+                                ++vfork_stripped;
+                                if (vfork_stripped == 1) {
+                                    __android_log_print(ANDROID_LOG_INFO, "alr_loader",
+                                        "alr G1 vfork->fork (clone) tid=%d flags=0x%llx",
+                                        static_cast<int>(w),
+                                        static_cast<unsigned long long>(flags));
+                                }
+                            }
+                        }
+                        ::ptrace(PTRACE_CONT, w, nullptr, nullptr);
+                        continue;
+                    }
+                    if (is_clone3) {
+                        // clone3(struct clone_args* args, size_t size). flags is the first
+                        // u64 field of clone_args (x0 -> args). Read it, strip, write back.
+                        const uintptr_t args_addr = static_cast<uintptr_t>(regs[0]);
+                        if (args_addr != 0) {
+                            int mfd = mem_fd_for(w);
+                            if (mfd >= 0) {
+                                uint64_t cflags = 0;
+                                if (::pread(mfd, &cflags, sizeof(cflags),
+                                            static_cast<off_t>(args_addr)) ==
+                                        static_cast<ssize_t>(sizeof(cflags)) &&
+                                    (cflags & static_cast<uint64_t>(CLONE_VFORK))) {
+                                    const uint64_t nflags =
+                                        cflags & ~static_cast<uint64_t>(
+                                                     CLONE_VFORK | CLONE_VM);
+                                    if (::pwrite(mfd, &nflags, sizeof(nflags),
+                                                 static_cast<off_t>(args_addr)) ==
+                                            static_cast<ssize_t>(sizeof(nflags))) {
+                                        ++vfork_stripped;
+                                        if (vfork_stripped == 1) {
+                                            __android_log_print(ANDROID_LOG_INFO,
+                                                "alr_loader",
+                                                "alr G1 vfork->fork (clone3) tid=%d "
+                                                "flags=0x%llx",
+                                                static_cast<int>(w),
+                                                static_cast<unsigned long long>(cflags));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        ::ptrace(PTRACE_CONT, w, nullptr, nullptr);
+                        continue;
+                    }
+                }
                 const bool is_exec =
                     (sysno == static_cast<uint64_t>(__NR_execve) ||
                      sysno == static_cast<uint64_t>(__NR_execveat));
@@ -4190,7 +4285,8 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     out << "\nalr exec traps=" << exec_traps
         << " rewrites=" << exec_rewrites
         << " exec_events=" << exec_events
-        << " clone_events=" << guest_threads;
+        << " clone_events=" << guest_threads
+        << " vfork_stripped=" << vfork_stripped;  // G1: vfork->fork conversions
     // ADR-003 §3 (B-3) child envp re-injection telemetry. envp_injected>0 proves
     // the supervisor rebuilt at least one exec'd child's envp so the new image
     // re-enters ALR interpose mediation; ld_preload_set is the subset carrying our
