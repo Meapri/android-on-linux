@@ -2061,9 +2061,20 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         // went silent ~2min under chromium's thread/syscall storm via the serialized
         // ptrace supervision). Give chromium 600s to answer "does it render GIVEN time
         // (window-bound) or never (a real supervision-throughput wall)?".
+        // Standalone Chromium app (launcher entry "ALR Chromium"): a PERSISTENT GUI,
+        // not a bounded probe. ALR_PERSIST_GUEST=1 (set by MainActivity.runChromium-
+        // Standalone) means "run until the user leaves" — NO SIGALRM lifetime cap, so
+        // the window stays up instead of going black when the 180s chromium probe
+        // window expired (the device-observed "black after ~3 min").
+        const bool persist_guest = [] {
+            const char* p = ::getenv("ALR_PERSIST_GUEST");
+            return p != nullptr && p[0] == '1';
+        }();
         const unsigned alarm_sec =
-            dynamic ? (is_gimp ? 1800u : ((is_chromium || is_pkgtool) ? 180u : 25u))
-                    : 5u;
+            persist_guest
+                ? 0u  // alarm(0) cancels any alarm — no lifetime cap (persistent app)
+                : (dynamic ? (is_gimp ? 1800u : ((is_chromium || is_pkgtool) ? 180u : 25u))
+                           : 5u);
         ::alarm(alarm_sec);
         alr_enter_guest(reinterpret_cast<void*>(start), reinterpret_cast<void*>(jump_entry),
                         reinterpret_cast<void*>(tcb));
@@ -2417,6 +2428,12 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     // install class both legitimately run long under the serialized in-process
     // supervisor, so they get the large ceiling; GIMP is interactive; everything else
     // keeps the short 40s ceiling.
+    // Standalone Chromium app: persistent GUI, never watchdog-killed (no ceiling, no
+    // no-progress timeout) — it must stay pinned up. Matches the alarm(0) in the child.
+    const bool persist_guest = [] {
+        const char* p = ::getenv("ALR_PERSIST_GUEST");
+        return p != nullptr && p[0] == '1';
+    }();
     const unsigned watchdog_sec =
         (host_path.find("chrom") != std::string::npos ||
          host_path.find("/dpkg") != std::string::npos ||
@@ -2436,7 +2453,7 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     const unsigned kNoProgressSec = 40u;
     const pid_t leader_pid = pid;
     const pid_t sup_tid = ::gettid();  // the single tracer thread, for self-diagnosis
-    std::thread watchdog([leader_pid, sup_tid, watchdog_sec, &sup_done,
+    std::thread watchdog([leader_pid, sup_tid, watchdog_sec, persist_guest, &sup_done,
                           &ev_ring, &ev_head, &guard_fires, &guard_ints]() {
         uint32_t last_ev = ev_head.load(std::memory_order_acquire);
         unsigned stagnant = 0;   // consecutive seconds with NO event progress
@@ -2446,6 +2463,10 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
             if (sup_done.load(std::memory_order_acquire)) return;
             std::this_thread::sleep_for(std::chrono::seconds(1));
             ++elapsed;
+            // Persistent standalone app (ALR Chromium): never time out — no ceiling, no
+            // no-progress kill. The user wants the window pinned up; a genuine wedge just
+            // blocks the launch Thread while the app + compositor keep running.
+            if (persist_guest) continue;
             const uint32_t now_ev = ev_head.load(std::memory_order_acquire);
             if (now_ev != last_ev) {       // progress -> reset the no-progress timer
                 last_ev = now_ev;

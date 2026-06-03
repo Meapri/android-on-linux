@@ -2034,6 +2034,10 @@ class MainActivity : Activity() {
                         // trace is visible without waiting for the (never-arriving) probe
                         // report. Only set on this lean cronly path.
                         android.system.Os.setenv("ALR_TEE_GUEST_STDOUT", "1", true)
+                        // Standalone app: pin chromium up forever — no SIGALRM lifetime cap
+                        // (was 180s) and no stall-watchdog ceiling/no-progress kill (was
+                        // 200s/40s), which is what turned the window black "after a while".
+                        android.system.Os.setenv("ALR_PERSIST_GUEST", "1", true)
                         val out = nativeAlrNativeLoaderProbe(
                             packageName,
                             applicationInfo.nativeLibraryDir,
