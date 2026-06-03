@@ -23,12 +23,21 @@ package dev.chanwoo.androlinux.ui
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.CenterAlignedTopAppBar
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import dev.chanwoo.androlinux.R
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.CreationExtras
@@ -126,15 +135,59 @@ private fun NavGraphBuilder.launcherDestination(
     // collectAsState 로 받아 *기존 Route 시그니처* 그대로 넘긴다(화면은 ViewModel 을 모름).
     val vm: LauncherViewModel = viewModel(factory = alrViewModelFactory { LauncherViewModel(runtime) })
     val state by vm.uiState.collectAsState()
-    LauncherRoute(
-        installedApps = state.installedApps,
-        // 실행은 통합 측이 RunningSurface 결선과 함께 수행(onLaunchApp 위임) — ViewModel 의
-        // launch 는 mock/세션 표현용이라 두 경로가 같은 launch 로 수렴한다.
-        onLaunch = { app -> onLaunchApp(app.toLaunchRequest()) },
-        onOpenCatalog = { navController.navigate(AlrRoutes.CATALOG) },
-        onOpenSettings = { navController.navigate(AlrRoutes.SETTINGS) },
-        onOpenAppDetail = { appId -> navController.navigate(AlrRoutes.appDetail(appId)) },
-    )
+    // 브랜드 정체성 헤더("Android on Linux") — 최상위 scaffold chrome(presentation only).
+    // 앱-그리드 로직/런타임 결선은 불변; LauncherRoute 를 그대로 호출만 한다.
+    BrandedLauncherScaffold {
+        LauncherRoute(
+            installedApps = state.installedApps,
+            // 실행은 통합 측이 RunningSurface 결선과 함께 수행(onLaunchApp 위임) — ViewModel 의
+            // launch 는 mock/세션 표현용이라 두 경로가 같은 launch 로 수렴한다.
+            onLaunch = { app -> onLaunchApp(app.toLaunchRequest()) },
+            onOpenCatalog = { navController.navigate(AlrRoutes.CATALOG) },
+            onOpenSettings = { navController.navigate(AlrRoutes.SETTINGS) },
+            onOpenAppDetail = { appId -> navController.navigate(AlrRoutes.appDetail(appId)) },
+        )
+    }
+}
+
+// --------------------------------------------------------------------------- //
+// 브랜드 헤더 — "Android on Linux" 단일 정체성(아이덴티티 레이어, presentation only).
+//   런처 홈 최상단에 브랜드 TopAppBar(제목 + 부제 "Linux apps, natively")를 깐다. 앱-그리드/
+//   런타임은 LauncherScreen.kt(타 트랙 소유)가 그대로 그리며, 여기서는 브랜드 chrome 만 더한다.
+// --------------------------------------------------------------------------- //
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun BrandedLauncherScaffold(content: @Composable () -> Unit) {
+    Scaffold(
+        topBar = {
+            CenterAlignedTopAppBar(
+                title = {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text(
+                            text = stringResource(R.string.launcher_brand_title),
+                            style = MaterialTheme.typography.titleLarge,
+                            textAlign = TextAlign.Center,
+                        )
+                        Text(
+                            text = stringResource(R.string.launcher_brand_subtitle),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center,
+                        )
+                    }
+                },
+                colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.primaryContainer,
+                    titleContentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                ),
+            )
+        },
+    ) { padding ->
+        Column(modifier = Modifier.fillMaxSize().padding(padding)) {
+            content()
+        }
+    }
 }
 
 private fun NavGraphBuilder.catalogDestination(

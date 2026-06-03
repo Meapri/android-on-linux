@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android on Linux — adaptive icon FOREGROUND.
+
+  An Android + Linux hybrid mascot: a clean white Tux (Linux penguin) silhouette
+  wearing the Android robot's two diagonal antennae. Everything sits inside the
+  central 72dp safe zone of the 108dp adaptive canvas (viewport 26..82 x, 18..86 y)
+  so no part is clipped by any launcher mask shape.
+
+  Palette:
+    - body / antennae  : white  (#FFFFFF)        — the silhouette, reads on green bg
+    - belly            : soft white (#F4FBF7)
+    - eyes             : Android green-dark (#0B3D26) on small white sclera
+    - beak / feet      : Android green (#3DDC84)  — ties the penguin to the brand
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Android antennae (robot ears) rising diagonally from the head. White rods. -->
+    <path
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="3.4"
+        android:strokeLineCap="round"
+        android:pathData="M45.5,27 L40,18.5" />
+    <path
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="3.4"
+        android:strokeLineCap="round"
+        android:pathData="M62.5,27 L68,18.5" />
+
+    <!-- Feet — two Android-green flippers under the body. -->
+    <path
+        android:fillColor="#FF3DDC84"
+        android:pathData="M40,78 C38,78 34,80 33,83 C32.4,84.8 34,86 36,86 L48,86 C49.6,86 50,84.5 49.5,83 C48.8,80.5 46,78 44,78 Z" />
+    <path
+        android:fillColor="#FF3DDC84"
+        android:pathData="M64,78 C62,78 59.2,80.5 58.5,83 C58,84.5 58.4,86 60,86 L72,86 C74,86 75.6,84.8 75,83 C74,80 70,78 68,78 Z" />
+
+    <!-- Body — white rounded penguin silhouette (head + torso in one blob). -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M54,24
+            C44,24 37.5,30.5 37.5,40
+            C37.5,45 38.5,48 38.5,52
+            C38.5,60 34,64 34,72
+            C34,80 42.5,84 54,84
+            C65.5,84 74,80 74,72
+            C74,64 69.5,60 69.5,52
+            C69.5,48 70.5,45 70.5,40
+            C70.5,30.5 64,24 54,24 Z" />
+
+    <!-- Belly — soft-white oval over the lower torso. -->
+    <path
+        android:fillColor="#FFF4FBF7"
+        android:pathData="M54,50
+            C46.5,50 42,56 42,66
+            C42,76 47.5,80.5 54,80.5
+            C60.5,80.5 66,76 66,66
+            C66,56 61.5,50 54,50 Z" />
+
+    <!-- Eyes — small white sclera with green-dark pupils. -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M48,38 m-4.4,0 a4.4,4.4 0 1,0 8.8,0 a4.4,4.4 0 1,0 -8.8,0 Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M60,38 m-4.4,0 a4.4,4.4 0 1,0 8.8,0 a4.4,4.4 0 1,0 -8.8,0 Z" />
+    <path
+        android:fillColor="#FF0B3D26"
+        android:pathData="M49,38.5 m-2.2,0 a2.2,2.2 0 1,0 4.4,0 a2.2,2.2 0 1,0 -4.4,0 Z" />
+    <path
+        android:fillColor="#FF0B3D26"
+        android:pathData="M59,38.5 m-2.2,0 a2.2,2.2 0 1,0 4.4,0 a2.2,2.2 0 1,0 -4.4,0 Z" />
+
+    <!-- Beak — Android-green diamond between the eyes. -->
+    <path
+        android:fillColor="#FF3DDC84"
+        android:pathData="M54,42 L59.5,46 L54,50.5 L48.5,46 Z" />
+
+</vector>
