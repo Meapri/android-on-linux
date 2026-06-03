@@ -1976,7 +1976,17 @@ class MainActivity : Activity() {
                             // statically linked, T1). Offline demo.html (no network).
                             val crWinMarker = java.io.File("/data/local/tmp/.alr-crwin")
                             val crWin = crWinMarker.isFile
-                            val gimpGuiClient = if (crWin) {
+                            // The default GIMP launch below is a PERSISTENT wl client — the
+                            // nativeAlrNativeLoaderProbe call blocks this thread until the client
+                            // exits (it doesn't). When the ROOTFUL-Xwayland demo is armed
+                            // (.alr-xwayland), that would starve the Xwayland block further down,
+                            // so skip the blocking GIMP/chromium launch and go straight to
+                            // Xwayland (the markers are mutually-exclusive single-surface demos).
+                            val xwaylandArmed = java.io.File("/data/local/tmp/.alr-xwayland").isFile
+                            val gimpGuiClient = if (xwaylandArmed) {
+                                android.util.Log.i("alr_loader", "surface: .alr-xwayland armed — skipping blocking GIMP launch, proceeding to Xwayland")
+                                "(skipped: xwayland marker armed)"
+                            } else if (crWin) {
                                 val rootfsDirF = java.io.File(java.io.File(filesDir, "rootfs"), rootfsManifest.name)
                                 // wait (bounded) for the 337MB chromium-gui overlay to extract
                                 val chromiumBin = java.io.File(rootfsDirF, "usr/lib/chromium/chromium")
