@@ -6,12 +6,16 @@ import android.content.pm.PackageManager
 import android.content.Context
 import android.os.Build
 import android.os.Bundle
+import android.text.InputType
 import android.view.KeyEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
+import android.view.inputmethod.BaseInputConnection
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -23,6 +27,17 @@ import java.net.SocketTimeoutException
 import kotlin.concurrent.thread
 
 class MainActivity : Activity() {
+    // --- Android soft-keyboard IME <-> guest zwp_text_input_v3 state ---------
+    // Driven by the compositor's onGuestImeState upcall (a guest text field
+    // enabled/disabled text input). imeWanted gates onCheckIsTextEditor so the IME
+    // only treats the SurfaceView as an editor when a guest field has focus;
+    // imeInputType is recomputed from the guest content_purpose/hint. The
+    // SurfaceView the IME binds to is stashed here so onGuestImeState (on the UI
+    // thread, posted from the compositor thread) can restartInput / show / hide it.
+    @Volatile private var imeWanted = false
+    @Volatile private var imeInputType = InputType.TYPE_CLASS_TEXT
+    private var imeSurfaceView: SurfaceView? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         System.loadLibrary("alr_loader")
@@ -1229,7 +1244,23 @@ class MainActivity : Activity() {
             setPadding(32, 32, 32, 32)
             setTextIsSelectable(true)
         }
-        val surfaceView = SurfaceView(this).apply {
+        val surfaceView = object : SurfaceView(this) {
+            // Make the SurfaceView a soft-keyboard editor so an IME can deliver text
+            // (commitText/setComposingText) — a bare SurfaceView returns no
+            // InputConnection and silently drops all soft-IME text. onCheckIsTextEditor
+            // is gated on imeWanted so the keyboard only engages when a guest text
+            // field has focus (set by the compositor's onGuestImeState upcall).
+            override fun onCheckIsTextEditor(): Boolean = imeWanted
+            override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
+                outAttrs.inputType = imeInputType
+                outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_FULLSCREEN or
+                    EditorInfo.IME_FLAG_NO_EXTRACT_UI or
+                    EditorInfo.IME_ACTION_NONE
+                // fullEditor=false: there is no local text buffer; AlrInputConnection
+                // relays every edit straight to the guest via the native IME bridge.
+                return AlrInputConnection(this, false)
+            }
+        }.apply {
             // Focusable for BOTH touch and hardware/IME keys so key events dispatch
             // to our setOnKeyListener (and the soft keyboard can target this view).
             isFocusableInTouchMode = true
@@ -1376,6 +1407,11 @@ class MainActivity : Activity() {
                     val wlStart = nativeWaylandCompositorStart(
                         cacheDir.absolutePath, holder.surface, dm.densityDpi, dm.xdpi, dm.ydpi,
                         outW, outH, refreshMhz)
+                    // Wire the guest-IME-state upcall so a guest text field raises the
+                    // Android soft keyboard. The editor SurfaceView is stashed in
+                    // imeSurfaceView right after construction (below); onGuestImeState reads
+                    // it on the UI thread (posted from the compositor thread).
+                    nativeWaylandImeRegisterStateCallback()
                     // chromium-test fast path: when a CR-test flag is set, the chromium probe
                     // thread (started in onCreate) needs the loader's guest-launch lock
                     // immediately. This GUI guest battery (wl/pixman/gtk/foot/GIMP — GIMP alone
@@ -1771,6 +1807,9 @@ class MainActivity : Activity() {
                 override fun surfaceDestroyed(holder: SurfaceHolder) = Unit
             })
         }
+        // Stash the editor SurfaceView for the guest-IME-state upcall (onGuestImeState
+        // raises/hides the soft keyboard against it on the UI thread).
+        imeSurfaceView = surfaceView
         setContentView(
             LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
@@ -2368,6 +2407,116 @@ class MainActivity : Activity() {
         imm?.showSoftInput(target, InputMethodManager.SHOW_IMPLICIT)
     }
 
+    // InputConnection that relays soft-keyboard edits to the focused guest via the
+    // native IME bridge. fullEditor=false: there is NO local text buffer — every
+    // method forwards straight to the compositor (zwp_text_input_v3.commit_string /
+    // preedit_string / delete_surrounding_text). commit/preedit text is sent as a
+    // UTF-8 ByteArray to avoid JNI's CESU-8 emoji corruption (see the native side).
+    private inner class AlrInputConnection(
+        targetView: View,
+        fullEditor: Boolean,
+    ) : BaseInputConnection(targetView, fullEditor) {
+        override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
+            val s = text?.toString() ?: ""
+            nativeWaylandImeCommitText(s.toByteArray(Charsets.UTF_8))
+            return true
+        }
+
+        override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean {
+            val s = text?.toString() ?: ""
+            val bytes = s.toByteArray(Charsets.UTF_8)
+            // Composing cursor at the end of the run (caret line, not a selection).
+            nativeWaylandImePreedit(bytes, bytes.size)
+            return true
+        }
+
+        override fun finishComposingText(): Boolean {
+            nativeWaylandImePreedit(ByteArray(0), 0)  // clear the composing run
+            return true
+        }
+
+        override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
+            // No local buffer to measure code points against, so char counts are
+            // forwarded as UTF-8 byte counts. Exact for ASCII/Latin-1; soft keyboards
+            // overwhelmingly delete via sendKeyEvent(KEYCODE_DEL) for non-full editors,
+            // which takes the hardware-key path below instead (documented v1 limit).
+            nativeWaylandImeDeleteSurrounding(beforeLength, afterLength)
+            return true
+        }
+
+        override fun sendKeyEvent(event: KeyEvent?): Boolean {
+            // Hardware-style keys the soft keyboard sends (Enter/Del/arrows) go through
+            // the SAME evdev key path as a physical keyboard, so the guest receives real
+            // wl_keyboard keys (KEY_ENTER/KEY_BACKSPACE), not a text edit. Printable text
+            // arrives via commitText (commit_string), never here — the two never overlap.
+            if (event == null) return super.sendKeyEvent(event)
+            val evdev = androidKeyToEvdev(event.keyCode)
+            if (evdev == 0) return super.sendKeyEvent(event)
+            when (event.action) {
+                KeyEvent.ACTION_DOWN -> nativeWaylandInjectKey(evdev, 1)
+                KeyEvent.ACTION_UP -> nativeWaylandInjectKey(evdev, 0)
+            }
+            return true
+        }
+
+        override fun performEditorAction(actionCode: Int): Boolean {
+            // Enter/Go/Search/Done -> inject KEY_ENTER (evdev 28) down+up to the guest.
+            nativeWaylandInjectKey(28, 1)
+            nativeWaylandInjectKey(28, 0)
+            return true
+        }
+    }
+
+    // Guest text-input enable/disable upcall from the compositor (JNI, on the
+    // compositor thread). Hops to the UI thread, then raises or hides the soft
+    // keyboard and re-reads the editor inputType. @Suppress: invoked by name from
+    // native code (runtime_report.cpp ime_state_trampoline), not from Kotlin.
+    @Suppress("unused")
+    fun onGuestImeState(
+        enabled: Boolean,
+        purpose: Int,
+        hint: Int,
+        curX: Int,
+        curY: Int,
+        curW: Int,
+        curH: Int,
+    ) {
+        runOnUiThread {
+            val sv = imeSurfaceView ?: return@runOnUiThread
+            imeWanted = enabled
+            imeInputType = imeInputTypeFor(purpose, hint)
+            val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+                ?: return@runOnUiThread
+            if (enabled) {
+                sv.requestFocus()
+                imm.restartInput(sv)  // re-call onCreateInputConnection so inputType applies
+                imm.showSoftInput(sv, InputMethodManager.SHOW_IMPLICIT)
+            } else {
+                imm.hideSoftInputFromWindow(sv.windowToken, 0)
+            }
+        }
+    }
+
+    // zwp_text_input_v3 content_purpose/hint -> Android EditorInfo.inputType. Enum
+    // values mirror text-input-unstable-v3.xml verbatim (see the design §3.3).
+    private fun imeInputTypeFor(purpose: Int, hint: Int): Int {
+        var t = when (purpose) {
+            2, 9 -> InputType.TYPE_CLASS_NUMBER                              // digits, pin
+            3 -> InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_SIGNED or
+                InputType.TYPE_NUMBER_FLAG_DECIMAL                            // number
+            4 -> InputType.TYPE_CLASS_PHONE                                  // phone
+            5 -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI            // url
+            6 -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS  // email
+            8 -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD       // password
+            10, 11, 12 -> InputType.TYPE_CLASS_DATETIME                       // date/time/datetime
+            else -> InputType.TYPE_CLASS_TEXT                                // normal/alpha/name/...
+        }
+        if (hint and 0x200 != 0) t = t or InputType.TYPE_TEXT_FLAG_MULTI_LINE      // multiline
+        if (hint and 0x80 != 0) t = t or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS   // sensitive_data
+        if (hint and 0x4 != 0) t = t or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES     // auto_capitalization
+        return t
+    }
+
     // Translate an Android KeyEvent.keyCode into a Linux evdev keycode
     // (<linux/input-event-codes.h>), which the compositor forwards verbatim as a
     // wl_keyboard key (the guest applies its own default keymap). Returns 0 for keys
@@ -2805,6 +2954,16 @@ class MainActivity : Activity() {
 
     private external fun nativeWaylandInjectKey(evdevKey: Int, pressed: Int)
     private external fun nativeWaylandInjectScroll(x: Float, y: Float, value: Double, axis: Int)
+
+    // --- Android soft-keyboard IME <-> guest zwp_text_input_v3 bridge --------
+    // commit/preedit text are passed as UTF-8 ByteArray (NOT String): JNI's
+    // GetStringUTFChars yields modified UTF-8 (CESU-8), corrupting emoji/astral
+    // code points; text.toByteArray(UTF_8) keeps them intact.
+    private external fun nativeWaylandImeCommitText(utf8: ByteArray)
+    private external fun nativeWaylandImePreedit(utf8: ByteArray, cursorByte: Int)
+    private external fun nativeWaylandImeDeleteSurrounding(beforeBytes: Int, afterBytes: Int)
+    private external fun nativeWaylandImeFocusHasTextInput(): Boolean
+    private external fun nativeWaylandImeRegisterStateCallback()
 
     private external fun nativeRenderVulkanSurfaceFrames(
         surface: android.view.Surface,

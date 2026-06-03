@@ -124,6 +124,9 @@ if(ANDROID_ABI STREQUAL "arm64-v8a")
         ${ALR_TP}/wayland/src/wayland-util.c
         ${ALR_TP}/wayland_generated/wayland-protocol.c
         ${ALR_TP}/wayland_generated/xdg-shell-protocol.c
+        # zwp_text_input_v3 (Android soft-keyboard <-> guest IME). Hand-rolled
+        # marshalling (no wayland-scanner on host); header in the same dir.
+        ${ALR_TP}/wayland_generated/text-input-unstable-v3-protocol.c
     )
     set_target_properties(wayland_server PROPERTIES LINKER_LANGUAGE C)
     target_include_directories(wayland_server PUBLIC
