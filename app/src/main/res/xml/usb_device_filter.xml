@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  usb_device_filter.xml — devices the app auto-launches/auto-grants on attach
+  (docs/design/android-usb-host.md §2.1). A matching <usb-device> here makes the
+  system AUTO-APPROVE USB permission for that device when it is plugged in
+  (skipping the dialog) and route the attach Intent to RunningSurfaceActivity.
+
+  CONSERVATIVE DEFAULT: no <usb-device> entries, so NOTHING is auto-granted —
+  the runtime system USB-permission dialog (UsbHostBridge.requestPermissionBlocking)
+  remains the access path for every device. This is intentional: auto-grant is
+  optional UX polish and should be opt-in per known peripheral, not blanket.
+
+  To auto-grant a known peripheral, add e.g.:
+      <usb-device vendor-id="1234" product-id="5678" />
+  (decimal vendor/product ids), or by class:
+      <usb-device class="3" />   (3 = HID)
+-->
+<resources>
+</resources>
