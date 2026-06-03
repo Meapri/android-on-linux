@@ -354,6 +354,37 @@ class MainActivity : Activity() {
                 android.util.Log.e("alr_loader", "gpu-stage EXC: ${android.util.Log.getStackTraceString(e)}")
             }
         }.start()
+        // ANGLE-for-GLES (the GLES3+/desktop-GL breadth path): stage a SYSTEM ANGLE
+        // (libEGL.so.1/libGLESv2.so.2, Vulkan backend) → /usr/lib/androlinux so GLES/EGL
+        // guests translate GL → Vulkan → our guest VK ICD (libvulkan.so.1, the vk-icd
+        // overlay) → Mali instead of a software fallback. ANGLE's libGLESv2 dlopens
+        // libvulkan.so.1 at runtime; the loader puts /usr/lib/androlinux first on
+        // LD_LIBRARY_PATH under ALR_GPU_ACCEL=1 (ANGLE libEGL/libGLESv2) + ALR_VK_ICD=1
+        // (our libvulkan.so.1 ICD + VK rings). Built host-side by
+        // tools/build_angle_overlay.py (ANGLE bytes extracted from the Debian bookworm
+        // chromium-common .deb; the one base-missing DT_NEEDED, libXNVCtrl.so.0, flat).
+        //
+        // MUTUALLY EXCLUSIVE with gpushim: BOTH ship /usr/lib/androlinux/libEGL.so.1 +
+        // libGLESv2.so.2, and extractOverlayTar's frozen guard only protects BASE libs
+        // (androlinux is private-dir), so whichever extracts last wins. gpushim is the
+        // device-proven GLES2-direct→Mali path (glmark2-es2 score 1074); ANGLE adds
+        // GLES3+/desktop-GL→Vulkan breadth. To avoid clobbering the proven path on a
+        // normal cold start, ANGLE staging is OPT-IN behind the adb-pushed marker
+        // /data/local/tmp/.alr-angle (same idiom as .alr-cronly/.alr-aptdrain).
+        if (java.io.File("/data/local/tmp/.alr-angle").isFile) Thread {
+            try {
+                val angleTar = java.io.File("/data/local/tmp/angle-stage.tar")
+                val angleMarker = java.io.File(rootfsStatus.rootfsDir, ".angle-staged-${angleTar.length()}")
+                if (angleTar.isFile && !angleMarker.isFile) {
+                    val ovr = RootfsInstaller(this@MainActivity).extractOverlayTar(angleTar, rootfsStatus.rootfsDir)
+                    angleMarker.writeText("staged\n")
+                    android.util.Log.i("alr_loader", "angle-stage: overlay done (extracted=${ovr.extracted} skipped=${ovr.skipped.size})")
+                    if (ovr.skipped.isNotEmpty()) android.util.Log.w("alr_loader", "angle-stage: guard skipped:\n${ovr.skipped.joinToString("\n")}")
+                }
+            } catch (e: Throwable) {
+                android.util.Log.e("alr_loader", "angle-stage EXC: ${android.util.Log.getStackTraceString(e)}")
+            }
+        }.start()
         // WS-4 §10(b): apt/dpkg/X11 FUNCTIONAL probes. The dpkg-db/x11/apt-config overlays
         // already stage above; until now their only proof on device was the exec-summary
         // TextView (never logcat). This actually RUNS dpkg-query/apt-get/Xwayland through the

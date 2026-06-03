@@ -264,6 +264,13 @@ class NativeAppSession internal constructor(
         // vk-icd ships the guest Vulkan ICD (libvulkan.so.1) the loader binds when a
         // launch opts into ALR_VK_ICD=1; staged best-effort like the rest (no-op when
         // its tar is absent), so a normal GUI launch is unaffected.
+        //
+        // NOTE: the ANGLE overlay (angle-stage.tar, a SYSTEM ANGLE libEGL.so.1/
+        // libGLESv2.so.2 → /usr/lib/androlinux for the GL→Vulkan→our-ICD breadth path)
+        // is deliberately NOT in this always-on set. It and gpushim ship the SAME
+        // androlinux SONAMEs (private-dir, so the frozen guard does not arbitrate), so
+        // ANGLE is an explicit OPT-IN gated on /data/local/tmp/.alr-angle in
+        // MainActivity — never auto-staged here where it could shadow gpushim.
         private val OVERLAY_NAMES =
             listOf("interpose", "nss", "xkb-gegl", "babl-gegl", "x11", "pulse", "vk-icd")
 
