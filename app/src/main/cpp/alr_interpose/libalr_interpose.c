@@ -340,6 +340,59 @@ static const char *rw(const char *p, char *buf, size_t buflen) {
     return buf;
 }
 
+/*
+ * guest_canon(): the INVERSE of rw() applied to a realpath()/readlink-f RESULT.
+ * If `path` is under the rootfs (or its /data/data canonical alias), strip that
+ * host prefix IN PLACE so the returned canonical is the GUEST-consistent spelling
+ * (the guest's own view, e.g. "/tmp/apt-key-gpghome.XXX" rather than
+ * "<rootfs>/tmp/apt-key-gpghome.XXX"). No-op for a path under neither form
+ * (/proc, /sys, /dev, or a host path genuinely outside the rootfs) and for a
+ * NULL/relative path.
+ *
+ * WHY (the device bug this closes): glibc realpath()/canonicalize_file_name()
+ * always return an ABSOLUTE, symlink-resolved path. Because our realpath wrapper
+ * resolves against the real host tree (rw() suppressed), that result is a HOST
+ * path under <rootfs>. A program that canonicalizes a path and then *re-uses the
+ * canonical string in the guest namespace* (apt-key: it mints GPGHOMEDIR via
+ * mktemp as a guest "/tmp/…" path, then `readlink -f`/realpath's it and builds its
+ * keyring + hands gpgv `--homedir`/`--keyring` off that value) ends up with a
+ * host spelling on one side and the guest spelling on the other -> the keyring
+ * apt-key WRITES and the one gpgv OPENS disagree -> gpgv reads an empty/wrong
+ * keyring -> "NODATA" / "is not signed". Returning the guest spelling makes the
+ * two AGREE.
+ *
+ * WHY THIS DOES NOT REGRESS THE dpkg-status FIX (9aa644c / g_rootfs_canon):
+ *   - It changes only the RESULT STRING, never whether realpath SUCCEEDS: the
+ *     resolve still runs byte-identically against the real host tree (input still
+ *     rewritten to host form, internal walk still rw()-suppressed). apt's
+ *     `flAbsPath(<rootfs>/var/lib/dpkg/status)` still resolves (no ENOENT).
+ *   - Every path the guest subsequently OPENS goes back through rw() (libc
+ *     wrappers) or the seccomp net, both of which re-prefix a guest path to the
+ *     host file. So a returned guest "/var/lib/dpkg/status" re-opens to
+ *     "<rootfs>/var/lib/dpkg/status" exactly as before — the dpkg DB is still
+ *     found, the lock still lands in-rootfs. (Host-proven: /tmp/…/repro_fix2.)
+ *   - g_rootfs_canon STILL governs idempotency in rw() (a path under EITHER form
+ *     is already-host); guest_canon merely ALSO recognizes both forms when
+ *     stripping, so a result that came back as the /data/data spelling (the
+ *     per-user /data/user/0 symlink followed by realpath) is canonicalized to the
+ *     same guest path. The two mechanisms are complementary, not in tension.
+ */
+static void guest_canon(char *path) {
+    if (!path || path[0] != '/') return;
+    const char *pfx = NULL; size_t plen = 0;
+    if (g_rootfs_len && a_under(path, g_rootfs)) { pfx = g_rootfs; plen = g_rootfs_len; }
+    else if (g_rootfs_canon_len && a_under(path, g_rootfs_canon)) {
+        pfx = g_rootfs_canon; plen = g_rootfs_canon_len;
+    }
+    if (!pfx) return;                         /* not under the rootfs -> leave it */
+    /* Shift the suffix (the trailing guest path, incl. its NUL) left over the
+     * stripped prefix. a_under guarantees path[plen] is '/' or '\0'. */
+    size_t i = 0;
+    while (path[plen + i]) { path[i] = path[plen + i]; ++i; }
+    path[i] = '\0';
+    if (path[0] == '\0') { path[0] = '/'; path[1] = '\0'; }  /* exactly the rootfs root */
+}
+
 /* Per-call scratch sized for rootfs prefix + a long guest path. */
 #define ALR_PBUF 2304
 
@@ -2285,9 +2338,19 @@ gid_t getegid(void) {
  * suppression an intermediate component (e.g. "/data" on the way to canonicalizing
  * "<rootfs>/var/lib/dpkg/status") would be re-mapped to the nonexistent
  * "<rootfs>/data" and realpath would fail ENOENT even though the target exists —
- * the device-observed apt-get install `flAbsPath … status … realpath (2: …)`. The
- * resolved output is a rootfs host path, correct for a subsequent open() (already-
- * host paths are left alone by both us and the seccomp net). */
+ * the device-observed apt-get install `flAbsPath … status … realpath (2: …)`.
+ *
+ * The real glibc realpath then returns a HOST path under <rootfs>. We finally run
+ * guest_canon() on it to strip the rootfs prefix back off so the canonical we
+ * hand the caller is the GUEST spelling. This is required because a program that
+ * re-uses the canonical string IN THE GUEST NAMESPACE — apt-key mints a guest
+ * "/tmp/apt-key-gpghome.XXX" GPGHOMEDIR, `readlink -f`/realpath's it, then builds
+ * its keyring + passes gpgv `--homedir`/`--keyring` off that value — must get back
+ * a string that AGREES with the guest path everywhere; a host spelling there
+ * splits the keyring apt-key writes from the one gpgv opens (gpgv NODATA / "is not
+ * signed"). dpkg-status is unaffected: the resolve still succeeds, and the guest
+ * result re-opens through rw()/seccomp back to the same host file (host-proven —
+ * see guest_canon's note). already-host inputs are still resolved correctly. */
 char *realpath(const char *path, char *resolved) {
     static char *(*real)(const char *, char *);
     ALR_REAL(real, char *(*)(const char *, char *), "realpath");
@@ -2296,6 +2359,7 @@ char *realpath(const char *path, char *resolved) {
     g_rw_suppress++;
     char *r = real(in, resolved);
     g_rw_suppress--;
+    if (r) guest_canon(r);   /* host result -> guest-consistent canonical */
     return r;
 }
 char *canonicalize_file_name(const char *path) {
@@ -2306,12 +2370,16 @@ char *canonicalize_file_name(const char *path) {
     g_rw_suppress++;
     char *r = real(in);
     g_rw_suppress--;
+    if (r) guest_canon(r);   /* host result -> guest-consistent canonical */
     return r;
 }
 /* FORTIFY (_FORTIFY_SOURCE) variant of realpath: glibc adds a resolved-buffer
  * size arg for its __chk guard. We rewrite the input path and forward to the
  * real __realpath_chk so its overflow guard still fires identically (rw()
- * suppressed during the resolve — same reason as plain realpath above). */
+ * suppressed during the resolve — same reason as plain realpath above), then
+ * guest_canon() the result (same guest-consistency reason as realpath()). The
+ * strip only ever SHORTENS the string, so it can never overflow the buffer the
+ * __chk guard already validated. */
 char *__realpath_chk(const char *path, char *resolved, size_t resolvedlen) {
     static char *(*real)(const char *, char *, size_t);
     ALR_REAL(real, char *(*)(const char *, char *, size_t), "__realpath_chk");
@@ -2320,6 +2388,7 @@ char *__realpath_chk(const char *path, char *resolved, size_t resolvedlen) {
     g_rw_suppress++;
     char *r = real(in, resolved, resolvedlen);
     g_rw_suppress--;
+    if (r) guest_canon(r);   /* host result -> guest-consistent canonical */
     return r;
 }
 
