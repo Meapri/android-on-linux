@@ -37,14 +37,19 @@ import pytest
 from tools import build_content_shell_stage as bcs
 from tools.build_content_shell_stage import (
     ENTRYPOINT,
+    ORIGIN_DIR,
     PACKAGES,
     SUITE,
     ARCH_TRIPLET,
     binary_has_ozone_wayland,
     _add_bytes,
     _entry_needed,
+    _flat_lib_basenames,
+    _flatten_origin_needed,
     _member_names,
+    _origin_needed_to_flatten,
     _read_member,
+    _synthetic_elf,
     _unsatisfied_needed,
     _repack_with_addons,
 )
@@ -181,3 +186,107 @@ def test_unsatisfied_needed_empty_when_no_needed(closure_tar, tmp_path):
     with tarfile.open(base, "w") as t:
         _add_bytes(t, f"lib/{ARCH_TRIPLET}/libc.so.6", b"BASE")
     assert _unsatisfied_needed(closure_tar, base) == ()
+
+
+# --------------------------------------------------------------------------- #
+# $ORIGIN-only DT_NEEDED flatten — the libtest_trace_processor.so device fix.
+#
+# chromium-shell is linked RUNPATH=$ORIGIN and DT_NEEDEDs libtest_trace_processor.so,
+# which the leaf .deb installs ONLY at $ORIGIN (/usr/lib/chromium/). The ALR loader
+# resolves DT_NEEDED solely on the flat LD_LIBRARY_PATH and does NOT search $ORIGIN,
+# so the device FATALed "libtest_trace_processor.so: cannot open shared object file"
+# even though the file was in the tar. These tests pin the flatten + the flat-aware
+# gate that makes that false-negative impossible to ship again.
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture
+def origin_overlay(tmp_path: Path) -> Path:
+    """An overlay whose entrypoint is a REAL (parseable) ELF: RUNPATH=$ORIGIN,
+    DT_NEEDED libtest_trace_processor.so (+ libc.so.6), with the lib placed ONLY at
+    $ORIGIN — exactly the chromium-shell-on-device shape."""
+    p = tmp_path / "origin-ov.tar"
+    with tarfile.open(p, "w") as t:
+        _add_bytes(
+            t, ENTRYPOINT.lstrip("/"),
+            _synthetic_elf(("libtest_trace_processor.so", "libc.so.6"),
+                           runpath="$ORIGIN",
+                           extra_tokens=b"ozone_platform_wayland.cc ozone-platform"),
+            mode=0o755,
+        )
+        _add_bytes(t, f"{ORIGIN_DIR}/libtest_trace_processor.so", b"TTP")
+    return p
+
+
+@pytest.fixture
+def base_with_libc(tmp_path: Path) -> Path:
+    base = tmp_path / "base.tar"
+    with tarfile.open(base, "w") as t:
+        _add_bytes(t, f"lib/{ARCH_TRIPLET}/libc.so.6", b"BASE-libc")
+    return base
+
+
+def test_entry_needed_reads_real_synthetic_elf(origin_overlay):
+    # The synthetic ELF is real enough that elf_needed parses its DT_NEEDED.
+    assert _entry_needed(origin_overlay) == ["libtest_trace_processor.so", "libc.so.6"]
+
+
+def test_flat_lib_basenames_excludes_origin_dir(origin_overlay):
+    # The $ORIGIN copy lives in /usr/lib/chromium/, which is NOT a flat load dir, so
+    # the flat-name set must NOT contain it (this is the crux of the old false 0).
+    flat = _flat_lib_basenames(origin_overlay)
+    assert "libtest_trace_processor.so" not in flat
+
+
+def test_flat_lib_basenames_counts_flat_libdir(tmp_path):
+    p = tmp_path / "ov.tar"
+    with tarfile.open(p, "w") as t:
+        _add_bytes(t, f"{LIBREL}/libdav1d.so.6", b"D")          # flat usr/lib
+        _add_bytes(t, f"lib/{ARCH_TRIPLET}/libc.so.6", b"C")    # flat lib (merged-usr)
+        _add_bytes(t, f"{LIBREL}/pulseaudio/libpulsecommon-16.1.so", b"P")  # subdir → no
+        _add_bytes(t, f"{LIBREL}/nss/libsoftokn3.so", b"S")     # subdir → no
+    flat = _flat_lib_basenames(p)
+    assert {"libdav1d.so.6", "libc.so.6"} <= flat
+    assert "libpulsecommon-16.1.so" not in flat   # buried in pulseaudio/
+    assert "libsoftokn3.so" not in flat           # buried in nss/
+
+
+def test_gate_flags_origin_only_lib_before_flatten(origin_overlay, base_with_libc):
+    # THE REGRESSION GUARD: before flattening, the flat-aware gate must report the
+    # $ORIGIN-only lib as unsatisfied (the device-true state the old gate hid).
+    assert _unsatisfied_needed(origin_overlay, base_with_libc) == ("libtest_trace_processor.so",)
+
+
+def test_origin_plan_targets_the_lib_from_origin(origin_overlay):
+    plan = _origin_needed_to_flatten(origin_overlay)
+    assert plan == {"libtest_trace_processor.so": f"{ORIGIN_DIR}/libtest_trace_processor.so"}
+
+
+def test_flatten_adds_flat_copy_and_keeps_origin(origin_overlay):
+    flattened = _flatten_origin_needed(origin_overlay, _origin_needed_to_flatten(origin_overlay))
+    assert flattened == ("libtest_trace_processor.so",)
+    names = _member_names(origin_overlay)
+    # the flat copy the loader CAN find …
+    assert f"./{LIBREL}/libtest_trace_processor.so" in names
+    assert _read_member(origin_overlay, f"{LIBREL}/libtest_trace_processor.so") == b"TTP"
+    # … and the original $ORIGIN copy is left in place (harmless).
+    assert f"./{ORIGIN_DIR}/libtest_trace_processor.so" in names
+
+
+def test_gate_clears_after_flatten(origin_overlay, base_with_libc):
+    _flatten_origin_needed(origin_overlay, _origin_needed_to_flatten(origin_overlay))
+    assert _unsatisfied_needed(origin_overlay, base_with_libc) == ()
+
+
+def test_flatten_is_idempotent(origin_overlay):
+    _flatten_origin_needed(origin_overlay, _origin_needed_to_flatten(origin_overlay))
+    # second pass: the flat copy already exists → nothing to add
+    assert _flatten_origin_needed(origin_overlay, _origin_needed_to_flatten(origin_overlay)) == ()
+
+
+def test_flatten_never_invents_a_missing_lib(tmp_path):
+    # A NEEDED with no $ORIGIN copy must NOT be conjured — it stays a genuine miss.
+    p = tmp_path / "ov.tar"
+    with tarfile.open(p, "w") as t:
+        _add_bytes(t, ENTRYPOINT.lstrip("/"),
+                   _synthetic_elf(("libabsent.so.9",)), mode=0o755)
+    assert _origin_needed_to_flatten(p) == {}

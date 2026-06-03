@@ -49,15 +49,25 @@ lays over the base) carrying, with **zero unsatisfied DT_NEEDED** in the runtime
 closure:
 
   1. The ``chromium-shell`` ELF + its ``content_shell.pak`` / ``shell_resources.pak``
-     and ``libtest_trace_processor.so`` (the leaf .deb's own files, kept verbatim).
+     and ``libtest_trace_processor.so`` (the leaf .deb's own files, kept verbatim
+     at ``/usr/lib/chromium/``).
   2. Every shared library the shell binary pulls via **DT_NEEDED** (transitively)
      that the **base rootfs does not already provide** — computed by
      ``deb_closure.build_minimal_overlay`` (flat-SONAME, base-subtracted, no
      base-library downgrade). Same engine the full-GUI builder uses.
   3. **libpulsecommon-<v>.so flattened** onto the flat ``LD_LIBRARY_PATH`` dir
      (libpulse DT_NEEDEDs it but only resolves it on its absolute RUNPATH, which
-     the ALR loader does not honor — the one non-flat .so, same fix the full-GUI
-     and first-device runs needed).
+     the ALR loader does not honor — same fix the full-GUI and first-device runs
+     needed).
+  3b. **``$ORIGIN``-only DT_NEEDED .so flattened.** chromium-shell is linked with
+     ``RUNPATH=$ORIGIN`` and DT_NEEDEDs ``libtest_trace_processor.so``, which the
+     .deb installs ONLY next to the binary (``$ORIGIN`` = ``/usr/lib/chromium/``).
+     The ALR loader resolves DT_NEEDED solely on the flat ``LD_LIBRARY_PATH`` and
+     does NOT search ``$ORIGIN``, so the on-device load FATALs ``libtest_trace_
+     processor.so: cannot open shared object file`` even though the file is in the
+     tar. Fix (this builder, ``_flatten_origin_needed``): copy each such NEEDED .so
+     to the flat libdir. Distinct from the full ``chromium`` binary, which has no
+     RUNPATH and no ``$ORIGIN``-only NEEDED — this is content_shell-specific.
   4. **NSS dlopen plugin modules** (libsoftokn3/libfreebl3/…). content_shell
      initializes NSS during TLS; those modules are ``dlopen()``'d (NOT DT_NEEDED →
      the closure drops them, and NSS FATALs ``nss_error=-5925`` without them).
@@ -76,9 +86,11 @@ conformance, entrypoint present, ozone-wayland token check). It does NOT run
 content_shell on a device — the on-screen ``--ozone-platform=wayland`` window and
 the single-process memory-fit claim are the **device/compositor gate** (DEVICE-REQ
 in ``docs/research/chromium-window-lightweight-options.md``). "0 missing .so" is
-over the binary's **DT_NEEDED** graph plus the two dlopen sets added by hand
-(pulse, NSS); a real render may still want runtime config (fonts, the net overlay
-for DNS/TLS) supplied by the other overlays.
+over the binary's **DT_NEEDED** graph resolved on the **flat ``LD_LIBRARY_PATH``**
+(the loader's real search path — NOT basename-anywhere, which previously gave a
+false 0 for the ``$ORIGIN`` ``libtest_trace_processor.so``), plus the two dlopen
+sets added by hand (pulse, NSS); a real render may still want runtime config
+(fonts, the net overlay for DNS/TLS) supplied by the other overlays.
 """
 
 from __future__ import annotations
@@ -135,6 +147,16 @@ ENTRYPOINT = "/usr/lib/chromium/chromium-shell"
 
 ARCH_TRIPLET = "aarch64-linux-gnu"
 
+# The entrypoint's own directory == its DT_RUNPATH ``$ORIGIN``. chromium-shell is
+# linked with ``RUNPATH=$ORIGIN`` and DT_NEEDEDs ``libtest_trace_processor.so``,
+# which the .deb installs ONLY here (next to the binary), NOT in the flat libdir.
+# On a normal Linux system the loader finds it via $ORIGIN; the ALR loader resolves
+# DT_NEEDED solely on the flat LD_LIBRARY_PATH (= LIBDIR) and does NOT honor
+# $ORIGIN, so any such $ORIGIN-only NEEDED .so must be FLATTENED into LIBDIR or the
+# ELF dies at load with "cannot open shared object file" (device-confirmed for
+# libtest_trace_processor.so). Same RUNPATH-not-honored class as libpulsecommon.
+ORIGIN_DIR = str(Path(ENTRYPOINT).parent).lstrip("/")  # "usr/lib/chromium"
+
 DEFAULT_OUT = "out/v2-stage/content-shell-stage.tar"
 DEFAULT_CACHE = "/tmp/deb-cache-bookworm"
 
@@ -156,6 +178,7 @@ class ContentShellStageBuild:
     missing_soname: tuple[str, ...]
     unsatisfied_needed: tuple[str, ...]
     pulsecommon_flattened: str | None
+    origin_libs_flattened: tuple[str, ...]
     nss_modules_added: tuple[str, ...]
     compat_aliases: tuple[str, ...]
     ozone_wayland_ok: bool
@@ -183,7 +206,8 @@ class ContentShellStageBuild:
     def as_dict(self) -> dict:
         d = dict(self.__dict__)
         for k in ("reachable_libs", "missing_soname", "unsatisfied_needed",
-                  "nss_modules_added", "compat_aliases", "violations", "unsupported"):
+                  "origin_libs_flattened", "nss_modules_added", "compat_aliases",
+                  "violations", "unsupported"):
             d[k] = list(getattr(self, k))
         d["tar_mib"] = round(self.tar_bytes / (1024 * 1024), 1)
         d["extract_mib"] = round(self.extract_bytes / (1024 * 1024), 1)
@@ -246,14 +270,106 @@ def _plan_aliases_for(overlay_tar: str | Path, base: str | Path) -> dict[str, st
     return compat_alias_plan(needed, base_names, overlay_real)
 
 
+# --------------------------------------------------------------------------- #
+# Flat-load-path satisfaction (the REAL device criterion, not basename-anywhere)
+# --------------------------------------------------------------------------- #
+# A flat ARCH libdir the ALR loader puts on LD_LIBRARY_PATH. The base ships libs
+# under BOTH /lib/<triplet> and /usr/lib/<triplet> (merged-usr); a real lib resolves
+# only if it sits DIRECTLY in one of these (no deeper subdir like pulseaudio/ or
+# nss/, and NOT in the entrypoint's $ORIGIN dir which the loader does not search).
+_FLAT_LIBDIRS = (f"lib/{ARCH_TRIPLET}", f"usr/lib/{ARCH_TRIPLET}")
+
+
+def _flat_lib_basenames(tar_path: str | Path) -> set[str]:
+    """Library basenames a tar provides on the FLAT load path — i.e. files sitting
+    DIRECTLY in a flat ARCH libdir (``lib/<triplet>`` or ``usr/lib/<triplet>``), the
+    only place the ALR loader resolves DT_NEEDED. A .so buried in a subdir
+    (``…/pulseaudio/``, ``…/nss/``) or at the entrypoint's ``$ORIGIN``
+    (``/usr/lib/chromium/``) is NOT counted — matching what the loader can actually
+    find, unlike ``_lib_basenames`` (which counts a basename anywhere in the tar and
+    so falsely satisfied ``libtest_trace_processor.so`` from $ORIGIN)."""
+    out: set[str] = set()
+    with tarfile.open(tar_path, "r:*") as t:
+        for m in t.getmembers():
+            if not m.isfile():
+                continue
+            rel = m.name.lstrip("./")
+            for d in _FLAT_LIBDIRS:
+                if rel.startswith(d + "/") and "/" not in rel[len(d) + 1:]:
+                    out.add(Path(rel).name)
+                    break
+    return out
+
+
+def _origin_needed_to_flatten(overlay_tar: str | Path) -> dict[str, str]:
+    """Plan flat copies for entrypoint DT_NEEDED .so files that exist in the overlay
+    ONLY at the entrypoint's ``$ORIGIN`` dir (``/usr/lib/chromium/``) and NOT on the
+    flat load path.
+
+    Returns ``{soname: origin_rel_source}`` (e.g.
+    ``libtest_trace_processor.so -> usr/lib/chromium/libtest_trace_processor.so``).
+    A NEEDED already on the flat path (base or overlay) yields no entry; a NEEDED with
+    no $ORIGIN copy either yields no entry (it is a genuine miss the gate reports)."""
+    needed = _entry_needed(overlay_tar)
+    if not needed:
+        return {}
+    flat = _flat_lib_basenames(overlay_tar)
+    origin_files = {
+        Path(n.lstrip("./")).name: n.lstrip("./")
+        for n in _member_names(overlay_tar)
+        if n.lstrip("./").startswith(ORIGIN_DIR + "/")
+        and "/" not in n.lstrip("./")[len(ORIGIN_DIR) + 1:]
+    }
+    plan: dict[str, str] = {}
+    for soname in needed:
+        if soname.startswith("ld-linux") or soname in flat:
+            continue
+        src = origin_files.get(soname)
+        if src is not None:
+            plan[soname] = src
+    return plan
+
+
+def _flatten_origin_needed(tar_path: Path, plan: dict[str, str]) -> tuple[str, ...]:
+    """Append a flat ``{LIBDIR}/<soname>`` copy of each $ORIGIN-only NEEDED .so to an
+    existing overlay tar (in place). Idempotent: skips any flat dest already present.
+    Returns the sorted list of sonames flattened."""
+    if not plan:
+        return ()
+    existing = _member_names(tar_path)
+    flattened: list[str] = []
+    todo = {
+        soname: src for soname, src in plan.items()
+        if ("./" + f"{LIBDIR}/{soname}") not in existing
+    }
+    if not todo:
+        return ()
+    with tarfile.open(tar_path, "r:*") as src_t:
+        blobs = {
+            soname: src_t.extractfile(src_t.getmember("./" + src)).read()
+            for soname, src in todo.items()
+        }
+    with tarfile.open(tar_path, "a") as dst:
+        for soname in sorted(blobs):
+            _add_bytes(dst, f"{LIBDIR}/{soname}", blobs[soname], mode=0o755)
+            flattened.append(soname)
+    return tuple(flattened)
+
+
 def _unsatisfied_needed(overlay_tar: str | Path, base: str | Path) -> tuple[str, ...]:
-    """DT_NEEDED entries of the content_shell binary NOT provided (by exact name) by
-    base ∪ the produced overlay. ``ld-linux`` (the dynamic loader, always provided
-    by the runtime) is excluded."""
+    """DT_NEEDED entries of the content_shell binary NOT resolvable on the FLAT load
+    path (base ∪ overlay flat ARCH libdirs). ``ld-linux`` (the dynamic loader, always
+    provided by the runtime) is excluded.
+
+    This is the HONEST device gate: it counts only libs the ALR loader can actually
+    find on LD_LIBRARY_PATH. The earlier basename-anywhere check counted the
+    ``$ORIGIN`` copy of ``libtest_trace_processor.so`` and so reported 0 unsatisfied
+    while the device FATALed — that false-negative is what this flat-aware gate fixes.
+    """
     needed = _entry_needed(overlay_tar)
     if not needed:
         return ()
-    have = _lib_basenames(base) | _lib_basenames(overlay_tar)
+    have = _flat_lib_basenames(base) | _flat_lib_basenames(overlay_tar)
     miss = [n for n in needed if n not in have and not n.startswith("ld-linux")]
     return tuple(sorted(miss))
 
@@ -279,8 +395,11 @@ def build_content_shell_stage(
        the base lacks, base-subtracted and §5-E flat.
     2. repack to add the flat libpulsecommon, the NSS dlopen plugins, and any
        DT_NEEDED-major compat alias.
-    3. validate: entrypoint present, §5-E conformant, no base downgrade, Wayland
-       Ozone token present.
+    3. flatten every $ORIGIN-only DT_NEEDED .so (libtest_trace_processor.so) into the
+       flat libdir — the leaf .deb installs it next to the binary ($ORIGIN RUNPATH),
+       which the ALR loader does not search (device-confirmed FATAL otherwise).
+    4. validate: entrypoint present, §5-E conformant, no base downgrade, Wayland
+       Ozone token present, 0 DT_NEEDED unsatisfied on the FLAT load path.
     """
     out_tar = Path(out_tar)
     out_tar.parent.mkdir(parents=True, exist_ok=True)
@@ -308,6 +427,12 @@ def build_content_shell_stage(
             raw_tar, out_tar, nss_blobs, alias_plan
         )
 
+    # Flatten $ORIGIN-only DT_NEEDED .so files (libtest_trace_processor.so) into the
+    # flat libdir so the ALR loader (which honors only LD_LIBRARY_PATH, not $ORIGIN)
+    # can resolve them. The $ORIGIN copy at /usr/lib/chromium/ is kept too (harmless).
+    origin_plan = _origin_needed_to_flatten(out_tar)
+    origin_flattened = _flatten_origin_needed(out_tar, origin_plan)
+
     entrypoint_present = _has_member(out_tar, ENTRYPOINT)
     elf = _read_member(out_tar, ENTRYPOINT)
     ozone_ok = bool(elf) and binary_has_ozone_wayland(elf)
@@ -332,6 +457,7 @@ def build_content_shell_stage(
         missing_soname=tuple(m["missing_soname"]),
         unsatisfied_needed=missing_needed,
         pulsecommon_flattened=pulse_flat,
+        origin_libs_flattened=origin_flattened,
         nss_modules_added=nss_added,
         compat_aliases=aliases_added,
         ozone_wayland_ok=ozone_ok,
@@ -358,12 +484,15 @@ def _print_build(b: ContentShellStageBuild) -> None:
           f"→ ONE re-mapped address space")
     print(f"  closure pkgs:     {b.closure_pkgs}")
     print(f"  reachable libs:   {len(b.reachable_libs)} (base-missing .so added)")
-    print(f"  DT_NEEDED gate:   {len(b.unsatisfied_needed)} unsatisfied"
+    print(f"  DT_NEEDED gate:   {len(b.unsatisfied_needed)} unsatisfied on FLAT load path"
           + (f"  !! {list(b.unsatisfied_needed)}" if b.unsatisfied_needed
-             else "  (full closure: base ∪ overlay)"))
+             else "  (full closure: base ∪ overlay flat libdir)"))
     print(f"  libpulsecommon:   "
           + (f"flattened → {b.pulsecommon_flattened}" if b.pulsecommon_flattened
              else "NOT flattened"))
+    print(f"  $ORIGIN .so flat: "
+          + (f"{list(b.origin_libs_flattened)} (RUNPATH=$ORIGIN, loader-invisible → flattened)"
+             if b.origin_libs_flattened else "none needed"))
     print(f"  NSS dlopen mods:  {len(b.nss_modules_added)} {list(b.nss_modules_added)}")
     if b.compat_aliases:
         print(f"  compat aliases:   {list(b.compat_aliases)}")
@@ -414,6 +543,46 @@ def main(argv: list[str] | None = None) -> int:
     else:
         _print_build(b)
     return 0 if b.ok else 1
+
+
+# --------------------------------------------------------------------------- #
+# Synthetic ELF builder (offline tests) — a minimal valid ELF64-LE AArch64 ET_DYN
+# carrying a real .dynamic section so read_elf_dynamic returns the given DT_NEEDED
+# (+ optional DT_RUNPATH). Lets the $ORIGIN-flatten path be exercised with no .deb.
+# --------------------------------------------------------------------------- #
+def _synthetic_elf(needed: tuple[str, ...], runpath: str | None = None,
+                   extra_tokens: bytes = b"") -> bytes:
+    import struct
+
+    strs = b"\x00"
+    off: dict[str, int] = {}
+    for n in list(needed) + ([runpath] if runpath else []):
+        if n not in off:
+            off[n] = len(strs)
+            strs += n.encode() + b"\x00"
+
+    DT_NEEDED, DT_STRTAB, DT_STRSZ, DT_RUNPATH, DT_NULL = 1, 5, 10, 29, 0
+    ehdr_sz, phdr_sz, nph = 64, 56, 2
+    strtab_off = ehdr_sz + phdr_sz * nph + len(extra_tokens)
+    dyn_off = strtab_off + len(strs)
+
+    dyn = b"".join(struct.pack("<qQ", DT_NEEDED, off[n]) for n in needed)
+    if runpath:
+        dyn += struct.pack("<qQ", DT_RUNPATH, off[runpath])
+    dyn += struct.pack("<qQ", DT_STRTAB, strtab_off)   # vaddr == fileoff (identity)
+    dyn += struct.pack("<qQ", DT_STRSZ, len(strs))
+    dyn += struct.pack("<qQ", DT_NULL, 0)
+    total = dyn_off + len(dyn)
+
+    e_ident = b"\x7fELF" + bytes([2, 1, 1]) + b"\x00" * 9
+    ehdr = e_ident + struct.pack(
+        "<HHIQQQIHHHHHH",
+        3, 183, 1, 0, ehdr_sz, 0, 0, ehdr_sz, phdr_sz, nph, 0, 0, 0,
+    )
+    PT_LOAD, PT_DYNAMIC = 1, 2
+    ph0 = struct.pack("<IIQQQQQQ", PT_LOAD, 5, 0, 0, 0, total, total, 0x1000)
+    ph1 = struct.pack("<IIQQQQQQ", PT_DYNAMIC, 6, dyn_off, dyn_off, 0, len(dyn), len(dyn), 8)
+    return ehdr + ph0 + ph1 + extra_tokens + strs + dyn
 
 
 # --------------------------------------------------------------------------- #
@@ -523,6 +692,62 @@ def _selftest() -> int:
         pf2, nss2, al2 = _repack_with_addons(out_tar, out2, nss_blobs, alias_plan)
         check("re-repack adds nothing (idempotent)",
               pf2 is None and nss2 == () and al2 == ())
+
+    # --- $ORIGIN-only DT_NEEDED flatten (the libtest_trace_processor.so fix) ---- #
+    # A REAL synthetic ELF: RUNPATH=$ORIGIN, DT_NEEDED libtest_trace_processor.so
+    # (the leaf installs it ONLY at $ORIGIN /usr/lib/chromium/) + libc.so.6 (base).
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        base_tar = tdp / "base.tar"
+        with tarfile.open(base_tar, "w") as t:
+            _add_bytes(t, f"lib/{ARCH_TRIPLET}/libc.so.6", b"BASE-libc")
+
+        ov = tdp / "ov.tar"
+        with tarfile.open(ov, "w") as t:
+            _add_bytes(t, "usr/lib/chromium/chromium-shell",
+                       _synthetic_elf(("libtest_trace_processor.so", "libc.so.6"),
+                                      runpath="$ORIGIN",
+                                      extra_tokens=b"ozone_platform_wayland.cc ozone-platform"),
+                       mode=0o755)
+            # the leaf .deb ships the lib ONLY next to the binary ($ORIGIN), NOT flat
+            _add_bytes(t, "usr/lib/chromium/libtest_trace_processor.so", b"TTP")
+
+        # BEFORE flatten: the flat-aware gate must FLAG it (the device-true state) —
+        # proving the old basename-anywhere gate's 0 was a false negative.
+        check("entrypoint NEEDs libtest_trace_processor.so",
+              "libtest_trace_processor.so" in _entry_needed(ov))
+        miss_before = _unsatisfied_needed(ov, base_tar)
+        check("flat-aware gate FLAGS $ORIGIN-only lib before flatten",
+              miss_before == ("libtest_trace_processor.so",))
+
+        # plan + flatten in place
+        plan = _origin_needed_to_flatten(ov)
+        check("flatten plan targets libtest_trace_processor.so from $ORIGIN",
+              plan == {"libtest_trace_processor.so": "usr/lib/chromium/libtest_trace_processor.so"})
+        flattened = _flatten_origin_needed(ov, plan)
+        check("flatten reports libtest_trace_processor.so", flattened == ("libtest_trace_processor.so",))
+
+        names = _member_names(ov)
+        check("flat copy added to LIBDIR",
+              f"./usr/lib/{ARCH_TRIPLET}/libtest_trace_processor.so" in names)
+        check("flat copy carries the $ORIGIN bytes",
+              _read_member(ov, f"usr/lib/{ARCH_TRIPLET}/libtest_trace_processor.so") == b"TTP")
+        check("$ORIGIN copy still kept (harmless)",
+              "./usr/lib/chromium/libtest_trace_processor.so" in names)
+
+        # AFTER flatten: 0 unsatisfied on the flat load path (the real device gate)
+        check("flat-aware gate: 0 unsatisfied after flatten",
+              _unsatisfied_needed(ov, base_tar) == ())
+        # idempotent: re-planning finds nothing to do
+        check("flatten is idempotent (nothing to re-add)",
+              _flatten_origin_needed(ov, _origin_needed_to_flatten(ov)) == ())
+        # a NEEDED with no $ORIGIN copy is NOT invented (stays a genuine miss)
+        ov2 = tdp / "ov2.tar"
+        with tarfile.open(ov2, "w") as t:
+            _add_bytes(t, "usr/lib/chromium/chromium-shell",
+                       _synthetic_elf(("libabsent.so.9",)), mode=0o755)
+        check("no $ORIGIN copy → no phantom flatten",
+              _origin_needed_to_flatten(ov2) == {})
 
     print(f"\nselftest: {'ALL PASS' if failures == 0 else str(failures) + ' FAILED'}")
     return 1 if failures else 0
