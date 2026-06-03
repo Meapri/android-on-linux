@@ -1533,6 +1533,13 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     guest_env.push_back("TERM=xterm-256color");
     guest_env.push_back("XDG_RUNTIME_DIR=" + xdg_runtime_dir);
     guest_env.push_back("WAYLAND_DISPLAY=wayland-0");
+    // Audio (design android-audio-sink.md §4): point libpulse at the in-app
+    // PulseAudio-native server's AF_UNIX socket inside the SAME XDG_RUNTIME_DIR
+    // (bound by alr_audio at ${XDG_RUNTIME_DIR}/pulse/native). PULSE_SERVER beats
+    // client.conf, so this is the authoritative selector; harmless for non-audio
+    // guests. PULSE_CLIENTCONFIG makes the address explicit for tools that read it.
+    guest_env.push_back("PULSE_SERVER=unix:" + xdg_runtime_dir + "/pulse/native");
+    guest_env.push_back("PULSE_CLIENTCONFIG=/etc/pulse/client.conf");
     guest_env.push_back("GDK_BACKEND=wayland");
     guest_env.push_back("SDL_VIDEODRIVER=wayland");
     // Qt6 apps: select the wayland QPA plugin (libqwayland-generic.so, shipped 0755 in

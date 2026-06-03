@@ -236,7 +236,7 @@ class MainActivity : Activity() {
         // is wired separately. Device test = CP-5.
         Thread {
             try {
-                for (name in listOf("sdl2", "netsurf", "qt6", "xwayland", "babl-gegl", "microbench", "interpose", "dpkg-db", "x11", "apt-config", "chromium-net", "nss")) {
+                for (name in listOf("sdl2", "netsurf", "qt6", "xwayland", "babl-gegl", "microbench", "interpose", "dpkg-db", "x11", "apt-config", "chromium-net", "nss", "pulse")) {
                     val tar = java.io.File("/data/local/tmp/$name-stage.tar")
                     val marker = java.io.File(rootfsStatus.rootfsDir, ".$name-staged-${tar.length()}")
                     if (tar.isFile && !marker.isFile) {
@@ -1376,6 +1376,22 @@ class MainActivity : Activity() {
                     val wlStart = nativeWaylandCompositorStart(
                         cacheDir.absolutePath, holder.surface, dm.densityDpi, dm.xdpi, dm.ydpi,
                         outW, outH, refreshMhz)
+                    // Audio sink (design §9B): start the in-app PulseAudio-native server on
+                    // the SAME XDG_RUNTIME_DIR the compositor + guest env use
+                    // (cacheDir/alr-xdg → socket at .../pulse/native). Output-only AAudio
+                    // needs no runtime permission on API 26+. Started here, before the
+                    // chromium-test early return below, so audio is up for chromium too.
+                    try {
+                        val rate = (getSystemService(AUDIO_SERVICE) as android.media.AudioManager)
+                            .getProperty(android.media.AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE)
+                            ?.toIntOrNull() ?: 48000
+                        val xdgRuntimeDir = cacheDir.absolutePath + "/alr-xdg"
+                        val audioStart = nativeAudioSinkStart(xdgRuntimeDir, rate)
+                        android.util.Log.i("alr_loader", "audio sink: $audioStart")
+                    } catch (e: Throwable) {
+                        android.util.Log.e("alr_loader",
+                            "audio sink start EXC: ${android.util.Log.getStackTraceString(e)}")
+                    }
                     // chromium-test fast path: when a CR-test flag is set, the chromium probe
                     // thread (started in onCreate) needs the loader's guest-launch lock
                     // immediately. This GUI guest battery (wl/pixman/gtk/foot/GIMP — GIMP alone
@@ -1795,6 +1811,19 @@ class MainActivity : Activity() {
         // even before the first touch. (post: run after layout so the view tree is
         // attached and requestFocus actually takes.)
         surfaceView.post { surfaceView.requestFocus() }
+    }
+
+    override fun onDestroy() {
+        // Tear down the audio sink (joins the epoll thread, closes AAudio + the
+        // socket). Best-effort: a stop on a never-started sink is a no-op.
+        try {
+            val audioStop = nativeAudioSinkStop()
+            android.util.Log.i("alr_loader", "audio sink: $audioStop")
+        } catch (e: Throwable) {
+            android.util.Log.e("alr_loader",
+                "audio sink stop EXC: ${android.util.Log.getStackTraceString(e)}")
+        }
+        super.onDestroy()
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -2798,6 +2827,14 @@ class MainActivity : Activity() {
     private external fun nativeWaylandCompositorStatus(): String
 
     private external fun nativeWaylandCompositorStop(): String
+
+    // ALR audio sink (in-app PulseAudio-native server -> AAudio; design §5f Option A).
+    // Kotlin only starts/stops the sink + reads status — no PCM crosses JNI.
+    private external fun nativeAudioSinkStart(xdgRuntimeDir: String, deviceRate: Int): String
+
+    private external fun nativeAudioSinkStatus(): String
+
+    private external fun nativeAudioSinkStop(): String
 
     private external fun nativeWaylandInjectSelfTest(x: Float, y: Float): String
 
