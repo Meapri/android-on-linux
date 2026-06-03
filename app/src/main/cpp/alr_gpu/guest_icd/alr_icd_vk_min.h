@@ -37,7 +37,12 @@
 #define VK_UUID_SIZE 16U
 #define VK_MAX_MEMORY_TYPES 32U
 #define VK_MAX_MEMORY_HEAPS 16U
+#define VK_MAX_EXTENSION_NAME_SIZE 256U
+#define VK_MAX_DESCRIPTION_SIZE 256U
 #define VK_NULL_HANDLE ((void*)0)
+
+/* VK 1.3 version macro (ANGLE may query 1.1/1.3; we cap our reported API at 1.1). */
+#define VK_API_VERSION_1_3 ((((uint32_t)0) << 29) | (((uint32_t)1) << 22) | (((uint32_t)3) << 12) | (uint32_t)0)
 
 typedef uint32_t VkFlags;
 typedef uint32_t VkBool32;
@@ -293,6 +298,55 @@ typedef struct VkPhysicalDeviceProperties {
     VkPhysicalDeviceLimits             limits;
     VkPhysicalDeviceSparseProperties   sparseProperties;
 } VkPhysicalDeviceProperties;
+
+/* ---- ANGLE-init enumeration/query structs (the read-only bring-up queries ANGLE's
+ * RendererVk issues before any device-object creation). Exact official sizes/layout so
+ * a caller can stack-allocate arrays of them. ---- */
+typedef struct VkExtensionProperties {
+    char     extensionName[VK_MAX_EXTENSION_NAME_SIZE];
+    uint32_t specVersion;
+} VkExtensionProperties;
+
+typedef struct VkLayerProperties {
+    char     layerName[VK_MAX_EXTENSION_NAME_SIZE];
+    uint32_t specVersion;
+    uint32_t implementationVersion;
+    char     description[VK_MAX_DESCRIPTION_SIZE];
+} VkLayerProperties;
+
+/* VkPhysicalDeviceFeatures: 55 VkBool32 fields (Vulkan 1.0). We mirror it as a sized
+ * blob of 55 VkBool32 so the size/stride is exact; the ICD memset(0)s it (a conservative
+ * "no optional features" answer ANGLE tolerates by disabling those code paths). */
+typedef struct VkPhysicalDeviceFeatures {
+    VkBool32 features[55];
+} VkPhysicalDeviceFeatures;
+
+typedef struct VkMemoryType {
+    VkFlags      propertyFlags;  /* VkMemoryPropertyFlags */
+    uint32_t     heapIndex;
+} VkMemoryType;
+typedef struct VkMemoryHeap {
+    VkDeviceSize size;
+    VkFlags      flags;          /* VkMemoryHeapFlags */
+} VkMemoryHeap;
+typedef struct VkPhysicalDeviceMemoryProperties {
+    uint32_t      memoryTypeCount;
+    VkMemoryType  memoryTypes[VK_MAX_MEMORY_TYPES];
+    uint32_t      memoryHeapCount;
+    VkMemoryHeap  memoryHeaps[VK_MAX_MEMORY_HEAPS];
+} VkPhysicalDeviceMemoryProperties;
+
+typedef struct VkFormatProperties {
+    VkFlags linearTilingFeatures;
+    VkFlags optimalTilingFeatures;
+    VkFlags bufferFeatures;
+} VkFormatProperties;
+
+/* Common VkMemoryPropertyFlagBits (only the ones a minimal allocator reports). */
+#define VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT     0x00000001
+#define VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT     0x00000002
+#define VK_MEMORY_PROPERTY_HOST_COHERENT_BIT    0x00000004
+#define VK_MEMORY_HEAP_DEVICE_LOCAL_BIT         0x00000001
 
 /* ---- entry-point PFN typedefs the ICD's GIPA returns ---- */
 typedef PFN_vkVoidFunction (VKAPI_PTR *PFN_vkGetInstanceProcAddr)(VkInstance instance, const char* pName);

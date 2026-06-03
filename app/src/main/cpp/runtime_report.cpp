@@ -1595,14 +1595,33 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         const char* vi = ::getenv("ALR_VK_ICD");
         if (vi && vi[0] == '1') vk_icd_requested = true;
     }
+    // ANGLE-for-GLES collision fix: a SYSTEM ANGLE ships into a PRIVATE dir
+    // /usr/lib/androlinux-angle (tools/build_angle_overlay.py) so it never clobbers the
+    // device-proven gpushim libEGL.so.1/libGLESv2.so.2 in the shared /usr/lib/androlinux
+    // (the old last-writer-wins collision). When the launcher sets ALR_ANGLE=1 (only when
+    // the /data/local/tmp/.alr-angle marker is present), the loader prepends the ANGLE dir
+    // AHEAD of the shared dir on LD_LIBRARY_PATH so ANGLE's EGL/GLES win there; ANGLE's
+    // runtime dlopen of libvulkan.so.1 still resolves our VK ICD from the shared dir (next
+    // on the path). With ALR_ANGLE unset the ANGLE dir is never on the path → gpushim is
+    // byte-for-byte the proven path (strict no-regression). ALR_ANGLE implies the GLES
+    // accel intent, so it also flips gpu_accel_requested (ring attach + shared dir on path).
+    bool angle_requested = false;
+    {
+        const char* an = ::getenv("ALR_ANGLE");
+        if (an && an[0] == '1') { angle_requested = true; gpu_accel_requested = true; }
+    }
     // CP-2: a GLES guest (glmark2) dlopens the GPU shim libEGL.so.1/libGLESv2.so.2 from
     // /usr/lib/androlinux — it MUST resolve ahead of any rootfs/vendor GL lib, so prepend
     // that dir. Gated on accel-request so the general path never risks shim-shadowing a
-    // real libEGL (non-GPU guests don't dlopen those sonames anyway).
+    // real libEGL (non-GPU guests don't dlopen those sonames anyway). Under ALR_ANGLE the
+    // private androlinux-angle dir goes FIRST (ANGLE wins), then the shared androlinux dir
+    // (so ANGLE's dlopen of our libvulkan.so.1 ICD still resolves).
+    const std::string ld_angle =
+        angle_requested ? (config.rootfs_dir + "/usr/lib/androlinux-angle:") : std::string();
     const std::string ld_shim =
         (gpu_accel_requested || vk_icd_requested)
             ? (config.rootfs_dir + "/usr/lib/androlinux:") : std::string();
-    guest_env.push_back("LD_LIBRARY_PATH=" + ld_shim +
+    guest_env.push_back("LD_LIBRARY_PATH=" + ld_angle + ld_shim +
                         config.rootfs_dir + "/lib/aarch64-linux-gnu:" +
                         config.rootfs_dir + "/lib:" + config.rootfs_dir + "/usr/lib/aarch64-linux-gnu:" +
                         config.rootfs_dir + "/usr/lib");
@@ -1620,7 +1639,17 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     // backend) — so this is harmless for the non-X guests and required for the X ones.
     // The :0 X socket (/tmp/.X11-unix/X0) is shared because both Xwayland and the X
     // app run in-process under the SAME rootfs path mediation (ALR_ROOTFS).
-    guest_env.push_back("DISPLAY=:0");
+    // ANGLE exception: ANGLE's Vulkan backend on Linux picks its display sub-backend by
+    // platform — with DISPLAY set it selects DisplayVkXcb and calls xcb_connect() (FAILS:
+    // no X server) BEFORE creating the Vulkan instance. Under ALR_ANGLE we (a) do NOT
+    // export DISPLAY and (b) set XDG_SESSION_TYPE=wayland so ANGLE selects DisplayVkWayland
+    // (connects to the in-app compositor on WAYLAND_DISPLAY) → reaches vkCreateInstance on
+    // our guest libvulkan.so.1 ICD. Non-ANGLE guests keep DISPLAY=:0 (Xwayland path).
+    if (angle_requested) {
+        guest_env.push_back("XDG_SESSION_TYPE=wayland");
+    } else {
+        guest_env.push_back("DISPLAY=:0");
+    }
     // Audio (design android-audio-sink.md §4): point libpulse at the in-app
     // PulseAudio-native server's AF_UNIX socket inside the SAME XDG_RUNTIME_DIR
     // (bound by alr_audio at ${XDG_RUNTIME_DIR}/pulse/native). PULSE_SERVER beats
@@ -1782,6 +1811,11 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     // Record both arms in the report so each run is self-identifying for A/B.
     out << "\nalr native loader pcgate=" << (pcgate_on ? "on" : "off")
         << " interpose=" << (interpose_off ? "off" : "on");
+    // GPU path self-identification: which GL/Vulkan dirs are on the guest library path
+    // (so a device run shows ANGLE-mode vs gpushim-mode vs VK-ICD-mode at a glance).
+    out << "\nalr native loader gpu accel=" << (gpu_accel_requested ? "on" : "off")
+        << " vk_icd=" << (vk_icd_requested ? "on" : "off")
+        << " angle=" << (angle_requested ? "on(androlinux-angle first)" : "off");
 
     const int fd = ::open(host_path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
@@ -1891,10 +1925,20 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
             for (const auto& kv : alr::gpu::vk_ring_guest_env(vk_ring))
                 guest_env.push_back(kv);
         }
+        out << "\nalr native loader vk ring attached=" << (vk_ring_attached ? "yes" : "no");
         // Forward VK_LOADER_DEBUG (e.g. =all) into the guest so a device run can trace
         // ICD discovery; only set if the host has it, so the default run is quiet.
         if (const char* vld = ::getenv("VK_LOADER_DEBUG"))
             guest_env.push_back(std::string("VK_LOADER_DEBUG=") + vld);
+        // ALR_ICD_DIAG: make our guest libvulkan.so.1 ICD emit a per-entrypoint call trace
+        // ([alr-icd] lines) so a device run sees EXACTLY which vk* calls a real client
+        // (ANGLE's RendererVk) makes and which one it stops at — the precise ANGLE-on-Vulkan
+        // boundary. Forward the host value if set; otherwise default it ON under ALR_ANGLE
+        // (the ANGLE bring-up is exactly when this trace is wanted).
+        if (const char* icd_diag = ::getenv("ALR_ICD_DIAG"))
+            guest_env.push_back(std::string("ALR_ICD_DIAG=") + icd_diag);
+        else if (angle_requested)
+            guest_env.push_back("ALR_ICD_DIAG=1");
         // If a future build takes the LOADER route (real Khronos loader + our ICD
         // manifest) instead of the direct-SONAME route, point the loader at the manifest
         // the vk-icd overlay stages. Harmless for the direct route (no loader reads it).
@@ -2341,6 +2385,13 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     unsigned long long fault_x8 = 0;
     int fault_signo = 0;
     int fault_syscall = -1;
+    // ANGLE/GPU root-cause aid: which mapped file (+offset) contains the fault PC and
+    // the return-address (LR). For a dlopen'd-lib crash (ANGLE libGLESv2/libEGL) the raw
+    // PC is meaningless without the load base; this resolves it to "<sofile>+0x<off>" so
+    // a device run pinpoints the crashing module without a tombstone. Captured once, at
+    // the first fatal stop, from /proc/<faulting-tid>/maps (the tracee is still alive).
+    std::string fault_pc_map;
+    std::string fault_lr_map;
     int emulated_syscalls = 0;
     int emulated_list[64] = {0};
     int guest_threads = 0;
@@ -4221,6 +4272,47 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
             }
             fault_signo = stopsig;
             captured = true;
+            // Resolve fault_pc / fault_lr to "<basename>+0x<file-offset>" from the
+            // faulting tid's maps while it is still stopped (alive). Lets a device run
+            // attribute an ANGLE/dlopen'd-lib crash to the exact .so without a tombstone.
+            {
+                char mp[64];
+                std::snprintf(mp, sizeof(mp), "/proc/%d/maps", static_cast<int>(w));
+                std::string maps;
+                if (int mfd = ::open(mp, O_RDONLY | O_CLOEXEC); mfd >= 0) {
+                    char b[8192]; ssize_t n;
+                    while ((n = ::read(mfd, b, sizeof(b))) > 0) maps.append(b, (size_t)n);
+                    ::close(mfd);
+                }
+                auto resolve = [&maps](unsigned long long a) -> std::string {
+                    if (a == 0 || maps.empty()) return std::string();
+                    size_t pos = 0;
+                    while (pos < maps.size()) {
+                        size_t eol = maps.find('\n', pos);
+                        if (eol == std::string::npos) eol = maps.size();
+                        std::string line = maps.substr(pos, eol - pos);
+                        pos = eol + 1;
+                        unsigned long long lo = 0, hi = 0, off = 0;
+                        char perms[8] = {0};
+                        // addr-addr perms offset dev inode pathname
+                        if (std::sscanf(line.c_str(), "%llx-%llx %7s %llx",
+                                        &lo, &hi, perms, &off) >= 4 &&
+                            a >= lo && a < hi) {
+                            size_t sl = line.rfind('/');
+                            std::string base =
+                                (sl == std::string::npos) ? std::string("[anon]")
+                                                          : line.substr(sl + 1);
+                            char res[256];
+                            std::snprintf(res, sizeof(res), "%s+0x%llx",
+                                          base.c_str(), (a - lo) + off);
+                            return std::string(res);
+                        }
+                    }
+                    return std::string("<unmapped>");
+                };
+                fault_pc_map = resolve(fault_pc);
+                fault_lr_map = resolve(fault_lr);
+            }
         }
         // Deliver any other signal to the tracee that received it — EXCEPT the
         // four group-stop signals. Under PTRACE_SEIZE a genuine group-stop is now
@@ -4295,6 +4387,10 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         << " x0=0x" << fault_x0
         << " x8=0x" << fault_x8 << std::dec
         << " syscall=" << fault_syscall;
+    if (!fault_pc_map.empty() || !fault_lr_map.empty()) {
+        out << "\nalr native loader fault pc@" << fault_pc_map
+            << " lr@" << fault_lr_map;
+    }
     out << "\nalr native loader guest threads spawned=" << guest_threads;
     out << "\nalr native loader path-mediation traps=" << path_traps
         << " rewrites=" << path_rewrites
