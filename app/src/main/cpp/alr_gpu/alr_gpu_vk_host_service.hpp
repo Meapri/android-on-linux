@@ -59,6 +59,14 @@
 // vkMapMemory uses. The hand-written 200..229 ops are untouched.
 #include "alr_gpu/generated/alr_gpu_vk_gen_decode.hpp"  // decode_vk_gen_op + registrar
 #include "alr_gpu/generated/alr_gpu_vk_arena.hpp"       // alr_vk_arena_create (host side)
+// The CMD-LOG band (the vkCmd* command-recording mechanism — alr_gpu_vk_cmdlog.hpp): the
+// host half of vkQueueSubmit (replay each command buffer's shared-arena record log into a
+// real Mali VkCommandBuffer + real vkQueueSubmit) + the fence/semaphore/wait sync ops.
+// #including it here self-registers its dispatcher into decode_vk_batch's SECOND generated-op
+// seam (set_vk_cmd_dispatch), on a DISJOINT u16 sub-op band (0x4000) from the create-forwards
+// codegen (1..), so the servicer replays cmd-log + submit/sync ops on real Mali too. Under
+// ALR_VK_DECODE_REAL it pulls the real-Mali replay (alr_gpu_vk_cmd_dispatch_real.hpp).
+#include "alr_gpu/alr_gpu_vk_cmd_dispatch.hpp"          // decode_vk_cmd_op + registrar
 
 namespace alr::gpu {
 

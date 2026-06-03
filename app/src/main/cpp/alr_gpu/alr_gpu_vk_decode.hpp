@@ -68,8 +68,21 @@ public:
         pos_ += len;
         return true;
     }
+    // Borrow `n` raw bytes (NO length prefix) as a pointer into the buffer, advancing the
+    // cursor. Used by the cmd-log replay (alr_gpu_vk_cmdlog.hpp) for fixed-width inline blobs
+    // — VkClearValue (16B), push-constant data — whose size the opcode already fixed.
+    bool take_raw(const uint8_t*& data, uint32_t n) {
+        if (pos_ + n > n_) return false;
+        data = p_ + pos_;
+        pos_ += n;
+        return true;
+    }
     bool done() const { return pos_ >= n_; }
     size_t pos() const { return pos_; }
+    // Restore the cursor to a previously-saved pos() (used by decode_vk_batch to PEEK an
+    // escape's u16 sub-opcode to route between the generated band and the cmd-log band, then
+    // rewind so the chosen dispatcher reads the sub-opcode itself). Clamped to the buffer.
+    void seek(size_t p) { pos_ = p <= n_ ? p : n_; }
 
 private:
     template <typename T>
@@ -2073,6 +2086,34 @@ inline const void*& vk_gen_provider_ptr() {
 }
 inline void set_vk_gen_provider(const void* p) { vk_gen_provider_ptr() = p; }
 
+// ---------------------------------------------------------------------------
+// SECOND generated-op seam: the CMD-LOG band (alr_gpu_vk_cmd_dispatch.hpp). It also rides
+// the ALR_VK_OP_GEN_ESCAPE byte but on a DISJOINT u16 sub-opcode band (0x4000.. — the
+// vkQueueSubmit / fence / semaphore / wait ops; the create-forwards codegen owns 1..). Two
+// distinct dispatchers are registered so the cmd-log agent and the create-forwards agent
+// keep separate files + opcode ranges (they merge cleanly). decode_vk_batch's default case
+// consults the gen dispatcher FIRST (it claims the low sub-ops) and, only if that declines
+// the escape, the cmd dispatcher (it claims 0x4000..). Same fn-ptr-registration pattern as
+// vk_gen_dispatch to avoid a circular include. `cmd_provider` is the opaque VkCmdProvider*
+// the caller may set (the wire test's synthetic Mali for the submit/sync ops); null on
+// device -> the cmd dispatcher's real-Mali path.
+// The single reserved u8 opcode the generated bands escape through (mirrors
+// ALR_VK_OP_GEN_ESCAPE in the generated proto header — defined locally here so this
+// lower-level decoder doesn't depend on the generated header; the value is the wire ABI).
+inline constexpr uint8_t kVkGenEscapeOp = 230;
+using VkCmdDispatchFn = bool (*)(uint8_t op, VkReader& r, VkDecodeState& st,
+                                 VkReplyEncoder& reply, const void* cmd_provider);
+inline VkCmdDispatchFn& vk_cmd_dispatch() {
+    static VkCmdDispatchFn fn = nullptr;
+    return fn;
+}
+inline void set_vk_cmd_dispatch(VkCmdDispatchFn fn) { vk_cmd_dispatch() = fn; }
+inline const void*& vk_cmd_provider_ptr_seam() {
+    static const void* p = nullptr;
+    return p;
+}
+inline void set_vk_cmd_provider_seam(const void* p) { vk_cmd_provider_ptr_seam() = p; }
+
 inline bool decode_vk_batch(const uint8_t* data, size_t len, VkDecodeState& st,
                             VkReplyEncoder& reply, const VkProvider* provider = nullptr) {
     VkReader r(data, len);
@@ -2589,14 +2630,29 @@ inline bool decode_vk_batch(const uint8_t* data, size_t len, VkDecodeState& st,
             }
 
             default: {
-                // First give the generated 300.. band a chance (if its dispatcher is
-                // registered). It reads the op's operands off the SAME reader and appends
-                // its reply. If it handled the op, continue; otherwise fall through to the
-                // fail-stop (same policy as the GLES decoder — never accept an off-contract
-                // op). The hand-written 200..229 cases above always win for their numbers.
-                VkGenDispatchFn gd = vk_gen_dispatch();
-                if (gd && gd(op, r, st, reply, vk_gen_provider_ptr())) {
-                    break;  // handled by the generated decoder (st.ok reflects its result)
+                // The generated bands ride the single escape byte ALR_VK_OP_GEN_ESCAPE (230)
+                // + a u16 sub-opcode. TWO dispatchers share that escape on DISJOINT sub-op
+                // bands: the create-forwards codegen (decode_vk_gen_op, sub-ops 1..0x3fff) and
+                // the cmd-log band (decode_vk_cmd_op, sub-ops 0x4000..). Both read the sub-op
+                // destructively off the SAME reader, so we PEEK it here (save pos, read u16,
+                // rewind) and route to the owning dispatcher by range — neither can swallow
+                // the other's ops. A non-escape unknown op (or an escape with no registered
+                // owner) fail-stops, same policy as the GLES decoder. The hand-written
+                // 200..229 cases above always win for their numbers.
+                if (op == kVkGenEscapeOp) {
+                    const size_t save = r.pos();
+                    uint16_t sub = 0;
+                    if (!r.u16(sub)) { st.ok = false; break; }
+                    r.seek(save);  // rewind: the chosen dispatcher re-reads the sub-opcode
+                    if (sub >= 0x4000u) {
+                        VkCmdDispatchFn cd = vk_cmd_dispatch();
+                        if (cd && cd(op, r, st, reply, vk_cmd_provider_ptr_seam())) break;
+                    } else {
+                        VkGenDispatchFn gd = vk_gen_dispatch();
+                        if (gd && gd(op, r, st, reply, vk_gen_provider_ptr())) break;
+                    }
+                    st.ok = false;  // escape but no dispatcher owns this sub-op band
+                    break;
                 }
                 st.ok = false;
                 break;

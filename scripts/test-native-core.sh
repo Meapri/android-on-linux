@@ -197,3 +197,18 @@ cxx="${CXX:-g++}"
   -o /tmp/alr-native-vk-gen-passthrough-test
 
 /tmp/alr-native-vk-gen-passthrough-test
+
+# Vulkan CMD-LOG recording band (the vkCmd* command-recording mechanism — the hard part of
+# GPU full-passthrough): a guest-local per-command-buffer record log in the shared arena
+# (vkBeginCommandBuffer..vkCmd*..vkEndCommandBuffer, NO ring op per call), the host replay
+# round trip (the log decodes back to the same opcodes + handles the host replays into a real
+# Mali VkCommandBuffer), and the vkQueueSubmit / fence / semaphore / wait sync ops over a
+# DISJOINT escape sub-op band (0x4000) that coexists with the create-forwards codegen band.
+# NO Vulkan SDK (synthetic Mali provider); the real-Mali replay is syntax-verified against
+# the NDK vulkan.h by tests/test_vk_cmdlog.py.
+"$cxx" -std=c++20 -Wall -Wextra -Werror \
+  -Iapp/src/main/cpp \
+  tests/native_vk_cmdlog_test.cpp \
+  -o /tmp/alr-native-vk-cmdlog-test
+
+/tmp/alr-native-vk-cmdlog-test
