@@ -39,6 +39,12 @@
  * memory + buffer + image + image-view render batch. Produced by
  * tools/gen_vk_passthrough.py; C-clean (extern "C"). */
 #include "alr_gpu/generated/alr_gpu_vk_gen_proto.hpp"
+/* The GUEST-SIDE command-buffer RECORDER + submit/sync ring encoders (the cmd-log band):
+ * AlrIcdCmdLog + the per-vkCmd* record helpers + the vkQueueSubmit/fence-sync ring builders.
+ * Needs AlrVkReader (alr_icd_gen_glue.h, above) + AlrVkEncoder (alr_gpu_vk_proto.hpp, above)
+ * in scope, so it MUST follow both. The cmd-record VKAPI entrypoints that drive these live in
+ * alr_icd_cmd_entrypoints.inc (included after the dispatch types, below). */
+#include "alr_icd_cmd_record.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -114,6 +120,8 @@ typedef struct AlrIcdCommandBuffer {
     VK_LOADER_DATA loader;   /* MUST be first */
     uint32_t       vcmd;     /* virtual command-buffer id on the wire */
     AlrIcdDevice*  dev;
+    AlrIcdCmdLog   log;      /* the guest-local cmd-record byte log (vkCmd* append here, ship
+                              * at vkQueueSubmit). See alr_icd_cmd_record.h. */
 } AlrIcdCommandBuffer;
 
 /* ---- monotonic virtual-id allocators (start at 1; 0 reserved). The ENUM rung is
@@ -159,6 +167,9 @@ static uint32_t g_next_vdset    = 20000000;
 /* WAVE C generated render-pass / framebuffer virtual-id pools. */
 static uint32_t g_next_vrpass   = 21000000;
 static uint32_t g_next_vfb      = 22000000;
+/* WAVE (pipeline) generated graphics/compute-pipeline virtual-id pool. Referenced by the
+ * generated alr_vkCreate{Graphics,Compute}Pipelines (alr_gpu_vk_gen_icd.inc). */
+static uint32_t g_next_vpipe    = 23000000;
 /* The vcmd of the most recent coarse draw-record (alrVkCmdDrawTriangleModules). The
  * single-surface bring-up records then presents, so QUEUE_PRESENT (which keys the host's
  * recorded draw by vcmd) uses this. A multi-surface breadth rung carries vcmd explicitly
@@ -766,6 +777,7 @@ static VkResult VKAPI_CALL alr_vkAllocateCommandBuffers(VkDevice device,
         alr_set_loader_magic_value(cb);
         cb->vcmd = alr_alloc(&g_next_vcmd, 1);
         cb->dev = dev;
+        alr_icd_cmdlog_init(&cb->log);   /* fresh record log (vkBeginCommandBuffer resets it) */
         if (alr_icd_ring_ok()) {
             uint8_t req[32]; AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
             uint32_t vpool = (uint32_t)(uintptr_t)pAllocateInfo->commandPool;
@@ -1320,6 +1332,18 @@ static VkResult VKAPI_CALL alr_vkGetPhysicalDeviceImageFormatProperties2(
 #undef ALR_ICD_GEN_DEFINE
 
 /* ============================================================================
+ * COMMAND-BUFFER RECORDING entrypoints (the wave-8 wiring): vkBeginCommandBuffer / vkCmd* /
+ * vkQueueSubmit / vkWaitForFences / ... Each RECORDS into its command buffer's cb->log (or
+ * ships a submit/sync ring op). Defined here (ALR_ICD_CMD_DEFINE) BEFORE alr_lookup so the
+ * table can reference them; the ALR_ENTRY rows are spliced into alr_lookup below
+ * (ALR_ICD_CMD_TABLE). This is what makes vkGetDeviceProcAddr return NON-NULL for the whole
+ * render/submit family ANGLE caches at device-init (without it ANGLE SIGABRTs on a NULL fn).
+ * ============================================================================ */
+#define ALR_ICD_CMD_DEFINE 1
+#include "alr_icd_cmd_entrypoints.inc"
+#undef ALR_ICD_CMD_DEFINE
+
+/* ============================================================================
  * Dispatch — vkGetInstanceProcAddr / vkGetDeviceProcAddr. The app/loader resolves
  * every entry point through these. We return our ENUM-rung implementations and
  * vkGetInstanceProcAddr / vkGetDeviceProcAddr themselves (a global GIPA also resolves
@@ -1388,6 +1412,12 @@ static PFN_vkVoidFunction alr_lookup(const char *pName) {
 #define ALR_ICD_GEN_TABLE 1
 #include "alr_gpu/generated/alr_gpu_vk_gen_icd.inc"
 #undef ALR_ICD_GEN_TABLE
+        /* ---- COMMAND-BUFFER RECORDING + submit/sync entrypoints (the wave-8 wiring). These
+         * make vkGetDeviceProcAddr return NON-NULL for the cmd-record + queue-submit + fence
+         * family ANGLE caches at device-init. Functions defined above (ALR_ICD_CMD_DEFINE). */
+#define ALR_ICD_CMD_TABLE 1
+#include "alr_icd_cmd_entrypoints.inc"
+#undef ALR_ICD_CMD_TABLE
     };
     size_t i;
     if (!pName) return NULL;

@@ -212,3 +212,17 @@ cxx="${CXX:-g++}"
   -o /tmp/alr-native-vk-cmdlog-test
 
 /tmp/alr-native-vk-cmdlog-test
+
+# GUEST ICD recorder <-> HOST decoder agreement (the wave-8 cmd-log WIRING check): the C
+# recorder header (alr_gpu/guest_icd/alr_icd_cmd_record.h) the ICD's vkCmd* entrypoints
+# (alr_icd_cmd_entrypoints.inc) drive must emit a command-buffer log byte-for-byte decodable
+# by the host cmd_decode_one (alr_gpu_vk_cmdlog.hpp). Records a triangle pass with the guest
+# helpers + decodes it host-side, asserting the opcode/operand round trip. A drift here would
+# make the host replay garbage onto Mali. (-Wno-unused-function: the gen-glue header carries
+# arena helpers this TU does not call.)
+"$cxx" -std=c++20 -Wall -Wextra -Werror -Wno-unused-function \
+  -Iapp/src/main/cpp \
+  tests/native_vk_cmdlog_record_test.cpp \
+  -o /tmp/alr-native-vk-cmdlog-record-test
+
+/tmp/alr-native-vk-cmdlog-record-test
