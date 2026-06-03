@@ -136,6 +136,20 @@ std::string alr_start_wayland_compositor(const CompositorConfig& config);
 // Stop and join the running compositor (idempotent). Returns a status string.
 std::string alr_stop_wayland_compositor();
 
+// Dynamically re-size the Wayland output of the RUNNING compositor (rotation,
+// multi-window, split-screen, inset change). Updates the advertised output
+// width/height/refresh/DPI, re-sends wl_output geometry+mode+done to every bound
+// output resource, and re-sends an xdg_toplevel.configure (+ xdg_surface.configure)
+// to every mapped toplevel so the client (chromium/GTK) re-lays-out to the new
+// size. Safe to call from any thread (the work is marshalled onto the compositor
+// thread via the reactor wakeup). No-op (returns an error line) if no compositor
+// is running. Pass 0 for any metric to leave it unchanged. The caller is
+// responsible for re-pointing the presenter at the new ANativeWindow (the EGL
+// surface is window-bound) BEFORE the next present — see the JNI resize entry.
+std::string alr_resize_wayland_output(int32_t output_width, int32_t output_height,
+                                      int32_t refresh_mhz, int32_t density_dpi,
+                                      float xdpi, float ydpi);
+
 // True if a compositor thread is currently running.
 bool alr_wayland_compositor_running();
 

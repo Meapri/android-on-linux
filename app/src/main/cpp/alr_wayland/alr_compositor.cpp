@@ -178,6 +178,14 @@ public:
     const std::string& status() const { return status_; }
     const CompositorConfig& config() const { return config_; }
 
+    // Mutable output-metric accessors for a live re-size (rotation / multi-window).
+    // Only the output geometry/refresh/DPI fields are touched; the socket path and
+    // present callbacks are never changed. Caller must run this on the compositor
+    // thread (drain_resize_queue does). 0 leaves a field unchanged.
+    void apply_output_resize(int32_t w, int32_t h, int32_t refresh_mhz,
+                             int32_t density_dpi, float xdpi, float ydpi);
+    void drain_resize_queue();   // compositor thread: pending resize -> protocol
+
     // --- presentation: called from surface commit on the compositor thread ---
     void present(const PresentFrame& frame) {
         if (config_.present) {
@@ -686,6 +694,22 @@ void surface_resource_destroy(struct wl_resource* resource) {
 // ---------------------------------------------------------------------------
 std::vector<SurfaceState*> g_zorder;       // mapped toplevels, bottom->top
 std::vector<SurfaceState*> g_all_surfaces; // every live SurfaceState
+
+// Live wl_output resources, so a dynamic output re-size (rotation / multi-window)
+// can re-send geometry+mode+done to each bound client. Tracked on the compositor
+// thread only; entries are removed by the per-resource destroy listener.
+std::vector<struct wl_resource*> g_output_resources;
+
+// Pending output re-size, posted from any thread (the JNI resize entry) and
+// applied on the compositor thread in drain_resize_queue() after a wake(). A
+// width of 0 means "no resize pending"; non-zero w AND h arm it.
+struct PendingResize {
+    bool armed = false;
+    int32_t w = 0, h = 0, refresh_mhz = 0, density_dpi = 0;
+    float xdpi = 0.0f, ydpi = 0.0f;
+};
+std::mutex g_resize_mutex;
+PendingResize g_pending_resize;
 
 void registry_add(SurfaceState* s) { g_all_surfaces.push_back(s); }
 void registry_remove(SurfaceState* s) {
@@ -1673,6 +1697,48 @@ void output_release(struct wl_client*, struct wl_resource* resource) {
 }
 const struct wl_output_interface kOutputImpl = {output_release};
 
+// Drop a destroyed wl_output resource from the live tracking list so a later
+// dynamic resize never re-sends events to a freed resource (UAF guard). Runs on
+// the compositor thread (libwayland dispatches destroy there).
+void output_resource_destroyed(struct wl_resource* resource) {
+    g_output_resources.erase(
+        std::remove(g_output_resources.begin(), g_output_resources.end(), resource),
+        g_output_resources.end());
+}
+
+// Send the current output geometry/mode/scale/done to one bound wl_output
+// resource. Shared by the initial bind and the dynamic-resize re-advertise so the
+// two never drift. `version` is the resource's negotiated wl_output version.
+void send_output_state(struct wl_resource* r, const CompositorConfig& cfg) {
+    const uint32_t version = static_cast<uint32_t>(wl_resource_get_version(r));
+    const int32_t w = cfg.output_width  > 0 ? cfg.output_width  : 1280;
+    const int32_t h = cfg.output_height > 0 ? cfg.output_height : 720;
+    // wl_output.geometry takes the PHYSICAL size in MILLIMETRES; derive from dpi.
+    const float xdpi = cfg.xdpi > 1.0f ? cfg.xdpi
+        : (cfg.density_dpi > 0 ? static_cast<float>(cfg.density_dpi) : 160.0f);
+    const float ydpi = cfg.ydpi > 1.0f ? cfg.ydpi
+        : (cfg.density_dpi > 0 ? static_cast<float>(cfg.density_dpi) : 160.0f);
+    const int32_t phys_w_mm = static_cast<int32_t>(static_cast<float>(w) / xdpi * 25.4f + 0.5f);
+    const int32_t phys_h_mm = static_cast<int32_t>(static_cast<float>(h) / ydpi * 25.4f + 0.5f);
+    const int32_t scale = cfg.output_scale > 0 ? cfg.output_scale : 1;
+    wl_output_send_geometry(r, 0, 0, phys_w_mm, phys_h_mm, WL_OUTPUT_SUBPIXEL_UNKNOWN,
+                            "ALR", "android-surface", WL_OUTPUT_TRANSFORM_NORMAL);
+    wl_output_send_mode(r, WL_OUTPUT_MODE_CURRENT | WL_OUTPUT_MODE_PREFERRED, w, h,
+                        cfg.output_refresh_mhz);
+    if (version >= WL_OUTPUT_SCALE_SINCE_VERSION) {
+        wl_output_send_scale(r, scale);
+    }
+    if (version >= WL_OUTPUT_NAME_SINCE_VERSION) {
+        wl_output_send_name(r, "ALR-0");
+    }
+    if (version >= WL_OUTPUT_DESCRIPTION_SINCE_VERSION) {
+        wl_output_send_description(r, "ALR Android SurfaceView output");
+    }
+    if (version >= WL_OUTPUT_DONE_SINCE_VERSION) {
+        wl_output_send_done(r);
+    }
+}
+
 // =================== wl_subsurface / wl_subcompositor ===================
 // Minimal: GTK's Wayland backend probes wl_subcompositor at startup (and uses
 // subsurfaces for menus/tooltips/popups). A single toplevel window needs the
@@ -1811,41 +1877,16 @@ void Compositor::bind_output(struct wl_client* client, void* data,
         wl_client_post_no_memory(client);
         return;
     }
-    wl_resource_set_implementation(r, &kOutputImpl, nullptr, nullptr);
+    // Track this resource (with a destroy listener) so a later dynamic output
+    // resize can re-advertise geometry/mode to it, and so it is dropped on destroy.
+    wl_resource_set_implementation(r, &kOutputImpl, nullptr, &output_resource_destroyed);
+    g_output_resources.push_back(r);
+    send_output_state(r, self->config_);
     const int32_t w = self->config_.output_width > 0 ? self->config_.output_width : 1280;
     const int32_t h = self->config_.output_height > 0 ? self->config_.output_height : 720;
-    // wl_output.geometry takes the PHYSICAL size in MILLIMETRES (not pixels) — a
-    // toolkit divides px/mm to get monitor DPI. Derive mm from the device's real
-    // dpi (xdpi/ydpi, else densityDpi, else ~160): mm = px / dpi * 25.4.
-    const float xdpi = self->config_.xdpi > 1.0f ? self->config_.xdpi
-        : (self->config_.density_dpi > 0 ? static_cast<float>(self->config_.density_dpi) : 160.0f);
-    const float ydpi = self->config_.ydpi > 1.0f ? self->config_.ydpi
-        : (self->config_.density_dpi > 0 ? static_cast<float>(self->config_.density_dpi) : 160.0f);
-    const int32_t phys_w_mm = static_cast<int32_t>(static_cast<float>(w) / xdpi * 25.4f + 0.5f);
-    const int32_t phys_h_mm = static_cast<int32_t>(static_cast<float>(h) / ydpi * 25.4f + 0.5f);
-    const int32_t scale = self->config_.output_scale > 0 ? self->config_.output_scale : 1;
-    wl_output_send_geometry(r, 0, 0, phys_w_mm, phys_h_mm, WL_OUTPUT_SUBPIXEL_UNKNOWN,
-                            "ALR", "android-surface", WL_OUTPUT_TRANSFORM_NORMAL);
-    wl_output_send_mode(r, WL_OUTPUT_MODE_CURRENT | WL_OUTPUT_MODE_PREFERRED, w, h,
-                        self->config_.output_refresh_mhz);
-    if (version >= WL_OUTPUT_SCALE_SINCE_VERSION) {
-        wl_output_send_scale(r, scale);
-    }
-    // wl_output v4 name/description (sent before done, per protocol event ordering).
-    // chromium ozone/wayland's WaylandOutput records these; a stable machine-readable
-    // name also lets a client correlate the output across reconnects. Older clients
-    // (which negotiated <v4) never receive these, so this is additive only.
-    if (version >= WL_OUTPUT_NAME_SINCE_VERSION) {
-        wl_output_send_name(r, "ALR-0");
-    }
-    if (version >= WL_OUTPUT_DESCRIPTION_SINCE_VERSION) {
-        wl_output_send_description(r, "ALR Android SurfaceView output");
-    }
-    if (version >= WL_OUTPUT_DONE_SINCE_VERSION) {
-        wl_output_send_done(r);
-    }
-    ALR_WL_LOGI("client bound: wl_output v%u (%dx%d px, %dx%d mm, scale=%d, dpi=%.0f)",
-                version, w, h, phys_w_mm, phys_h_mm, scale, xdpi);
+    ALR_WL_LOGI("client bound: wl_output v%u (%dx%d px, refresh=%d, scale=%d)",
+                version, w, h, self->config_.output_refresh_mhz,
+                self->config_.output_scale > 0 ? self->config_.output_scale : 1);
 }
 
 void Compositor::bind_xdg_wm_base(struct wl_client* client, void* /*data*/,
@@ -2251,6 +2292,75 @@ void Compositor::drain_input_queue() {
     wl_display_flush_clients(display_);
 }
 
+// Re-size the live Wayland output (rotation / multi-window / split-screen / inset
+// change). Compositor thread only (drain_resize_queue calls it). Updates config_'s
+// output geometry/refresh/DPI (+ recomputes the integer scale the same way the JNI
+// start path does), re-advertises every bound wl_output, and re-sends an
+// xdg_toplevel.configure to every mapped toplevel so the client re-lays-out to the
+// new size. present_composited() reads config_.output_* every frame, so the
+// placement follows automatically once config_ is updated.
+void Compositor::apply_output_resize(int32_t w, int32_t h, int32_t refresh_mhz,
+                                     int32_t density_dpi, float xdpi, float ydpi) {
+    const int32_t old_w = config_.output_width;
+    const int32_t old_h = config_.output_height;
+    if (w > 0) config_.output_width = w;
+    if (h > 0) config_.output_height = h;
+    if (refresh_mhz > 0) config_.output_refresh_mhz = refresh_mhz;
+    if (density_dpi > 0) config_.density_dpi = density_dpi;
+    if (xdpi > 1.0f) config_.xdpi = xdpi;
+    if (ydpi > 1.0f) config_.ydpi = ydpi;
+    // Recompute the buffer scale exactly as nativeWaylandCompositorStart does, so a
+    // HiDPI panel keeps logical width >= 1024 px and the configure logical size below
+    // matches what the client expects (device px / scale).
+    int wl_scale = config_.density_dpi > 0 ? (config_.density_dpi + 80) / 160 : 1;
+    if (wl_scale < 1) wl_scale = 1;
+    while (wl_scale > 1 && config_.output_width > 0 && config_.output_width / wl_scale < 1024)
+        --wl_scale;
+    config_.output_scale = wl_scale;
+
+    // Re-pace the frame timer if the refresh rate changed (e.g. a mode switch).
+    if (refresh_mhz > 0 && frame_timer_fd_ >= 0) {
+        long period_ns = 1'000'000'000'000LL / refresh_mhz;
+        if (period_ns < 1'000'000 || period_ns > 1'000'000'000LL) period_ns = 16'666'667;
+        struct itimerspec its{};
+        its.it_interval.tv_nsec = period_ns;
+        its.it_value.tv_nsec = period_ns;
+        ::timerfd_settime(frame_timer_fd_, 0, &its, nullptr);
+    }
+
+    // Re-advertise the output to every bound client (geometry+mode+scale+done).
+    for (struct wl_resource* r : g_output_resources) {
+        if (r) send_output_state(r, config_);
+    }
+    // Re-configure every mapped toplevel so chromium/GTK re-lay-out. send_initial_configure
+    // already sends the ACTIVATED+MAXIMIZED state at the current (now-updated) output size
+    // in logical coords; re-using it keeps the resize path identical to the first map.
+    int reconfigured = 0;
+    for (SurfaceState* s : g_all_surfaces) {
+        if (s && s->xdg_toplevel && s->xdg_surface) {
+            send_initial_configure(s);
+            ++reconfigured;
+        }
+    }
+    // Force a repaint at the new size on the next frame tick.
+    g_scene_dirty = true;
+    ALR_WL_LOGI("apply_output_resize %dx%d -> %dx%d scale=%d refresh=%d reconfigured_toplevels=%d outputs=%zu",
+                old_w, old_h, config_.output_width, config_.output_height,
+                config_.output_scale, config_.output_refresh_mhz, reconfigured,
+                g_output_resources.size());
+}
+
+void Compositor::drain_resize_queue() {
+    PendingResize req;
+    {
+        std::lock_guard<std::mutex> lk(g_resize_mutex);
+        if (!g_pending_resize.armed) return;
+        req = g_pending_resize;
+        g_pending_resize.armed = false;
+    }
+    apply_output_resize(req.w, req.h, req.refresh_mhz, req.density_dpi, req.xdpi, req.ydpi);
+}
+
 // §5-C: bind the newest submitted GPU frame (AHardwareBuffer) to the top toplevel
 // for zero-copy present. Compositor thread only (reactor wakeup). Single-GPU-surface
 // bring-up: newest frame wins; superseded/older frames in the batch are released.
@@ -2326,6 +2436,7 @@ void Compositor::reactor() {
                 uint64_t v = 0;
                 ssize_t r = ::read(wakeup_fd_, &v, sizeof(v));
                 (void)r;  // drain; loop condition handles stop
+                drain_resize_queue(); // apply any pending output resize (rotation/MW)
                 drain_input_queue();  // deliver any injected input events
                 drain_gpu_queue();    // bind any submitted §5-C GPU (AHB) frames
             } else if (events[i].data.fd == frame_timer_fd_) {
@@ -2371,6 +2482,8 @@ void Compositor::teardown() {
     g_first_present_done = false;
     g_zorder.clear();
     g_all_surfaces.clear();
+    g_output_resources.clear();   // resources freed by wl_display teardown; drop dangling tracking
+    { std::lock_guard<std::mutex> lk(g_resize_mutex); g_pending_resize = PendingResize{}; }
     g_focus_surface = nullptr;
     g_input_target_surface = nullptr;
     g_keyboard_grab_surface = nullptr;  // stale-pointer guard on restart (UAF discipline)
@@ -2444,6 +2557,31 @@ std::string alr_stop_wayland_compositor() {
     delete g_instance;
     g_instance = nullptr;
     return "ALR WAYLAND COMPOSITOR: stopped";
+}
+
+std::string alr_resize_wayland_output(int32_t output_width, int32_t output_height,
+                                      int32_t refresh_mhz, int32_t density_dpi,
+                                      float xdpi, float ydpi) {
+    std::lock_guard<std::mutex> lk(g_instance_mutex);
+    if (g_instance == nullptr) {
+        return "ALR WAYLAND COMPOSITOR RESIZE: not running";
+    }
+    {
+        std::lock_guard<std::mutex> rk(g_resize_mutex);
+        // Coalesce: the latest pending size wins (a burst of surfaceChanged callbacks
+        // during a rotation animation collapses to one apply on the compositor thread).
+        g_pending_resize.armed = true;
+        if (output_width  > 0) g_pending_resize.w = output_width;
+        if (output_height > 0) g_pending_resize.h = output_height;
+        if (refresh_mhz   > 0) g_pending_resize.refresh_mhz = refresh_mhz;
+        if (density_dpi   > 0) g_pending_resize.density_dpi = density_dpi;
+        if (xdpi > 1.0f) g_pending_resize.xdpi = xdpi;
+        if (ydpi > 1.0f) g_pending_resize.ydpi = ydpi;
+    }
+    g_instance->wake();  // reactor -> drain_resize_queue() on the compositor thread
+    return std::string("ALR WAYLAND COMPOSITOR RESIZE: queued ") +
+           std::to_string(output_width) + "x" + std::to_string(output_height) +
+           " refresh=" + std::to_string(refresh_mhz);
 }
 
 bool alr_wayland_compositor_running() {

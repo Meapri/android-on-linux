@@ -1952,6 +1952,16 @@ class MainActivity : Activity() {
             }
         }.start()
 
+        // Shared between surfaceCreated (compositor start + chromium launch) and
+        // surfaceChanged (dynamic resize): the last content-area surface size the
+        // SurfaceView reported, so the chromium launch argv (window-size) and every
+        // later resize use the SAME content-area pixels (NOT the full panel), which
+        // is what keeps chromium inside the system-bar insets.
+        val crSurfaceW = java.util.concurrent.atomic.AtomicInteger(0)
+        val crSurfaceH = java.util.concurrent.atomic.AtomicInteger(0)
+        val crLaunched = java.util.concurrent.atomic.AtomicBoolean(false)
+        val crRefreshMhz = java.util.concurrent.atomic.AtomicInteger(60000)
+
         val surfaceView = SurfaceView(this)
         surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(holder: SurfaceHolder) {
@@ -1960,16 +1970,31 @@ class MainActivity : Activity() {
                         val dm = resources.displayMetrics
                         val disp = if (Build.VERSION.SDK_INT >= 30) display
                             else @Suppress("DEPRECATION") windowManager.defaultDisplay
-                        val realSize = android.graphics.Point()
-                        @Suppress("DEPRECATION") disp?.getRealSize(realSize)
-                        val outW = if (realSize.x > 0) realSize.x else dm.widthPixels
-                        val outH = if (realSize.y > 0) realSize.y else dm.heightPixels
+                        // CONTENT-AREA size, not the full panel: the SurfaceView is laid
+                        // out inside the system-bar insets (see the inset listener below),
+                        // so its surfaceFrame is the area between the status bar and the
+                        // nav bar. The compositor output = this size, so chromium lays its
+                        // omnibox/tab strip out for the visible region and never paints
+                        // under the bars. Fall back to the panel size only if the frame is
+                        // not ready yet (0).
+                        val frame = holder.surfaceFrame
+                        val outW = if (frame.width() > 0) frame.width() else dm.widthPixels
+                        val outH = if (frame.height() > 0) frame.height() else dm.heightPixels
                         val refreshMhz = Math.round((disp?.refreshRate ?: 60f) * 1000f)
+                        crSurfaceW.set(outW); crSurfaceH.set(outH); crRefreshMhz.set(refreshMhz)
                         val wlStart = nativeWaylandCompositorStart(
                             cacheDir.absolutePath, holder.surface, dm.densityDpi, dm.xdpi, dm.ydpi,
                             outW, outH, refreshMhz,
                         )
-                        android.util.Log.i("alr_loader", "cronly: compositor ${wlStart.lineSequence().firstOrNull()}")
+                        android.util.Log.i("alr_loader", "cronly: compositor ${wlStart.lineSequence().firstOrNull()} content=${outW}x${outH}")
+                        // Launch chromium exactly ONCE. If the surface is destroyed+recreated
+                        // (some rotation/multi-window transitions), surfaceCreated re-fires:
+                        // re-bind the compositor (above) but do NOT spawn a second chromium —
+                        // the running browser just gets reconfigured via surfaceChanged.
+                        if (!crLaunched.compareAndSet(false, true)) {
+                            android.util.Log.i("alr_loader", "cronly: compositor re-bound (surface recreate); chromium already running")
+                            return@Thread
+                        }
                         // CR-4 race fix: wait for the chromium-gui overlay to FINISH
                         // extracting, not just for the chromium binary to appear. The
                         // device drain showed chromium launching at "bin=true" (the binary
@@ -2087,8 +2112,12 @@ class MainActivity : Activity() {
                                 // omnibox out for a 1200-wide window while the surface was
                                 // 1920 wide, pushing the top chrome partly off the visible
                                 // area. Sizing to 1920x1200 lets the full browser UI fit.
-                                "\n--start-maximized\n--window-size=1920,1200" +
-                                "\n--ozone-override-screen-size=1920,1200" +
+                                // Size chromium to the CONTENT-AREA surface (between the
+                                // status bar + nav bar), not the full panel — so the omnibox/
+                                // tab strip + page fit the visible region and nothing paints
+                                // under the Android bars. surfaceChanged re-sizes on rotation.
+                                "\n--start-maximized\n--window-size=${crSurfaceW.get()},${crSurfaceH.get()}" +
+                                "\n--ozone-override-screen-size=${crSurfaceW.get()},${crSurfaceH.get()}" +
                                 "\n--enable-logging=stderr\n--v=1" +
                                 // RENDER FIX (device-diagnosed): a file:///root/demo.html
                                 // load painted, but full chromium's FileURLLoader served it
@@ -2108,7 +2137,28 @@ class MainActivity : Activity() {
                 }.start()
             }
 
-            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) = Unit
+            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+                // Rotation / multi-window / split-screen / any resolution change resizes
+                // the SurfaceView surface. Reconfigure the live compositor output (wl_output
+                // + re-send xdg_toplevel.configure to chromium) to the NEW content-area size
+                // so chromium re-lays-out for the new geometry instead of going black. The
+                // native side coalesces a rotation-animation burst and rebinds the
+                // ANativeWindow. Skip no-op repeats (first surfaceChanged often equals the
+                // surfaceCreated size).
+                if (width <= 0 || height <= 0) return
+                if (width == crSurfaceW.get() && height == crSurfaceH.get()) return
+                crSurfaceW.set(width); crSurfaceH.set(height)
+                val dm = resources.displayMetrics
+                val disp = if (Build.VERSION.SDK_INT >= 30) display
+                    else @Suppress("DEPRECATION") windowManager.defaultDisplay
+                val refreshMhz = Math.round((disp?.refreshRate ?: 60f) * 1000f)
+                crRefreshMhz.set(refreshMhz)
+                val r = nativeWaylandCompositorResize(
+                    holder.surface, width, height, dm.densityDpi, dm.xdpi, dm.ydpi, refreshMhz,
+                )
+                android.util.Log.i("alr_loader", "cronly: surfaceChanged ${width}x$height -> $r")
+            }
+
             override fun surfaceDestroyed(holder: SurfaceHolder) = Unit
         })
         // Fullscreen surface; route touch into the focused Wayland client for scroll/click.
@@ -3223,6 +3273,19 @@ class MainActivity : Activity() {
     private external fun nativeWaylandCompositorStatus(): String
 
     private external fun nativeWaylandCompositorStop(): String
+
+    // Dynamic surface resize / rotation / multi-window: hands the compositor the NEW
+    // surface (EGL rebind) + the content-area pixel size so wl_output and every mapped
+    // toplevel reconfigure. Called from SurfaceHolder.surfaceChanged.
+    private external fun nativeWaylandCompositorResize(
+        surface: android.view.Surface,
+        widthPx: Int,
+        heightPx: Int,
+        densityDpi: Int,
+        xdpi: Float,
+        ydpi: Float,
+        refreshMilliHz: Int,
+    ): String
 
     private external fun nativeWaylandInjectSelfTest(x: Float, y: Float): String
 

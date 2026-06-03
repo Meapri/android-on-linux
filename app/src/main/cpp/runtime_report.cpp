@@ -6057,12 +6057,23 @@ struct WaylandPresenter {
     EGLDisplay display = EGL_NO_DISPLAY;
     EGLSurface surface = EGL_NO_SURFACE;
     EGLContext context = EGL_NO_CONTEXT;
+    EGLConfig egl_config = nullptr;      // kept so reset_window() can re-create the surface
     GLuint program = 0;
     GLuint texture = 0;                  // legacy single-surface texture
     GLint a_pos = -1;
     GLint a_uv = -1;
     GLint u_tex = -1;
     ANativeWindow* window = nullptr;
+    // Rotation / surface re-create: the SurfaceView destroys its surface and hands a
+    // NEW ANativeWindow on the next surfaceCreated/Changed. The EGL window-surface is
+    // bound to the OLD ANativeWindow, so swapping to it after the old buffer queue is
+    // abandoned paints nothing (black screen). pending_window is published from the JNI
+    // resize/restart entry (any thread) and adopted on the compositor (GL) thread at the
+    // top of the next present, where we tear down the old EGL surface and build a new one
+    // on the new window. acquire/release keeps the ANativeWindow alive across the handoff.
+    ANativeWindow* pending_window = nullptr;
+    bool window_dirty = false;
+    std::mutex window_mutex;             // guards pending_window / window_dirty
     std::vector<uint8_t> repack;         // scratch for padded-stride wl_shm buffers
     bool init_done = false;
     bool init_ok = false;
@@ -6126,6 +6137,62 @@ struct WaylandPresenter {
         return s;
     }
 
+    // Publish a NEW ANativeWindow from any thread (the JNI resize entry, called on the
+    // Android surfaceChanged/surfaceCreated callback). We acquire it so it survives until
+    // the GL thread adopts it; if a previous pending window was never adopted we release
+    // that one to avoid leaking. Adoption (EGL surface re-create) happens on the GL thread.
+    void set_pending_window(ANativeWindow* w) {
+        if (w) ANativeWindow_acquire(w);
+        std::lock_guard<std::mutex> lk(window_mutex);
+        if (pending_window && pending_window != w) ANativeWindow_release(pending_window);
+        pending_window = w;
+        window_dirty = true;
+    }
+
+    // GL-thread side of the rotation/surface-recreate handoff. Called at the top of
+    // present()/present_list() (which hold present_mutex). If a new window was published,
+    // tear down the EGL surface bound to the old ANativeWindow and create a fresh one on
+    // the new window, keeping the GL context + programs + texture cache intact. Returns
+    // true if a swap happened (so the caller can re-read the window size).
+    bool adopt_pending_window() {
+        ANativeWindow* next = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(window_mutex);
+            if (!window_dirty) return false;
+            window_dirty = false;
+            next = pending_window;
+            pending_window = nullptr;
+        }
+        if (next == nullptr) return false;
+        ANativeWindow* old = window;
+        window = next;  // ownership of the acquire ref transfers to `window`
+        // Before EGL is up there is nothing to re-create; ensure_init() will build the
+        // surface on the new window. Just drop the old window ref.
+        if (!init_done || !init_ok || display == EGL_NO_DISPLAY) {
+            if (old && old != window) ANativeWindow_release(old);
+            status = "window-adopted-preinit";
+            return true;
+        }
+        // Detach the context from the old (about-to-be-destroyed) surface first.
+        eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        if (surface != EGL_NO_SURFACE) {
+            eglDestroySurface(display, surface);
+            surface = EGL_NO_SURFACE;
+        }
+        if (old && old != window) ANativeWindow_release(old);
+        surface = eglCreateWindowSurface(display, egl_config, window, nullptr);
+        if (surface == EGL_NO_SURFACE ||
+            eglMakeCurrent(display, surface, surface, context) != EGL_TRUE) {
+            status = "window-adopt-fail:surface";
+            // Mark uninitialised so a later ensure_init retries cleanly on this window.
+            init_done = false;
+            init_ok = false;
+            return true;
+        }
+        status = "window-adopted";
+        return true;
+    }
+
     bool ensure_init() {
         if (init_done) {
             return init_ok;
@@ -6153,6 +6220,7 @@ struct WaylandPresenter {
             status = "egl-init-fail:config";
             return false;
         }
+        egl_config = cfg;  // retained for reset_window() surface re-creation
         surface = eglCreateWindowSurface(display, cfg, window, nullptr);
         if (surface == EGL_NO_SURFACE) {
             status = "egl-init-fail:surface";
@@ -6425,6 +6493,7 @@ struct WaylandPresenter {
     // ---- legacy single-surface present (unchanged behaviour) ----
     void present(const alr::wayland::PresentFrame& f) {
         std::lock_guard<std::mutex> lk(present_mutex);
+        adopt_pending_window();  // rotation/surface-recreate: rebind EGL to the new window first
         if (!ensure_init() || f.pixels == nullptr || f.width <= 0 || f.height <= 0) {
             return;
         }
@@ -6465,6 +6534,7 @@ struct WaylandPresenter {
     void present_list(const std::vector<alr::wayland::PresentSurface>& surfaces,
                       int32_t out_w, int32_t out_h) {
         std::lock_guard<std::mutex> lk(present_mutex);
+        adopt_pending_window();  // rotation/surface-recreate: rebind EGL to the new window first
         if (!ensure_init()) return;
 
         const int win_w = std::max(1, ANativeWindow_getWidth(window));
@@ -7143,6 +7213,50 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandCompositorStart(
     (void)out_height_px;
     (void)refresh_mhz;
     return env->NewStringUTF("ALR WAYLAND COMPOSITOR: not-built");
+#endif
+}
+
+// Dynamic surface resize / rotation / multi-window. Called from SurfaceHolder.
+// surfaceChanged on the Android UI thread with the NEW surface and its pixel size.
+// Two coupled steps:
+//   1. Hand the presenter the new ANativeWindow so the GL thread rebinds its EGL
+//      window-surface (a rotation gives a brand-new surface; reusing the old EGL
+//      surface paints black). set_pending_window acquires its own ref; adoption
+//      happens on the compositor/GL thread at the next present.
+//   2. Re-size the Wayland output so wl_output + every mapped xdg_toplevel are
+//      reconfigured to (w,h) and chromium/GTK re-lay-out (no bar overlap, correct
+//      orientation). Pass the content-area pixel size from the SurfaceView.
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeWaylandCompositorResize(
+    JNIEnv* env,
+    jobject /* thiz */,
+    jobject surface,
+    jint width_px,
+    jint height_px,
+    jint density_dpi,
+    jfloat xdpi,
+    jfloat ydpi,
+    jint refresh_mhz) {
+#ifdef ALR_HAVE_WAYLAND
+    if (surface != nullptr) {
+        ANativeWindow* win = ANativeWindow_fromSurface(env, surface);
+        if (win != nullptr) {
+            // Pin the buffer geometry to the reported size so getWidth/getHeight
+            // (read by the presenter for glViewport) reflect the post-rotation size.
+            if (width_px > 0 && height_px > 0) {
+                ANativeWindow_setBuffersGeometry(win, width_px, height_px, 0);
+            }
+            g_wl_presenter.set_pending_window(win);  // acquires its own ref
+            ANativeWindow_release(win);              // drop the fromSurface ref
+        }
+    }
+    const std::string status = alr::wayland::alr_resize_wayland_output(
+        width_px, height_px, refresh_mhz, density_dpi, xdpi, ydpi);
+    return env->NewStringUTF(status.c_str());
+#else
+    (void)env; (void)surface; (void)width_px; (void)height_px;
+    (void)density_dpi; (void)xdpi; (void)ydpi; (void)refresh_mhz;
+    return env->NewStringUTF("ALR WAYLAND COMPOSITOR RESIZE: not-built");
 #endif
 }
 

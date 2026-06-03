@@ -24,10 +24,18 @@
             android:configChanges="orientation|screenSize|keyboardHidden|density"
             android:theme="@style/AppTheme" />
 
-        <!-- 기존 probe 하니스 — LAUNCHER 강등(진단 전용, 외부 진입 불요). -->
+        <!-- 기존 probe 하니스 — LAUNCHER 강등(진단 전용, 외부 진입 불요).
+             Standalone Chromium 경로(activity-alias .ui.ChromiumStandalone)가 이
+             MainActivity 를 target 하므로, 회전/멀티윈도우/리사이즈가 Activity 를
+             destroy/recreate 하지 않도록 configChanges 를 직접 처리한다 — SurfaceView +
+             in-app Wayland 컴포지터가 살아남고, surfaceChanged 로 새 크기를 받아
+             nativeWaylandCompositorResize 로 동적 재구성한다. resizeableActivity 로
+             split-screen/free-form 멀티윈도우도 허용. -->
         <activity
             android:name=".MainActivity"
-            android:exported="true" />
+            android:exported="true"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|keyboardHidden|uiMode"
+            android:resizeableActivity="true" />
 
         <!-- Standalone Chromium 앱 진입점: 탭하면 MainActivity 가 LEAN chromium-only
              경로(runChromiumStandalone)로 분기 — GPU/probe/GIMP/toolkit 전부 스킵해
