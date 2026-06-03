@@ -2081,14 +2081,52 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     std::string drain_err;
     const int out_rd = out_pipe[0];
     const int diag_rd = diag_pipe[0];
-    std::thread out_reader([out_rd, &guest_stdout_buf, &drain_err]() {
-        try { guest_stdout_buf = read_all_from_fd(out_rd); }
+    // CR-4 live tee: when ALR_TEE_GUEST_STDOUT=1, stream the guest's stdout/stderr +
+    // the trampoline diag pipe to logcat LINE BY LINE as they arrive, instead of only
+    // accumulating for the final report. This is the only way to see chromium's
+    // --enable-logging=stderr --v=1 init trace (and the ALR-INPROC re-map diag) WHILE a
+    // GUI chromium is wedged — the report is emitted only after the probe returns, but a
+    // hung multiprocess guest never lets it return until the watchdog SIGKILLs (and the
+    // post-kill reap can stall), so the buffered text would never surface. We still
+    // append every line to the buffer so the report is byte-identical when it does
+    // return. Gated (chromium --v=1 is very verbose) so normal GIMP/GPU runs are quiet.
+    const bool tee_guest = []{
+        const char* e = ::getenv("ALR_TEE_GUEST_STDOUT");
+        return e != nullptr && e[0] == '1';
+    }();
+    // Line-buffered fd drain that optionally tees to logcat. Reuses read() directly
+    // (read_all_from_fd reads to EOF, which defeats live streaming). Appends raw bytes
+    // to *sink; flushes complete '\n'-delimited lines to logcat under `tag` when teeing.
+    auto drain_fd_tee = [tee_guest](int fd, std::string* sink, const char* tag) {
+        std::string line;
+        char buf[4096];
+        for (;;) {
+            ssize_t n = ::read(fd, buf, sizeof(buf));
+            if (n < 0) { if (errno == EINTR) continue; break; }
+            if (n == 0) break;
+            sink->append(buf, static_cast<size_t>(n));
+            if (!tee_guest) continue;
+            for (ssize_t i = 0; i < n; ++i) {
+                if (buf[i] == '\n') {
+                    __android_log_print(ANDROID_LOG_INFO, tag, "%s", line.c_str());
+                    line.clear();
+                } else if (line.size() < 8192) {
+                    line.push_back(buf[i]);
+                }
+            }
+        }
+        if (tee_guest && !line.empty()) {
+            __android_log_print(ANDROID_LOG_INFO, tag, "%s", line.c_str());
+        }
+    };
+    std::thread out_reader([out_rd, &guest_stdout_buf, &drain_err, &drain_fd_tee]() {
+        try { drain_fd_tee(out_rd, &guest_stdout_buf, "alr_cr_out"); }
         catch (const std::exception& e) { drain_err = e.what(); }
     });
-    std::thread diag_reader([diag_rd, &diag_buf]() {
+    std::thread diag_reader([diag_rd, &diag_buf, &drain_fd_tee]() {
         // diag failures are non-fatal (the report still stands on stdout + exit code);
         // swallow so a diag-pipe error never masks a good run.
-        try { diag_buf = read_all_from_fd(diag_rd); } catch (const std::exception&) {}
+        try { drain_fd_tee(diag_rd, &diag_buf, "alr_cr_diag"); } catch (const std::exception&) {}
     });
     // SEIZE attach (replaces the child's PTRACE_TRACEME + initial SIGSTOP). The child
     // is blocked reading go_pipe[0]; we attach with PTRACE_SEIZE — which, unlike
@@ -2188,6 +2226,30 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         return e != nullptr && e[0] == '1';
     }();
     int exec_inproc_redirected = 0;  // execs PC-redirected into the in-process trampoline
+    // CR-4 instrumentation + runaway guard. The GUI chromium re-map storm (this
+    // session's wall): ozone-wayland spawns GPU/utility/renderer children, each a
+    // fork()+execve("/proc/self/exe", ["--type=...", …]). GATE-1 below substitutes the
+    // launch chrome (host_path) for EVERY such self-exe and in-process re-maps it — a
+    // full ~800 MiB image per child. If a child crashes (e.g. the GPU child on
+    // --disable-gpu) the browser RETRIES it, and each retry is another self-exe exec ->
+    // another full re-map -> monotonic RSS growth (device: 542->801->1056->1311 MiB)
+    // -> OOM before paint. CR-5 headless (--dump-dom) never hit this because it spawns
+    // ~no children. We (1) LOG each self-exe redirect with its --type and the process
+    // RSS so a device drain pins which child type recurs, and (2) CAP the total number
+    // of self-exe re-maps per launch: past the cap we let the execve proceed as a plain
+    // B-1 path-rewrite (no in-process re-map) so a runaway child fails to relaunch
+    // instead of OOM-killing the whole app. The cap is generous (covers a healthy GUI's
+    // browser+gpu+utility+renderer ≈ a handful of children plus a few restarts) but
+    // finite, so a crash-retry loop is bounded, not unbounded. Env-overridable for
+    // bring-up (ALR_SELFEXE_REMAP_CAP); 0/unset uses the default.
+    int self_exe_remaps = 0;          // total /proc/self/exe -> chrome re-maps this launch
+    const int self_exe_remap_cap = []{
+        const char* e = ::getenv("ALR_SELFEXE_REMAP_CAP");
+        if (e != nullptr) { int v = ::atoi(e); if (v > 0) return v; }
+        return 12;  // healthy GUI: browser+gpu+utility+renderer + a few restarts
+    }();
+    bool self_exe_cap_logged = false;
+    std::string first_self_exe_type;  // first observed --type= on a self-exe child
     // G1 seqint: execs DELIBERATELY NOT inproc-redirected (fell through to B-1/B-3).
     // The trampoline can only map a rootfs glibc target, so we must skip /proc/self/exe
     // (resolves to the loader's own ANDROID bionic binary, interp /system/bin/linker64),
@@ -2758,6 +2820,98 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                                             // into the re-map path; the host-selection below
                                             // reads self_exe_subst to use host_path (not gp).
                                             self_exe_subst = true;
+                                            // CR-4 instrumentation: read the child's
+                                            // argv[1..] to recover its --type=, and sample
+                                            // this process's RSS, so a device drain can see
+                                            // WHICH chromium child type recurs and how RSS
+                                            // climbs per re-map. argv reg: execve=x1,
+                                            // execveat=x2 (already chosen by is_at below).
+                                            std::string child_type = "?";
+                                            {
+                                                const uintptr_t av =
+                                                    is_at
+                                                        ? static_cast<uintptr_t>(regs[2])
+                                                        : static_cast<uintptr_t>(regs[1]);
+                                                // Scan up to a few argv entries for "--type=".
+                                                for (int ai = 1; av && ai < 8; ++ai) {
+                                                    uintptr_t sp_ptr = 0;
+                                                    if (::pread(mfd, &sp_ptr,
+                                                                sizeof(sp_ptr),
+                                                                static_cast<off_t>(
+                                                                    av + ai * sizeof(
+                                                                        uintptr_t))) !=
+                                                        static_cast<ssize_t>(
+                                                            sizeof(sp_ptr)) ||
+                                                        sp_ptr == 0) {
+                                                        break;
+                                                    }
+                                                    char ab[64] = {0};
+                                                    if (::pread(mfd, ab, sizeof(ab) - 1,
+                                                                static_cast<off_t>(
+                                                                    sp_ptr)) > 0 &&
+                                                        std::strncmp(ab, "--type=",
+                                                                     7) == 0) {
+                                                        child_type = ab + 7;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            if (first_self_exe_type.empty()) {
+                                                first_self_exe_type = child_type;
+                                            }
+                                            // Sample RSS (KiB) from /proc/self/statm
+                                            // field 2 (resident pages) * page size.
+                                            long rss_mib = -1;
+                                            {
+                                                int sfd = ::open("/proc/self/statm",
+                                                                 O_RDONLY | O_CLOEXEC);
+                                                if (sfd >= 0) {
+                                                    char sb[128] = {0};
+                                                    ssize_t sn = ::read(sfd, sb,
+                                                                        sizeof(sb) - 1);
+                                                    ::close(sfd);
+                                                    if (sn > 0) {
+                                                        long total_pg = 0, res_pg = 0;
+                                                        if (std::sscanf(sb, "%ld %ld",
+                                                                        &total_pg,
+                                                                        &res_pg) == 2) {
+                                                            rss_mib =
+                                                                (res_pg *
+                                                                 (long)::sysconf(
+                                                                     _SC_PAGESIZE)) /
+                                                                (1024 * 1024);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            // CR-4 runaway guard: past the cap, refuse the
+                                            // in-process re-map (fall back to B-1) so a
+                                            // crash-retry storm is bounded, not OOM.
+                                            if (self_exe_remaps >= self_exe_remap_cap) {
+                                                inproc_skip_reason = "selfexe-cap";
+                                                self_exe_subst = false;
+                                                if (!self_exe_cap_logged) {
+                                                    self_exe_cap_logged = true;
+                                                    __android_log_print(
+                                                        ANDROID_LOG_WARN, "alr_loader",
+                                                        "alr CR4 self-exe re-map CAP hit "
+                                                        "(%d>=%d) type=%s rss=%ldMiB "
+                                                        "tid=%d — refusing further "
+                                                        "re-maps (runaway guard)",
+                                                        self_exe_remaps,
+                                                        self_exe_remap_cap,
+                                                        child_type.c_str(), rss_mib,
+                                                        static_cast<int>(w));
+                                                }
+                                            } else {
+                                                __android_log_print(
+                                                    ANDROID_LOG_INFO, "alr_loader",
+                                                    "alr CR4 self-exe re-map #%d "
+                                                    "type=%s rss=%ldMiB tid=%d",
+                                                    self_exe_remaps + 1,
+                                                    child_type.c_str(), rss_mib,
+                                                    static_cast<int>(w));
+                                            }
                                         } else {
                                             // Launch guest unknown -> conservative SKIP.
                                             inproc_skip_reason = "proc-self-exe";
@@ -2856,6 +3010,14 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                                                         &sio) == 0) {
                                                     ++exec_inproc_redirected;
                                                     inproc_redirected_this_trap = true;
+                                                    // CR-4: count only self-exe
+                                                    // substitutions toward the runaway
+                                                    // cap (a legit rootfs-binary exec is
+                                                    // not part of the chromium child
+                                                    // storm and must not be throttled).
+                                                    if (self_exe_subst) {
+                                                        ++self_exe_remaps;
+                                                    }
                                                     if (first_reentry_target
                                                             .empty()) {
                                                         first_reentry_target = host;
@@ -3450,15 +3612,50 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
             uint64_t regs[34] = {0};
             struct iovec io{regs, sizeof(regs)};
             if (::ptrace(PTRACE_GETREGSET, w, reinterpret_cast<void*>(NT_PRSTATUS), &io) == 0) {
-                ++emul_hist[static_cast<int>(regs[8])];  // M-R2 storm decomposition
+                const int blocked_nr = static_cast<int>(regs[8]);
+                ++emul_hist[blocked_nr];  // M-R2 storm decomposition
                 if (emulated_syscalls < 64) {
-                    emulated_list[emulated_syscalls] = static_cast<int>(regs[8]);
+                    emulated_list[emulated_syscalls] = blocked_nr;
                 }
-                // Return -ENOSYS (not 0). glibc ignores the result of
+                // CR-4: log the FIRST occurrence of each distinct blocked syscall nr to
+                // logcat (bounded), so a device drain of a wedged chromium sees WHICH
+                // syscalls are being -ENOSYS'd WITHOUT needing the (never-arriving) final
+                // report's emul_hist. A blocked syscall that chromium cannot tolerate
+                // (vs glibc's set_robust_list/rseq which ignore the result) is the prime
+                // suspect for the GetCollectStatsConsent-then-brk crash. seen[] is a tiny
+                // supervisor-thread-local set (no lock); we cap distinct logs at 24.
+                {
+                    static int seen_nrs[24];
+                    static int seen_cnt = 0;
+                    bool already = false;
+                    for (int si = 0; si < seen_cnt; ++si) {
+                        if (seen_nrs[si] == blocked_nr) { already = true; break; }
+                    }
+                    if (!already && seen_cnt < 24) {
+                        seen_nrs[seen_cnt++] = blocked_nr;
+                        __android_log_print(ANDROID_LOG_WARN, "alr_loader",
+                            "alr CR4 blocked-syscall nr=%d -> ENOSYS (tid=%d, distinct#%d)",
+                            blocked_nr, static_cast<int>(w), seen_cnt);
+                    }
+                }
+                // Default: return -ENOSYS. glibc ignores the result of
                 // set_robust_list/rseq, but for syscalls it has fallbacks for
                 // (e.g. faccessat2 -> faccessat) the fallback keys specifically on
                 // ENOSYS; faking success (0) or EPERM would break it.
-                regs[0] = static_cast<uint64_t>(-38);  // -ENOSYS
+                // CR-4 EXCEPTION: set_robust_list (aarch64 nr=99). The device drain of a
+                // wedged single-process chromium showed nr=99 as the ONLY blocked syscall
+                // right before the crash/wedge. glibc's thread setup calls set_robust_list
+                // unconditionally and a robust-futex-aware runtime (chromium's
+                // PartitionAlloc / base threading) can mis-handle an -ENOSYS here (the
+                // kernel normally HAS this syscall, so ENOSYS is an unexpected value that
+                // glibc records as "no robust list" but some TLS teardown paths still deref
+                // the list head). Faking SUCCESS (0) matches what the real kernel returns
+                // and is safe: we are not actually registering a robust list (we cancelled
+                // the syscall), but neither glibc nor chromium reads back kernel robust-list
+                // state — they only gate on the return code. This removes the one ENOSYS the
+                // crash correlates with. (rseq nr=293 and the faccessat2 fallback class keep
+                // ENOSYS — only nr=99 is special-cased.)
+                regs[0] = (blocked_nr == 99) ? 0u : static_cast<uint64_t>(-38);  // 0 for set_robust_list, else -ENOSYS
                 ++emulated_syscalls;
                 ::ptrace(PTRACE_SETREGSET, w, reinterpret_cast<void*>(NT_PRSTATUS), &io);
                 ::ptrace(PTRACE_CONT, w, nullptr, nullptr);  // suppress SIGSYS
@@ -3602,6 +3799,15 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         << " inproc=" << (inproc_reexec_on ? "on" : "off")
         << " inproc_redirected=" << exec_inproc_redirected
         << " inproc_skipped=" << exec_inproc_skipped;
+    // CR-4: self-exe (/proc/self/exe) re-map storm telemetry. self_exe_remaps is the
+    // count of chromium children re-mapped from the launch chrome; cap is the runaway
+    // bound; first type names the first child kind seen (gpu-process/utility/renderer/
+    // zygote). A drain comparing this to the per-#N RSS logs pins the storm shape.
+    out << "\nalr CR4 self_exe_remaps=" << self_exe_remaps
+        << " cap=" << self_exe_remap_cap
+        << " cap_hit=" << (self_exe_cap_logged ? "yes" : "no")
+        << " first_type=" << (first_self_exe_type.empty() ? "(none)"
+                                                          : first_self_exe_type);
     // G1 seqint: when execs were correctly NOT redirected (e.g. the chromium zygote's
     // /proc/self/exe, or a non-rootfs/native target, or the alr-reentry stub), surface
     // the first reason+target so the WS-1 drain can confirm the scoping before flipping

@@ -1963,10 +1963,25 @@ class MainActivity : Activity() {
                             outW, outH, refreshMhz,
                         )
                         android.util.Log.i("alr_loader", "cronly: compositor ${wlStart.lineSequence().firstOrNull()}")
-                        // wait (bounded) for the chromium-gui overlay to finish extracting
+                        // CR-4 race fix: wait for the chromium-gui overlay to FINISH
+                        // extracting, not just for the chromium binary to appear. The
+                        // device drain showed chromium launching at "bin=true" (the binary
+                        // is early in the tar) while libopenh264.so.7 (under
+                        // usr/lib/aarch64-linux-gnu, late in the tar) was still extracting —
+                        // chromium's ld.so then died with "error while loading shared
+                        // libraries: libopenh264.so.7: cannot open shared object file" ~50ms
+                        // before that .so landed. Gate on the extraction-complete marker the
+                        // staging thread writes LAST (".chromium-gui-staged-<size>") AND on a
+                        // late-tar dependency file, so launch only proceeds with the overlay
+                        // fully in place.
                         val chromiumBin = File(rootfsDir, "usr/lib/chromium/chromium")
+                        val crGuiTar = File("/data/local/tmp/chromium-gui-stage.tar")
+                        val crGuiMarker = File(rootfsDir, ".chromium-gui-staged-${crGuiTar.length()}")
+                        val openh264 = File(rootfsDir, "usr/lib/aarch64-linux-gnu/libopenh264.so.7")
                         var waited = 0
-                        while (waited < 180000 && !chromiumBin.isFile) { Thread.sleep(1000); waited += 1000 }
+                        while (waited < 180000 &&
+                            !(chromiumBin.isFile && crGuiMarker.isFile && openh264.isFile)
+                        ) { Thread.sleep(500); waited += 500 }
                         try {
                             val demoSrc = File("/data/local/tmp/alr-demo.html")
                             val demoDst = File(rootfsDir, "root/demo.html")
@@ -1976,17 +1991,61 @@ class MainActivity : Activity() {
                         } catch (_: Throwable) {}
                         android.util.Log.i("alr_loader", "cronly: chromium bin=${chromiumBin.isFile} (waited ${waited}ms); launching ozone-wayland window")
                         android.system.Os.setenv("ALR_REEXEC_INPROC", "1", true)
+                        // CR-4 live diagnostics: stream chromium stderr (--v=1) + the
+                        // in-process re-map trampoline diag to logcat (tags alr_cr_out /
+                        // alr_cr_diag) AS THEY ARRIVE, so a wedged GUI chromium's init
+                        // trace is visible without waiting for the (never-arriving) probe
+                        // report. Only set on this lean cronly path.
+                        android.system.Os.setenv("ALR_TEE_GUEST_STDOUT", "1", true)
                         val out = nativeAlrNativeLoaderProbe(
                             packageName,
                             applicationInfo.nativeLibraryDir,
                             filesDir.absolutePath,
                             cacheDir.absolutePath,
                             rootfsManifest.name,
+                            // CR-4 re-map-storm fix (flag layer) — DEVICE-DIAGNOSED.
+                            // Live tee (alr_cr_out) showed the runaway is NOT a self-exe
+                            // GPU storm: with --no-zygote, the launch chromium repeatedly
+                            // fork+execs TWO absolute-path binaries — chrome_crashpad_handler
+                            // and /usr/lib/chromium/chromium (argc=10, chromium's internal
+                            // child argv) — each of which the supervisor in-process re-maps
+                            // (~258 MiB / chromium image). The trigger is a CRASH-RESTART
+                            // loop: chromium logs "No usable sandbox!" then IMMEDIATE_CRASHes
+                            // (SIGTRAP brk), spawning chrome_crashpad_handler, and retries —
+                            // 4× crashpad + 8× chromium = the 542->1052 MiB climb, twice,
+                            // until the watchdog SIGKILLs. --no-sandbox is on the LAUNCH argv
+                            // but the child bootstrap still trips the sandbox path.
+                            // FIX: --single-process collapses renderer + GPU + utility into
+                            // the ONE browser process — no fork+exec of chromium children at
+                            // all, so the in-process re-map count for chromium drops to ZERO
+                            // (only the launch image, mapped once by the normal loader path,
+                            // not the trampoline). That removes the storm at its source
+                            // instead of throttling it. --in-process-gpu/--disable-gpu-
+                            // compositing keep GPU work CPU-side (we are --disable-gpu/wl_shm).
+                            // Crashpad is suppressed via --disable-crash-reporter/breakpad.
+                            // SANDBOX (device-diagnosed crash cause): the live drain showed
+                            // chromium logs "No usable sandbox!" then IMMEDIATE_CRASHes right
+                            // after GetCollectStatsConsent, and the only -ENOSYS'd syscall is
+                            // nr=99 set_robust_list. chromium installs its OWN seccomp-bpf
+                            // filter and probes the namespace/setuid sandbox — both fight our
+                            // ptrace+seccomp supervision. --no-sandbox alone does NOT stop the
+                            // seccomp-bpf filter install. So disable EVERY sandbox layer:
+                            //   --disable-seccomp-filter-sandbox : chromium must NOT install a
+                            //       nested seccomp-bpf filter (it collides with our SEIZE+
+                            //       seccomp trace and is the prime crash suspect).
+                            //   --disable-setuid-sandbox / --disable-namespace-sandbox /
+                            //   --disable-gpu-sandbox : no SUID helper, no userns clone, no GPU
+                            //       sandbox — none can work inside an untrusted_app domain.
                             "/usr/lib/chromium/chromium\n--ozone-platform=wayland" +
-                                "\n--no-sandbox\n--no-zygote\n--renderer-process-limit=1\n--disable-gpu" +
+                                "\n--no-sandbox\n--disable-seccomp-filter-sandbox" +
+                                "\n--disable-setuid-sandbox\n--disable-namespace-sandbox" +
+                                "\n--disable-gpu-sandbox" +
+                                "\n--single-process\n--no-zygote\n--disable-gpu" +
+                                "\n--in-process-gpu\n--disable-gpu-compositing" +
                                 "\n--disable-dev-shm-usage\n--user-data-dir=/tmp/cr4-profile" +
                                 "\n--no-first-run\n--no-default-browser-check" +
-                                "\n--disable-crash-reporter\n--start-maximized" +
+                                "\n--disable-crash-reporter\n--disable-breakpad" +
+                                "\n--start-maximized" +
                                 "\n--window-size=1200,1920\n--enable-logging=stderr\n--v=1" +
                                 "\nfile:///root/demo.html",
                         )
