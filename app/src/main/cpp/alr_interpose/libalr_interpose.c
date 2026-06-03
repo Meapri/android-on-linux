@@ -1525,6 +1525,31 @@ int connect(int fd, const struct sockaddr *addr, socklen_t len) {
     return real(fd, addr, len);
 }
 
+/* accept(): route to accept4() — the Android app sandbox blocks the bare accept(2)
+ * syscall (nr 202) but ALLOWS accept4(2) (nr 242). ===========================
+ *
+ * Device-root-caused (ALR_SUPDIAG, leader=Xwayland's X-server supervisor): the
+ * ROOTFUL X server's WaitForSomething/connection loop calls accept(2) on its
+ * /tmp/.X11-unix/X0 listening socket to reap each new client. The Android
+ * untrusted_app base seccomp filter SECCOMP_RET_TRAPs accept (only accept4 is on
+ * the allow-list — bionic itself only ever emits accept4), so every accept raised
+ * SIGSYS. The supervisor's SIGSYS handler emulated it as -ENOSYS, but the pending
+ * connection stayed on the listen queue → select() kept reporting the listen fd
+ * readable → the server called accept again → ENOSYS again: a tight busy-loop
+ * (device: nr=202 SIGSYS storm, >17000 in a row on the X-server tid) that pegged a
+ * core and starved the server's client servicing. accept4(fd, addr, len, 0) is
+ * IDENTICAL to accept(fd, addr, len) (flags 0) and IS permitted, so we transparently
+ * substitute it. The glibc accept() wrapper issues the bare __NR_accept directly
+ * (no accept4 fallback on Linux), which is why only the LD_PRELOAD interpose — not a
+ * libc fallback — closes this. A guest that calls accept4 directly is unaffected
+ * (its own symbol, not this one). Returns the new connected fd, or -1/errno. */
+int accept(int fd, struct sockaddr *addr, socklen_t *len) {
+    static int (*real_accept4)(int, struct sockaddr *, socklen_t *, int);
+    ALR_REAL(real_accept4, int (*)(int, struct sockaddr *, socklen_t *, int),
+             "accept4");
+    return real_accept4(fd, addr, len, 0);
+}
+
 /* setsockopt(): CAP_NET_ADMIN routing-policy hints denied to untrusted_app.
  * chromium's Linux net stack tags every outbound socket on the connect path with
  * SO_MARK (traffic accounting / network isolation) and may set SO_BINDTODEVICE /
