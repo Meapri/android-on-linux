@@ -21,7 +21,11 @@ object AlrRuntimeHolder {
             instance ?: buildRuntime(context.applicationContext).also { instance = it }
         }
 
-    // v1: FakeAlrRuntime. 단계 ④-B 에서 실 런타임(NativeAlrRuntime)으로 교체.
-    private fun buildRuntime(@Suppress("UNUSED_PARAMETER") appContext: Context): AlrRuntime =
-        FakeAlrRuntime()
+    // Phase 1: REAL runtime — discovers installed Linux apps from the rootfs (.desktop
+    // scan) and runs them via the proven compositor + native-loader wiring (AlrNative
+    // facade). FakeAlrRuntime stays for Compose @Preview usage elsewhere; only the holder
+    // changes (§4-B). The whole UI talks to the AlrRuntime interface, so this single seam
+    // flips every screen onto the real runtime.
+    private fun buildRuntime(appContext: Context): AlrRuntime =
+        NativeAlrRuntime(appContext)
 }
