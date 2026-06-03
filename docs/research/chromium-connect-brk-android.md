@@ -1,5 +1,13 @@
 # CR-2 connect/TLS `brk` — root-cause + ranked interposer fixes (chromium 147, untrusted_app)
 
+> **⚠️ SUPERSEDED — this doc's #1 prediction (`setsockopt(SO_MARK)`) was DISPROVED on device.**
+> Full-stderr capture (v162) showed the real brk = **NSS init** (`crypto/nss_util.cc`,
+> `nss_error=-5925`, missing dlopen'd `libsoftokn3.so`), fixed by `tools/build_nss_overlay.py`
+> (v163). The definitive SSOT is **`docs/design/cr2-connect-brk.md`** (+ host model
+> `tools/cr2_connect_brk_model.py`). This doc is retained for its §1 #4 (IP-level `setsockopt`
+> clause, still useful if a *post-NSS* drain shows a new brk) and §6 (capture method). The
+> SO_MARK wrapper is kept as a harmless no-op belt, NOT as the brk fix.
+
 Date: 2026-06-02 · Branch `auto/cr2-connect-brk` · HOST-ONLY research (no device)
 Owner files I touch: this doc only. WS-1 owns `libalr_interpose.c` / `runtime_report.cpp`
 / `MainActivity.kt` and implements any wrapper from the DESIGN below (`wsActionNeeded`).
