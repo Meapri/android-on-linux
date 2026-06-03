@@ -293,5 +293,76 @@ def test_two_line_fix_clears_all_primaries():
         assert [f for f in d.findings if f.startswith("PRIMARY")] == []
 
 
+# --------------------------------------------------------------------------
+# Shebang (#!) re-target — the in-process binfmt_script emulation that unblocks
+# authenticated apt (apt's gpgv method exec()s /usr/bin/apt-key, a #!/bin/sh
+# script). Mirrors alr_inproc_reexec.c:parse_shebang + the worker's interp resolve
+# + argv splice. Before the fix the trampoline sys_exit(72)'d on the non-ELF magic.
+# --------------------------------------------------------------------------
+ROOTFS = "/data/data/com.example.alr/files/rootfs"
+
+
+def test_shebang_parse_basic_interp_no_arg():
+    assert M.parse_shebang_line(b"#!/bin/sh\nset -e\n") == ("/bin/sh", "")
+
+
+def test_shebang_parse_interp_with_single_arg():
+    # env -S / busybox style: the WHOLE remainder is ONE argument (no word-split).
+    assert M.parse_shebang_line(b"#!/usr/bin/env python3\n") == ("/usr/bin/env", "python3")
+    assert M.parse_shebang_line(b"#!/bin/sh -e\n") == ("/bin/sh", "-e")
+    # multiple "words" after the interp collapse into a single arg (kernel semantics).
+    assert M.parse_shebang_line(b"#!/bin/awk -f -v x=1\n") == ("/bin/awk", "-f -v x=1")
+
+
+def test_shebang_parse_trims_whitespace():
+    assert M.parse_shebang_line(b"#!   /bin/sh   \n") == ("/bin/sh", "")
+    assert M.parse_shebang_line(b"#!\t/bin/dash\targ\t\n") == ("/bin/dash", "arg")
+
+
+def test_shebang_parse_rejects_non_shebang_and_empty():
+    assert M.parse_shebang_line(b"\x7fELF....") is None       # ELF, not a script
+    assert M.parse_shebang_line(b"#!\n") is None              # "#!" with no interpreter
+    assert M.parse_shebang_line(b"#") is None                 # too short
+    assert M.parse_shebang_line(b"echo hi\n") is None         # no shebang
+
+
+def test_apt_key_shebang_retargets_to_rootfs_sh():
+    # THE load-bearing case: apt execs /usr/bin/apt-key (a #!/bin/sh script). The
+    # trampoline must map <rootfs>/bin/sh and run `sh <rootfs>/usr/bin/apt-key …`.
+    target_host = ROOTFS + "/usr/bin/apt-key"
+    orig_argv = ("/usr/bin/apt-key", "verify", "--keyring", "/k.gpg", "InRelease")
+    r = M.model_shebang_retarget(target_host, b"#!/bin/sh\nset -e\n", orig_argv, ROOTFS)
+    assert r.is_shebang and not r.error
+    assert r.interp_guest == "/bin/sh"
+    assert r.interp_host == ROOTFS + "/bin/sh"       # the ELF actually mapped
+    # argv = [interp, <script host path>, orig argv[1..]] — orig argv[0] dropped.
+    assert r.argv == (
+        "/bin/sh", ROOTFS + "/usr/bin/apt-key",
+        "verify", "--keyring", "/k.gpg", "InRelease",
+    )
+
+
+def test_shebang_with_arg_splices_optarg_before_script():
+    target_host = ROOTFS + "/usr/local/bin/tool"
+    r = M.model_shebang_retarget(
+        target_host, b"#!/usr/bin/env python3\n", ("/usr/local/bin/tool", "--x"), ROOTFS
+    )
+    # kernel order: [interp, optarg, script, orig argv1..]
+    assert r.argv == ("/usr/bin/env", "python3", target_host, "--x")
+    assert r.interp_host == ROOTFS + "/usr/bin/env"
+
+
+def test_elf_target_is_not_a_shebang_falls_through():
+    # An ELF target must NOT be treated as a shebang (the worker maps it directly).
+    r = M.model_shebang_retarget(ROOTFS + "/bin/dash", b"\x7fELF\x02\x01\x01", ("/bin/dash",), ROOTFS)
+    assert r.is_shebang is False and r.argv == () and not r.error
+
+
+def test_malformed_shebang_is_an_error_not_a_silent_elf():
+    # "#!"-prefixed but no interpreter -> the C sys_exit(EX_ELF_TARGET); model flags it.
+    r = M.model_shebang_retarget(ROOTFS + "/x", b"#!\n", ("/x",), ROOTFS)
+    assert r.is_shebang is True and r.error == "malformed shebang" and r.argv == ()
+
+
 if __name__ == "__main__":
     sys.exit(__import__("pytest").main([__file__, "-q"]))

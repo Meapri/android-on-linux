@@ -36,7 +36,7 @@ Both ``ports.ubuntu.com`` (Ubuntu arm64 = ``ubuntu-ports``) and
 is GPG-signed and every ``Packages`` index and ``.deb`` is checksum-pinned by that
 signed Release. So **HTTP is the simpler, more robust offline transport** — no
 cert, no clock-skew failures, no SNI subtleties — while integrity is still
-guaranteed by apt's signature chain (see "Authenticated by default" below). We
+guaranteed by apt's signature chain (see "Signature trust" below). We
 therefore default the sources to
 ``http://`` (``--scheme http``). HTTPS is offered (``--scheme https``) for
 environments that require transport encryption; it works via the ``/etc/hosts``
@@ -49,10 +49,28 @@ it is strictly heavier than HTTP here.
      curl                              https://172.66.152.176/…/InRelease       -> TLS handshake FAIL
    i.e. hostname-via-/etc/hosts works over both; raw-IP HTTPS fails the cert.)
 
-Authenticated by default — gpgv via apt-key + a Signed-By keyring
+Signature trust — DEMO-TRUST default; authenticated (gpgv) opt-in
 ----------------------------------------------------------------
 Integrity is only real if apt **verifies the signature** on that ``InRelease``.
-The overlay therefore ships an honest, authenticated path by default:
+The overlay CAN ship a full authenticated path, BUT it is **not the default**: as
+of this writing authenticated ``apt-get update`` is BROKEN ON DEVICE. noble apt's
+``gpgv`` method execs ``/usr/bin/apt-key`` — a ``#!/bin/sh`` POSIX script — and the
+loader's in-process exec-re-map historically rejected any ``#!``-interpreter target
+(it sys_exit(72)'d on the non-ELF magic), so the verify chain failed closed
+("Unknown error executing apt-key" → "E: The repository is not signed"). A
+companion loader fix (app/src/main/cpp/alr_inproc_reexec.c: emulate binfmt_script —
+map the rootfs interpreter and splice the script path into argv) removes that wall,
+but until it is DEVICE-PROVEN the safe, working default is **demo-trust**
+(``Trusted: yes`` + ``AllowUnauthenticated``). Authenticated mode is the explicit
+opt-in (``--authenticated`` / ``trusted=False``); flip the default back once the
+apt-key→gpgv chain shows a real ``gpgv`` "Good signature" on device.
+
+DEMO-TRUST (default): ``Trusted: yes`` on the stanza + ``AllowUnauthenticated`` in
+apt.conf — apt SKIPS signature verification. This is UNAUTHENTICATED: a MITM on the
+HTTP mirror could inject packages. It is the default ONLY because it is the path
+that currently works end-to-end on the device; it is not a security recommendation.
+
+AUTHENTICATED (``--authenticated`` opt-in), how it is wired:
 
   * It stages the **Ubuntu archive signing key** into the rootfs at
     ``/usr/share/keyrings/ubuntu-archive-keyring.gpg`` (a dearmored binary
@@ -84,9 +102,13 @@ The overlay therefore ships an honest, authenticated path by default:
     NB: a plain ``.gpg`` Signed-By keyring needs **no** ``gpg``/``gpgconf`` (the
     apt-key dearmor of a ``.gpg`` is a no-op, the merge is ``cat``, and cleanup's
     ``gpgconf`` is ``command_available``-guarded — script-traced), so we do not pull
-    the heavy gnupg stack. RESIDUAL (if it still fails after both halves land):
-    ``apt → apt-key → gpgv`` is a 2-deep fork/exec chain, so any remaining failure
-    is a native exec-re-entry-depth issue for the loader track, NOT this tooling.
+    the heavy gnupg stack. THE THIRD HALF (loader): ``apt → apt-key → gpgv`` is not
+    a depth problem — it is that ``apt-key`` is a ``#!/bin/sh`` script and the
+    in-process exec-re-map could not load a shebang interpreter (it bailed on the
+    non-ELF magic with exit 72, so apt-key never ran). app/src/main/cpp/
+    alr_inproc_reexec.c now emulates binfmt_script (maps the rootfs interpreter +
+    splices the script path into argv), which closes the chain. Authenticated mode
+    stays opt-in until that is device-proven end-to-end (gpgv "Good signature").
   * The key bytes are the **exact** ones the base rootfs already ships in
     ``etc/apt/trusted.gpg.d/`` — the **Ubuntu Archive Automatic Signing Key
     (2018)**, fingerprint ``F6ECB3762474EDA9D21B7022871920D1991BC93C`` (plus the
@@ -385,10 +407,21 @@ UBUNTU_SOURCES_NEUTRALIZED = (
 def build_apt_conf_body(
     *,
     rootfs_abs: str | None = DEFAULT_ROOTFS_ABS,
-    trusted: bool = False,
+    trusted: bool = True,
     status_path: str | None = None,
 ) -> str:
     """The apt.conf drop-in for the DNS-less, single-mirror apt path.
+
+    DEFAULT = DEMO-TRUST (``trusted=True``). The authenticated path (gpgv via
+    apt-key) is currently BROKEN ON DEVICE: noble apt's gpgv method execs
+    ``/usr/bin/apt-key`` — a ``#!/bin/sh`` script — and the loader's in-process
+    exec-re-map historically could not load a ``#!``-interpreter target, so the
+    verify chain failed closed ("Unknown error executing apt-key" → "is not
+    signed"). Until that fix is DEVICE-PROVEN, shipping authenticated-by-default is
+    a footgun (every ``apt-get update`` fails), so the default is the demo
+    ``Trusted: yes`` + ``AllowUnauthenticated`` skip and authenticated is explicit
+    opt-in (``--authenticated`` / ``trusted=False``). See the module docstring and
+    the loader shebang fix in app/src/main/cpp/alr_inproc_reexec.c.
 
     Three concerns, all device-proven necessary (see the run logs in
     ``docs/research/cr2-online-apt-integration.md`` / the commit body):
@@ -450,9 +483,11 @@ def build_apt_conf_body(
        dependency. Emitted ONLY in authenticated mode (``--demo-trust`` skips
        verification, so the verifier path is irrelevant there). This is the
        eliminate-the-apt-key-failure half of GAP 1; the staging half is the
-       overlay's. If a RESIDUAL failure persists after both pins + staging, it is a
-       native exec-re-entry issue (apt→apt-key→gpgv is a 2-deep fork/exec chain) —
-       documented for the loader track, NOT patched here.
+       overlay's. The loader half (the actual device blocker) was that ``apt-key``
+       is a ``#!/bin/sh`` script and the in-process exec-re-map could not load a
+       shebang interpreter — fixed in app/src/main/cpp/alr_inproc_reexec.c (emulate
+       binfmt_script). Authenticated mode stays opt-in (``--authenticated``) until
+       that is device-proven; the default is demo-trust.
 
     ``Languages "none"`` + ``ForceIPv4`` are retained (trim round-trips; avoid a
     dead IPv6 path on the pinned IPv4 anycast).
@@ -460,9 +495,10 @@ def build_apt_conf_body(
     lines = [
         "// ALR apt mirror-IP overlay (DoH fallback): robust single-mirror apt without DNS.",
         "// (1) Dir::Etc isolates apt to the ports stanza in sources.list.alr.d (ignores the",
-        "//     base cloud-init ubuntu.sources + github-cli/tailscale). (2) Signature: AUTHENTICATED",
-        "//     by default (stanza Signed-By + gpgv verify); the unauthenticated skip is opt-in",
-        "//     via --demo-trust. (3) Dir::State::status pins the dpkg DB to its absolute rootfs path.",
+        "//     base cloud-init ubuntu.sources + github-cli/tailscale). (2) Signature: DEMO-TRUST",
+        "//     by default (stanza Trusted:yes + the unauthenticated skip — authenticated gpgv is",
+        "//     opt-in via --authenticated, broken on device pending the loader apt-key#!/sh fix).",
+        "//     (3) Dir::State::status pins the dpkg DB to its absolute rootfs path.",
         "//     (4) Blank the PackageKit/c-n-f Post-Invoke hooks + run as root (no _apt user):",
         "//     those hooks exec gdbus/dbus that this headless rootfs lacks, which otherwise",
         "//     fails apt-get update AFTER a clean fetch. (5) AUTHENTICATED only: pin",
@@ -518,9 +554,14 @@ def build_apt_conf_body(
     return "\n".join(lines) + "\n"
 
 
-# Back-compat: a module-level default body (no device path baked in beyond the
-# catalog default) for callers/selftests that import APT_CONF_BODY directly.
-APT_CONF_BODY = build_apt_conf_body()
+# A module-level AUTHENTICATED reference apt.conf body (verifier pins ON) for the
+# selftest / tests that validate the authenticated-mode shape (Dir::Bin::apt-key +
+# Apt::Key::gpgvcommand pins, no AllowUnauthenticated). NB: this is NOT the runtime
+# default — the build path calls build_apt_conf_body() with the DEMO-TRUST default
+# (trusted=True); we pin trusted=False here so the constant keeps exercising the
+# authenticated wiring (the opt-in path) regardless of the default flip. The demo
+# body is tested separately via build_apt_conf_body(trusted=True).
+APT_CONF_BODY = build_apt_conf_body(trusted=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -572,7 +613,7 @@ def build_sources_body(
     scheme: str = DEFAULT_SCHEME,
     suite: str | None = None,
     components: tuple[str, ...] | None = None,
-    trusted: bool = False,
+    trusted: bool = True,
 ) -> str:
     """A deb822 ``.sources`` stanza naming the **hostname** (not a bare IP).
 
@@ -580,18 +621,20 @@ def build_sources_body(
     Naming the hostname (resolved offline via /etc/hosts) is what lets HTTPS keep
     a valid SNI + cert; over HTTP it is simply the clean canonical URI.
 
-    AUTHENTICATED by default (``trusted=False``): emits ``Signed-By: <keyring>``
-    so apt verifies the Release signature with gpgv against the archive keyring
-    this overlay stages at ``/<ARCHIVE_KEYRING_PATH>`` (the modern keyring path —
-    NOT apt-key). For Ubuntu that keyring is the 2018 archive key (fpr
-    ``F6EC…C93C``) which signs the noble InRelease (host-proven).
+    DEFAULT = DEMO-TRUST (``trusted=True``): emits ``Trusted: yes`` to SKIP
+    signature verification. The authenticated path is currently BROKEN ON DEVICE
+    (noble apt's gpgv method execs the ``/usr/bin/apt-key`` ``#!/bin/sh`` script,
+    which the loader's in-process exec-re-map historically could not load), so
+    authenticated-by-default would make every ``apt-get update`` fail closed. Until
+    that fix is device-proven the safe, working default is the demo skip.
+    UNAUTHENTICATED: any MITM on the HTTP mirror could inject packages.
 
-    ``trusted=True`` is the DEMO fallback (``--demo-trust``): emits
-    ``Trusted: yes`` to SKIP signature verification, for the case where gpgv is
-    unavailable on the device (the base ships the apt gpgv *method* but not the
-    ``/usr/bin/gpgv`` binary unless the apt+dpkg overlay is also staged). This
-    matches the device's broken ``apt-key`` workaround but is UNAUTHENTICATED —
-    any MITM on the HTTP mirror could inject packages. Prefer the default.
+    ``trusted=False`` (``--authenticated``) is the opt-in authenticated path: emits
+    ``Signed-By: <keyring>`` so apt verifies the Release signature with gpgv against
+    the archive keyring this overlay stages at ``/<ARCHIVE_KEYRING_PATH>`` (the
+    modern keyring path — NOT apt-key). For Ubuntu that keyring is the 2018 archive
+    key (fpr ``F6EC…C93C``) which signs the noble InRelease (host-proven). Use it
+    once the apt-key→gpgv exec-re-entry chain is device-verified.
     """
     suite = suite or mirror.suite
     comps = components or mirror.components
@@ -686,7 +729,7 @@ class AptMirrorOverlayResult:
     base_uri: str
     members: tuple[str, ...] = ()
     file_count: int = 0
-    trusted: bool = False
+    trusted: bool = True  # DEFAULT = demo-trust (authenticated is opt-in; see build_apt_mirror_overlay)
     rootfs_abs: str | None = None
     keyring_path: str | None = None       # staged keyring (authenticated mode), else None
     keyring_fpr: str | None = None        # archive signing-key fingerprint
@@ -718,7 +761,7 @@ def build_apt_mirror_overlay(
     components: tuple[str, ...] | None = None,
     bootstrap_ips: tuple[str, ...] | None = None,
     extra_hosts: tuple[tuple[str, tuple[str, ...]], ...] = (),
-    trusted: bool = False,
+    trusted: bool = True,
     rootfs_abs: str | None = DEFAULT_ROOTFS_ABS,
     status_path: str | None = None,
     keyring_bytes: bytes | None = None,
@@ -747,9 +790,12 @@ def build_apt_mirror_overlay(
     ``bootstrap_ips`` overrides the catalog pins. ``rootfs_abs`` is the on-device
     rootfs path baked into the absolute Dir::Etc::sourceparts / Dir::State::status
     (None => relative sourceparts + no status pin). ``trusted`` toggles the DEMO
-    signature skip (default False = authenticated; see ``build_sources_body`` /
-    ``build_apt_conf_body``). ``keyring_bytes`` overrides the embedded archive
-    keyring (e.g. re-extracted via :func:`keyring_from_rootfs`).
+    signature skip (default **True = demo-trust**; the authenticated path is opt-in
+    via ``trusted=False`` / ``--authenticated`` because it is currently broken on
+    device — noble apt's gpgv method execs the ``/usr/bin/apt-key`` ``#!/bin/sh``
+    script; see ``build_sources_body`` / ``build_apt_conf_body`` and the loader
+    shebang fix). ``keyring_bytes`` overrides the embedded archive keyring (e.g.
+    re-extracted via :func:`keyring_from_rootfs`).
     """
     m = resolve_mirror(mirror)
     if bootstrap_ips:
@@ -1067,18 +1113,29 @@ def main(argv: list[str] | None = None) -> int:
                         "/data/local/tmp/alr-dpkg-status) to dodge the on-device realpath edge "
                         "that fails flAbsPath for in-rootfs paths — WORKAROUND, needs that file "
                         "staged as a separate device asset")
-    # Signature mode. DEFAULT = authenticated (Signed-By + staged keyring + gpgv).
-    # --demo-trust falls back to the UNAUTHENTICATED Trusted:yes shim; --no-trusted
-    # is kept as a back-compat alias for "authenticated" (it always meant GPG-on).
-    parser.add_argument("--demo-trust", dest="trusted", action="store_true",
-                        help="UNAUTHENTICATED demo fallback: Trusted:yes + AllowUnauthenticated "
-                        "(skips signature verification). Use ONLY where gpgv is unavailable on "
-                        "the device — any MITM on the HTTP mirror could inject packages. The "
-                        "default is authenticated (Signed-By staged keyring + gpgv)")
+    # Signature mode. DEFAULT = DEMO-TRUST (Trusted:yes + AllowUnauthenticated).
+    # The authenticated path (Signed-By + staged keyring + gpgv) is currently BROKEN
+    # ON DEVICE — noble apt's gpgv method execs /usr/bin/apt-key, a #!/bin/sh script
+    # the loader's in-process exec-re-map historically could not load, so authenticated
+    # `apt-get update` fails closed ("Unknown error executing apt-key" → "is not
+    # signed"). Until the loader shebang fix is device-proven the default is the demo
+    # skip (it WORKS), and authenticated is explicit opt-in. --authenticated turns
+    # verification ON; --no-trusted is kept as a back-compat alias for it; --demo-trust
+    # is kept as the explicit form of the (now default) demo skip.
+    parser.add_argument("--authenticated", dest="trusted", action="store_false",
+                        help="OPT-IN authenticated path: Signed-By staged keyring + gpgv verify "
+                        "(NO AllowUnauthenticated). Currently BROKEN on device pending the loader "
+                        "apt-key(#!/bin/sh)->gpgv exec-re-entry fix — use only once that is "
+                        "device-verified. Default is the demo-trust skip (which works today)")
     parser.add_argument("--no-trusted", dest="trusted", action="store_false",
-                        help="(back-compat alias for the authenticated default) keep apt GPG "
-                        "signature verification ON via the staged Signed-By keyring")
-    parser.set_defaults(trusted=False)
+                        help="(back-compat alias for --authenticated) turn apt GPG signature "
+                        "verification ON via the staged Signed-By keyring")
+    parser.add_argument("--demo-trust", dest="trusted", action="store_true",
+                        help="(explicit form of the DEFAULT) UNAUTHENTICATED demo: Trusted:yes + "
+                        "AllowUnauthenticated, skips signature verification. This is the default "
+                        "because authenticated is broken on device; any MITM on the HTTP mirror "
+                        "could inject packages")
+    parser.set_defaults(trusted=True)
     parser.add_argument("--keyring-from-rootfs", metavar="TAR|DIR",
                         help="re-extract the Ubuntu archive keyring from a live base rootfs "
                         "(tar or dir) instead of the embedded copy; must byte-match the "
@@ -1316,7 +1373,9 @@ def _selftest() -> int:
     check("hosts comment names the CDN (Cloudflare)", "Cloudflare" in hb)
 
     # --- sources name the HOSTNAME (not a bare IP) so SNI/cert match -------- #
-    # Default is AUTHENTICATED (trusted=False): Signed-By staged keyring, NO Trusted.
+    # DEFAULT is now DEMO-TRUST (trusted=True): Trusted: yes, NO Signed-By. The
+    # authenticated path (Signed-By staged keyring) is the OPT-IN (trusted=False),
+    # broken on device pending the loader apt-key(#!/bin/sh)->gpgv re-entry fix.
     sb_http = build_sources_body(ports, scheme="http")
     check("http sources URI names the hostname (not an IP)",
           "URIs: http://ports.ubuntu.com/ubuntu-ports" in sb_http)
@@ -1324,37 +1383,47 @@ def _selftest() -> int:
           "172.66.152.176" not in sb_http and "104.20.28.246" not in sb_http)
     check("sources include noble + -updates + -security suites",
           "Suites: noble noble-updates noble-security" in sb_http)
-    check("DEFAULT sources are AUTHENTICATED: Signed-By the staged archive keyring",
-          f"Signed-By: /{ARCHIVE_KEYRING_PATH}" in sb_http)
-    check("default sources DROP Trusted: yes (no unauthenticated skip)",
-          "Trusted: yes" not in sb_http)
+    check("DEFAULT sources are DEMO-TRUST: Trusted: yes (authenticated is opt-in)",
+          "Trusted: yes" in sb_http)
+    check("default sources DROP Signed-By (no gpgv verify in demo mode)",
+          "Signed-By:" not in sb_http)
     check("sources are deb822 (Types: deb)", sb_http.startswith("#") and "Types: deb" in sb_http)
-    # --demo-trust (trusted=True) falls back to the UNAUTHENTICATED Trusted:yes shim.
-    sb_demo = build_sources_body(ports, scheme="http", trusted=True)
-    check("demo-trust sources carry Trusted: yes (UNAUTHENTICATED skip)",
-          "Trusted: yes" in sb_demo)
-    check("demo-trust sources drop Signed-By", "Signed-By:" not in sb_demo)
+    # --authenticated (trusted=False) is the opt-in GPG path: Signed-By staged keyring.
+    sb_auth = build_sources_body(ports, scheme="http", trusted=False)
+    check("authenticated sources carry Signed-By the staged archive keyring",
+          f"Signed-By: /{ARCHIVE_KEYRING_PATH}" in sb_auth)
+    check("authenticated sources drop Trusted: yes", "Trusted: yes" not in sb_auth)
     sb_https = build_sources_body(ports, scheme="https")
     check("https sources URI names the hostname (SNI/cert match)",
           "URIs: https://ports.ubuntu.com/ubuntu-ports" in sb_https)
 
-    # debian sources differ (no -security suffix the same way; Fastly host). The
-    # Debian Signed-By names the stock debian keyring (we don't stage that one).
-    sb_deb = build_sources_body(deb, scheme="http")
+    # debian sources differ (no -security suffix the same way; Fastly host). In the
+    # authenticated opt-in the Debian Signed-By names the stock debian keyring (we
+    # don't stage that one).
+    sb_deb = build_sources_body(deb, scheme="http", trusted=False)
     check("debian sources name deb.debian.org",
           "URIs: http://deb.debian.org/debian" in sb_deb)
     check("debian sources use the debian keyring path",
           "debian-archive-keyring.gpg" in sb_deb)
 
-    # --- apt.conf: Dir::Etc isolation + AUTHENTICATED default + status pin --- #
+    # --- apt.conf: Dir::Etc isolation + AUTHENTICATED reference + status pin - #
+    # APT_CONF_BODY is the authenticated reference (build_apt_conf_body(trusted=False));
+    # the RUNTIME default is demo-trust (checked via build_apt_conf_body() below).
     check("apt.conf sets Languages none", 'Acquire::Languages "none";' in APT_CONF_BODY)
     check("apt.conf forces IPv4", 'Acquire::ForceIPv4 "true";' in APT_CONF_BODY)
     check("apt.conf isolates sourcelist to /dev/null (ignore base sources.list)",
           'Dir::Etc::sourcelist "/dev/null";' in APT_CONF_BODY)
     check("apt.conf repoints sourceparts at sources.list.alr.d",
           "sources.list.alr.d" in APT_CONF_BODY and "Dir::Etc::sourceparts" in APT_CONF_BODY)
-    check("apt.conf (authenticated default) does NOT set AllowUnauthenticated",
+    check("apt.conf (authenticated reference) does NOT set AllowUnauthenticated",
           'APT::Get::AllowUnauthenticated' not in APT_CONF_BODY)
+    # The RUNTIME default (no trust arg) is DEMO-TRUST: AllowUnauthenticated ON, NO
+    # verifier pins (authenticated is broken on device pending the loader shebang fix).
+    _conf_default = build_apt_conf_body()
+    check("apt.conf RUNTIME DEFAULT is demo-trust (AllowUnauthenticated ON)",
+          'APT::Get::AllowUnauthenticated "true";' in _conf_default)
+    check("apt.conf runtime default does NOT pin apt-key/gpgv (demo skips verify)",
+          f'Dir::Bin::apt-key "{APT_KEY_BIN_PATH}";' not in _conf_default)
     # (5) authenticated mode pins the apt-key + gpgv verifier paths absolutely
     # (noble apt 2.7.14 always shells to apt-key, which PATH-resolves gpgv).
     check("apt.conf (authenticated) pins Dir::Bin::apt-key to the absolute rootfs path",
@@ -1401,10 +1470,13 @@ def _selftest() -> int:
           "Types: deb" not in UBUNTU_SOURCES_NEUTRALIZED
           and UBUNTU_SOURCES_NEUTRALIZED.startswith("#"))
 
-    # --- full OFFLINE pack + §5-E conformance ------------------------------- #
+    # --- full OFFLINE pack + §5-E conformance (AUTHENTICATED opt-in) --------- #
+    # Authenticated is now the OPT-IN (trusted=False); the DEFAULT is demo-trust
+    # (asserted in the demo-pack block below). We pack authenticated here to keep the
+    # Signed-By + staged-keyring + verifier-pin wiring under test.
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "apt-mirror-stage.tar"
-        res = build_apt_mirror_overlay(out, mirror="ports", scheme="http")
+        res = build_apt_mirror_overlay(out, mirror="ports", scheme="http", trusted=False)
         with tarfile.open(out) as t:
             names = {m.name: m for m in t.getmembers()}
             bodies = {n: t.extractfile(m).read() for n, m in names.items() if m.isfile()}
@@ -1497,10 +1569,10 @@ def _selftest() -> int:
     else:
         check("keyring_from_rootfs skipped (no rootfs/tiny-rootfs.tar handy)", True)
 
-    # --- debian mirror: authenticated but keyring NOT staged (base owns it) -- #
+    # --- debian mirror: authenticated opt-in, keyring NOT staged (base owns it) #
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "debian.tar"
-        rdeb = build_apt_mirror_overlay(out, mirror="debian", scheme="http")
+        rdeb = build_apt_mirror_overlay(out, mirror="debian", scheme="http", trusted=False)
         with tarfile.open(out) as t:
             dnames = {m.name for m in t.getmembers()}
         check("debian authenticated mode does NOT stage an Ubuntu keyring",
