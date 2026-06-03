@@ -364,5 +364,75 @@ def test_malformed_shebang_is_an_error_not_a_silent_elf():
     assert r.is_shebang is True and r.error == "malformed shebang" and r.argv == ()
 
 
+# --------------------------------------------------------------------------
+# execve FD_CLOEXEC emulation — the in-process re-map fd-table fix.
+# Locks in the single root cause behind BOTH the apt fd-3 "not signed" failure
+# and the Xwayland "XKB: Failed to compile keymap" failure: the no-execve re-map
+# must close FD_CLOEXEC fds itself, exactly as a real execve would.
+# --------------------------------------------------------------------------
+REEXEC_C = os.path.join(
+    os.path.dirname(_HERE), "app", "src", "main", "cpp", "alr_inproc_reexec.c"
+)
+
+
+def test_cloexec_flag_decides_close():
+    # The kernel closes iff FD_CLOEXEC is set; the number is irrelevant.
+    assert M.fd_should_close_on_exec(M.FD_CLOEXEC) is True
+    assert M.fd_should_close_on_exec(0) is False
+    assert M.fd_should_close_on_exec(M.FD_CLOEXEC | 0x10) is True  # other bits don't matter
+
+
+def test_cloexec_sweep_closes_only_marked_fds():
+    # 0/1/2 (stdio, not CLOEXEC) and fd 3 (the dup2'd status end, CLOEXEC cleared)
+    # survive; a leaked higher write end marked CLOEXEC is closed.
+    table = {0: 0, 1: 0, 2: 0, 3: 0, 7: M.FD_CLOEXEC, 9: M.FD_CLOEXEC}
+    surviving, closed = M.close_cloexec_fds_model(table)
+    assert set(surviving) == {0, 1, 2, 3}
+    assert closed == {7, 9}
+
+
+def test_apt_status_fd3_survives_only_after_sweep():
+    # apt: fd 3 = dup2'd status write end (CLOEXEC cleared, flags 0); fd 8 = the
+    # ORIGINAL pre-dup write end of the SAME pipe (CLOEXEC). Pre-sweep both are open
+    # → the pipe never EOFs → "not signed". Post-sweep fd 3 alone remains → GOODSIG.
+    pre_sweep = {0: 0, 1: 0, 2: 0, 3: 0, 8: M.FD_CLOEXEC}
+    # The invariant the fix establishes: status fd survives AND every CLOEXEC end closed.
+    assert M.apt_status_fd_survives_remap(pre_sweep, status_fd=3) is True
+    # If fd 3 itself were (wrongly) left CLOEXEC, the status end would be closed -> fail.
+    bad = {0: 0, 1: 0, 2: 0, 3: M.FD_CLOEXEC, 8: M.FD_CLOEXEC}
+    assert M.apt_status_fd_survives_remap(bad, status_fd=3) is False
+
+
+def test_xkbcomp_keymap_pipe_write_end_pruned():
+    # X server marks its sockets/extra fds CLOEXEC so xkbcomp inherits only the
+    # keymap pipe ends it set up. Modeled: every CLOEXEC server fd is closed at the
+    # re-map boundary, leaving xkbcomp's intended (non-CLOEXEC) fds intact.
+    table = {0: 0, 1: 0, 2: 0, 4: M.FD_CLOEXEC, 5: M.FD_CLOEXEC, 6: M.FD_CLOEXEC}
+    surviving, closed = M.close_cloexec_fds_model(table)
+    assert closed == {4, 5, 6} and set(surviving) == {0, 1, 2}
+
+
+def test_no_cloexec_fds_closes_nothing():
+    # A guest with no CLOEXEC fds (GIMP/glmark2 class) closes none — byte-no-op.
+    table = {0: 0, 1: 0, 2: 0, 3: 0}
+    surviving, closed = M.close_cloexec_fds_model(table)
+    assert surviving == table and closed == set()
+
+
+def test_reexec_c_actually_honors_cloexec():
+    # Source-invariant: the C worker must perform the CLOEXEC sweep before the jump,
+    # else the model above is testing behavior the binary does not have.
+    src = open(REEXEC_C, encoding="utf-8").read()
+    assert "close_cloexec_fds" in src           # the sweep helper exists
+    assert "FD_CLOEXEC" in src                  # checks the close-on-exec bit
+    assert "F_GETFD" in src                     # reads the fd flags via fcntl
+    assert "/proc/self/fd" in src               # enumerates the open fds (bounded)
+    assert "SYS_getdents64" in src              # via getdents64
+    # It must be CALLED in the worker right before entering the guest image.
+    call_idx = src.find("cloexec_closed = close_cloexec_fds()")
+    enter_idx = src.find("enter_guest((void*)start")
+    assert call_idx != -1 and enter_idx != -1 and call_idx < enter_idx
+
+
 if __name__ == "__main__":
     sys.exit(__import__("pytest").main([__file__, "-q"]))

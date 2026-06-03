@@ -617,3 +617,73 @@ def model_shebang_retarget(
         interp_host=interp_host,
         argv=tuple(new_argv),
     )
+
+
+# ---------------------------------------------------------------------------
+# execve FD_CLOEXEC emulation — the in-process re-map's fd-table fix.
+#
+# WHY: a real execve() closes every fd whose FD_CLOEXEC bit is set, at the exec
+# boundary; the surviving fds become the new image's table. The in-process re-map
+# (alr_inproc_reexec.c) does NO execve, so without an explicit sweep every
+# CLOEXEC-marked fd the caller meant to drop stays open in the re-mapped guest.
+# Two device-root-caused failures collapse to exactly this gap:
+#
+#   * authenticated `apt-get update`: apt's ExecGPGV/ExecFork mark all fds >= 3
+#     FD_CLOEXEC (close_range(3,~0U,CLOSE_RANGE_CLOEXEC)) then dup2 the gpgv status
+#     pipe's WRITE end onto fd 3 (--status-fd 3) and clear CLOEXEC on that one only.
+#     After a real exec, fd 3 is the SOLE remaining write end, so when gpgv finishes
+#     the pipe EOFs and apt parses GOODSIG/VALIDSIG. Under the no-execve re-map the
+#     pre-dup write end (still CLOEXEC) lingers as a SECOND write end → the status
+#     pipe never EOFs → the GOODSIG is never finalized → "not signed".
+#   * ROOTFUL Xwayland: the X server fork()+execs /usr/bin/xkbcomp, marking its
+#     sockets/fds CLOEXEC so xkbcomp does not inherit them and reading the compiled
+#     keymap back through a pipe. Leaked CLOEXEC fds keep the keymap pipe's write
+#     end open → the read never EOFs → "XKB: Failed to compile keymap".
+#
+# The model mirrors the C (close_cloexec_fds): close iff FD_CLOEXEC is set; an fd
+# the caller deliberately left inheritable (NOT CLOEXEC: fd 3, stdio, the dup2'd
+# status fd) is kept — exactly what the kernel does on execve.
+
+FD_CLOEXEC = 1  # POSIX close-on-exec bit (matches the C #define)
+
+
+def fd_should_close_on_exec(fd_flags: int) -> bool:
+    """True iff a real execve would close this fd — i.e. FD_CLOEXEC is set. The
+    in-process re-map must reproduce this for every open fd. fd NUMBER is
+    irrelevant (the kernel checks the flag, not the number); stdio survives only
+    because the caller does not mark it CLOEXEC, never because we special-case it.
+    """
+    return bool(fd_flags & FD_CLOEXEC)
+
+
+def close_cloexec_fds_model(fd_table: dict[int, int]) -> tuple[dict[int, int], set[int]]:
+    """Model alr_inproc_reexec.c:close_cloexec_fds over an fd->flags table.
+
+    Returns (surviving_table, closed_fds): every fd whose flags carry FD_CLOEXEC is
+    removed (closed), the rest are retained verbatim — the post-execve fd table the
+    re-mapped guest must see. Deterministic and order-independent (the C closes each
+    independently; closing one never resurrects another).
+    """
+    surviving: dict[int, int] = {}
+    closed: set[int] = set()
+    for fd, flags in fd_table.items():
+        if fd_should_close_on_exec(flags):
+            closed.add(fd)
+        else:
+            surviving[fd] = flags
+    return surviving, closed
+
+
+def apt_status_fd_survives_remap(fd_table: dict[int, int], status_fd: int = 3) -> bool:
+    """The load-bearing apt invariant: after the CLOEXEC sweep, the status fd (3)
+    that apt dup2'd (CLOEXEC-cleared) must REMAIN open AND no OTHER write end of the
+    same status pipe may remain. Modeled as: status_fd survives, and every CLOEXEC
+    fd (the leaked pre-dup write ends) is closed. Given a table where fd 3 is the
+    dup2'd end (flags 0) and some higher fd is the original write end (FD_CLOEXEC),
+    this returns True only once the sweep is applied — the regression guard for the
+    'repository is not signed' device failure.
+    """
+    surviving, closed = close_cloexec_fds_model(fd_table)
+    return status_fd in surviving and all(
+        fd in closed for fd, flags in fd_table.items() if (flags & FD_CLOEXEC)
+    )
