@@ -119,6 +119,21 @@ typedef uint32_t VkPipelineLayoutCreateFlags;
 typedef uint32_t VkDescriptorPoolCreateFlags;
 typedef int32_t  VkDescriptorType;
 
+/* ---- WAVE C (render pass / framebuffer) ABI additions. VkRenderPass is also defined for
+ * the present rung elsewhere? no — add it here (non-dispatchable uint64_t). ---- */
+typedef uint64_t VkRenderPass;
+typedef uint64_t VkFramebuffer;
+typedef uint32_t VkRenderPassCreateFlags;
+typedef uint32_t VkFramebufferCreateFlags;
+typedef uint32_t VkAttachmentDescriptionFlags;
+typedef uint32_t VkSubpassDescriptionFlags;
+typedef uint32_t VkDependencyFlags;
+typedef uint32_t VkPipelineStageFlags;
+typedef uint32_t VkAccessFlags;
+typedef int32_t  VkAttachmentLoadOp;
+typedef int32_t  VkAttachmentStoreOp;
+typedef int32_t  VkPipelineBindPoint;
+
 typedef enum VkResult {
     VK_SUCCESS = 0,
     VK_NOT_READY = 1,
@@ -759,6 +774,73 @@ typedef struct VkCopyDescriptorSet {
     uint32_t        dstArrayElement;
     uint32_t        descriptorCount;
 } VkCopyDescriptorSet;
+
+/* ---- WAVE C render-pass + framebuffer structs (full ABI layout). The generated render-pass
+ * ICD forwarder walks the real VkRenderPassCreateInfo (attachments / subpasses with nested
+ * attachment-reference arrays / dependencies) to drive the wire encoders. ---- */
+typedef struct VkAttachmentDescription {
+    VkAttachmentDescriptionFlags flags;
+    VkFormat                     format;
+    VkSampleCountFlags           samples;       /* VkSampleCountFlagBits */
+    VkAttachmentLoadOp           loadOp;
+    VkAttachmentStoreOp          storeOp;
+    VkAttachmentLoadOp           stencilLoadOp;
+    VkAttachmentStoreOp          stencilStoreOp;
+    VkImageLayout                initialLayout;
+    VkImageLayout                finalLayout;
+} VkAttachmentDescription;
+
+typedef struct VkAttachmentReference {
+    uint32_t      attachment;
+    VkImageLayout layout;
+} VkAttachmentReference;
+
+typedef struct VkSubpassDescription {
+    VkSubpassDescriptionFlags    flags;
+    VkPipelineBindPoint          pipelineBindPoint;
+    uint32_t                     inputAttachmentCount;
+    const VkAttachmentReference *pInputAttachments;
+    uint32_t                     colorAttachmentCount;
+    const VkAttachmentReference *pColorAttachments;
+    const VkAttachmentReference *pResolveAttachments;
+    const VkAttachmentReference *pDepthStencilAttachment;
+    uint32_t                     preserveAttachmentCount;
+    const uint32_t              *pPreserveAttachments;
+} VkSubpassDescription;
+
+typedef struct VkSubpassDependency {
+    uint32_t             srcSubpass;
+    uint32_t             dstSubpass;
+    VkPipelineStageFlags srcStageMask;
+    VkPipelineStageFlags dstStageMask;
+    VkAccessFlags        srcAccessMask;
+    VkAccessFlags        dstAccessMask;
+    VkDependencyFlags    dependencyFlags;
+} VkSubpassDependency;
+
+typedef struct VkRenderPassCreateInfo {
+    VkStructureType                sType;
+    const void                    *pNext;
+    VkRenderPassCreateFlags        flags;
+    uint32_t                       attachmentCount;
+    const VkAttachmentDescription *pAttachments;
+    uint32_t                       subpassCount;
+    const VkSubpassDescription    *pSubpasses;
+    uint32_t                       dependencyCount;
+    const VkSubpassDependency     *pDependencies;
+} VkRenderPassCreateInfo;
+
+typedef struct VkFramebufferCreateInfo {
+    VkStructureType          sType;
+    const void              *pNext;
+    VkFramebufferCreateFlags flags;
+    VkRenderPass             renderPass;
+    uint32_t                 attachmentCount;
+    const VkImageView       *pAttachments;
+    uint32_t                 width;
+    uint32_t                 height;
+    uint32_t                 layers;
+} VkFramebufferCreateInfo;
 
 /* The "2" sType values (official Vulkan constants). */
 #define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 1000059000

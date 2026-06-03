@@ -51,6 +51,9 @@ struct VkGenTables {
     std::map<uint32_t, VkPipelineLayout> pipeline_layouts; // vplayout -> real
     std::map<uint32_t, VkDescriptorPool> descriptor_pools; // vdpool  -> real
     std::map<uint32_t, VkDescriptorSet> descriptor_sets;   // vdset   -> real
+    // WAVE C render-pass / framebuffer handle tables.
+    std::map<uint32_t, VkRenderPass> render_passes;     // vrpass   -> real
+    std::map<uint32_t, VkFramebuffer> framebuffers;     // vfb      -> real
 #endif
     // Arena offset assigned to each device-memory virtual id (HOST_VISIBLE only).
     // UINT64_MAX == not arena-backed (e.g. a DEVICE_LOCAL alloc). Tracked even in
@@ -85,6 +88,9 @@ struct VkGenElem_create_descriptor_pool_poolSizes {  // one VkDescriptorPoolSize
     uint32_t type = 0;
     uint32_t descriptorCount = 0;
 };
+struct VkGenElem_create_framebuffer_attachments {  // one VkImageView
+    uint32_t self = 0;
+};
 struct VkGenBufferInfo { uint32_t vbuffer = 0; uint64_t offset = 0; uint64_t range = 0; };
 struct VkGenImageInfo  { uint32_t vsampler = 0; uint32_t vimageview = 0; uint32_t image_layout = 0; };
 struct VkGenDescWrite {
@@ -108,6 +114,22 @@ inline bool vk_gen_desc_is_image(uint32_t t) {
             return false;  // UNIFORM_BUFFER / STORAGE_BUFFER / *_DYNAMIC / texel buffers
     }
 }
+// ---- Render-pass wire PODs (the nested create_render_pass structure). ----
+struct VkGenRpAttachment {
+    uint32_t flags = 0, format = 0, samples = 0, loadOp = 0, storeOp = 0;
+    uint32_t stencilLoadOp = 0, stencilStoreOp = 0, initialLayout = 0, finalLayout = 0;
+};
+struct VkGenRpRef { uint32_t attachment = 0; uint32_t layout = 0; };
+struct VkGenRpSubpass {
+    uint32_t flags = 0, pipelineBindPoint = 0;
+    std::vector<VkGenRpRef> input, color, resolve;
+    bool has_depth = false; VkGenRpRef depth{};
+    std::vector<uint32_t> preserve;
+};
+struct VkGenRpDependency {
+    uint32_t srcSubpass = 0, dstSubpass = 0, srcStageMask = 0, dstStageMask = 0;
+    uint32_t srcAccessMask = 0, dstAccessMask = 0, dependencyFlags = 0;
+};
 
 }  // namespace alr::gpu (block 1)
 
@@ -1149,6 +1171,160 @@ inline bool decode_vk_gen_op(uint8_t op, VkReader& r, VkDecodeState& st,
             if (!gp) vk_gen_real_update_descriptor_sets(st, vdev, writes);
 #endif
             (void)vdev;
+            st.decoded++;
+            return true;
+        }
+        case ALR_VK_GEN_OP_CREATE_RENDER_PASS: {  // vkCreateRenderPass
+            uint32_t vdev = 0, vhandle = 0, flags = 0;
+            if (!r.u32(vdev) || !r.u32(vhandle) || !r.u32(flags)) {
+                st.ok = false; return true; }
+            uint32_t att_count = 0;
+            if (!r.u32(att_count) || att_count > 4096) { st.ok = false; return true; }
+            std::vector<VkGenRpAttachment> attachments; attachments.reserve(att_count);
+            for (uint32_t i = 0; i < att_count; ++i) {
+                VkGenRpAttachment a{};
+                if (!r.u32(a.flags) || !r.u32(a.format) || !r.u32(a.samples) ||
+                    !r.u32(a.loadOp) || !r.u32(a.storeOp) || !r.u32(a.stencilLoadOp) ||
+                    !r.u32(a.stencilStoreOp) || !r.u32(a.initialLayout) ||
+                    !r.u32(a.finalLayout)) { st.ok = false; return true; }
+                attachments.push_back(a);
+            }
+            uint32_t sub_count = 0;
+            if (!r.u32(sub_count) || sub_count > 4096) { st.ok = false; return true; }
+            std::vector<VkGenRpSubpass> subpasses; subpasses.reserve(sub_count);
+            for (uint32_t i = 0; i < sub_count; ++i) {
+                VkGenRpSubpass s{};
+                uint32_t inC = 0, colC = 0, resC = 0, hasD = 0, presC = 0;
+                if (!r.u32(s.flags) || !r.u32(s.pipelineBindPoint) || !r.u32(inC) ||
+                    !r.u32(colC) || !r.u32(resC) || !r.u32(hasD) || !r.u32(presC)) {
+                    st.ok = false; return true; }
+                if (inC > 4096 || colC > 4096 || resC > 4096 || presC > 4096) {
+                    st.ok = false; return true; }
+                auto read_refs = [&](std::vector<VkGenRpRef>& out, uint32_t n) -> bool {
+                    out.reserve(n);
+                    for (uint32_t j = 0; j < n; ++j) { VkGenRpRef rf{};
+                        if (!r.u32(rf.attachment) || !r.u32(rf.layout)) return false;
+                        out.push_back(rf); } return true; };
+                if (!read_refs(s.input, inC) || !read_refs(s.color, colC) ||
+                    !read_refs(s.resolve, resC)) { st.ok = false; return true; }
+                s.has_depth = hasD != 0;
+                if (s.has_depth) { if (!r.u32(s.depth.attachment) ||
+                    !r.u32(s.depth.layout)) { st.ok = false; return true; } }
+                s.preserve.reserve(presC);
+                for (uint32_t j = 0; j < presC; ++j) { uint32_t p = 0;
+                    if (!r.u32(p)) { st.ok = false; return true; } s.preserve.push_back(p); }
+                subpasses.push_back(std::move(s));
+            }
+            uint32_t dep_count = 0;
+            if (!r.u32(dep_count) || dep_count > 4096) { st.ok = false; return true; }
+            std::vector<VkGenRpDependency> deps; deps.reserve(dep_count);
+            for (uint32_t i = 0; i < dep_count; ++i) {
+                VkGenRpDependency d{};
+                if (!r.u32(d.srcSubpass) || !r.u32(d.dstSubpass) || !r.u32(d.srcStageMask) ||
+                    !r.u32(d.dstStageMask) || !r.u32(d.srcAccessMask) ||
+                    !r.u32(d.dstAccessMask) || !r.u32(d.dependencyFlags)) {
+                    st.ok = false; return true; }
+                deps.push_back(d);
+            }
+            uint32_t pnext_count = 0;
+            std::vector<uint32_t> pnext_types;
+            std::vector<std::vector<uint8_t>> pnext_bytes;
+            if (!r.u32(pnext_count)) { st.ok = false; return true; }
+            if (pnext_count > 32) { st.ok = false; return true; }
+            for (uint32_t i = 0; i < pnext_count; ++i) {
+                uint32_t stype = 0; const uint8_t* d = nullptr; uint32_t n = 0;
+                if (!r.u32(stype) || !r.blob(d, n)) { st.ok = false; return true; }
+                if (n > 1024) { st.ok = false; return true; }
+                pnext_types.push_back(stype);
+                pnext_bytes.emplace_back(d, d + n);
+            }
+            (void)pnext_count;
+            int res = -1;
+#ifdef ALR_VK_DECODE_REAL
+            if (!gp) {
+                res = static_cast<int>(vk_gen_real_create_render_pass(
+                    st, vdev, vhandle, flags, attachments, subpasses, deps,
+                    pnext_types, pnext_bytes));
+            }
+#endif
+            if (gp && gp->create_handle)
+                res = gp->create_handle(gp->ctx, ALR_VK_GEN_OP_CREATE_RENDER_PASS, vdev, vhandle, 0, 0);
+            reply.u8(static_cast<uint8_t>(ALR_VK_REPLY_GEN_ESCAPE));
+            reply.u16(static_cast<uint16_t>(ALR_VK_GEN_REPLY_CREATE_RENDER_PASS));
+            reply.u32(vhandle);
+            reply.i32(res);
+            st.decoded++;
+            return true;
+        }
+        case ALR_VK_GEN_OP_DESTROY_RENDER_PASS: {  // vkDestroyRenderPass
+            uint32_t vdev = 0, vhandle = 0;
+            if (!r.u32(vdev) || !r.u32(vhandle)) { st.ok = false; return true; }
+            (void)vdev;
+#ifdef ALR_VK_DECODE_REAL
+            if (!gp) {
+                vk_gen_real_destroy_render_pass(st, vdev, vhandle);
+            }
+#endif
+            if (gp && gp->destroy_handle)
+                gp->destroy_handle(gp->ctx, ALR_VK_GEN_OP_DESTROY_RENDER_PASS, vdev, vhandle);
+            st.decoded++;
+            return true;
+        }
+        case ALR_VK_GEN_OP_CREATE_FRAMEBUFFER: {  // vkCreateFramebuffer
+            uint32_t vdev = 0, vhandle = 0;
+            if (!r.u32(vdev) || !r.u32(vhandle)) { st.ok = false; return true; }
+            uint32_t flags = 0; uint32_t renderPass = 0; uint32_t width = 0; uint32_t height = 0; uint32_t layers = 0;
+            if (!(r.u32(flags) && r.u32(renderPass) && r.u32(width) && r.u32(height) && r.u32(layers))) { st.ok = false; return true; }
+            uint32_t attachments_count = 0;
+            if (!r.u32(attachments_count)) { st.ok = false; return true; }
+            if (attachments_count > 4096) { st.ok = false; return true; }
+            std::vector<VkGenElem_create_framebuffer_attachments> attachments;
+            attachments.reserve(attachments_count);
+            for (uint32_t i = 0; i < attachments_count; ++i) {
+                VkGenElem_create_framebuffer_attachments el{};
+                if (!(r.u32(el.self))) { st.ok = false; return true; }
+                attachments.push_back(el);
+            }
+            uint32_t pnext_count = 0;
+            std::vector<uint32_t> pnext_types;
+            std::vector<std::vector<uint8_t>> pnext_bytes;
+            if (!r.u32(pnext_count)) { st.ok = false; return true; }
+            if (pnext_count > 32) { st.ok = false; return true; }
+            for (uint32_t i = 0; i < pnext_count; ++i) {
+                uint32_t stype = 0; const uint8_t* d = nullptr; uint32_t n = 0;
+                if (!r.u32(stype) || !r.blob(d, n)) { st.ok = false; return true; }
+                if (n > 1024) { st.ok = false; return true; }
+                pnext_types.push_back(stype);
+                pnext_bytes.emplace_back(d, d + n);
+            }
+            (void)pnext_count;
+            int res = -1;
+#ifdef ALR_VK_DECODE_REAL
+            if (!gp) {
+                res = static_cast<int>(vk_gen_real_create_framebuffer(
+                    st, vdev, vhandle, flags, renderPass, width, height, layers, attachments, pnext_types, pnext_bytes));
+            }
+#endif
+            if (gp && gp->create_handle)
+                res = gp->create_handle(gp->ctx, ALR_VK_GEN_OP_CREATE_FRAMEBUFFER, vdev, vhandle, 0, 0);
+            reply.u8(static_cast<uint8_t>(ALR_VK_REPLY_GEN_ESCAPE));
+            reply.u16(static_cast<uint16_t>(ALR_VK_GEN_REPLY_CREATE_FRAMEBUFFER));
+            reply.u32(vhandle);
+            reply.i32(res);
+            st.decoded++;
+            return true;
+        }
+        case ALR_VK_GEN_OP_DESTROY_FRAMEBUFFER: {  // vkDestroyFramebuffer
+            uint32_t vdev = 0, vhandle = 0;
+            if (!r.u32(vdev) || !r.u32(vhandle)) { st.ok = false; return true; }
+            (void)vdev;
+#ifdef ALR_VK_DECODE_REAL
+            if (!gp) {
+                vk_gen_real_destroy_framebuffer(st, vdev, vhandle);
+            }
+#endif
+            if (gp && gp->destroy_handle)
+                gp->destroy_handle(gp->ctx, ALR_VK_GEN_OP_DESTROY_FRAMEBUFFER, vdev, vhandle);
             st.decoded++;
             return true;
         }

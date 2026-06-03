@@ -66,6 +66,10 @@ enum AlrVkGenOp {
     ALR_VK_GEN_OP_ALLOCATE_DESCRIPTOR_SETS = 38,  // vkAllocateDescriptorSets
     ALR_VK_GEN_OP_FREE_DESCRIPTOR_SETS = 39,  // vkFreeDescriptorSets
     ALR_VK_GEN_OP_UPDATE_DESCRIPTOR_SETS = 40,  // vkUpdateDescriptorSets
+    ALR_VK_GEN_OP_CREATE_RENDER_PASS = 41,  // vkCreateRenderPass
+    ALR_VK_GEN_OP_DESTROY_RENDER_PASS = 42,  // vkDestroyRenderPass
+    ALR_VK_GEN_OP_CREATE_FRAMEBUFFER = 43,  // vkCreateFramebuffer
+    ALR_VK_GEN_OP_DESTROY_FRAMEBUFFER = 44,  // vkDestroyFramebuffer
 };
 
 // ---- Generated reply SUB-opcodes (u16; ride the reply escape). ----
@@ -91,6 +95,8 @@ enum AlrVkGenReply {
     ALR_VK_GEN_REPLY_CREATE_PIPELINE_LAYOUT = 19,  // reply of vkCreatePipelineLayout
     ALR_VK_GEN_REPLY_CREATE_DESCRIPTOR_POOL = 20,  // reply of vkCreateDescriptorPool
     ALR_VK_GEN_REPLY_ALLOCATE_DESCRIPTOR_SETS = 21,  // reply of vkAllocateDescriptorSets
+    ALR_VK_GEN_REPLY_CREATE_RENDER_PASS = 22,  // reply of vkCreateRenderPass
+    ALR_VK_GEN_REPLY_CREATE_FRAMEBUFFER = 23,  // reply of vkCreateFramebuffer
 };
 
 // A u16 little-endian field (the generated sub-opcode width). The hand-written
@@ -586,6 +592,87 @@ static inline void alr_vk_enc_gen_update_descriptor_sets_image_info(AlrVkEncoder
     alr_vk_enc_u32(e, vsampler);
     alr_vk_enc_u32(e, vimageview);
     alr_vk_enc_u32(e, image_layout);
+}
+
+// Encoder for vkCreateRenderPass (DEDICATED: nested subpasses). _begin ships flags; then the
+// attachments array (_attachment), the subpasses array (each _subpass_begin + its
+// _ref / _preserve elements), and the dependencies array (_dependency); then pNext.
+static inline void alr_vk_enc_gen_create_render_pass_begin(AlrVkEncoder *e, uint32_t vdev, uint32_t vrpass,
+                          uint32_t flags) {
+    alr_vk_gen_op_begin(e, ALR_VK_GEN_OP_CREATE_RENDER_PASS);
+    alr_vk_enc_u32(e, vdev);
+    alr_vk_enc_u32(e, vrpass);
+    alr_vk_enc_u32(e, flags);
+}
+static inline void alr_vk_enc_gen_create_render_pass_attachment_count(AlrVkEncoder *e, uint32_t n) { alr_vk_enc_u32(e, n); }
+static inline void alr_vk_enc_gen_create_render_pass_attachment(AlrVkEncoder *e, uint32_t flags, uint32_t format,
+                          uint32_t samples, uint32_t loadOp, uint32_t storeOp,
+                          uint32_t stencilLoadOp, uint32_t stencilStoreOp,
+                          uint32_t initialLayout, uint32_t finalLayout) {
+    alr_vk_enc_u32(e, flags); alr_vk_enc_u32(e, format); alr_vk_enc_u32(e, samples);
+    alr_vk_enc_u32(e, loadOp); alr_vk_enc_u32(e, storeOp);
+    alr_vk_enc_u32(e, stencilLoadOp); alr_vk_enc_u32(e, stencilStoreOp);
+    alr_vk_enc_u32(e, initialLayout); alr_vk_enc_u32(e, finalLayout);
+}
+static inline void alr_vk_enc_gen_create_render_pass_subpass_count(AlrVkEncoder *e, uint32_t n) { alr_vk_enc_u32(e, n); }
+// A subpass: scalar prefix + the 4 reference-array counts + a has-depth flag, then
+// the caller appends input refs, color refs, resolve refs (if any), the depth ref
+// (if any), and the preserve indices, in that fixed order.
+static inline void alr_vk_enc_gen_create_render_pass_subpass_begin(AlrVkEncoder *e, uint32_t flags,
+                          uint32_t pipelineBindPoint, uint32_t inputCount,
+                          uint32_t colorCount, uint32_t resolveCount,
+                          uint32_t hasDepth, uint32_t preserveCount) {
+    alr_vk_enc_u32(e, flags); alr_vk_enc_u32(e, pipelineBindPoint);
+    alr_vk_enc_u32(e, inputCount); alr_vk_enc_u32(e, colorCount);
+    alr_vk_enc_u32(e, resolveCount); alr_vk_enc_u32(e, hasDepth);
+    alr_vk_enc_u32(e, preserveCount);
+}
+static inline void alr_vk_enc_gen_create_render_pass_ref(AlrVkEncoder *e, uint32_t attachment, uint32_t layout) {
+    alr_vk_enc_u32(e, attachment); alr_vk_enc_u32(e, layout);
+}
+static inline void alr_vk_enc_gen_create_render_pass_preserve(AlrVkEncoder *e, uint32_t attachment) { alr_vk_enc_u32(e, attachment); }
+static inline void alr_vk_enc_gen_create_render_pass_dependency_count(AlrVkEncoder *e, uint32_t n) { alr_vk_enc_u32(e, n); }
+static inline void alr_vk_enc_gen_create_render_pass_dependency(AlrVkEncoder *e, uint32_t srcSubpass,
+                          uint32_t dstSubpass, uint32_t srcStageMask,
+                          uint32_t dstStageMask, uint32_t srcAccessMask,
+                          uint32_t dstAccessMask, uint32_t dependencyFlags) {
+    alr_vk_enc_u32(e, srcSubpass); alr_vk_enc_u32(e, dstSubpass);
+    alr_vk_enc_u32(e, srcStageMask); alr_vk_enc_u32(e, dstStageMask);
+    alr_vk_enc_u32(e, srcAccessMask); alr_vk_enc_u32(e, dstAccessMask);
+    alr_vk_enc_u32(e, dependencyFlags);
+}
+
+// Encoder for vkDestroyRenderPass (forwards a destroy; no reply).
+static inline void alr_vk_enc_gen_destroy_render_pass(AlrVkEncoder *e, uint32_t vdev, uint32_t vrpass) {
+    alr_vk_gen_op_begin(e, ALR_VK_GEN_OP_DESTROY_RENDER_PASS);
+    alr_vk_enc_u32(e, vdev);
+    alr_vk_enc_u32(e, vrpass);
+}
+
+// Encoder for vkCreateFramebuffer (VkFramebufferCreateInfo with array members). _begin ships the scalar POD
+// prefix; then per array call _<array>_count + _<array>_elem; then the pNext chain.
+static inline void alr_vk_enc_gen_create_framebuffer_begin(AlrVkEncoder *e, uint32_t vdev, uint32_t vfb, uint32_t flags, uint32_t renderPass, uint32_t width, uint32_t height, uint32_t layers) {
+    alr_vk_gen_op_begin(e, ALR_VK_GEN_OP_CREATE_FRAMEBUFFER);
+    alr_vk_enc_u32(e, vdev);
+    alr_vk_enc_u32(e, vfb);
+    alr_vk_enc_u32(e, flags);
+    alr_vk_enc_u32(e, renderPass);
+    alr_vk_enc_u32(e, width);
+    alr_vk_enc_u32(e, height);
+    alr_vk_enc_u32(e, layers);
+}
+static inline void alr_vk_enc_gen_create_framebuffer_attachments_count(AlrVkEncoder *e, uint32_t count) {
+    alr_vk_enc_u32(e, count);
+}
+static inline void alr_vk_enc_gen_create_framebuffer_attachments_elem(AlrVkEncoder *e, uint32_t self) {
+    alr_vk_enc_u32(e, self);
+}
+
+// Encoder for vkDestroyFramebuffer (forwards a destroy; no reply).
+static inline void alr_vk_enc_gen_destroy_framebuffer(AlrVkEncoder *e, uint32_t vdev, uint32_t vfb) {
+    alr_vk_gen_op_begin(e, ALR_VK_GEN_OP_DESTROY_FRAMEBUFFER);
+    alr_vk_enc_u32(e, vdev);
+    alr_vk_enc_u32(e, vfb);
 }
 
 #ifdef __cplusplus

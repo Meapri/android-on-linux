@@ -458,6 +458,59 @@ SPECS = [
     {
         "name": "vkUpdateDescriptorSets", "kind": "update_sets",
     },
+    # =======================================================================
+    # WAVE C — the render-pass / framebuffer / pipeline create family ANGLE hits once it
+    # starts RENDERING (after the descriptor stage). These are the heaviest creates: a render
+    # pass has nested subpasses (each an array of attachment-references), and a graphics
+    # pipeline is a deep nested-state CreateInfo whose pStages reference shader modules + that
+    # references a pipeline layout + render pass. Render pass + pipelines use DEDICATED kinds
+    # (create_render_pass / create_pipelines) whose hand-written real bodies do the nested
+    # reconstruction; framebuffer fits the create_struct kind (a flat image-view handle array
+    # + a render-pass handle). NOTE: ANGLE is currently blocked UPSTREAM at device-chain
+    # creation (host-service op 204), so these create-forwards are staged + ready for when
+    # that unblocks — they are not yet reached on device.
+    # =======================================================================
+    # ---- render pass (attachments[] + subpasses[] {nested attachment-ref arrays} +
+    #      dependencies[]). The nested subpass arrays make this a DEDICATED kind. ----
+    {
+        "name": "vkCreateRenderPass", "kind": "create_render_pass",
+        "out": "VkRenderPass",
+    },
+    {
+        "name": "vkDestroyRenderPass", "kind": "destroy_handle",
+        "handle_param": ("renderPass", "VkRenderPass"),
+    },
+    # ---- framebuffer (renderPass HANDLE + pAttachments[]: image-view HANDLES + w/h/layers).
+    #      Imageless framebuffers (VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT) deferred. ----
+    {
+        "name": "vkCreateFramebuffer", "kind": "create_struct",
+        "ci": "VkFramebufferCreateInfo",
+        "ci_fields": [("flags", "u32"), ("@renderPass:VkRenderPass", "vhandle"),
+                      ("width", "u32"), ("height", "u32"), ("layers", "u32")],
+        "arrays": [
+            {"count_field": "attachmentCount", "ptr_field": "pAttachments",
+             "elem": "VkImageView", "handle_elem": "VkImageView",
+             "fields": [("@self:VkImageView", "vhandle")]},
+        ],
+        "out": "VkFramebuffer",
+    },
+    {
+        "name": "vkDestroyFramebuffer", "kind": "destroy_handle",
+        "handle_param": ("framebuffer", "VkFramebuffer"),
+    },
+    # ---- graphics + compute pipelines: the HEAVIEST creates (pStages reference shader
+    #      modules; layout + renderPass are handles; the per-pipeline fixed-function state is
+    #      a deep nested CreateInfo — vertex input bindings/attributes, viewport/scissor,
+    #      rasterization, multisample, depth-stencil, per-attachment color blend, dynamic
+    #      state). DEFERRED to a dedicated create_pipelines kind: ANGLE is currently blocked
+    #      UPSTREAM at device-chain creation (host-service op 204), so it does not reach
+    #      pipeline creation, and shipping a large nested-state marshaller that cannot be
+    #      device-validated would be untested. The marshalling design (per-stage SPIR-V
+    #      module handle + the allowlisted nested-state sub-structs) is written up in the
+    #      task report; vkDestroyPipeline is likewise deferred with them so the wire band
+    #      stays append-only when the pair lands. The vkCmd* RECORDING family
+    #      (vkBeginCommandBuffer + vkCmdBindPipeline/Draw/...) is the concurrent byte-log
+    #      track, not a per-call create-forward (see report).
 ]
 
 # ---------------------------------------------------------------------------
@@ -823,6 +876,58 @@ def gen_proto_encoder(op):
         a("    alr_vk_enc_u32(e, vimageview);")
         a("    alr_vk_enc_u32(e, image_layout);")
         a("}")
+    elif k == "create_render_pass":
+        # The render pass: scalar flags, then three top-level arrays (attachments, subpasses,
+        # dependencies). Subpasses themselves carry nested attachment-reference sub-arrays, so
+        # the subpass encoder is split into a _subpass_begin (its scalar prefix + counts) +
+        # per-reference appenders. The ICD walks the real VkRenderPassCreateInfo to drive these.
+        a(f"// Encoder for {name} (DEDICATED: nested subpasses). _begin ships flags; then the")
+        a("// attachments array (_attachment), the subpasses array (each _subpass_begin + its")
+        a("// _ref / _preserve elements), and the dependencies array (_dependency); then pNext.")
+        a(f"static inline void {enc}_begin(AlrVkEncoder *e, uint32_t vdev, uint32_t vrpass,")
+        a("                          uint32_t flags) {")
+        a(f"    alr_vk_gen_op_begin(e, {op['op_enum']});")
+        a("    alr_vk_enc_u32(e, vdev);")
+        a("    alr_vk_enc_u32(e, vrpass);")
+        a("    alr_vk_enc_u32(e, flags);")
+        a("}")
+        a(f"static inline void {enc}_attachment_count(AlrVkEncoder *e, uint32_t n) {{ alr_vk_enc_u32(e, n); }}")
+        a(f"static inline void {enc}_attachment(AlrVkEncoder *e, uint32_t flags, uint32_t format,")
+        a("                          uint32_t samples, uint32_t loadOp, uint32_t storeOp,")
+        a("                          uint32_t stencilLoadOp, uint32_t stencilStoreOp,")
+        a("                          uint32_t initialLayout, uint32_t finalLayout) {")
+        a("    alr_vk_enc_u32(e, flags); alr_vk_enc_u32(e, format); alr_vk_enc_u32(e, samples);")
+        a("    alr_vk_enc_u32(e, loadOp); alr_vk_enc_u32(e, storeOp);")
+        a("    alr_vk_enc_u32(e, stencilLoadOp); alr_vk_enc_u32(e, stencilStoreOp);")
+        a("    alr_vk_enc_u32(e, initialLayout); alr_vk_enc_u32(e, finalLayout);")
+        a("}")
+        a(f"static inline void {enc}_subpass_count(AlrVkEncoder *e, uint32_t n) {{ alr_vk_enc_u32(e, n); }}")
+        a(f"// A subpass: scalar prefix + the 4 reference-array counts + a has-depth flag, then")
+        a("// the caller appends input refs, color refs, resolve refs (if any), the depth ref")
+        a("// (if any), and the preserve indices, in that fixed order.")
+        a(f"static inline void {enc}_subpass_begin(AlrVkEncoder *e, uint32_t flags,")
+        a("                          uint32_t pipelineBindPoint, uint32_t inputCount,")
+        a("                          uint32_t colorCount, uint32_t resolveCount,")
+        a("                          uint32_t hasDepth, uint32_t preserveCount) {")
+        a("    alr_vk_enc_u32(e, flags); alr_vk_enc_u32(e, pipelineBindPoint);")
+        a("    alr_vk_enc_u32(e, inputCount); alr_vk_enc_u32(e, colorCount);")
+        a("    alr_vk_enc_u32(e, resolveCount); alr_vk_enc_u32(e, hasDepth);")
+        a("    alr_vk_enc_u32(e, preserveCount);")
+        a("}")
+        a(f"static inline void {enc}_ref(AlrVkEncoder *e, uint32_t attachment, uint32_t layout) {{")
+        a("    alr_vk_enc_u32(e, attachment); alr_vk_enc_u32(e, layout);")
+        a("}")
+        a(f"static inline void {enc}_preserve(AlrVkEncoder *e, uint32_t attachment) {{ alr_vk_enc_u32(e, attachment); }}")
+        a(f"static inline void {enc}_dependency_count(AlrVkEncoder *e, uint32_t n) {{ alr_vk_enc_u32(e, n); }}")
+        a(f"static inline void {enc}_dependency(AlrVkEncoder *e, uint32_t srcSubpass,")
+        a("                          uint32_t dstSubpass, uint32_t srcStageMask,")
+        a("                          uint32_t dstStageMask, uint32_t srcAccessMask,")
+        a("                          uint32_t dstAccessMask, uint32_t dependencyFlags) {")
+        a("    alr_vk_enc_u32(e, srcSubpass); alr_vk_enc_u32(e, dstSubpass);")
+        a("    alr_vk_enc_u32(e, srcStageMask); alr_vk_enc_u32(e, dstStageMask);")
+        a("    alr_vk_enc_u32(e, srcAccessMask); alr_vk_enc_u32(e, dstAccessMask);")
+        a("    alr_vk_enc_u32(e, dependencyFlags);")
+        a("}")
     return "\n".join(L)
 
 
@@ -963,6 +1068,24 @@ def gen_struct_helpers(ops):
     a("            return false;  // UNIFORM_BUFFER / STORAGE_BUFFER / *_DYNAMIC / texel buffers")
     a("    }")
     a("}")
+    # Render-pass wire PODs (create_render_pass) — emitted only if a render pass is in SPECS.
+    if any(op["kind"] == "create_render_pass" for op in ops):
+        a("// ---- Render-pass wire PODs (the nested create_render_pass structure). ----")
+        a("struct VkGenRpAttachment {")
+        a("    uint32_t flags = 0, format = 0, samples = 0, loadOp = 0, storeOp = 0;")
+        a("    uint32_t stencilLoadOp = 0, stencilStoreOp = 0, initialLayout = 0, finalLayout = 0;")
+        a("};")
+        a("struct VkGenRpRef { uint32_t attachment = 0; uint32_t layout = 0; };")
+        a("struct VkGenRpSubpass {")
+        a("    uint32_t flags = 0, pipelineBindPoint = 0;")
+        a("    std::vector<VkGenRpRef> input, color, resolve;")
+        a("    bool has_depth = false; VkGenRpRef depth{};")
+        a("    std::vector<uint32_t> preserve;")
+        a("};")
+        a("struct VkGenRpDependency {")
+        a("    uint32_t srcSubpass = 0, dstSubpass = 0, srcStageMask = 0, dstStageMask = 0;")
+        a("    uint32_t srcAccessMask = 0, dstAccessMask = 0, dependencyFlags = 0;")
+        a("};")
     return "\n".join(L)
 
 
@@ -993,6 +1116,9 @@ def gen_decode_state_ext():
     a("    std::map<uint32_t, VkPipelineLayout> pipeline_layouts; // vplayout -> real")
     a("    std::map<uint32_t, VkDescriptorPool> descriptor_pools; // vdpool  -> real")
     a("    std::map<uint32_t, VkDescriptorSet> descriptor_sets;   // vdset   -> real")
+    a("    // WAVE C render-pass / framebuffer handle tables.")
+    a("    std::map<uint32_t, VkRenderPass> render_passes;     // vrpass   -> real")
+    a("    std::map<uint32_t, VkFramebuffer> framebuffers;     // vfb      -> real")
     a("#endif")
     a("    // Arena offset assigned to each device-memory virtual id (HOST_VISIBLE only).")
     a("    // UINT64_MAX == not arena-backed (e.g. a DEVICE_LOCAL alloc). Tracked even in")
@@ -1333,6 +1459,75 @@ def gen_decode_case(op):
         a("            if (!gp) vk_gen_real_update_descriptor_sets(st, vdev, writes);")
         a("#endif")
         a("            (void)vdev;")
+        a("            st.decoded++;")
+        a("            return true;")
+    elif k == "create_render_pass":
+        a("            uint32_t vdev = 0, vhandle = 0, flags = 0;")
+        a("            if (!r.u32(vdev) || !r.u32(vhandle) || !r.u32(flags)) {")
+        a("                st.ok = false; return true; }")
+        a("            uint32_t att_count = 0;")
+        a("            if (!r.u32(att_count) || att_count > 4096) { st.ok = false; return true; }")
+        a("            std::vector<VkGenRpAttachment> attachments; attachments.reserve(att_count);")
+        a("            for (uint32_t i = 0; i < att_count; ++i) {")
+        a("                VkGenRpAttachment a{};")
+        a("                if (!r.u32(a.flags) || !r.u32(a.format) || !r.u32(a.samples) ||")
+        a("                    !r.u32(a.loadOp) || !r.u32(a.storeOp) || !r.u32(a.stencilLoadOp) ||")
+        a("                    !r.u32(a.stencilStoreOp) || !r.u32(a.initialLayout) ||")
+        a("                    !r.u32(a.finalLayout)) { st.ok = false; return true; }")
+        a("                attachments.push_back(a);")
+        a("            }")
+        a("            uint32_t sub_count = 0;")
+        a("            if (!r.u32(sub_count) || sub_count > 4096) { st.ok = false; return true; }")
+        a("            std::vector<VkGenRpSubpass> subpasses; subpasses.reserve(sub_count);")
+        a("            for (uint32_t i = 0; i < sub_count; ++i) {")
+        a("                VkGenRpSubpass s{};")
+        a("                uint32_t inC = 0, colC = 0, resC = 0, hasD = 0, presC = 0;")
+        a("                if (!r.u32(s.flags) || !r.u32(s.pipelineBindPoint) || !r.u32(inC) ||")
+        a("                    !r.u32(colC) || !r.u32(resC) || !r.u32(hasD) || !r.u32(presC)) {")
+        a("                    st.ok = false; return true; }")
+        a("                if (inC > 4096 || colC > 4096 || resC > 4096 || presC > 4096) {")
+        a("                    st.ok = false; return true; }")
+        a("                auto read_refs = [&](std::vector<VkGenRpRef>& out, uint32_t n) -> bool {")
+        a("                    out.reserve(n);")
+        a("                    for (uint32_t j = 0; j < n; ++j) { VkGenRpRef rf{};")
+        a("                        if (!r.u32(rf.attachment) || !r.u32(rf.layout)) return false;")
+        a("                        out.push_back(rf); } return true; };")
+        a("                if (!read_refs(s.input, inC) || !read_refs(s.color, colC) ||")
+        a("                    !read_refs(s.resolve, resC)) { st.ok = false; return true; }")
+        a("                s.has_depth = hasD != 0;")
+        a("                if (s.has_depth) { if (!r.u32(s.depth.attachment) ||")
+        a("                    !r.u32(s.depth.layout)) { st.ok = false; return true; } }")
+        a("                s.preserve.reserve(presC);")
+        a("                for (uint32_t j = 0; j < presC; ++j) { uint32_t p = 0;")
+        a("                    if (!r.u32(p)) { st.ok = false; return true; } s.preserve.push_back(p); }")
+        a("                subpasses.push_back(std::move(s));")
+        a("            }")
+        a("            uint32_t dep_count = 0;")
+        a("            if (!r.u32(dep_count) || dep_count > 4096) { st.ok = false; return true; }")
+        a("            std::vector<VkGenRpDependency> deps; deps.reserve(dep_count);")
+        a("            for (uint32_t i = 0; i < dep_count; ++i) {")
+        a("                VkGenRpDependency d{};")
+        a("                if (!r.u32(d.srcSubpass) || !r.u32(d.dstSubpass) || !r.u32(d.srcStageMask) ||")
+        a("                    !r.u32(d.dstStageMask) || !r.u32(d.srcAccessMask) ||")
+        a("                    !r.u32(d.dstAccessMask) || !r.u32(d.dependencyFlags)) {")
+        a("                    st.ok = false; return true; }")
+        a("                deps.push_back(d);")
+        a("            }")
+        a(gen_pnext_read())
+        a("            int res = -1;")
+        a("#ifdef ALR_VK_DECODE_REAL")
+        a("            if (!gp) {")
+        a("                res = static_cast<int>(vk_gen_real_create_render_pass(")
+        a("                    st, vdev, vhandle, flags, attachments, subpasses, deps,")
+        a("                    pnext_types, pnext_bytes));")
+        a("            }")
+        a("#endif")
+        a("            if (gp && gp->create_handle)")
+        a(f"                res = gp->create_handle(gp->ctx, {op['op_enum']}, vdev, vhandle, 0, 0);")
+        a("            reply.u8(static_cast<uint8_t>(ALR_VK_REPLY_GEN_ESCAPE));")
+        a(f"            reply.u16(static_cast<uint16_t>({op['reply_enum']}));")
+        a("            reply.u32(vhandle);")
+        a("            reply.i32(res);")
         a("            st.decoded++;")
         a("            return true;")
     a("        }")
@@ -1718,6 +1913,81 @@ def gen_icd_fn(op):
         a("        free(req);")
         a("    }")
         a("}")
+    elif k == "create_render_pass":
+        out_ty = op["out"]
+        a(f"static VkResult VKAPI_CALL {fn}(VkDevice device, const VkRenderPassCreateInfo *pCreateInfo,")
+        a(f"                          const VkAllocationCallbacks *pAllocator, {out_ty} *pHandle) {{")
+        a("    (void)pAllocator;")
+        a("    AlrIcdDevice *dev = (AlrIcdDevice *)device; uint32_t vid; int32_t res = 0; uint32_t i, j;")
+        a("    if (!dev || !pCreateInfo || !pHandle) return VK_ERROR_INITIALIZATION_FAILED;")
+        a(f"    vid = alr_alloc(&{op['counter']}, 1);")
+        a("    if (alr_icd_ring_ok()) {")
+        a("        AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];")
+        # Generous size estimate: attachments*36 + subpasses*(28 + refs*8) + deps*28 + slack.
+        a("        size_t cap = 512;")
+        a("        cap += (size_t)pCreateInfo->attachmentCount * 40;")
+        a("        cap += (size_t)pCreateInfo->dependencyCount * 32;")
+        a("        for (i = 0; i < pCreateInfo->subpassCount; ++i) {")
+        a("            const VkSubpassDescription *sp = &pCreateInfo->pSubpasses[i];")
+        a("            cap += 40 + (size_t)(sp->inputAttachmentCount + sp->colorAttachmentCount) * 8")
+        a("                 + (size_t)(sp->colorAttachmentCount + sp->preserveAttachmentCount) * 8;")
+        a("        }")
+        a("        uint8_t *req = (uint8_t *)malloc(cap);")
+        a("        if (!req) return VK_ERROR_OUT_OF_HOST_MEMORY;")
+        a("        alr_vk_enc_init(&e, req, cap);")
+        a(f"        {op['enc_name']}_begin(&e, dev->vdev, vid, (uint32_t)pCreateInfo->flags);")
+        a("        /* attachments */")
+        a(f"        {op['enc_name']}_attachment_count(&e, pCreateInfo->attachmentCount);")
+        a("        for (i = 0; i < pCreateInfo->attachmentCount; ++i) {")
+        a("            const VkAttachmentDescription *at = &pCreateInfo->pAttachments[i];")
+        a(f"            {op['enc_name']}_attachment(&e, (uint32_t)at->flags, (uint32_t)at->format,")
+        a("                              (uint32_t)at->samples, (uint32_t)at->loadOp, (uint32_t)at->storeOp,")
+        a("                              (uint32_t)at->stencilLoadOp, (uint32_t)at->stencilStoreOp,")
+        a("                              (uint32_t)at->initialLayout, (uint32_t)at->finalLayout);")
+        a("        }")
+        a("        /* subpasses (with nested reference arrays) */")
+        a(f"        {op['enc_name']}_subpass_count(&e, pCreateInfo->subpassCount);")
+        a("        for (i = 0; i < pCreateInfo->subpassCount; ++i) {")
+        a("            const VkSubpassDescription *sp = &pCreateInfo->pSubpasses[i];")
+        a("            uint32_t hasDepth = sp->pDepthStencilAttachment ? 1u : 0u;")
+        a("            uint32_t resCount = sp->pResolveAttachments ? sp->colorAttachmentCount : 0u;")
+        a(f"            {op['enc_name']}_subpass_begin(&e, (uint32_t)sp->flags,")
+        a("                              (uint32_t)sp->pipelineBindPoint, sp->inputAttachmentCount,")
+        a("                              sp->colorAttachmentCount, resCount, hasDepth,")
+        a("                              sp->preserveAttachmentCount);")
+        a("            for (j = 0; j < sp->inputAttachmentCount; ++j)")
+        a(f"                {op['enc_name']}_ref(&e, sp->pInputAttachments[j].attachment, (uint32_t)sp->pInputAttachments[j].layout);")
+        a("            for (j = 0; j < sp->colorAttachmentCount; ++j)")
+        a(f"                {op['enc_name']}_ref(&e, sp->pColorAttachments[j].attachment, (uint32_t)sp->pColorAttachments[j].layout);")
+        a("            for (j = 0; j < resCount; ++j)")
+        a(f"                {op['enc_name']}_ref(&e, sp->pResolveAttachments[j].attachment, (uint32_t)sp->pResolveAttachments[j].layout);")
+        a("            if (hasDepth)")
+        a(f"                {op['enc_name']}_ref(&e, sp->pDepthStencilAttachment->attachment, (uint32_t)sp->pDepthStencilAttachment->layout);")
+        a("            for (j = 0; j < sp->preserveAttachmentCount; ++j)")
+        a(f"                {op['enc_name']}_preserve(&e, sp->pPreserveAttachments[j]);")
+        a("        }")
+        a("        /* dependencies */")
+        a(f"        {op['enc_name']}_dependency_count(&e, pCreateInfo->dependencyCount);")
+        a("        for (i = 0; i < pCreateInfo->dependencyCount; ++i) {")
+        a("            const VkSubpassDependency *dp = &pCreateInfo->pDependencies[i];")
+        a(f"            {op['enc_name']}_dependency(&e, dp->srcSubpass, dp->dstSubpass,")
+        a("                              (uint32_t)dp->srcStageMask, (uint32_t)dp->dstStageMask,")
+        a("                              (uint32_t)dp->srcAccessMask, (uint32_t)dp->dstAccessMask,")
+        a("                              (uint32_t)dp->dependencyFlags);")
+        a("        }")
+        a("        alr_vk_gen_pnext_count(&e, 0);")
+        a("        alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);")
+        a("        if (!e.overflow) {")
+        a("            uint32_t rlen = alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));")
+        a(f"            if (rlen) (void)alr_icd_gen_scan_result(reply, rlen, (uint16_t){op['reply_enum']}, &res);")
+        a("            else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;")
+        a("        } else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;")
+        a("        free(req);")
+        a("    }")
+        a("    if (res != 0) return (VkResult)res;")
+        a(f"    *pHandle = ({out_ty})(uintptr_t)vid;")
+        a("    return VK_SUCCESS;")
+        a("}")
     return "\n".join(L)
 
 
@@ -1850,6 +2120,9 @@ COUNTERS = {
     "VkPipelineLayout": "g_next_vplayout",
     "VkDescriptorPool": "g_next_vdpool",
     "VkDescriptorSet": "g_next_vdset",
+    # WAVE C render-pass / framebuffer virtual-id pools.
+    "VkRenderPass": "g_next_vrpass",
+    "VkFramebuffer": "g_next_vfb",
 }
 VHANDLE_VAR = {
     "VkCommandPool": "vpool",
@@ -1868,6 +2141,8 @@ VHANDLE_VAR = {
     "VkPipelineLayout": "vplayout",
     "VkDescriptorPool": "vdpool",
     "VkDescriptorSet": "vdset",
+    "VkRenderPass": "vrpass",
+    "VkFramebuffer": "vfb",
 }
 SHORT = {
     "vkCreateCommandPool": "create_command_pool",
@@ -1908,6 +2183,11 @@ SHORT = {
     "vkAllocateDescriptorSets": "allocate_descriptor_sets",
     "vkFreeDescriptorSets": "free_descriptor_sets",
     "vkUpdateDescriptorSets": "update_descriptor_sets",
+    # WAVE C.
+    "vkCreateRenderPass": "create_render_pass",
+    "vkDestroyRenderPass": "destroy_render_pass",
+    "vkCreateFramebuffer": "create_framebuffer",
+    "vkDestroyFramebuffer": "destroy_framebuffer",
 }
 # Reply-record payload sizes (after the u8 opcode) for the ICD skip table.
 REPLY_SKIP = {
@@ -1945,7 +2225,8 @@ def resolve_ops(reg):
         op_num += 1
         k = spec["kind"]
         has_reply = k in ("create_handle", "create_pool", "alloc_memory", "map_memory",
-                          "get_reqs", "bind_memory", "create_struct", "alloc_sets")
+                          "get_reqs", "bind_memory", "create_struct", "alloc_sets",
+                          "create_render_pass")
         if has_reply:
             op["reply_enum"] = "ALR_VK_GEN_REPLY_" + out_snake.upper()
             op["reply_num"] = reply_num
@@ -1955,14 +2236,17 @@ def resolve_ops(reg):
                 "bind_memory": REPLY_SKIP["result"], "alloc_memory": REPLY_SKIP["alloc"],
                 "map_memory": REPLY_SKIP["map"], "get_reqs": REPLY_SKIP["reqs"],
                 # create_struct reply is { u32 vid, i32 result }; alloc_sets is
-                # { u32 set_count, i32 result } — same two-field shape as "result".
+                # { u32 set_count, i32 result }; create_render_pass { u32 vid, i32 result } —
+                # all the same two-field shape as "result".
                 "create_struct": REPLY_SKIP["result"], "alloc_sets": REPLY_SKIP["result"],
+                "create_render_pass": REPLY_SKIP["result"],
             }[k]
         else:
             op["reply_enum"] = None
             op["reply_num"] = None
-        # create_struct / alloc_sets need an out handle type (counter + vout) like create_*.
-        if k in ("create_handle", "create_pool", "alloc_memory", "create_struct", "alloc_sets"):
+        # The create kinds with an out handle type (counter + vout).
+        if k in ("create_handle", "create_pool", "alloc_memory", "create_struct", "alloc_sets",
+                 "create_render_pass"):
             out_ty = spec["out"]
             op["counter"] = COUNTERS[out_ty]
             op["vout"] = VHANDLE_VAR[out_ty]

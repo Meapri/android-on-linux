@@ -861,6 +861,165 @@ inline void vk_gen_real_update_descriptor_sets(VkDecodeState& st, uint32_t vdev,
                                0, nullptr);
 }
 
+// ===========================================================================
+// WAVE C — render pass (nested subpasses) + framebuffer. The render-pass real body rebuilds
+// VkRenderPassCreateInfo from the wire attachment/subpass/dependency vectors, materializing
+// each subpass's nested attachment-reference arrays into stable storage that outlives the
+// vkCreateRenderPass call. Framebuffer translates its render-pass + image-view handles via
+// VkGenTables. (Reachable once the device-init host-service wall — op 204 — is cleared.)
+// ===========================================================================
+inline VkResult vk_gen_real_create_render_pass(
+    VkDecodeState& st, uint32_t vdev, uint32_t vrpass, uint32_t flags,
+    const std::vector<VkGenRpAttachment>& attachments,
+    const std::vector<VkGenRpSubpass>& subpasses,
+    const std::vector<VkGenRpDependency>& dependencies,
+    const std::vector<uint32_t>& pnext_types,
+    const std::vector<std::vector<uint8_t>>& pnext_bytes) {
+    (void)pnext_types; (void)pnext_bytes;
+    auto dit = st.real_dev.find(vdev);
+    if (dit == st.real_dev.end()) return VK_ERROR_INITIALIZATION_FAILED;
+    std::vector<VkAttachmentDescription> att;
+    att.reserve(attachments.size());
+    for (const auto& a : attachments) {
+        VkAttachmentDescription d{};
+        d.flags = a.flags;
+        d.format = static_cast<VkFormat>(a.format);
+        d.samples = a.samples ? static_cast<VkSampleCountFlagBits>(a.samples)
+                              : VK_SAMPLE_COUNT_1_BIT;
+        d.loadOp = static_cast<VkAttachmentLoadOp>(a.loadOp);
+        d.storeOp = static_cast<VkAttachmentStoreOp>(a.storeOp);
+        d.stencilLoadOp = static_cast<VkAttachmentLoadOp>(a.stencilLoadOp);
+        d.stencilStoreOp = static_cast<VkAttachmentStoreOp>(a.stencilStoreOp);
+        d.initialLayout = static_cast<VkImageLayout>(a.initialLayout);
+        d.finalLayout = static_cast<VkImageLayout>(a.finalLayout);
+        att.push_back(d);
+    }
+    // The reference arrays each subpass points at must outlive vkCreateRenderPass, so they
+    // are held in per-subpass storage vectors here (stable addresses while we build + call).
+    std::vector<std::vector<VkAttachmentReference>> in_refs(subpasses.size());
+    std::vector<std::vector<VkAttachmentReference>> col_refs(subpasses.size());
+    std::vector<std::vector<VkAttachmentReference>> res_refs(subpasses.size());
+    std::vector<VkAttachmentReference> depth_refs(subpasses.size());
+    std::vector<std::vector<uint32_t>> pres(subpasses.size());
+    std::vector<VkSubpassDescription> subs;
+    subs.reserve(subpasses.size());
+    auto to_refs = [](const std::vector<VkGenRpRef>& src,
+                      std::vector<VkAttachmentReference>& dst) {
+        dst.reserve(src.size());
+        for (const auto& r : src) {
+            VkAttachmentReference ar{};
+            ar.attachment = r.attachment;
+            ar.layout = static_cast<VkImageLayout>(r.layout);
+            dst.push_back(ar);
+        }
+    };
+    for (size_t i = 0; i < subpasses.size(); ++i) {
+        const auto& s = subpasses[i];
+        to_refs(s.input, in_refs[i]);
+        to_refs(s.color, col_refs[i]);
+        to_refs(s.resolve, res_refs[i]);
+        pres[i] = s.preserve;
+        VkSubpassDescription sd{};
+        sd.flags = s.flags;
+        sd.pipelineBindPoint = static_cast<VkPipelineBindPoint>(s.pipelineBindPoint);
+        sd.inputAttachmentCount = static_cast<uint32_t>(in_refs[i].size());
+        sd.pInputAttachments = in_refs[i].empty() ? nullptr : in_refs[i].data();
+        sd.colorAttachmentCount = static_cast<uint32_t>(col_refs[i].size());
+        sd.pColorAttachments = col_refs[i].empty() ? nullptr : col_refs[i].data();
+        // pResolveAttachments, if present, must have colorAttachmentCount entries.
+        sd.pResolveAttachments =
+            (!res_refs[i].empty() && res_refs[i].size() == col_refs[i].size())
+                ? res_refs[i].data() : nullptr;
+        if (s.has_depth) {
+            depth_refs[i].attachment = s.depth.attachment;
+            depth_refs[i].layout = static_cast<VkImageLayout>(s.depth.layout);
+            sd.pDepthStencilAttachment = &depth_refs[i];
+        }
+        sd.preserveAttachmentCount = static_cast<uint32_t>(pres[i].size());
+        sd.pPreserveAttachments = pres[i].empty() ? nullptr : pres[i].data();
+        subs.push_back(sd);
+    }
+    std::vector<VkSubpassDependency> deps;
+    deps.reserve(dependencies.size());
+    for (const auto& d : dependencies) {
+        VkSubpassDependency sd{};
+        sd.srcSubpass = d.srcSubpass;
+        sd.dstSubpass = d.dstSubpass;
+        sd.srcStageMask = d.srcStageMask;
+        sd.dstStageMask = d.dstStageMask;
+        sd.srcAccessMask = d.srcAccessMask;
+        sd.dstAccessMask = d.dstAccessMask;
+        sd.dependencyFlags = d.dependencyFlags;
+        deps.push_back(sd);
+    }
+    VkRenderPassCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    ci.flags = flags;
+    ci.attachmentCount = static_cast<uint32_t>(att.size());
+    ci.pAttachments = att.empty() ? nullptr : att.data();
+    ci.subpassCount = static_cast<uint32_t>(subs.size());
+    ci.pSubpasses = subs.empty() ? nullptr : subs.data();
+    ci.dependencyCount = static_cast<uint32_t>(deps.size());
+    ci.pDependencies = deps.empty() ? nullptr : deps.data();
+    VkRenderPass rp = VK_NULL_HANDLE;
+    VkResult r = vkCreateRenderPass(dit->second.dev, &ci, nullptr, &rp);
+    if (r == VK_SUCCESS) gen_tables(st).render_passes[vrpass] = rp;
+    return r;
+}
+
+inline void vk_gen_real_destroy_render_pass(VkDecodeState& st, uint32_t vdev, uint32_t vrpass) {
+    auto& t = gen_tables(st);
+    auto it = t.render_passes.find(vrpass);
+    auto dit = st.real_dev.find(vdev);
+    if (it != t.render_passes.end() && dit != st.real_dev.end() && it->second != VK_NULL_HANDLE)
+        vkDestroyRenderPass(dit->second.dev, it->second, nullptr);
+    t.render_passes.erase(vrpass);
+}
+
+// ---- framebuffer (renderPass + image-view HANDLES translated via VkGenTables) ----
+inline VkResult vk_gen_real_create_framebuffer(
+    VkDecodeState& st, uint32_t vdev, uint32_t vfb, uint32_t flags, uint32_t renderPass,
+    uint32_t width, uint32_t height, uint32_t layers,
+    const std::vector<VkGenElem_create_framebuffer_attachments>& attachments,
+    const std::vector<uint32_t>& pnext_types,
+    const std::vector<std::vector<uint8_t>>& pnext_bytes) {
+    (void)pnext_types; (void)pnext_bytes;
+    auto dit = st.real_dev.find(vdev);
+    if (dit == st.real_dev.end()) return VK_ERROR_INITIALIZATION_FAILED;
+    auto& t = gen_tables(st);
+    auto rpit = t.render_passes.find(renderPass);
+    if (rpit == t.render_passes.end()) return VK_ERROR_INITIALIZATION_FAILED;  // unknown rpass
+    std::vector<VkImageView> views;
+    views.reserve(attachments.size());
+    for (const auto& a : attachments) {
+        auto vit = t.views.find(a.self);
+        if (vit == t.views.end()) return VK_ERROR_INITIALIZATION_FAILED;  // unknown view id
+        views.push_back(vit->second);
+    }
+    VkFramebufferCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    ci.flags = flags;
+    ci.renderPass = rpit->second;
+    ci.attachmentCount = static_cast<uint32_t>(views.size());
+    ci.pAttachments = views.empty() ? nullptr : views.data();
+    ci.width = width ? width : 1;
+    ci.height = height ? height : 1;
+    ci.layers = layers ? layers : 1;
+    VkFramebuffer fb = VK_NULL_HANDLE;
+    VkResult r = vkCreateFramebuffer(dit->second.dev, &ci, nullptr, &fb);
+    if (r == VK_SUCCESS) gen_tables(st).framebuffers[vfb] = fb;
+    return r;
+}
+
+inline void vk_gen_real_destroy_framebuffer(VkDecodeState& st, uint32_t vdev, uint32_t vfb) {
+    auto& t = gen_tables(st);
+    auto it = t.framebuffers.find(vfb);
+    auto dit = st.real_dev.find(vdev);
+    if (it != t.framebuffers.end() && dit != st.real_dev.end() && it->second != VK_NULL_HANDLE)
+        vkDestroyFramebuffer(dit->second.dev, it->second, nullptr);
+    t.framebuffers.erase(vfb);
+}
+
 }  // namespace alr::gpu
 
 #endif  // ALR_VK_DECODE_REAL

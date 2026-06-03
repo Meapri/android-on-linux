@@ -783,6 +783,138 @@ static void VKAPI_CALL alr_vkUpdateDescriptorSets(VkDevice device, uint32_t desc
     }
 }
 
+static VkResult VKAPI_CALL alr_vkCreateRenderPass(VkDevice device, const VkRenderPassCreateInfo *pCreateInfo,
+                          const VkAllocationCallbacks *pAllocator, VkRenderPass *pHandle) {
+    (void)pAllocator;
+    AlrIcdDevice *dev = (AlrIcdDevice *)device; uint32_t vid; int32_t res = 0; uint32_t i, j;
+    if (!dev || !pCreateInfo || !pHandle) return VK_ERROR_INITIALIZATION_FAILED;
+    vid = alr_alloc(&g_next_vrpass, 1);
+    if (alr_icd_ring_ok()) {
+        AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
+        size_t cap = 512;
+        cap += (size_t)pCreateInfo->attachmentCount * 40;
+        cap += (size_t)pCreateInfo->dependencyCount * 32;
+        for (i = 0; i < pCreateInfo->subpassCount; ++i) {
+            const VkSubpassDescription *sp = &pCreateInfo->pSubpasses[i];
+            cap += 40 + (size_t)(sp->inputAttachmentCount + sp->colorAttachmentCount) * 8
+                 + (size_t)(sp->colorAttachmentCount + sp->preserveAttachmentCount) * 8;
+        }
+        uint8_t *req = (uint8_t *)malloc(cap);
+        if (!req) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        alr_vk_enc_init(&e, req, cap);
+        alr_vk_enc_gen_create_render_pass_begin(&e, dev->vdev, vid, (uint32_t)pCreateInfo->flags);
+        /* attachments */
+        alr_vk_enc_gen_create_render_pass_attachment_count(&e, pCreateInfo->attachmentCount);
+        for (i = 0; i < pCreateInfo->attachmentCount; ++i) {
+            const VkAttachmentDescription *at = &pCreateInfo->pAttachments[i];
+            alr_vk_enc_gen_create_render_pass_attachment(&e, (uint32_t)at->flags, (uint32_t)at->format,
+                              (uint32_t)at->samples, (uint32_t)at->loadOp, (uint32_t)at->storeOp,
+                              (uint32_t)at->stencilLoadOp, (uint32_t)at->stencilStoreOp,
+                              (uint32_t)at->initialLayout, (uint32_t)at->finalLayout);
+        }
+        /* subpasses (with nested reference arrays) */
+        alr_vk_enc_gen_create_render_pass_subpass_count(&e, pCreateInfo->subpassCount);
+        for (i = 0; i < pCreateInfo->subpassCount; ++i) {
+            const VkSubpassDescription *sp = &pCreateInfo->pSubpasses[i];
+            uint32_t hasDepth = sp->pDepthStencilAttachment ? 1u : 0u;
+            uint32_t resCount = sp->pResolveAttachments ? sp->colorAttachmentCount : 0u;
+            alr_vk_enc_gen_create_render_pass_subpass_begin(&e, (uint32_t)sp->flags,
+                              (uint32_t)sp->pipelineBindPoint, sp->inputAttachmentCount,
+                              sp->colorAttachmentCount, resCount, hasDepth,
+                              sp->preserveAttachmentCount);
+            for (j = 0; j < sp->inputAttachmentCount; ++j)
+                alr_vk_enc_gen_create_render_pass_ref(&e, sp->pInputAttachments[j].attachment, (uint32_t)sp->pInputAttachments[j].layout);
+            for (j = 0; j < sp->colorAttachmentCount; ++j)
+                alr_vk_enc_gen_create_render_pass_ref(&e, sp->pColorAttachments[j].attachment, (uint32_t)sp->pColorAttachments[j].layout);
+            for (j = 0; j < resCount; ++j)
+                alr_vk_enc_gen_create_render_pass_ref(&e, sp->pResolveAttachments[j].attachment, (uint32_t)sp->pResolveAttachments[j].layout);
+            if (hasDepth)
+                alr_vk_enc_gen_create_render_pass_ref(&e, sp->pDepthStencilAttachment->attachment, (uint32_t)sp->pDepthStencilAttachment->layout);
+            for (j = 0; j < sp->preserveAttachmentCount; ++j)
+                alr_vk_enc_gen_create_render_pass_preserve(&e, sp->pPreserveAttachments[j]);
+        }
+        /* dependencies */
+        alr_vk_enc_gen_create_render_pass_dependency_count(&e, pCreateInfo->dependencyCount);
+        for (i = 0; i < pCreateInfo->dependencyCount; ++i) {
+            const VkSubpassDependency *dp = &pCreateInfo->pDependencies[i];
+            alr_vk_enc_gen_create_render_pass_dependency(&e, dp->srcSubpass, dp->dstSubpass,
+                              (uint32_t)dp->srcStageMask, (uint32_t)dp->dstStageMask,
+                              (uint32_t)dp->srcAccessMask, (uint32_t)dp->dstAccessMask,
+                              (uint32_t)dp->dependencyFlags);
+        }
+        alr_vk_gen_pnext_count(&e, 0);
+        alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
+        if (!e.overflow) {
+            uint32_t rlen = alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
+            if (rlen) (void)alr_icd_gen_scan_result(reply, rlen, (uint16_t)ALR_VK_GEN_REPLY_CREATE_RENDER_PASS, &res);
+            else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;
+        } else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;
+        free(req);
+    }
+    if (res != 0) return (VkResult)res;
+    *pHandle = (VkRenderPass)(uintptr_t)vid;
+    return VK_SUCCESS;
+}
+
+static void VKAPI_CALL alr_vkDestroyRenderPass(VkDevice device, VkRenderPass renderPass,
+                          const VkAllocationCallbacks *pAllocator) {
+    (void)pAllocator;
+    AlrIcdDevice *dev = (AlrIcdDevice *)device;
+    uint32_t vh = (uint32_t)(uintptr_t)renderPass;
+    if (!dev || renderPass == 0 || !alr_icd_ring_ok()) return;
+    uint8_t req[24]; AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
+    alr_vk_enc_init(&e, req, sizeof(req));
+    alr_vk_enc_gen_destroy_render_pass(&e, dev->vdev, vh);
+    alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
+    if (!e.overflow) (void)alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
+}
+
+static VkResult VKAPI_CALL alr_vkCreateFramebuffer(VkDevice device, const VkFramebufferCreateInfo *pCreateInfo,
+                          const VkAllocationCallbacks *pAllocator, VkFramebuffer *pHandle) {
+    (void)pAllocator;
+    AlrIcdDevice *dev = (AlrIcdDevice *)device;
+    uint32_t vid; int32_t res = 0; uint32_t ai;
+    if (!dev || !pCreateInfo || !pHandle) return VK_ERROR_INITIALIZATION_FAILED;
+    vid = alr_alloc(&g_next_vfb, 1);
+    if (alr_icd_ring_ok()) {
+        AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
+        size_t cap = 256;
+        cap += (size_t)pCreateInfo->attachmentCount * 24;
+        uint8_t *req = (uint8_t *)malloc(cap);
+        if (!req) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        alr_vk_enc_init(&e, req, cap);
+        alr_vk_enc_gen_create_framebuffer_begin(&e, dev->vdev, vid, (uint32_t)pCreateInfo->flags, (uint32_t)(uintptr_t)pCreateInfo->renderPass, (uint32_t)pCreateInfo->width, (uint32_t)pCreateInfo->height, (uint32_t)pCreateInfo->layers);
+        { uint32_t n = pCreateInfo->attachmentCount; if (n > 4096) n = 4096;
+          alr_vk_enc_gen_create_framebuffer_attachments_count(&e, n);
+          for (ai = 0; ai < n; ++ai) {
+              alr_vk_enc_gen_create_framebuffer_attachments_elem(&e, (uint32_t)(uintptr_t)pCreateInfo->pAttachments[ai]); } }
+        alr_vk_gen_pnext_count(&e, 0);
+        alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
+        if (!e.overflow) {
+            uint32_t rlen = alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
+            if (rlen) (void)alr_icd_gen_scan_result(reply, rlen, (uint16_t)ALR_VK_GEN_REPLY_CREATE_FRAMEBUFFER, &res);
+            else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;
+        } else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;
+        free(req);
+    }
+    if (res != 0) return (VkResult)res;
+    *pHandle = (VkFramebuffer)(uintptr_t)vid;
+    return VK_SUCCESS;
+}
+
+static void VKAPI_CALL alr_vkDestroyFramebuffer(VkDevice device, VkFramebuffer framebuffer,
+                          const VkAllocationCallbacks *pAllocator) {
+    (void)pAllocator;
+    AlrIcdDevice *dev = (AlrIcdDevice *)device;
+    uint32_t vh = (uint32_t)(uintptr_t)framebuffer;
+    if (!dev || framebuffer == 0 || !alr_icd_ring_ok()) return;
+    uint8_t req[24]; AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
+    alr_vk_enc_init(&e, req, sizeof(req));
+    alr_vk_enc_gen_destroy_framebuffer(&e, dev->vdev, vh);
+    alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
+    if (!e.overflow) (void)alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
+}
+
 #endif  // ALR_ICD_GEN_DEFINE
 
 #ifdef ALR_ICD_GEN_TABLE
@@ -822,4 +954,8 @@ static void VKAPI_CALL alr_vkUpdateDescriptorSets(VkDevice device, uint32_t desc
     ALR_ENTRY("vkAllocateDescriptorSets", alr_vkAllocateDescriptorSets),
     ALR_ENTRY("vkFreeDescriptorSets", alr_vkFreeDescriptorSets),
     ALR_ENTRY("vkUpdateDescriptorSets", alr_vkUpdateDescriptorSets),
+    ALR_ENTRY("vkCreateRenderPass", alr_vkCreateRenderPass),
+    ALR_ENTRY("vkDestroyRenderPass", alr_vkDestroyRenderPass),
+    ALR_ENTRY("vkCreateFramebuffer", alr_vkCreateFramebuffer),
+    ALR_ENTRY("vkDestroyFramebuffer", alr_vkDestroyFramebuffer),
 #endif  // ALR_ICD_GEN_TABLE
