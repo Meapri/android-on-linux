@@ -19,15 +19,18 @@ These tests pin the stage-by-stage ALR-gate classification of
 from __future__ import annotations
 
 from tools.apt_install_e2e_model import (
+    DEMO_MULTIDEP_CLOSURE,
     PROFILE_HELLO,
     PROFILE_HELLO_DPKG_I,
     PROFILE_WITH_DEVNODE,
     PROFILE_WITH_SCRIPTS,
+    ClosurePackage,
     Entry,
     Gate,
     PackageProfile,
     Proc,
     build_chain,
+    complete_closure_via_dpkg,
     decide,
     metadata_stages_host_proof,
 )
@@ -306,7 +309,72 @@ def test_as_dict_serialises_every_stage_with_gate_and_ceiling():
 
 
 # --------------------------------------------------------------------------- #
-# (9) the module selftest is green
+# (9) GAP 2 — multi-dep closure completion via ONE top-level dpkg
+#     (the AptInstaller fallback: `dpkg -i <every archived .deb>` + `--configure -a`)
+# --------------------------------------------------------------------------- #
+
+def test_multidep_closure_installs_whole_set_in_dependency_order():
+    """The GAP-2 strategy: handing dpkg the WHOLE archived .deb set unpacks all,
+    then configures in dependency order, so a multi-dep app's entire closure
+    reaches `install ok installed` from one top-level dpkg invocation — no reliance
+    on apt's blocked in-line unpack."""
+    comp = complete_closure_via_dpkg(DEMO_MULTIDEP_CLOSURE, target="gtk-demo-app")
+    assert comp.all_installed is True
+    assert comp.cyclic is False
+    # every closure member is configured
+    assert set(comp.configure_order) == {p.name for p in DEMO_MULTIDEP_CLOSURE}
+    # topological: a dep is configured strictly before any package that needs it
+    order = comp.configure_order
+    assert order.index("libsomedep0") < order.index("libgtkapp-helper0")
+    assert order.index("libgtkapp-helper0") < order.index("gtk-demo-app")
+
+
+def test_multidep_closure_unpacks_all_before_configuring():
+    comp = complete_closure_via_dpkg(DEMO_MULTIDEP_CLOSURE, target="gtk-demo-app")
+    # dpkg unpacks the entire set (the model preserves all members in unpack_order)
+    assert set(comp.unpack_order) == {p.name for p in DEMO_MULTIDEP_CLOSURE}
+    assert len(comp.unpack_order) == len(DEMO_MULTIDEP_CLOSURE)
+
+
+def test_single_leaf_closure_is_the_proven_base_case():
+    """A single-leaf package (tree/galculator — already device-proven) completes
+    trivially: one .deb, one configure, no intra-closure ordering."""
+    single = complete_closure_via_dpkg((ClosurePackage("galculator"),),
+                                       target="galculator")
+    assert single.all_installed is True
+    assert single.configure_order == ("galculator",)
+    assert single.cyclic is False
+
+
+def test_base_provided_dep_does_not_block_configure():
+    """A Depends satisfied by the BASE (not in the downloaded set) imposes no
+    intra-closure edge, so it never blocks the target's configure."""
+    comp = complete_closure_via_dpkg(
+        (ClosurePackage("app", depends=("libc6",)),), target="app")  # libc6 ∉ set
+    assert comp.all_installed is True
+    assert comp.configure_order == ("app",)
+
+
+def test_dependency_cycle_is_surfaced_not_silently_ok():
+    """An intra-closure dependency cycle has no pure topological order; the model
+    flags it (cyclic=True, all_installed=False) rather than claiming success — the
+    honest rare edge dpkg would need a --configure retry to break."""
+    cyc = complete_closure_via_dpkg(
+        (ClosurePackage("a", ("b",)), ClosurePackage("b", ("a",))), target="a")
+    assert cyc.cyclic is True
+    assert cyc.all_installed is False
+
+
+def test_closure_completion_is_json_serialisable():
+    import json
+
+    d = complete_closure_via_dpkg(DEMO_MULTIDEP_CLOSURE, target="gtk-demo-app").as_dict()
+    assert json.loads(json.dumps(d))["target"] == "gtk-demo-app"
+    assert "configure_order" in d and "all_installed" in d
+
+
+# --------------------------------------------------------------------------- #
+# (10) the module selftest is green
 # --------------------------------------------------------------------------- #
 
 def test_module_selftest_passes():

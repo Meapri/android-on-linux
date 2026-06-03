@@ -1,0 +1,413 @@
+/*
+ * AptInstaller — the SHARED, device-proven online apt-install pipeline.
+ *
+ * This is the EXTRACTION of MainActivity.runAptInstallProbe (CR-2 keystone, device-proven
+ * for `tree`/`galculator`) into one reusable place so BOTH callers drive identical native
+ * behavior:
+ *   1. MainActivity's marker path (`echo install:<pkg> > /data/local/tmp/.alr-aptdrain`),
+ *      which now delegates here — its logcat proof lines are preserved verbatim.
+ *   2. NativeAlrRuntime.install(appId) — the in-app launcher UI install button.
+ *
+ * The pipeline (unchanged from the proven probe):
+ *   - stage the apt overlays (apt-mirror demo-trust + fakeroot + apt-dpkg + dpkg-db) via the
+ *     lib-downgrade-guarded extractOverlayTar, keyed on tar size (idempotent),
+ *   - wait for the interpose .so to finish staging (its path-mediation ctor must run before
+ *     any guest LD_PRELOADs it, or apt reads literal Android paths),
+ *   - normalize the bundled dpkg status to a deps-stripped consistent leaf set so apt's
+ *     global solver does not refuse on the pre-existing broken closure,
+ *   - set the apt env (ALR_FAKEROOT/ALR_REEXEC_INPROC/ALR_PERSIST_GUEST/ALR_TEE_GUEST_STDOUT),
+ *   - `apt-get -o Acquire::ForceIPv4=true update` (fetch the pinned-mirror index), re-normalize,
+ *   - `apt-get install -y --no-install-recommends <pkg>` (download the .deb CLOSURE from
+ *     the pool into var/cache/apt/archives),
+ *   - if apt's in-line unpack hit the nested re-entry edge (apt→dpkg→dpkg-split, exit 71),
+ *     COMPLETE the whole closure OUTSIDE apt: one top-level `dpkg -i <every archived .deb>`
+ *     (dpkg unpacks all, then configures in dependency order) + `dpkg --configure -a` to
+ *     flush any deferred configure — so a MULTI-DEP app (not just a single leaf) installs
+ *     end-to-end without relying on apt's blocked in-line unpack (GAP 2),
+ *   - verify via `dpkg --status <pkg>` ("Status: install ok installed"), and log any dep
+ *     that did not reach "installed" so a partial closure is honestly visible.
+ *
+ * Host abstraction: the two callers differ only in WHICH JNI symbol runs the guest
+ * (MainActivity's mangled export vs the runtime AlrNative export) and in their Context for
+ * extractOverlayTar. [Host] captures exactly that, so the body below is shared 1:1.
+ *
+ * Progress: [onProgress] receives coarse [Phase] transitions parsed from apt's stdout so the
+ * UI can show a monotonic percent. The marker path passes a no-op (it logs instead).
+ *
+ * Signature mode: this pipeline drives whatever the staged apt-mirror overlay configures.
+ * With `--demo-trust` the overlay ships `Trusted: yes` (verification SKIPPED). With the
+ * AUTHENTICATED default it ships `Signed-By: <staged keyring>` + pins Dir::Bin::apt-key and
+ * Apt::Key::gpgvcommand; noble apt 2.7.14 then verifies the InRelease by exec'ing apt-key →
+ * gpgv (a 2-deep fork chain), which needs the apt+dpkg `--self-contained` overlay staged
+ * (it ships apt-key + methods/gpgv + gpgv + the coreutils apt-key shells out to). This
+ * helper is signature-mode-agnostic — it just runs `apt-get update`/`install`; whether that
+ * update is authenticated is decided by the overlays, not here.
+ */
+package dev.chanwoo.androlinux.runtime
+
+import android.system.Os
+import android.util.Log
+import java.io.File
+
+object AptInstaller {
+
+    private const val TAG = "alr_loader"
+
+    /** The overlays the apt path stages (same set + order as the proven probe). */
+    private val APT_OVERLAYS = listOf("fakeroot", "apt-dpkg", "dpkg-db", "apt-mirror")
+
+    /** Coarse install phases parsed from apt stdout → the UI's monotonic percent. */
+    enum class Phase { RESOLVING, DOWNLOADING, UNPACKING, CONFIGURING, REGISTERING }
+
+    /**
+     * Everything that differs between the two call sites: the four app dirs, the native
+     * loader probe symbol, and the overlay extractor. Logging is shared (logcat tag above).
+     */
+    interface Host {
+        val packageName: String
+        val nativeLibraryDir: String
+        val filesDir: String
+        val cacheDir: String
+
+        /** Run a guest program (NEWLINE-delimited argv); BLOCKS until it exits; returns stdout. */
+        fun loaderProbe(rootfsName: String, program: String): String
+
+        /** Extract an overlay stage-tar with the lib-downgrade guard. Returns (extracted#, skipped#). */
+        fun extractOverlay(tar: File, rootfsDir: File): Pair<Int, Int>
+    }
+
+    /** Terminal result of an install attempt — what install() turns into Done/Failed. */
+    data class Result(
+        val installed: Boolean,
+        val downloaded: Boolean,
+        val binaryPresent: Boolean,
+        /** A short human-readable failure reason when !installed (apt's E: line if present). */
+        val error: String? = null,
+    )
+
+    /**
+     * Run the full online apt install of [pkg] into [rootfsDir]. Blocks (call off the UI
+     * thread). [onProgress] is fed coarse [Phase] transitions as apt's stdout streams; it may
+     * be a no-op. Returns the terminal [Result]. Prereq-missing or exceptions → installed=false.
+     *
+     * The body is a faithful copy of the proven runAptInstallProbe, with the only differences
+     * being (a) host-provided probe/extract and (b) the onProgress emissions.
+     */
+    fun install(
+        host: Host,
+        rootfsDir: File,
+        rootfsName: String,
+        pkg: String,
+        onProgress: (Phase) -> Unit = {},
+    ): Result {
+        Log.i(TAG, "aptinstall: armed pkg=$pkg — staging interpose/fakeroot/apt-dpkg/dpkg-db/apt-mirror")
+        onProgress(Phase.RESOLVING)
+
+        // --- stage the interpose overlay (path-mediation .so) FIRST -----------------------
+        // The path interposer (libalr_interpose.so) is what rewrites in-rootfs absolute paths
+        // (apt's CPU table, locale-archive, …) to the on-device rootfs; WITHOUT it apt reads
+        // literal Android paths and dies "E: Error reading the CPU table". MainActivity's
+        // onCreate stages this, but the LAUNCHER-only install path has no such onCreate — so
+        // stage it here, with the CANONICAL `.interpose-staged-<len>` marker the settle-wait
+        // below blocks on (the SAME convention MainActivity uses).
+        stageInterpose(host, rootfsDir)
+
+        // --- stage the apt overlays (size-keyed, idempotent) ------------------------------
+        for (name in APT_OVERLAYS) {
+            val tar = File("/data/local/tmp/$name-stage.tar")
+            val m = File(rootfsDir, ".aptdrain-$name-staged-${tar.length()}")
+            if (tar.isFile && !m.isFile) {
+                val (extracted, skipped) = host.extractOverlay(tar, rootfsDir)
+                m.writeText("staged\n")
+                Log.i(TAG, "aptinstall: $name-stage done (extracted=$extracted skipped=$skipped)")
+            } else if (!tar.isFile) {
+                Log.i(TAG, "aptinstall: $name-stage.tar absent (push it to /data/local/tmp)")
+            }
+        }
+
+        val fakerootSo = File(rootfsDir, "usr/lib/androlinux/libalr_fakeroot.so")
+        val aptGetBin = File(rootfsDir, "usr/bin/apt-get")
+        val srcFile = File(rootfsDir, "etc/apt/sources.list.alr.d/alr-ports.sources")
+        // Wait for libalr_interpose.so to be fully rewritten (its .interpose-staged-<len>
+        // marker lands only AFTER extract completes) before any guest LD_PRELOADs it.
+        val interposeSo = File(rootfsDir, "usr/lib/androlinux/libalr_interpose.so")
+        val interposeStageTar = File("/data/local/tmp/interpose-stage.tar")
+        val interposeStaging = {
+            interposeStageTar.isFile &&
+                (rootfsDir.listFiles { f -> f.name.startsWith(".interpose-staged-") }?.isEmpty() ?: true)
+        }
+        var w = 0
+        while (w < 40000 &&
+            !(fakerootSo.isFile && aptGetBin.isFile && srcFile.isFile &&
+                interposeSo.isFile && !interposeStaging())
+        ) { Thread.sleep(500); w += 500 }
+        Log.i(
+            TAG,
+            "aptinstall: fakeroot.so=${fakerootSo.isFile} apt-get=${aptGetBin.isFile} " +
+                "sources=${srcFile.isFile} (waited ${w}ms)",
+        )
+        if (!(fakerootSo.isFile && aptGetBin.isFile && srcFile.isFile)) {
+            Log.w(TAG, "aptinstall: prerequisites missing — push fakeroot/apt-dpkg/dpkg-db/apt-mirror stage tars")
+            return Result(installed = false, downloaded = false, binaryPresent = false,
+                error = "apt 오버레이가 준비되지 않았습니다 (fakeroot/apt-dpkg/dpkg-db/apt-mirror)")
+        }
+
+        val candidateBins = listOf("usr/bin/$pkg", "bin/$pkg", "usr/games/$pkg")
+        val preExisting = candidateBins.filter { File(rootfsDir, it).isFile }
+        Log.i(TAG, "aptinstall: pre-install binaries present=$preExisting (expect empty for a fresh download proof)")
+
+        // --- deps-stripped dpkg status normalize (reusable; re-run after `update`) --------
+        val normalizeStatus = normalize@{
+            runCatching {
+                val statusFile = File(rootfsDir, "var/lib/dpkg/status")
+                if (!statusFile.isFile) return@normalize
+                val backup = File(rootfsDir, "var/lib/dpkg/status.alr-preinstall")
+                if (!backup.isFile) statusFile.copyTo(backup, overwrite = false)
+                val src = backup.takeIf { it.isFile } ?: statusFile
+                val dropPrefixes = listOf("Depends:", "Pre-Depends:", "Recommends:", "Suggests:")
+                val sb = StringBuilder()
+                var keptPkgs = 0
+                for (stanza in src.readText().split("\n\n")) {
+                    if (stanza.isBlank()) continue
+                    if (!stanza.contains("Status: install ok installed")) {
+                        sb.append(stanza.trimEnd('\n')).append("\n\n"); continue
+                    }
+                    keptPkgs++
+                    var dropping = false
+                    for (line in stanza.split("\n")) {
+                        if (line.isEmpty()) continue
+                        val isContinuation = line.startsWith(" ") || line.startsWith("\t")
+                        if (isContinuation) {
+                            if (!dropping) sb.append(line).append("\n")
+                            continue
+                        }
+                        dropping = dropPrefixes.any { line.startsWith(it) }
+                        if (!dropping) sb.append(line).append("\n")
+                    }
+                    sb.append("\n")
+                }
+                statusFile.writeText(sb.toString())
+                Log.i(TAG, "aptinstall: normalized dpkg status (deps-stripped, kept $keptPkgs installed stanzas, ${statusFile.length()}b) for a clean solver")
+            }.onFailure { Log.w(TAG, "aptinstall: status normalize failed: $it") }
+            Unit
+        }
+        normalizeStatus()
+
+        Os.setenv("ALR_FAKEROOT", "1", true)
+        Os.setenv("ALR_REEXEC_INPROC", "1", true)
+        Os.setenv("ALR_PERSIST_GUEST", "1", true)
+        Os.setenv("ALR_INTERPOSE_DIAG", "1", true)
+        Os.setenv("ALR_TEE_GUEST_STDOUT", "1", true)
+        try {
+            // STEP 1 — apt-get update: fetch the index from the pinned mirror.
+            val upOut = host.loaderProbe(
+                rootfsName,
+                "/usr/bin/apt-get\n-o\nAcquire::ForceIPv4=true\nupdate",
+            )
+            val idxOk = upOut.contains("Reading package lists") ||
+                upOut.contains("Packages") || upOut.contains("Get:")
+            Log.i(TAG, "aptinstall: pre-install `apt-get update` indexOk=$idxOk")
+            Log.i(TAG, "aptinstall-update-out:\n$upOut")
+            // `apt-get update` restored full Depends in the status — re-strip for a clean solver.
+            normalizeStatus()
+            onProgress(Phase.DOWNLOADING)
+
+            // STEP 2 — apt-get install -y --no-install-recommends <pkg>.
+            val out = host.loaderProbe(
+                rootfsName,
+                "/usr/bin/apt-get\n-o\nAcquire::ForceIPv4=true\n-o\n" +
+                    "APT::Sandbox::User=root\n-o\nAPT::Get::Fix-Broken=false\n-o\n" +
+                    "pkgProblemResolver::FixByInstall=false\n" +
+                    "install\n-y\n--no-install-recommends\n--no-fix-broken\n" + pkg,
+            )
+            val downloaded = out.contains("Get:")
+            val unpacking = out.contains("Unpacking $pkg")
+            val settingUp = out.contains("Setting up $pkg")
+            Log.i(TAG, "aptinstall: pkg=$pkg downloaded=$downloaded unpacking=$unpacking settingUp=$settingUp")
+            // Quote each apt download line so the proof shows the EXACT pool URLs.
+            for (line in out.lineSequence()) {
+                if (line.startsWith("Get:") || line.startsWith("Fetched ") ||
+                    line.contains("ports.ubuntu.com")) {
+                    Log.i(TAG, "aptinstall-fetch: $line")
+                }
+            }
+            Log.i(TAG, "aptinstall-out:\n$out")
+            if (unpacking) onProgress(Phase.UNPACKING)
+            if (settingUp) onProgress(Phase.CONFIGURING)
+
+            val nowPresent = candidateBins.filter { File(rootfsDir, it).isFile }
+            Log.i(TAG, "aptinstall: post-install binaries present=$nowPresent (was $preExisting)")
+
+            val statusOut = host.loaderProbe(rootfsName, "/usr/bin/dpkg\n--status\n" + pkg)
+            var installed = statusOut.contains("Status: install ok installed")
+            Log.i(TAG, "aptinstall: installed=$installed (dpkg --status $pkg)")
+            Log.i(TAG, "aptinstall-status:\n$statusOut")
+
+            // COMPLETION via top-level dpkg on the apt-downloaded .deb SET (proven re-entry).
+            //
+            // GAP 2 — MULTI-DEP closures. apt's own in-line unpack hits the nested re-entry
+            // DEPTH edge (apt → dpkg → dpkg-split, exit 71), so we finish OUTSIDE apt with a
+            // single top-level dpkg, which is the proven ONE-level re-entry shape. For a leaf
+            // package (tree/galculator) one `.deb` sufficed; a package with deps not already
+            // in the base (e.g. a GTK app pulling several libs) has apt download the WHOLE
+            // closure into var/cache/apt/archives, so we must install ALL of them, in
+            // dependency order. dpkg does that ITSELF: given many .debs on one command line it
+            // unpacks them all first, then configures in topological dependency order (it
+            // defers a Setting-up until that package's Depends are configured). So one
+            // `dpkg -i <every archived .deb>` installs+configures a multi-dep set end-to-end
+            // without relying on apt's blocked in-line unpack. A trailing `dpkg --configure -a`
+            // then flushes any package left half-configured (deferred by an ordering or a
+            // re-entry hiccup), so the closure ends fully "install ok installed".
+            if (!installed) {
+                onProgress(Phase.UNPACKING)
+                val archives = File(rootfsDir, "var/cache/apt/archives")
+                // Every .deb apt downloaded for THIS install (the closure), target first so a
+                // single-leaf install is byte-identical to the old behavior. apt names them
+                // <pkg>_<ver>_<arch>.deb in the flat archives dir; _arm64 (native) + _all
+                // (arch-independent data pkgs) are the two arches a noble arm64 closure uses.
+                val allDebs = archives.listFiles { f ->
+                    f.isFile && (f.name.endsWith("_arm64.deb") || f.name.endsWith("_all.deb"))
+                }?.sortedBy { it.name } ?: emptyList()
+                val target = allDebs.filter { it.name.startsWith("${pkg}_") }
+                val deps = allDebs.filter { !it.name.startsWith("${pkg}_") }
+                // Configure order on the COMMAND LINE doesn't matter (dpkg reorders configure
+                // by Depends), but list the target last so its Setting-up is the final line —
+                // easier to assert. dpkg still unpacks all before configuring any.
+                val debSet = deps + target
+                if (debSet.isNotEmpty()) {
+                    val debRels = debSet.map { "/var/cache/apt/archives/${it.name}" }
+                    Log.i(TAG, "aptinstall: completing via top-level dpkg -i on ${debSet.size} apt-downloaded .deb(s) " +
+                        "(target=${target.map { it.name }}, deps=${deps.size}): ${debSet.map { it.name }}")
+                    // `dpkg -i deb1 deb2 …`: unpack-all-then-configure-in-dep-order. NEWLINE-
+                    // delimited argv (loaderProbe contract). --force-not-root/--force-bad-path
+                    // are the same forces the leaf path used (fakeroot uid=0 + rootfs paths).
+                    val diArgv = buildString {
+                        append("/usr/bin/dpkg\n--force-not-root\n--force-bad-path\n-i")
+                        for (r in debRels) { append('\n'); append(r) }
+                    }
+                    val diOut = host.loaderProbe(rootfsName, diArgv)
+                    val diUnpack = diOut.contains("Unpacking $pkg")
+                    val diConfig = diOut.contains("Setting up $pkg")
+                    Log.i(TAG, "aptinstall: dpkg -i (set) unpacking=$diUnpack settingUp=$diConfig")
+                    Log.i(TAG, "aptinstall-dpkgi-out:\n$diOut")
+                    if (diConfig) onProgress(Phase.CONFIGURING)
+
+                    // Flush any half-configured package (deferred Setting-up). For a multi-dep
+                    // set a dep may be unpacked-but-not-yet-configured if its own deps weren't
+                    // ready on the first pass; `dpkg --configure -a` (a)ll re-runs every
+                    // pending configure in dependency order until none remain. No-op (exit 0,
+                    // nothing to configure) for a fully-configured single leaf, so it's safe to
+                    // always run.
+                    val cfgOut = host.loaderProbe(
+                        rootfsName,
+                        "/usr/bin/dpkg\n--force-not-root\n--force-bad-path\n--configure\n-a",
+                    )
+                    val cfgConfiguredTarget = cfgOut.contains("Setting up $pkg")
+                    Log.i(TAG, "aptinstall: dpkg --configure -a (flush) settingUpTarget=$cfgConfiguredTarget")
+                    Log.i(TAG, "aptinstall-dpkgconfig-out:\n$cfgOut")
+                    if (cfgConfiguredTarget) onProgress(Phase.CONFIGURING)
+
+                    val statusOut2 = host.loaderProbe(rootfsName, "/usr/bin/dpkg\n--status\n" + pkg)
+                    installed = statusOut2.contains("Status: install ok installed")
+                    val nowPresent2 = candidateBins.filter { File(rootfsDir, it).isFile }
+                    Log.i(TAG, "aptinstall: after dpkg -i(set)+configure-a installed=$installed binaries=$nowPresent2")
+                    Log.i(TAG, "aptinstall-status2:\n$statusOut2")
+                    // Honesty: report any dep that did NOT reach "installed" so a partial
+                    // closure is visible, not silently treated as success on the leaf alone.
+                    if (installed && deps.isNotEmpty()) {
+                        val depNames = deps.map { it.name.substringBefore('_') }.distinct()
+                        val unconfigured = depNames.filter { dn ->
+                            val s = host.loaderProbe(rootfsName, "/usr/bin/dpkg\n--status\n" + dn)
+                            !s.contains("Status: install ok installed")
+                        }
+                        if (unconfigured.isNotEmpty()) {
+                            Log.w(TAG, "aptinstall: closure target installed but these deps are NOT configured: $unconfigured")
+                        } else {
+                            Log.i(TAG, "aptinstall: full closure configured (${depNames.size} deps + target)")
+                        }
+                    }
+                } else {
+                    Log.w(TAG, "aptinstall: no *.deb in apt archives cache to complete via dpkg -i")
+                }
+            }
+            val binaryPresent = candidateBins.any { File(rootfsDir, it).isFile }
+            Log.i(TAG, "aptinstall: FINAL pkg=$pkg downloaded=$downloaded installed=$installed binary=$binaryPresent")
+            if (installed) onProgress(Phase.REGISTERING)
+            val err = if (installed) null else aptErrorLine(out) ?: aptErrorLine(statusOut)
+                ?: "설치를 완료하지 못했습니다 (apt/dpkg)"
+            return Result(installed = installed, downloaded = downloaded, binaryPresent = binaryPresent,
+                error = if (installed) null else err)
+        } finally {
+            Os.unsetenv("ALR_FAKEROOT")
+            Os.unsetenv("ALR_REEXEC_INPROC")
+            Os.unsetenv("ALR_PERSIST_GUEST")
+            Os.unsetenv("ALR_INTERPOSE_DIAG")
+            Os.unsetenv("ALR_TEE_GUEST_STDOUT")
+        }
+    }
+
+    /**
+     * Minimal `apt-get remove -y <pkg>` + status check. Reuses the SAME staged overlays +
+     * env as install (assumes install ran at least once; stages defensively anyway). Returns
+     * true when dpkg no longer reports the package as installed.
+     */
+    fun remove(host: Host, rootfsDir: File, rootfsName: String, pkg: String): Boolean {
+        Log.i(TAG, "aptremove: pkg=$pkg")
+        stageInterpose(host, rootfsDir)
+        for (name in APT_OVERLAYS) {
+            val tar = File("/data/local/tmp/$name-stage.tar")
+            val m = File(rootfsDir, ".aptdrain-$name-staged-${tar.length()}")
+            if (tar.isFile && !m.isFile) {
+                val (extracted, skipped) = host.extractOverlay(tar, rootfsDir)
+                m.writeText("staged\n")
+                Log.i(TAG, "aptremove: $name-stage done (extracted=$extracted skipped=$skipped)")
+            }
+        }
+        Os.setenv("ALR_FAKEROOT", "1", true)
+        Os.setenv("ALR_REEXEC_INPROC", "1", true)
+        Os.setenv("ALR_PERSIST_GUEST", "1", true)
+        Os.setenv("ALR_TEE_GUEST_STDOUT", "1", true)
+        try {
+            val out = host.loaderProbe(
+                rootfsName,
+                "/usr/bin/apt-get\n-o\nAPT::Sandbox::User=root\nremove\n-y\n" + pkg,
+            )
+            Log.i(TAG, "aptremove-out:\n$out")
+            val statusOut = host.loaderProbe(rootfsName, "/usr/bin/dpkg\n--status\n" + pkg)
+            // dpkg --status of a removed package: "not installed" / "Status: ... not-installed",
+            // or an error that the package is unknown. Treat any non-"install ok installed" as gone.
+            val stillInstalled = statusOut.contains("Status: install ok installed")
+            Log.i(TAG, "aptremove: stillInstalled=$stillInstalled")
+            return !stillInstalled
+        } finally {
+            Os.unsetenv("ALR_FAKEROOT")
+            Os.unsetenv("ALR_REEXEC_INPROC")
+            Os.unsetenv("ALR_PERSIST_GUEST")
+            Os.unsetenv("ALR_TEE_GUEST_STDOUT")
+        }
+    }
+
+    /**
+     * Stage the interpose overlay (libalr_interpose.so) with the CANONICAL
+     * `.interpose-staged-<tarlen>` marker — the SAME name+convention MainActivity's onCreate
+     * uses and that the install() settle-wait blocks on. Idempotent (size-keyed). No-op if
+     * the tar is absent (then the install relies on a pre-staged interpose .so, e.g. from a
+     * prior MainActivity launch).
+     */
+    private fun stageInterpose(host: Host, rootfsDir: File) {
+        val tar = File("/data/local/tmp/interpose-stage.tar")
+        if (!tar.isFile) {
+            Log.i(TAG, "aptinstall: interpose-stage.tar absent (relying on pre-staged interpose .so)")
+            return
+        }
+        val marker = File(rootfsDir, ".interpose-staged-${tar.length()}")
+        if (marker.isFile) return
+        val (extracted, skipped) = host.extractOverlay(tar, rootfsDir)
+        marker.writeText("staged\n")
+        Log.i(TAG, "aptinstall: interpose-stage done (extracted=$extracted skipped=$skipped)")
+    }
+
+    /** First apt error line ("E: …") in [out], trimmed, or null. */
+    private fun aptErrorLine(out: String): String? =
+        out.lineSequence().firstOrNull { it.startsWith("E:") }?.trim()
+}

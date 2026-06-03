@@ -40,7 +40,9 @@ from tools import build_apt_mirror_overlay as bam
 from tools.build_apt_mirror_overlay import (
     APT_CONF_BODY,
     APT_CONF_PATH,
+    APT_KEY_BIN_PATH,
     ARCHIVE_KEYRING_PATH,
+    GPGV_BIN_PATH,
     HOSTS_PATH,
     MIRRORS,
     Mirror,
@@ -206,6 +208,28 @@ def test_apt_conf_isolates_sources_and_authenticates_by_default():
     # #cleared (not blanked — assigning "" only appends an empty entry), run as root.
     assert "#clear APT::Update::Post-Invoke-Success;" in APT_CONF_BODY
     assert 'APT::Sandbox::User "root";' in APT_CONF_BODY
+
+
+def test_apt_conf_authenticated_pins_apt_key_and_gpgv_absolutely():
+    """GAP-1 fix: noble apt 2.7.14's gpgv method ALWAYS shells out to apt-key,
+    which then PATH-resolves gpgv. The guest PATH isn't guaranteed, so authenticated
+    mode pins BOTH the apt-key binary (Dir::Bin::apt-key) and its verifier
+    (Apt::Key::gpgvcommand) to absolute rootfs paths — eliminating the
+    "Unknown error executing apt-key" PATH miss."""
+    # the real `<knob> "<path>";` directive (not the descriptive comment) must be present
+    assert f'Dir::Bin::apt-key "{APT_KEY_BIN_PATH}";' in APT_CONF_BODY
+    assert f'Apt::Key::gpgvcommand "{GPGV_BIN_PATH}";' in APT_CONF_BODY
+    # the pinned paths are absolute (so guest PATH/cwd are irrelevant)
+    assert APT_KEY_BIN_PATH.startswith("/") and GPGV_BIN_PATH.startswith("/")
+
+
+def test_apt_conf_demo_trust_skips_verifier_pins():
+    """--demo-trust SKIPS signature verification entirely, so it must not EMIT the
+    verifier directives (the header comment still describes them — match the real
+    directive line, not the prose)."""
+    body = bam.build_apt_conf_body(trusted=True)
+    assert f'Dir::Bin::apt-key "{APT_KEY_BIN_PATH}";' not in body
+    assert f'Apt::Key::gpgvcommand "{GPGV_BIN_PATH}";' not in body
 
 
 def test_apt_conf_demo_trust_adds_allow_unauth():
