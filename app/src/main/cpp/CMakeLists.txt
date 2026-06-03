@@ -60,6 +60,29 @@ target_link_libraries(alr_runtime_interposer PRIVATE alr_runtime)
 target_link_libraries(alr_runtime_trampoline PRIVATE alr_runtime)
 
 # ===========================================================================
+# ALR audio sink (in-app PulseAudio-native server -> AAudio) — APPEND-ONLY
+# BLOCK. Self-contained so it can be merged/reverted as a unit. The module is
+# pure NDK (epoll/AF_UNIX + AAudio), so unlike the Wayland block it builds for
+# ALL 4 ABIs — the nativeAudioSink* JNI symbols Kotlin declares must resolve in
+# every ABI's alr_loader .so (only the arm64 device actually drives them).
+# AAudio is in the NDK at API 26+, matching minSdk=26. See
+# docs/design/android-audio-sink.md §5/§9(D).
+# ===========================================================================
+add_library(alr_audio STATIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/alr_audio/alr_pulse_server.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/alr_audio/alr_pulse_jni.cpp
+)
+target_compile_features(alr_audio PRIVATE cxx_std_20)
+target_include_directories(alr_audio PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+find_library(aaudio-lib aaudio)
+target_link_libraries(alr_audio PUBLIC ${aaudio-lib} log android)
+# Link the audio sink into the app's loader so the nativeAudioSink* JNI entry
+# points land in the same .so MainActivity loads. --whole-archive keeps the JNI
+# symbols (only referenced from the JVM) from being dropped by the linker.
+target_link_libraries(alr_loader PRIVATE -Wl,--whole-archive alr_audio -Wl,--no-whole-archive)
+target_compile_definitions(alr_loader PRIVATE ALR_HAVE_AUDIO=1)
+
+# ===========================================================================
 # ALR Wayland compositor (Phase 3) — APPEND-ONLY BLOCK. Do not interleave with
 # the lines above; everything the compositor needs is self-contained here so it
 # can be merged/reverted as a unit.
