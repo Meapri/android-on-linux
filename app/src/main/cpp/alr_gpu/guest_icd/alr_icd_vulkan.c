@@ -349,8 +349,9 @@ static VkResult VKAPI_CALL alr_vkEnumeratePhysicalDevices(VkInstance instance,
     AlrIcdInstance *inst = (AlrIcdInstance *)instance;
     uint32_t count = 0, base = 0, i;
     if (!inst || !pPhysicalDeviceCount) return VK_ERROR_INITIALIZATION_FAILED;
-    ALR_ICD_DIAG("vkEnumeratePhysicalDevices (fill=%p ring_ok=%d)",
-                 (void *)pPhysicalDevices, alr_icd_ring_ok());
+    ALR_ICD_DIAG("vkEnumeratePhysicalDevices (fill=%p in_count=%u cached=%u ring_ok=%d)",
+                 (void *)pPhysicalDevices, *pPhysicalDeviceCount, inst->phys_count,
+                 alr_icd_ring_ok());
 
     /* Marshal the enumerate the FIRST time (cache the count/base on the instance so a
      * two-call query — count, then fill — doesn't re-enumerate, matching Vulkan
@@ -383,11 +384,15 @@ static VkResult VKAPI_CALL alr_vkEnumeratePhysicalDevices(VkInstance instance,
 
     if (pPhysicalDevices == NULL) {
         *pPhysicalDeviceCount = count;  /* query-count call */
+        ALR_ICD_DIAG("vkEnumeratePhysicalDevices count-query -> %u", count);
         return VK_SUCCESS;
     }
 
     /* Fill call: hand back up to *pPhysicalDeviceCount handles. */
     uint32_t to_write = (*pPhysicalDeviceCount < count) ? *pPhysicalDeviceCount : count;
+    ALR_ICD_DIAG("vkEnumeratePhysicalDevices fill in_count=%u count=%u to_write=%u%s",
+                 *pPhysicalDeviceCount, count, to_write,
+                 (to_write < count) ? " -> VK_INCOMPLETE" : " -> VK_SUCCESS");
     for (i = 0; i < to_write; ++i) {
         AlrIcdPhysicalDevice *pd = (AlrIcdPhysicalDevice *)calloc(1, sizeof(AlrIcdPhysicalDevice));
         if (!pd) { *pPhysicalDeviceCount = i; return VK_ERROR_OUT_OF_HOST_MEMORY; }
@@ -469,6 +474,14 @@ static void VKAPI_CALL alr_vkGetPhysicalDeviceQueueFamilyProperties(
     *pQueueFamilyPropertyCount = to_write;
 }
 
+/* FULL DEVICE PASSTHROUGH: marshal the CLIENT's REAL VkDeviceCreateInfo (queue list,
+ * enabled device extensions, allowlisted pNext feature chain) to the host so it creates a
+ * real Mali VkDevice whose queues/features MATCH what the client (ANGLE's RendererVk) then
+ * uses. The coarse path invented its own single-queue device, which made the Android Vulkan
+ * loader's vkGetDeviceQueue null-deref on the (family,index) ANGLE actually requested
+ * (DEVICE-PROVEN tombstone). The request buffer is sized to the create info: header + the
+ * queue/ext lists + the feature blobs (a VkPhysicalDeviceFeatures2 is ~240 bytes), so it is
+ * heap-allocated rather than a fixed stack buffer. */
 static VkResult VKAPI_CALL alr_vkCreateDevice(VkPhysicalDevice physicalDevice,
                                               const VkDeviceCreateInfo *pCreateInfo,
                                               const VkAllocationCallbacks *pAllocator,
@@ -478,8 +491,11 @@ static VkResult VKAPI_CALL alr_vkCreateDevice(VkPhysicalDevice physicalDevice,
     AlrIcdDevice *dev;
     uint32_t vdev, gfx_family = 0;
     int32_t dev_result = 0;
-    ALR_ICD_DIAG("vkCreateDevice enter (ext_count=%u ring_ok=%d)",
-                 pCreateInfo ? pCreateInfo->enabledExtensionCount : 0u, alr_icd_ring_ok());
+    uint32_t qci_count = (pCreateInfo ? pCreateInfo->queueCreateInfoCount : 0u);
+    uint32_t ext_count = (pCreateInfo ? pCreateInfo->enabledExtensionCount : 0u);
+    ALR_ICD_DIAG("vkCreateDevice enter (qci=%u ext=%u pNext=%p ring_ok=%d)",
+                 qci_count, ext_count, pCreateInfo ? pCreateInfo->pNext : NULL,
+                 alr_icd_ring_ok());
     if (!pd || !pDevice) return VK_ERROR_INITIALIZATION_FAILED;
     if (!alr_icd_ring_ok()) { ALR_ICD_DIAG("vkCreateDevice FAIL no-ring"); return VK_ERROR_INITIALIZATION_FAILED; }  /* no GPU to create on */
 
@@ -490,10 +506,52 @@ static VkResult VKAPI_CALL alr_vkCreateDevice(VkPhysicalDevice physicalDevice,
     dev->vdev = vdev;
     dev->phys = pd;
 
+    /* Size the request buffer: fixed CREATE_DEVICE2 header (op + vinst/vphys/vdev = 13) +
+     * qci list (4 + qci_count*8) + ext list (4 + sum(4+namelen)) + feature list
+     * (4 + sum(4 sType + 4 len + struct bytes)) + a terminator. Walk the inputs to bound it.*/
+    uint32_t need = 13 + 4 + qci_count * 8u + 4u + 4u + 8u;
+    for (uint32_t i = 0; i < ext_count; ++i) {
+        const char *nm = pCreateInfo->ppEnabledExtensionNames
+                             ? pCreateInfo->ppEnabledExtensionNames[i] : NULL;
+        need += 4u + (uint32_t)(nm ? strlen(nm) : 0u);
+    }
+    /* Count + size the allowlisted pNext feature structs (so the buffer fits them). */
+    uint32_t feat_count = 0;
+    for (const VkBaseInStructure *p = pCreateInfo ? (const VkBaseInStructure *)pCreateInfo->pNext
+                                                  : NULL;
+         p; p = p->pNext) {
+        uint32_t sz = alr_icd_feature_struct_size((uint32_t)p->sType);
+        if (sz) { feat_count++; need += 4u + 4u + sz; }
+    }
+
+    uint8_t *req = (uint8_t *)malloc(need);
+    if (!req) { free(dev); return VK_ERROR_OUT_OF_HOST_MEMORY; }
     {
-        uint8_t req[64]; AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH]; uint32_t rlen;
-        alr_vk_enc_init(&e, req, sizeof(req));
-        alr_vk_enc_create_device(&e, pd->inst->vinst, pd->vphys, vdev);
+        uint8_t reply[ALR_ICD_REPLY_SCRATCH]; uint32_t rlen;
+        AlrVkEncoder e;
+        alr_vk_enc_init(&e, req, need);
+        alr_vk_enc_create_device2_begin(&e, pd->inst->vinst, pd->vphys, vdev);
+        /* queue-create list (family, count) — verbatim from the client. */
+        alr_vk_enc_create_device2_qci_count(&e, qci_count);
+        for (uint32_t i = 0; i < qci_count; ++i) {
+            const VkDeviceQueueCreateInfo *q = &pCreateInfo->pQueueCreateInfos[i];
+            alr_vk_enc_create_device2_qci(&e, q->queueFamilyIndex, q->queueCount);
+        }
+        /* enabled device extensions — verbatim from the client. */
+        alr_vk_enc_create_device2_ext_count(&e, ext_count);
+        for (uint32_t i = 0; i < ext_count; ++i) {
+            const char *nm = pCreateInfo->ppEnabledExtensionNames
+                                 ? pCreateInfo->ppEnabledExtensionNames[i] : "";
+            alr_vk_enc_create_device2_ext(&e, nm ? nm : "");
+        }
+        /* allowlisted pNext feature structs — whole struct (incl. its own sType/pNext). */
+        alr_vk_enc_create_device2_feat_count(&e, feat_count);
+        for (const VkBaseInStructure *p =
+                 (const VkBaseInStructure *)pCreateInfo->pNext;
+             p; p = p->pNext) {
+            uint32_t sz = alr_icd_feature_struct_size((uint32_t)p->sType);
+            if (sz) alr_vk_enc_create_device2_feat(&e, (uint32_t)p->sType, p, sz);
+        }
         alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
         if (!e.overflow) {
             rlen = alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
@@ -503,9 +561,11 @@ static VkResult VKAPI_CALL alr_vkCreateDevice(VkPhysicalDevice physicalDevice,
             dev_result = (int32_t)VK_ERROR_INITIALIZATION_FAILED;
         }
     }
-    if (dev_result != 0) { free(dev); return (VkResult)dev_result; }
+    free(req);
+    if (dev_result != 0) { free(dev); ALR_ICD_DIAG("vkCreateDevice FAIL host_result=%d", dev_result); return (VkResult)dev_result; }
     dev->gfx_family = gfx_family;
     *pDevice = (VkDevice)dev;
+    ALR_ICD_DIAG("vkCreateDevice OK vdev=%u gfx_family=%u feat=%u", vdev, gfx_family, feat_count);
     return VK_SUCCESS;
 }
 
@@ -530,7 +590,7 @@ static void VKAPI_CALL alr_vkGetDeviceQueue(VkDevice device, uint32_t queueFamil
     AlrIcdQueue *q;
     uint32_t vqueue;
     if (!dev || !pQueue) return;
-    (void)queueFamilyIndex;  /* host binds the graphics family it chose at create_device */
+    ALR_ICD_DIAG("vkGetDeviceQueue (family=%u index=%u)", queueFamilyIndex, queueIndex);
     q = (AlrIcdQueue *)calloc(1, sizeof(AlrIcdQueue));
     if (!q) { *pQueue = VK_NULL_HANDLE; return; }
     alr_set_loader_magic_value(q);
@@ -538,9 +598,12 @@ static void VKAPI_CALL alr_vkGetDeviceQueue(VkDevice device, uint32_t queueFamil
     q->vqueue = vqueue;
     q->dev = dev;
     if (alr_icd_ring_ok()) {
+        /* FULL DEVICE PASSTHROUGH: forward the client's ACTUAL (queueFamilyIndex,queueIndex)
+         * so the host binds the real queue the device was created with — never an
+         * un-created (family,index) that makes the driver's GetDeviceQueue null-deref. */
         uint8_t req[32]; AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
         alr_vk_enc_init(&e, req, sizeof(req));
-        alr_vk_enc_get_device_queue(&e, dev->vdev, queueIndex, vqueue);
+        alr_vk_enc_get_device_queue2(&e, dev->vdev, queueFamilyIndex, queueIndex, vqueue);
         alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
         if (!e.overflow) (void)alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
     }
@@ -1264,7 +1327,12 @@ static PFN_vkVoidFunction VKAPI_CALL alr_vkGetInstanceProcAddr(VkInstance instan
 static PFN_vkVoidFunction VKAPI_CALL alr_vkGetDeviceProcAddr(VkDevice device,
                                                              const char *pName) {
     (void)device;
-    return alr_lookup(pName);
+    PFN_vkVoidFunction fn = alr_lookup(pName);
+    /* Log device-fn resolution so a device run sees the LAST entrypoint ANGLE's RendererVk
+     * resolves before it stops — and crucially which ones we return NULL for (the next
+     * passthrough entrypoints to implement; ANGLE may call a NULL device fn). */
+    if (!fn) ALR_ICD_DIAG("vkGetDeviceProcAddr(%s) -> NULL (unimplemented)", pName ? pName : "?");
+    return fn;
 }
 
 /* ============================================================================

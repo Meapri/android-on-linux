@@ -73,6 +73,35 @@ enum AlrVkOp {
     ALR_VK_OP_GET_PHYS_IMAGE_FORMAT_PROPS = 203,
     //   u32 vinst, u32 vphys, u32 format, u32 type, u32 tiling, u32 usage, u32 flags
 
+    // ======================================================================
+    // FULL DEVICE PASSTHROUGH rung (ANGLE RendererVk): forward the client's REAL
+    // VkDeviceCreateInfo to the real Mali vkCreateDevice. The coarse CREATE_DEVICE (210)
+    // invents its OWN single-queue/AHB-only device that does NOT match what ANGLE then
+    // asks for at vkGetDeviceQueue(family,index) — the Android Vulkan loader's
+    // GetDeviceQueue then null-derefs (DEVICE-PROVEN tombstone: vulkan::driver::
+    // GetDeviceQueue+84 <- vk_real_get_queue). CREATE_DEVICE2 carries the client's actual
+    // queue-create list + enabled device extensions + the allowlisted pNext feature chain,
+    // so the host creates a device whose queues/features EXACTLY match the client's later
+    // calls. Distinct op (the coarse 210 stays for the proven clear/draw probes — strict
+    // no-regression). The host returns the same ALR_VK_REPLY_DEVICE (vdev,result,gfx_family)
+    // PLUS the per-(family) created queue counts so GET_DEVICE_QUEUE2 can validate the index.
+    ALR_VK_OP_CREATE_DEVICE2 = 204,
+    //   u32 vinst, u32 vphys, u32 vdev,
+    //   u32 qci_count, then qci_count × { u32 queue_family_index, u32 queue_count }
+    //   u32 ext_count, then ext_count × { str extension_name }
+    //   u32 feat_count, then feat_count × { u32 s_type, blob feature_struct_bytes }
+    //       (the allowlisted pNext chain off VkDeviceCreateInfo / its VkPhysicalDevice
+    //        Features2 — each ships the WHOLE struct verbatim incl. its own sType/pNext
+    //        header; the host relinks pNext and points VkDeviceCreateInfo at the chain.)
+
+    // queue-family-AWARE get-device-queue: bind virtual queue `vqueue` to the real queue at
+    // (queue_family_index, queue_index) of `vdev`. The coarse GET_DEVICE_QUEUE (211) keys
+    // only by a host-chosen gfx family; ANGLE asks for a SPECIFIC family it requested at
+    // CREATE_DEVICE2, so this carries the family explicitly. No round-trip (vkGetDeviceQueue
+    // can't fail); the host maps vqueue -> the real VkQueue.
+    ALR_VK_OP_GET_DEVICE_QUEUE2 = 205,
+    //   u32 vdev, u32 queue_family_index, u32 queue_index, u32 vqueue
+
     // destroy the instance `vinst` (releases the host's real VkInstance + virtual maps).
     ALR_VK_OP_DESTROY_INSTANCE = 209,  // u32 vinst
 
@@ -378,6 +407,54 @@ static inline void alr_vk_enc_get_phys_image_format_props(AlrVkEncoder *e, uint3
 static inline void alr_vk_enc_destroy_instance(AlrVkEncoder *e, uint32_t vinst) {
     alr_vk_enc_u8(e, (uint8_t)ALR_VK_OP_DESTROY_INSTANCE);
     alr_vk_enc_u32(e, vinst);
+}
+
+/* ---- FULL DEVICE PASSTHROUGH builders ----
+ * CREATE_DEVICE2 is emitted in PARTS (the variable-length queue/ext/feature lists are
+ * easier to build incrementally than via one varargs call): begin the op, then append
+ * each list, then close with the feature list. The guest ICD drives this directly off
+ * ANGLE's VkDeviceCreateInfo. The host decoder reads the SAME field order. */
+static inline void alr_vk_enc_create_device2_begin(AlrVkEncoder *e, uint32_t vinst,
+                                                   uint32_t vphys, uint32_t vdev) {
+    alr_vk_enc_u8(e, (uint8_t)ALR_VK_OP_CREATE_DEVICE2);
+    alr_vk_enc_u32(e, vinst);
+    alr_vk_enc_u32(e, vphys);
+    alr_vk_enc_u32(e, vdev);
+}
+/* Append the queue-create list header (count); follow with `count` family/count pairs. */
+static inline void alr_vk_enc_create_device2_qci_count(AlrVkEncoder *e, uint32_t count) {
+    alr_vk_enc_u32(e, count);
+}
+static inline void alr_vk_enc_create_device2_qci(AlrVkEncoder *e, uint32_t family,
+                                                 uint32_t queue_count) {
+    alr_vk_enc_u32(e, family);
+    alr_vk_enc_u32(e, queue_count);
+}
+/* Append the enabled-extension list header (count); follow with `count` strings. */
+static inline void alr_vk_enc_create_device2_ext_count(AlrVkEncoder *e, uint32_t count) {
+    alr_vk_enc_u32(e, count);
+}
+static inline void alr_vk_enc_create_device2_ext(AlrVkEncoder *e, const char *name) {
+    alr_vk_enc_str(e, name);
+}
+/* Append the feature-struct list header (count); follow with `count` { sType, blob }. */
+static inline void alr_vk_enc_create_device2_feat_count(AlrVkEncoder *e, uint32_t count) {
+    alr_vk_enc_u32(e, count);
+}
+static inline void alr_vk_enc_create_device2_feat(AlrVkEncoder *e, uint32_t s_type,
+                                                  const void *bytes, uint32_t len) {
+    alr_vk_enc_u32(e, s_type);
+    alr_vk_enc_blob(e, bytes, len);
+}
+/* queue-family-aware get-device-queue. */
+static inline void alr_vk_enc_get_device_queue2(AlrVkEncoder *e, uint32_t vdev,
+                                                uint32_t queue_family_index,
+                                                uint32_t queue_index, uint32_t vqueue) {
+    alr_vk_enc_u8(e, (uint8_t)ALR_VK_OP_GET_DEVICE_QUEUE2);
+    alr_vk_enc_u32(e, vdev);
+    alr_vk_enc_u32(e, queue_family_index);
+    alr_vk_enc_u32(e, queue_index);
+    alr_vk_enc_u32(e, vqueue);
 }
 
 /* ---- VK-M2 body request builders ---- */
