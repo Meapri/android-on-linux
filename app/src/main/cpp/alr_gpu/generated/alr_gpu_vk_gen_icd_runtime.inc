@@ -46,6 +46,8 @@ static int alr_icd_gen_skip(AlrVkReader *rd, uint16_t sub) {
         case (uint16_t)ALR_VK_GEN_REPLY_ALLOCATE_DESCRIPTOR_SETS: { if(!alr_vk_reader_u32(rd,&u)||!alr_vk_reader_i32(rd,&i)) return 0; } return 1;
         case (uint16_t)ALR_VK_GEN_REPLY_CREATE_RENDER_PASS: { if(!alr_vk_reader_u32(rd,&u)||!alr_vk_reader_i32(rd,&i)) return 0; } return 1;
         case (uint16_t)ALR_VK_GEN_REPLY_CREATE_FRAMEBUFFER: { if(!alr_vk_reader_u32(rd,&u)||!alr_vk_reader_i32(rd,&i)) return 0; } return 1;
+        case (uint16_t)ALR_VK_GEN_REPLY_CREATE_GRAPHICS_PIPELINES: { if(!alr_vk_reader_u32(rd,&u)||!alr_vk_reader_i32(rd,&i)) return 0; } return 1;
+        case (uint16_t)ALR_VK_GEN_REPLY_CREATE_COMPUTE_PIPELINES: { if(!alr_vk_reader_u32(rd,&u)||!alr_vk_reader_i32(rd,&i)) return 0; } return 1;
         default: return 0;  /* unknown record: stop (don't guess a size) */
     }
     (void)u; (void)i; (void)q;

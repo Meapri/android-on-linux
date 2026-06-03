@@ -70,6 +70,9 @@ enum AlrVkGenOp {
     ALR_VK_GEN_OP_DESTROY_RENDER_PASS = 42,  // vkDestroyRenderPass
     ALR_VK_GEN_OP_CREATE_FRAMEBUFFER = 43,  // vkCreateFramebuffer
     ALR_VK_GEN_OP_DESTROY_FRAMEBUFFER = 44,  // vkDestroyFramebuffer
+    ALR_VK_GEN_OP_CREATE_GRAPHICS_PIPELINES = 45,  // vkCreateGraphicsPipelines
+    ALR_VK_GEN_OP_CREATE_COMPUTE_PIPELINES = 46,  // vkCreateComputePipelines
+    ALR_VK_GEN_OP_DESTROY_PIPELINE = 47,  // vkDestroyPipeline
 };
 
 // ---- Generated reply SUB-opcodes (u16; ride the reply escape). ----
@@ -97,6 +100,8 @@ enum AlrVkGenReply {
     ALR_VK_GEN_REPLY_ALLOCATE_DESCRIPTOR_SETS = 21,  // reply of vkAllocateDescriptorSets
     ALR_VK_GEN_REPLY_CREATE_RENDER_PASS = 22,  // reply of vkCreateRenderPass
     ALR_VK_GEN_REPLY_CREATE_FRAMEBUFFER = 23,  // reply of vkCreateFramebuffer
+    ALR_VK_GEN_REPLY_CREATE_GRAPHICS_PIPELINES = 24,  // reply of vkCreateGraphicsPipelines
+    ALR_VK_GEN_REPLY_CREATE_COMPUTE_PIPELINES = 25,  // reply of vkCreateComputePipelines
 };
 
 // A u16 little-endian field (the generated sub-opcode width). The hand-written
@@ -673,6 +678,214 @@ static inline void alr_vk_enc_gen_destroy_framebuffer(AlrVkEncoder *e, uint32_t 
     alr_vk_gen_op_begin(e, ALR_VK_GEN_OP_DESTROY_FRAMEBUFFER);
     alr_vk_enc_u32(e, vdev);
     alr_vk_enc_u32(e, vfb);
+}
+
+// Encoder for vkCreateGraphicsPipelines (DEDICATED: deep nested pipeline state). _begin ships the device,
+// the pipeline-cache virtual id (0 == VK_NULL_HANDLE), and the pipeline count; then per
+// pipeline _pipeline (flags + layout/renderPass/subpass/basePipeline handles + the stage
+// count), per stage _stage (+ optional _stage_spec_*), and the fixed-function sub-states.
+static inline void alr_vk_enc_gen_create_graphics_pipelines_begin(AlrVkEncoder *e, uint32_t vdev, uint32_t vpcache,
+                          uint32_t pipeline_count) {
+    alr_vk_gen_op_begin(e, ALR_VK_GEN_OP_CREATE_GRAPHICS_PIPELINES);
+    alr_vk_enc_u32(e, vdev);
+    alr_vk_enc_u32(e, vpcache);
+    alr_vk_enc_u32(e, pipeline_count);
+}
+// One pipeline header: the guest's virtual id for THIS pipeline (vpipe; the host maps it
+// to the real Mali pipeline + registers it so vkCmdBindPipeline can translate), the create
+// flags, the layout / renderPass / basePipeline HANDLES (virtual ids; 0 == VK_NULL_HANDLE),
+// the subpass index, the basePipelineIndex, and the stage count. (renderPass/subpass are 0
+// for compute.)
+static inline void alr_vk_enc_gen_create_graphics_pipelines_pipeline(AlrVkEncoder *e, uint32_t vpipe, uint32_t flags,
+                          uint32_t vlayout, uint32_t vrenderpass, uint32_t subpass,
+                          uint32_t vbase, int32_t base_index, uint32_t stage_count) {
+    alr_vk_enc_u32(e, vpipe); alr_vk_enc_u32(e, flags); alr_vk_enc_u32(e, vlayout);
+    alr_vk_enc_u32(e, vrenderpass); alr_vk_enc_u32(e, subpass); alr_vk_enc_u32(e, vbase);
+    alr_vk_enc_i32(e, base_index); alr_vk_enc_u32(e, stage_count);
+}
+// One shader stage: the stage bit, the shader-MODULE handle (virtual id), the
+// entry-point name as a length-prefixed blob, and a spec-present flag. If present, the
+// caller then appends _stage_spec_begin + per-entry _stage_spec_entry + _stage_spec_data.
+static inline void alr_vk_enc_gen_create_graphics_pipelines_stage(AlrVkEncoder *e, uint32_t stage, uint32_t vmodule,
+                          const void *name, uint32_t name_len, uint32_t spec_present) {
+    alr_vk_enc_u32(e, stage); alr_vk_enc_u32(e, vmodule);
+    alr_vk_enc_blob(e, name, name_len);
+    alr_vk_enc_u32(e, spec_present);
+}
+static inline void alr_vk_enc_gen_create_graphics_pipelines_stage_spec_begin(AlrVkEncoder *e, uint32_t map_entry_count,
+                          uint32_t data_len) {
+    alr_vk_enc_u32(e, map_entry_count); alr_vk_enc_u32(e, data_len);
+}
+static inline void alr_vk_enc_gen_create_graphics_pipelines_stage_spec_entry(AlrVkEncoder *e, uint32_t constantID,
+                          uint32_t offset, uint32_t size) {
+    alr_vk_enc_u32(e, constantID); alr_vk_enc_u32(e, offset); alr_vk_enc_u32(e, size);
+}
+static inline void alr_vk_enc_gen_create_graphics_pipelines_stage_spec_data(AlrVkEncoder *e, const void *data, uint32_t len) {
+    alr_vk_enc_blob(e, data, len);
+}
+// ---- Fixed-function sub-states (GRAPHICS). Each _<state>(present) ships a u32 presence
+// flag; when present the caller then appends that state's fields/elements in order. ----
+static inline void alr_vk_enc_gen_create_graphics_pipelines_vertex_input(AlrVkEncoder *e, uint32_t present,
+                          uint32_t binding_count, uint32_t attr_count) {
+    alr_vk_enc_u32(e, present);
+    if (present) { alr_vk_enc_u32(e, binding_count); alr_vk_enc_u32(e, attr_count); }
+}
+static inline void alr_vk_enc_gen_create_graphics_pipelines_vertex_binding(AlrVkEncoder *e, uint32_t binding,
+                          uint32_t stride, uint32_t inputRate) {
+    alr_vk_enc_u32(e, binding); alr_vk_enc_u32(e, stride); alr_vk_enc_u32(e, inputRate);
+}
+static inline void alr_vk_enc_gen_create_graphics_pipelines_vertex_attr(AlrVkEncoder *e, uint32_t location,
+                          uint32_t binding, uint32_t format, uint32_t offset) {
+    alr_vk_enc_u32(e, location); alr_vk_enc_u32(e, binding);
+    alr_vk_enc_u32(e, format); alr_vk_enc_u32(e, offset);
+}
+static inline void alr_vk_enc_gen_create_graphics_pipelines_input_assembly(AlrVkEncoder *e, uint32_t present,
+                          uint32_t topology, uint32_t primitiveRestartEnable) {
+    alr_vk_enc_u32(e, present);
+    if (present) { alr_vk_enc_u32(e, topology); alr_vk_enc_u32(e, primitiveRestartEnable); }
+}
+static inline void alr_vk_enc_gen_create_graphics_pipelines_tessellation(AlrVkEncoder *e, uint32_t present,
+                          uint32_t patchControlPoints) {
+    alr_vk_enc_u32(e, present);
+    if (present) alr_vk_enc_u32(e, patchControlPoints);
+}
+static inline void alr_vk_enc_gen_create_graphics_pipelines_viewport(AlrVkEncoder *e, uint32_t present,
+                          uint32_t viewport_count, uint32_t scissor_count) {
+    alr_vk_enc_u32(e, present);
+    if (present) { alr_vk_enc_u32(e, viewport_count); alr_vk_enc_u32(e, scissor_count); }
+}
+static inline void alr_vk_enc_gen_create_graphics_pipelines_viewport_elem(AlrVkEncoder *e, float x, float y, float w,
+                          float h, float minDepth, float maxDepth) {
+    alr_vk_enc_f32(e, x); alr_vk_enc_f32(e, y); alr_vk_enc_f32(e, w);
+    alr_vk_enc_f32(e, h); alr_vk_enc_f32(e, minDepth); alr_vk_enc_f32(e, maxDepth);
+}
+static inline void alr_vk_enc_gen_create_graphics_pipelines_scissor_elem(AlrVkEncoder *e, int32_t offX, int32_t offY,
+                          uint32_t extW, uint32_t extH) {
+    alr_vk_enc_i32(e, offX); alr_vk_enc_i32(e, offY);
+    alr_vk_enc_u32(e, extW); alr_vk_enc_u32(e, extH);
+}
+static inline void alr_vk_enc_gen_create_graphics_pipelines_rasterization(AlrVkEncoder *e, uint32_t present,
+                          uint32_t depthClampEnable, uint32_t rasterizerDiscardEnable,
+                          uint32_t polygonMode, uint32_t cullMode, uint32_t frontFace,
+                          uint32_t depthBiasEnable, float depthBiasConstantFactor,
+                          float depthBiasClamp, float depthBiasSlopeFactor,
+                          float lineWidth) {
+    alr_vk_enc_u32(e, present);
+    if (!present) return;
+    alr_vk_enc_u32(e, depthClampEnable); alr_vk_enc_u32(e, rasterizerDiscardEnable);
+    alr_vk_enc_u32(e, polygonMode); alr_vk_enc_u32(e, cullMode); alr_vk_enc_u32(e, frontFace);
+    alr_vk_enc_u32(e, depthBiasEnable); alr_vk_enc_f32(e, depthBiasConstantFactor);
+    alr_vk_enc_f32(e, depthBiasClamp); alr_vk_enc_f32(e, depthBiasSlopeFactor);
+    alr_vk_enc_f32(e, lineWidth);
+}
+static inline void alr_vk_enc_gen_create_graphics_pipelines_multisample(AlrVkEncoder *e, uint32_t present,
+                          uint32_t rasterizationSamples, uint32_t sampleShadingEnable,
+                          float minSampleShading, uint32_t sampleMaskWordCount,
+                          uint32_t alphaToCoverageEnable, uint32_t alphaToOneEnable) {
+    alr_vk_enc_u32(e, present);
+    if (!present) return;
+    alr_vk_enc_u32(e, rasterizationSamples); alr_vk_enc_u32(e, sampleShadingEnable);
+    alr_vk_enc_f32(e, minSampleShading); alr_vk_enc_u32(e, sampleMaskWordCount);
+    alr_vk_enc_u32(e, alphaToCoverageEnable); alr_vk_enc_u32(e, alphaToOneEnable);
+}
+static inline void alr_vk_enc_gen_create_graphics_pipelines_sample_mask(AlrVkEncoder *e, uint32_t word) { alr_vk_enc_u32(e, word); }
+static inline void alr_vk_enc_gen_create_graphics_pipelines_depth_stencil(AlrVkEncoder *e, uint32_t present,
+                          uint32_t depthTestEnable, uint32_t depthWriteEnable,
+                          uint32_t depthCompareOp, uint32_t depthBoundsTestEnable,
+                          uint32_t stencilTestEnable, float minDepthBounds,
+                          float maxDepthBounds) {
+    alr_vk_enc_u32(e, present);
+    if (!present) return;
+    alr_vk_enc_u32(e, depthTestEnable); alr_vk_enc_u32(e, depthWriteEnable);
+    alr_vk_enc_u32(e, depthCompareOp); alr_vk_enc_u32(e, depthBoundsTestEnable);
+    alr_vk_enc_u32(e, stencilTestEnable);
+    alr_vk_enc_f32(e, minDepthBounds); alr_vk_enc_f32(e, maxDepthBounds);
+}
+// A VkStencilOpState (front/back): failOp,passOp,depthFailOp,compareOp (4×u32) +
+// compareMask,writeMask,reference (3×u32). Called twice per depth-stencil (front, back).
+static inline void alr_vk_enc_gen_create_graphics_pipelines_stencil_op(AlrVkEncoder *e, uint32_t failOp, uint32_t passOp,
+                          uint32_t depthFailOp, uint32_t compareOp, uint32_t compareMask,
+                          uint32_t writeMask, uint32_t reference) {
+    alr_vk_enc_u32(e, failOp); alr_vk_enc_u32(e, passOp); alr_vk_enc_u32(e, depthFailOp);
+    alr_vk_enc_u32(e, compareOp); alr_vk_enc_u32(e, compareMask);
+    alr_vk_enc_u32(e, writeMask); alr_vk_enc_u32(e, reference);
+}
+static inline void alr_vk_enc_gen_create_graphics_pipelines_color_blend(AlrVkEncoder *e, uint32_t present,
+                          uint32_t logicOpEnable, uint32_t logicOp,
+                          uint32_t attachment_count, float bc0, float bc1, float bc2,
+                          float bc3) {
+    alr_vk_enc_u32(e, present);
+    if (!present) return;
+    alr_vk_enc_u32(e, logicOpEnable); alr_vk_enc_u32(e, logicOp);
+    alr_vk_enc_u32(e, attachment_count);
+    alr_vk_enc_f32(e, bc0); alr_vk_enc_f32(e, bc1); alr_vk_enc_f32(e, bc2); alr_vk_enc_f32(e, bc3);
+}
+static inline void alr_vk_enc_gen_create_graphics_pipelines_blend_attachment(AlrVkEncoder *e, uint32_t blendEnable,
+                          uint32_t srcColorBlendFactor, uint32_t dstColorBlendFactor,
+                          uint32_t colorBlendOp, uint32_t srcAlphaBlendFactor,
+                          uint32_t dstAlphaBlendFactor, uint32_t alphaBlendOp,
+                          uint32_t colorWriteMask) {
+    alr_vk_enc_u32(e, blendEnable); alr_vk_enc_u32(e, srcColorBlendFactor);
+    alr_vk_enc_u32(e, dstColorBlendFactor); alr_vk_enc_u32(e, colorBlendOp);
+    alr_vk_enc_u32(e, srcAlphaBlendFactor); alr_vk_enc_u32(e, dstAlphaBlendFactor);
+    alr_vk_enc_u32(e, alphaBlendOp); alr_vk_enc_u32(e, colorWriteMask);
+}
+static inline void alr_vk_enc_gen_create_graphics_pipelines_dynamic_state(AlrVkEncoder *e, uint32_t present,
+                          uint32_t dynamic_state_count) {
+    alr_vk_enc_u32(e, present);
+    if (present) alr_vk_enc_u32(e, dynamic_state_count);
+}
+static inline void alr_vk_enc_gen_create_graphics_pipelines_dynamic_elem(AlrVkEncoder *e, uint32_t state) { alr_vk_enc_u32(e, state); }
+
+// Encoder for vkCreateComputePipelines (DEDICATED: deep nested pipeline state). _begin ships the device,
+// the pipeline-cache virtual id (0 == VK_NULL_HANDLE), and the pipeline count; then per
+// pipeline _pipeline (flags + layout/renderPass/subpass/basePipeline handles + the stage
+// count), per stage _stage (+ optional _stage_spec_*), and — compute has no fixed-function.
+static inline void alr_vk_enc_gen_create_compute_pipelines_begin(AlrVkEncoder *e, uint32_t vdev, uint32_t vpcache,
+                          uint32_t pipeline_count) {
+    alr_vk_gen_op_begin(e, ALR_VK_GEN_OP_CREATE_COMPUTE_PIPELINES);
+    alr_vk_enc_u32(e, vdev);
+    alr_vk_enc_u32(e, vpcache);
+    alr_vk_enc_u32(e, pipeline_count);
+}
+// One pipeline header: the guest's virtual id for THIS pipeline (vpipe; the host maps it
+// to the real Mali pipeline + registers it so vkCmdBindPipeline can translate), the create
+// flags, the layout / renderPass / basePipeline HANDLES (virtual ids; 0 == VK_NULL_HANDLE),
+// the subpass index, the basePipelineIndex, and the stage count. (renderPass/subpass are 0
+// for compute.)
+static inline void alr_vk_enc_gen_create_compute_pipelines_pipeline(AlrVkEncoder *e, uint32_t vpipe, uint32_t flags,
+                          uint32_t vlayout, uint32_t vrenderpass, uint32_t subpass,
+                          uint32_t vbase, int32_t base_index, uint32_t stage_count) {
+    alr_vk_enc_u32(e, vpipe); alr_vk_enc_u32(e, flags); alr_vk_enc_u32(e, vlayout);
+    alr_vk_enc_u32(e, vrenderpass); alr_vk_enc_u32(e, subpass); alr_vk_enc_u32(e, vbase);
+    alr_vk_enc_i32(e, base_index); alr_vk_enc_u32(e, stage_count);
+}
+// One shader stage: the stage bit, the shader-MODULE handle (virtual id), the
+// entry-point name as a length-prefixed blob, and a spec-present flag. If present, the
+// caller then appends _stage_spec_begin + per-entry _stage_spec_entry + _stage_spec_data.
+static inline void alr_vk_enc_gen_create_compute_pipelines_stage(AlrVkEncoder *e, uint32_t stage, uint32_t vmodule,
+                          const void *name, uint32_t name_len, uint32_t spec_present) {
+    alr_vk_enc_u32(e, stage); alr_vk_enc_u32(e, vmodule);
+    alr_vk_enc_blob(e, name, name_len);
+    alr_vk_enc_u32(e, spec_present);
+}
+static inline void alr_vk_enc_gen_create_compute_pipelines_stage_spec_begin(AlrVkEncoder *e, uint32_t map_entry_count,
+                          uint32_t data_len) {
+    alr_vk_enc_u32(e, map_entry_count); alr_vk_enc_u32(e, data_len);
+}
+static inline void alr_vk_enc_gen_create_compute_pipelines_stage_spec_entry(AlrVkEncoder *e, uint32_t constantID,
+                          uint32_t offset, uint32_t size) {
+    alr_vk_enc_u32(e, constantID); alr_vk_enc_u32(e, offset); alr_vk_enc_u32(e, size);
+}
+static inline void alr_vk_enc_gen_create_compute_pipelines_stage_spec_data(AlrVkEncoder *e, const void *data, uint32_t len) {
+    alr_vk_enc_blob(e, data, len);
+}
+
+// Encoder for vkDestroyPipeline (forwards a destroy; no reply).
+static inline void alr_vk_enc_gen_destroy_pipeline(AlrVkEncoder *e, uint32_t vdev, uint32_t vpipe) {
+    alr_vk_gen_op_begin(e, ALR_VK_GEN_OP_DESTROY_PIPELINE);
+    alr_vk_enc_u32(e, vdev);
+    alr_vk_enc_u32(e, vpipe);
 }
 
 #ifdef __cplusplus

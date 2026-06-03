@@ -915,6 +915,268 @@ static void VKAPI_CALL alr_vkDestroyFramebuffer(VkDevice device, VkFramebuffer f
     if (!e.overflow) (void)alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
 }
 
+static VkResult VKAPI_CALL alr_vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
+                          uint32_t createInfoCount, const VkGraphicsPipelineCreateInfo *pCreateInfos,
+                          const VkAllocationCallbacks *pAllocator, VkPipeline *pPipelines) {
+    (void)pAllocator;
+    AlrIcdDevice *dev = (AlrIcdDevice *)device; uint32_t i; int32_t res = 0;
+    if (!dev || !pCreateInfos || !pPipelines || createInfoCount == 0)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    uint32_t n = createInfoCount > 4096 ? 4096 : createInfoCount;
+    /* Pre-assign a virtual id per pipeline (the host maps each to a real Mali pipeline). */
+    for (i = 0; i < n; ++i)
+        pPipelines[i] = (VkPipeline)(uintptr_t)alr_alloc(&g_next_vpipe, 1);
+    if (alr_icd_ring_ok()) {
+        AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
+        size_t cap = 256;
+        for (i = 0; i < n; ++i) {
+            uint32_t s;
+            cap += 64;
+            for (s = 0; s < pCreateInfos[i].stageCount; ++s) {
+                const VkPipelineShaderStageCreateInfo *st = &pCreateInfos[i].pStages[s];
+                cap += 64 + (st->pName ? strlen(st->pName) : 0);
+                if (st->pSpecializationInfo) cap += 32 +
+                    (size_t)st->pSpecializationInfo->mapEntryCount * 12 +
+                    st->pSpecializationInfo->dataSize;
+            }
+            const VkGraphicsPipelineCreateInfo *ci = &pCreateInfos[i];
+            if (ci->pVertexInputState) cap += 16 +
+                (size_t)(ci->pVertexInputState->vertexBindingDescriptionCount +
+                         ci->pVertexInputState->vertexAttributeDescriptionCount) * 16;
+            if (ci->pViewportState) cap += 16 +
+                (size_t)(ci->pViewportState->viewportCount * 24 +
+                         ci->pViewportState->scissorCount * 16);
+            if (ci->pColorBlendState) cap += 48 +
+                (size_t)ci->pColorBlendState->attachmentCount * 32;
+            if (ci->pDynamicState) cap += 8 +
+                (size_t)ci->pDynamicState->dynamicStateCount * 4;
+            cap += 256;  /* the fixed-size sub-states (raster/multisample/depth/etc.) */
+        }
+        uint8_t *req = (uint8_t *)malloc(cap);
+        if (!req) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        alr_vk_enc_init(&e, req, cap);
+        alr_vk_enc_gen_create_graphics_pipelines_begin(&e, dev->vdev, (uint32_t)(uintptr_t)pipelineCache, n);
+        for (i = 0; i < n; ++i) {
+            const VkGraphicsPipelineCreateInfo *ci = &pCreateInfos[i];
+            uint32_t vpipe = (uint32_t)(uintptr_t)pPipelines[i];  /* the pre-assigned vid */
+            uint32_t stage_count = ci->stageCount;
+            uint32_t vbase = (uint32_t)(uintptr_t)ci->basePipelineHandle;
+            alr_vk_enc_gen_create_graphics_pipelines_pipeline(&e, vpipe, (uint32_t)ci->flags,
+                          (uint32_t)(uintptr_t)ci->layout,
+                          (uint32_t)(uintptr_t)ci->renderPass, ci->subpass, vbase,
+                          ci->basePipelineIndex, stage_count);
+            uint32_t s;
+            for (s = 0; s < stage_count; ++s) {
+                const VkPipelineShaderStageCreateInfo *ss = &ci->pStages[s];
+                const char *nm = ss->pName ? ss->pName : "main";
+                uint32_t spec_present = ss->pSpecializationInfo ? 1u : 0u;
+                alr_vk_enc_gen_create_graphics_pipelines_stage(&e, (uint32_t)ss->stage, (uint32_t)(uintptr_t)ss->module,
+                          nm, (uint32_t)strlen(nm), spec_present);
+                if (spec_present) {
+                    const VkSpecializationInfo *spi = ss->pSpecializationInfo;
+                    uint32_t me = spi->mapEntryCount, mi;
+                    alr_vk_enc_gen_create_graphics_pipelines_stage_spec_begin(&e, me, (uint32_t)spi->dataSize);
+                    for (mi = 0; mi < me; ++mi)
+                        alr_vk_enc_gen_create_graphics_pipelines_stage_spec_entry(&e, spi->pMapEntries[mi].constantID,
+                                          spi->pMapEntries[mi].offset,
+                                          (uint32_t)spi->pMapEntries[mi].size);
+                    alr_vk_enc_gen_create_graphics_pipelines_stage_spec_data(&e, spi->pData, (uint32_t)spi->dataSize);
+                }
+            }
+            /* ---- fixed-function sub-states (graphics) ---- */
+            uint32_t k;
+            /* vertex input */
+            if (ci->pVertexInputState) {
+                const VkPipelineVertexInputStateCreateInfo *vi = ci->pVertexInputState;
+                alr_vk_enc_gen_create_graphics_pipelines_vertex_input(&e, 1u, vi->vertexBindingDescriptionCount,
+                              vi->vertexAttributeDescriptionCount);
+                for (k = 0; k < vi->vertexBindingDescriptionCount; ++k)
+                    alr_vk_enc_gen_create_graphics_pipelines_vertex_binding(&e, vi->pVertexBindingDescriptions[k].binding,
+                              vi->pVertexBindingDescriptions[k].stride,
+                              (uint32_t)vi->pVertexBindingDescriptions[k].inputRate);
+                for (k = 0; k < vi->vertexAttributeDescriptionCount; ++k)
+                    alr_vk_enc_gen_create_graphics_pipelines_vertex_attr(&e, vi->pVertexAttributeDescriptions[k].location,
+                              vi->pVertexAttributeDescriptions[k].binding,
+                              (uint32_t)vi->pVertexAttributeDescriptions[k].format,
+                              vi->pVertexAttributeDescriptions[k].offset);
+            } else { alr_vk_enc_gen_create_graphics_pipelines_vertex_input(&e, 0u, 0u, 0u); }
+            /* input assembly */
+            if (ci->pInputAssemblyState)
+                alr_vk_enc_gen_create_graphics_pipelines_input_assembly(&e, 1u, (uint32_t)ci->pInputAssemblyState->topology,
+                              ci->pInputAssemblyState->primitiveRestartEnable);
+            else alr_vk_enc_gen_create_graphics_pipelines_input_assembly(&e, 0u, 0u, 0u);
+            /* tessellation */
+            if (ci->pTessellationState)
+                alr_vk_enc_gen_create_graphics_pipelines_tessellation(&e, 1u, ci->pTessellationState->patchControlPoints);
+            else alr_vk_enc_gen_create_graphics_pipelines_tessellation(&e, 0u, 0u);
+            /* viewport */
+            if (ci->pViewportState) {
+                const VkPipelineViewportStateCreateInfo *vp = ci->pViewportState;
+                alr_vk_enc_gen_create_graphics_pipelines_viewport(&e, 1u, vp->viewportCount, vp->scissorCount);
+                /* pViewports/pScissors may be null when the viewport/scissor is dynamic. */
+                for (k = 0; k < vp->viewportCount; ++k) {
+                    if (vp->pViewports)
+                        alr_vk_enc_gen_create_graphics_pipelines_viewport_elem(&e, vp->pViewports[k].x, vp->pViewports[k].y,
+                              vp->pViewports[k].width, vp->pViewports[k].height,
+                              vp->pViewports[k].minDepth, vp->pViewports[k].maxDepth);
+                    else alr_vk_enc_gen_create_graphics_pipelines_viewport_elem(&e, 0, 0, 0, 0, 0, 0);
+                }
+                for (k = 0; k < vp->scissorCount; ++k) {
+                    if (vp->pScissors)
+                        alr_vk_enc_gen_create_graphics_pipelines_scissor_elem(&e, vp->pScissors[k].offset.x, vp->pScissors[k].offset.y,
+                              vp->pScissors[k].extent.width, vp->pScissors[k].extent.height);
+                    else alr_vk_enc_gen_create_graphics_pipelines_scissor_elem(&e, 0, 0, 0, 0);
+                }
+            } else { alr_vk_enc_gen_create_graphics_pipelines_viewport(&e, 0u, 0u, 0u); }
+            /* rasterization */
+            if (ci->pRasterizationState) {
+                const VkPipelineRasterizationStateCreateInfo *rs = ci->pRasterizationState;
+                alr_vk_enc_gen_create_graphics_pipelines_rasterization(&e, 1u, rs->depthClampEnable, rs->rasterizerDiscardEnable,
+                              (uint32_t)rs->polygonMode, (uint32_t)rs->cullMode,
+                              (uint32_t)rs->frontFace, rs->depthBiasEnable,
+                              rs->depthBiasConstantFactor, rs->depthBiasClamp,
+                              rs->depthBiasSlopeFactor, rs->lineWidth);
+            } else { alr_vk_enc_gen_create_graphics_pipelines_rasterization(&e, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0, 0, 0, 0); }
+            /* multisample */
+            if (ci->pMultisampleState) {
+                const VkPipelineMultisampleStateCreateInfo *ms = ci->pMultisampleState;
+                /* pSampleMask is an array of ceil(rasterizationSamples/32) sample-mask words. */
+                uint32_t mw = (ms->pSampleMask && ms->rasterizationSamples)
+                    ? (((uint32_t)ms->rasterizationSamples + 31u) / 32u) : 0u;
+                alr_vk_enc_gen_create_graphics_pipelines_multisample(&e, 1u, (uint32_t)ms->rasterizationSamples,
+                              ms->sampleShadingEnable, ms->minSampleShading, mw,
+                              ms->alphaToCoverageEnable, ms->alphaToOneEnable);
+                for (k = 0; k < mw; ++k)
+                    alr_vk_enc_gen_create_graphics_pipelines_sample_mask(&e, ms->pSampleMask[k]);
+            } else { alr_vk_enc_gen_create_graphics_pipelines_multisample(&e, 0u, 0u, 0u, 0, 0u, 0u, 0u); }
+            /* depth stencil */
+            if (ci->pDepthStencilState) {
+                const VkPipelineDepthStencilStateCreateInfo *ds = ci->pDepthStencilState;
+                alr_vk_enc_gen_create_graphics_pipelines_depth_stencil(&e, 1u, ds->depthTestEnable, ds->depthWriteEnable,
+                              (uint32_t)ds->depthCompareOp, ds->depthBoundsTestEnable,
+                              ds->stencilTestEnable, ds->minDepthBounds, ds->maxDepthBounds);
+                alr_vk_enc_gen_create_graphics_pipelines_stencil_op(&e, (uint32_t)ds->front.failOp, (uint32_t)ds->front.passOp,
+                              (uint32_t)ds->front.depthFailOp, (uint32_t)ds->front.compareOp,
+                              ds->front.compareMask, ds->front.writeMask, ds->front.reference);
+                alr_vk_enc_gen_create_graphics_pipelines_stencil_op(&e, (uint32_t)ds->back.failOp, (uint32_t)ds->back.passOp,
+                              (uint32_t)ds->back.depthFailOp, (uint32_t)ds->back.compareOp,
+                              ds->back.compareMask, ds->back.writeMask, ds->back.reference);
+            } else { alr_vk_enc_gen_create_graphics_pipelines_depth_stencil(&e, 0u, 0u, 0u, 0u, 0u, 0u, 0, 0); }
+            /* color blend */
+            if (ci->pColorBlendState) {
+                const VkPipelineColorBlendStateCreateInfo *cb = ci->pColorBlendState;
+                alr_vk_enc_gen_create_graphics_pipelines_color_blend(&e, 1u, cb->logicOpEnable, (uint32_t)cb->logicOp,
+                              cb->attachmentCount, cb->blendConstants[0], cb->blendConstants[1],
+                              cb->blendConstants[2], cb->blendConstants[3]);
+                for (k = 0; k < cb->attachmentCount; ++k)
+                    alr_vk_enc_gen_create_graphics_pipelines_blend_attachment(&e, cb->pAttachments[k].blendEnable,
+                              (uint32_t)cb->pAttachments[k].srcColorBlendFactor,
+                              (uint32_t)cb->pAttachments[k].dstColorBlendFactor,
+                              (uint32_t)cb->pAttachments[k].colorBlendOp,
+                              (uint32_t)cb->pAttachments[k].srcAlphaBlendFactor,
+                              (uint32_t)cb->pAttachments[k].dstAlphaBlendFactor,
+                              (uint32_t)cb->pAttachments[k].alphaBlendOp,
+                              (uint32_t)cb->pAttachments[k].colorWriteMask);
+            } else { alr_vk_enc_gen_create_graphics_pipelines_color_blend(&e, 0u, 0u, 0u, 0u, 0, 0, 0, 0); }
+            /* dynamic state */
+            if (ci->pDynamicState) {
+                const VkPipelineDynamicStateCreateInfo *dy = ci->pDynamicState;
+                alr_vk_enc_gen_create_graphics_pipelines_dynamic_state(&e, 1u, dy->dynamicStateCount);
+                for (k = 0; k < dy->dynamicStateCount; ++k)
+                    alr_vk_enc_gen_create_graphics_pipelines_dynamic_elem(&e, (uint32_t)dy->pDynamicStates[k]);
+            } else { alr_vk_enc_gen_create_graphics_pipelines_dynamic_state(&e, 0u, 0u); }
+        }
+        alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
+        if (!e.overflow) {
+            uint32_t rlen = alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
+            if (rlen) (void)alr_icd_gen_scan_result(reply, rlen, (uint16_t)ALR_VK_GEN_REPLY_CREATE_GRAPHICS_PIPELINES, &res);
+            else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;
+        } else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;
+        free(req);
+    }
+    return (VkResult)res;
+}
+
+static VkResult VKAPI_CALL alr_vkCreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache,
+                          uint32_t createInfoCount, const VkComputePipelineCreateInfo *pCreateInfos,
+                          const VkAllocationCallbacks *pAllocator, VkPipeline *pPipelines) {
+    (void)pAllocator;
+    AlrIcdDevice *dev = (AlrIcdDevice *)device; uint32_t i; int32_t res = 0;
+    if (!dev || !pCreateInfos || !pPipelines || createInfoCount == 0)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    uint32_t n = createInfoCount > 4096 ? 4096 : createInfoCount;
+    /* Pre-assign a virtual id per pipeline (the host maps each to a real Mali pipeline). */
+    for (i = 0; i < n; ++i)
+        pPipelines[i] = (VkPipeline)(uintptr_t)alr_alloc(&g_next_vpipe, 1);
+    if (alr_icd_ring_ok()) {
+        AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
+        size_t cap = 256;
+        for (i = 0; i < n; ++i) {
+            uint32_t s;
+            cap += 64;
+            for (s = 0; s < 1u; ++s) {
+                const VkPipelineShaderStageCreateInfo *st = &pCreateInfos[i].stage;
+                cap += 64 + (st->pName ? strlen(st->pName) : 0);
+                if (st->pSpecializationInfo) cap += 32 +
+                    (size_t)st->pSpecializationInfo->mapEntryCount * 12 +
+                    st->pSpecializationInfo->dataSize;
+            }
+        }
+        uint8_t *req = (uint8_t *)malloc(cap);
+        if (!req) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        alr_vk_enc_init(&e, req, cap);
+        alr_vk_enc_gen_create_compute_pipelines_begin(&e, dev->vdev, (uint32_t)(uintptr_t)pipelineCache, n);
+        for (i = 0; i < n; ++i) {
+            const VkComputePipelineCreateInfo *ci = &pCreateInfos[i];
+            uint32_t vpipe = (uint32_t)(uintptr_t)pPipelines[i];  /* the pre-assigned vid */
+            uint32_t stage_count = 1;
+            uint32_t vbase = (uint32_t)(uintptr_t)ci->basePipelineHandle;
+            alr_vk_enc_gen_create_compute_pipelines_pipeline(&e, vpipe, (uint32_t)ci->flags,
+                          (uint32_t)(uintptr_t)ci->layout, 0u, 0u, vbase,
+                          ci->basePipelineIndex, stage_count);
+            uint32_t s;
+            for (s = 0; s < stage_count; ++s) {
+                const VkPipelineShaderStageCreateInfo *ss = &ci->stage;
+                const char *nm = ss->pName ? ss->pName : "main";
+                uint32_t spec_present = ss->pSpecializationInfo ? 1u : 0u;
+                alr_vk_enc_gen_create_compute_pipelines_stage(&e, (uint32_t)ss->stage, (uint32_t)(uintptr_t)ss->module,
+                          nm, (uint32_t)strlen(nm), spec_present);
+                if (spec_present) {
+                    const VkSpecializationInfo *spi = ss->pSpecializationInfo;
+                    uint32_t me = spi->mapEntryCount, mi;
+                    alr_vk_enc_gen_create_compute_pipelines_stage_spec_begin(&e, me, (uint32_t)spi->dataSize);
+                    for (mi = 0; mi < me; ++mi)
+                        alr_vk_enc_gen_create_compute_pipelines_stage_spec_entry(&e, spi->pMapEntries[mi].constantID,
+                                          spi->pMapEntries[mi].offset,
+                                          (uint32_t)spi->pMapEntries[mi].size);
+                    alr_vk_enc_gen_create_compute_pipelines_stage_spec_data(&e, spi->pData, (uint32_t)spi->dataSize);
+                }
+            }
+        }
+        alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
+        if (!e.overflow) {
+            uint32_t rlen = alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
+            if (rlen) (void)alr_icd_gen_scan_result(reply, rlen, (uint16_t)ALR_VK_GEN_REPLY_CREATE_COMPUTE_PIPELINES, &res);
+            else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;
+        } else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;
+        free(req);
+    }
+    return (VkResult)res;
+}
+
+static void VKAPI_CALL alr_vkDestroyPipeline(VkDevice device, VkPipeline pipeline,
+                          const VkAllocationCallbacks *pAllocator) {
+    (void)pAllocator;
+    AlrIcdDevice *dev = (AlrIcdDevice *)device;
+    uint32_t vh = (uint32_t)(uintptr_t)pipeline;
+    if (!dev || pipeline == 0 || !alr_icd_ring_ok()) return;
+    uint8_t req[24]; AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
+    alr_vk_enc_init(&e, req, sizeof(req));
+    alr_vk_enc_gen_destroy_pipeline(&e, dev->vdev, vh);
+    alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
+    if (!e.overflow) (void)alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
+}
+
 #endif  // ALR_ICD_GEN_DEFINE
 
 #ifdef ALR_ICD_GEN_TABLE
@@ -958,4 +1220,7 @@ static void VKAPI_CALL alr_vkDestroyFramebuffer(VkDevice device, VkFramebuffer f
     ALR_ENTRY("vkDestroyRenderPass", alr_vkDestroyRenderPass),
     ALR_ENTRY("vkCreateFramebuffer", alr_vkCreateFramebuffer),
     ALR_ENTRY("vkDestroyFramebuffer", alr_vkDestroyFramebuffer),
+    ALR_ENTRY("vkCreateGraphicsPipelines", alr_vkCreateGraphicsPipelines),
+    ALR_ENTRY("vkCreateComputePipelines", alr_vkCreateComputePipelines),
+    ALR_ENTRY("vkDestroyPipeline", alr_vkDestroyPipeline),
 #endif  // ALR_ICD_GEN_TABLE

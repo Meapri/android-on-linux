@@ -53,9 +53,10 @@ VkGenTables& gen_tables(VkDecodeState& st);
 // cmd band by calling cmd_register_*(). Both this header (via gen_decode.hpp) and
 // cmdlog_real.hpp are pulled into the SAME on-device TU (alr_gpu_vk_host_service.hpp), so
 // these inline definitions resolve at link time; a forward decl here avoids an include cycle
-// (cmdlog_real.hpp -> gen_decode.hpp -> this file). NOTE: cmd_register_pipeline has no caller
-// yet — graphics/compute pipeline create-forwards are still deferred (wave-8); it is wired
-// the moment that create body lands.
+// (cmdlog_real.hpp -> gen_decode.hpp -> this file). cmd_register_pipeline is now wired: the
+// graphics/compute pipeline create-forwards (vk_gen_real_create_{graphics,compute}_pipelines
+// below) call it for each returned real pipeline so vkCmdBindPipeline can translate the vid.
+inline void cmd_register_pipeline(VkDecodeState& st, uint32_t vid, VkPipeline h);
 inline void cmd_register_layout(VkDecodeState& st, uint32_t vid, VkPipelineLayout h);
 inline void cmd_register_descset(VkDecodeState& st, uint32_t vid, VkDescriptorSet h);
 inline void cmd_register_renderpass(VkDecodeState& st, uint32_t vid, VkRenderPass h);
@@ -1046,6 +1047,400 @@ inline void vk_gen_real_destroy_framebuffer(VkDecodeState& st, uint32_t vdev, ui
     if (it != t.framebuffers.end() && dit != st.real_dev.end() && it->second != VK_NULL_HANDLE)
         vkDestroyFramebuffer(dit->second.dev, it->second, nullptr);
     t.framebuffers.erase(vfb);
+}
+
+// ===========================================================================
+// WAVE D — graphics + compute pipelines: the DEEPEST nested create. The host decode
+// (decode_vk_gen_op) read the whole vkCreate{Graphics,Compute}Pipelines call into a
+// std::vector<VkGenPipeline> (wire PODs: handles are virtual ids, names are std::string, every
+// fixed-function sub-state behind a has_* flag). These hand-written bodies rebuild the typed
+// VkGraphics/ComputePipelineCreateInfo array — translating the shader-MODULE / layout /
+// renderPass / basePipeline virtual handles via VkGenTables, materializing each nested array
+// (pStages + per-stage pName/pSpecializationInfo, vertex bindings/attributes, viewports/
+// scissors, color-blend attachments, dynamic states, sample mask) into PER-PIPELINE storage
+// that OUTLIVES the vkCreate*Pipelines call — then call real Mali. Each returned real pipeline
+// is stored in gen_tables(st).pipelines AND registered with the cmd-log band via
+// cmd_register_pipeline so vkCmdBindPipeline can translate the guest vid. The guest pre-assigned
+// the virtual ids (in pPipelines, monotonic); the host maps vid order == pipes[] order.
+//
+// HANDLE policy: layout MUST resolve (a pipeline with no layout is invalid). renderPass MUST
+// resolve for graphics. basePipeline / pipelineCache are OPTIONAL (0 == VK_NULL_HANDLE).
+// An unresolved required handle fails the whole call (VK_ERROR_INITIALIZATION_FAILED) — never
+// pass a bogus handle to Mali. Mali validation does the rest (e.g. a stage's module must exist).
+
+// Build ONE VkPipelineShaderStageCreateInfo from a wire stage into stable storage. The name
+// string, the specialization map-entry array, the spec data bytes, and the VkSpecializationInfo
+// itself are appended to the provided storage vectors so their addresses stay valid until the
+// vkCreate*Pipelines call returns.
+inline void vk_gen_build_stage(
+    const VkGenPipeStage& ws, VkPipelineShaderStageCreateInfo& out, VkShaderModule real_module,
+    std::vector<std::string>& name_store,
+    std::vector<std::vector<VkSpecializationMapEntry>>& spec_entry_store,
+    std::vector<std::vector<uint8_t>>& spec_data_store,
+    std::vector<VkSpecializationInfo>& spec_info_store) {
+    out = VkPipelineShaderStageCreateInfo{};
+    out.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    out.stage = static_cast<VkShaderStageFlagBits>(ws.stage);
+    out.module = real_module;
+    name_store.push_back(ws.name.empty() ? std::string("main") : ws.name);
+    out.pName = name_store.back().c_str();
+    out.pSpecializationInfo = nullptr;
+    if (ws.has_spec) {
+        std::vector<VkSpecializationMapEntry> entries;
+        entries.reserve(ws.spec_entries.size());
+        for (const auto& me : ws.spec_entries) {
+            VkSpecializationMapEntry e{};
+            e.constantID = me.constantID;
+            e.offset = me.offset;
+            e.size = me.size;
+            entries.push_back(e);
+        }
+        spec_entry_store.push_back(std::move(entries));
+        spec_data_store.push_back(ws.spec_data);
+        VkSpecializationInfo si{};
+        si.mapEntryCount = static_cast<uint32_t>(spec_entry_store.back().size());
+        si.pMapEntries = spec_entry_store.back().empty() ? nullptr
+                                                         : spec_entry_store.back().data();
+        si.dataSize = spec_data_store.back().size();
+        si.pData = spec_data_store.back().empty() ? nullptr : spec_data_store.back().data();
+        spec_info_store.push_back(si);
+        out.pSpecializationInfo = &spec_info_store.back();
+    }
+}
+
+inline VkResult vk_gen_real_create_graphics_pipelines(
+    VkDecodeState& st, uint32_t vdev, uint32_t vpcache,
+    const std::vector<VkGenPipeline>& pipes) {
+    auto dit = st.real_dev.find(vdev);
+    if (dit == st.real_dev.end()) return VK_ERROR_INITIALIZATION_FAILED;
+    VkDevice dev = dit->second.dev;
+    auto& t = gen_tables(st);
+
+    VkPipelineCache cache = VK_NULL_HANDLE;
+    if (vpcache) {
+        auto cit = t.pipeline_caches.find(vpcache);
+        if (cit != t.pipeline_caches.end()) cache = cit->second;  // optional; null if unknown
+    }
+
+    const size_t n = pipes.size();
+    // Per-pipeline stable storage (addresses must outlive the create call). Each pipeline owns
+    // its stage array + the sub-state structs it points pCreateInfo at.
+    std::vector<VkGraphicsPipelineCreateInfo> cis(n);
+    std::vector<std::vector<VkPipelineShaderStageCreateInfo>> stages(n);
+    std::vector<std::string> name_store;
+    std::vector<std::vector<VkSpecializationMapEntry>> spec_entry_store;
+    std::vector<std::vector<uint8_t>> spec_data_store;
+    std::vector<VkSpecializationInfo> spec_info_store;
+    // Reserve so the *_store vectors never reallocate (pointers into them must stay valid).
+    size_t total_stages = 0;
+    for (const auto& p : pipes) total_stages += p.stages.size();
+    name_store.reserve(total_stages);
+    spec_entry_store.reserve(total_stages);
+    spec_data_store.reserve(total_stages);
+    spec_info_store.reserve(total_stages);
+
+    std::vector<VkPipelineVertexInputStateCreateInfo> vi_store(n);
+    std::vector<std::vector<VkVertexInputBindingDescription>> vbind_store(n);
+    std::vector<std::vector<VkVertexInputAttributeDescription>> vattr_store(n);
+    std::vector<VkPipelineInputAssemblyStateCreateInfo> ia_store(n);
+    std::vector<VkPipelineTessellationStateCreateInfo> ts_store(n);
+    std::vector<VkPipelineViewportStateCreateInfo> vp_store(n);
+    std::vector<std::vector<VkViewport>> vps_store(n);
+    std::vector<std::vector<VkRect2D>> scis_store(n);
+    std::vector<VkPipelineRasterizationStateCreateInfo> rs_store(n);
+    std::vector<VkPipelineMultisampleStateCreateInfo> ms_store(n);
+    std::vector<std::vector<VkSampleMask>> mask_store(n);
+    std::vector<VkPipelineDepthStencilStateCreateInfo> ds_store(n);
+    std::vector<VkPipelineColorBlendStateCreateInfo> cb_store(n);
+    std::vector<std::vector<VkPipelineColorBlendAttachmentState>> cba_store(n);
+    std::vector<VkPipelineDynamicStateCreateInfo> dy_store(n);
+    std::vector<std::vector<VkDynamicState>> dyn_store(n);
+
+    for (size_t i = 0; i < n; ++i) {
+        const VkGenPipeline& p = pipes[i];
+        // Required handles: layout + renderPass.
+        auto lit = t.pipeline_layouts.find(p.vlayout);
+        if (lit == t.pipeline_layouts.end()) return VK_ERROR_INITIALIZATION_FAILED;
+        auto rit = t.render_passes.find(p.vrenderpass);
+        if (rit == t.render_passes.end()) return VK_ERROR_INITIALIZATION_FAILED;
+        VkPipeline base = VK_NULL_HANDLE;
+        if (p.vbase) {
+            auto bit = t.pipelines.find(p.vbase);
+            if (bit != t.pipelines.end()) base = bit->second;
+        }
+        // Stages (module handles translated via VkGenTables).
+        stages[i].resize(p.stages.size());
+        for (size_t si = 0; si < p.stages.size(); ++si) {
+            VkShaderModule rm = VK_NULL_HANDLE;
+            auto mit = t.shader_modules.find(p.stages[si].vmodule);
+            if (mit == t.shader_modules.end()) return VK_ERROR_INITIALIZATION_FAILED;
+            rm = mit->second;
+            vk_gen_build_stage(p.stages[si], stages[i][si], rm, name_store, spec_entry_store,
+                               spec_data_store, spec_info_store);
+        }
+        VkGraphicsPipelineCreateInfo& ci = cis[i];
+        ci = VkGraphicsPipelineCreateInfo{};
+        ci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        ci.flags = p.flags;
+        ci.stageCount = static_cast<uint32_t>(stages[i].size());
+        ci.pStages = stages[i].empty() ? nullptr : stages[i].data();
+        ci.layout = lit->second;
+        ci.renderPass = rit->second;
+        ci.subpass = p.subpass;
+        ci.basePipelineHandle = base;
+        ci.basePipelineIndex = p.base_index;
+
+        // Vertex input.
+        if (p.has_vertex_input) {
+            auto& vb = vbind_store[i]; vb.reserve(p.vbindings.size());
+            for (const auto& b : p.vbindings) {
+                VkVertexInputBindingDescription d{};
+                d.binding = b.binding; d.stride = b.stride;
+                d.inputRate = static_cast<VkVertexInputRate>(b.inputRate);
+                vb.push_back(d);
+            }
+            auto& va = vattr_store[i]; va.reserve(p.vattrs.size());
+            for (const auto& at : p.vattrs) {
+                VkVertexInputAttributeDescription d{};
+                d.location = at.location; d.binding = at.binding;
+                d.format = static_cast<VkFormat>(at.format); d.offset = at.offset;
+                va.push_back(d);
+            }
+            VkPipelineVertexInputStateCreateInfo& vi = vi_store[i];
+            vi = VkPipelineVertexInputStateCreateInfo{};
+            vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+            vi.vertexBindingDescriptionCount = static_cast<uint32_t>(vb.size());
+            vi.pVertexBindingDescriptions = vb.empty() ? nullptr : vb.data();
+            vi.vertexAttributeDescriptionCount = static_cast<uint32_t>(va.size());
+            vi.pVertexAttributeDescriptions = va.empty() ? nullptr : va.data();
+            ci.pVertexInputState = &vi;
+        }
+        // Input assembly.
+        if (p.has_input_assembly) {
+            VkPipelineInputAssemblyStateCreateInfo& ia = ia_store[i];
+            ia = VkPipelineInputAssemblyStateCreateInfo{};
+            ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+            ia.topology = static_cast<VkPrimitiveTopology>(p.topology);
+            ia.primitiveRestartEnable = p.primitiveRestartEnable;
+            ci.pInputAssemblyState = &ia;
+        }
+        // Tessellation.
+        if (p.has_tessellation) {
+            VkPipelineTessellationStateCreateInfo& tsi = ts_store[i];
+            tsi = VkPipelineTessellationStateCreateInfo{};
+            tsi.sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO;
+            tsi.patchControlPoints = p.patchControlPoints;
+            ci.pTessellationState = &tsi;
+        }
+        // Viewport (pViewports/pScissors null when dynamic — count without data is valid).
+        if (p.has_viewport) {
+            auto& vps = vps_store[i]; vps.reserve(p.viewports.size());
+            for (const auto& v : p.viewports) {
+                VkViewport vv{}; vv.x = v.x; vv.y = v.y; vv.width = v.w; vv.height = v.h;
+                vv.minDepth = v.minDepth; vv.maxDepth = v.maxDepth; vps.push_back(vv);
+            }
+            auto& sci = scis_store[i]; sci.reserve(p.scissors.size());
+            for (const auto& s : p.scissors) {
+                VkRect2D rr{}; rr.offset.x = s.offX; rr.offset.y = s.offY;
+                rr.extent.width = s.extW; rr.extent.height = s.extH; sci.push_back(rr);
+            }
+            VkPipelineViewportStateCreateInfo& vp = vp_store[i];
+            vp = VkPipelineViewportStateCreateInfo{};
+            vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+            vp.viewportCount = static_cast<uint32_t>(p.viewports.size());
+            vp.pViewports = vps.empty() ? nullptr : vps.data();
+            vp.scissorCount = static_cast<uint32_t>(p.scissors.size());
+            vp.pScissors = sci.empty() ? nullptr : sci.data();
+            ci.pViewportState = &vp;
+        }
+        // Rasterization.
+        if (p.has_rasterization) {
+            VkPipelineRasterizationStateCreateInfo& rs = rs_store[i];
+            rs = VkPipelineRasterizationStateCreateInfo{};
+            rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+            rs.depthClampEnable = p.depthClampEnable;
+            rs.rasterizerDiscardEnable = p.rasterizerDiscardEnable;
+            rs.polygonMode = static_cast<VkPolygonMode>(p.polygonMode);
+            rs.cullMode = p.cullMode;
+            rs.frontFace = static_cast<VkFrontFace>(p.frontFace);
+            rs.depthBiasEnable = p.depthBiasEnable;
+            rs.depthBiasConstantFactor = p.depthBiasConstantFactor;
+            rs.depthBiasClamp = p.depthBiasClamp;
+            rs.depthBiasSlopeFactor = p.depthBiasSlopeFactor;
+            rs.lineWidth = p.lineWidth ? p.lineWidth : 1.0f;
+            ci.pRasterizationState = &rs;
+        }
+        // Multisample (+ optional sample mask).
+        if (p.has_multisample) {
+            auto& mask = mask_store[i];
+            mask.reserve(p.sample_mask.size());
+            for (uint32_t w : p.sample_mask) mask.push_back(static_cast<VkSampleMask>(w));
+            VkPipelineMultisampleStateCreateInfo& ms = ms_store[i];
+            ms = VkPipelineMultisampleStateCreateInfo{};
+            ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+            ms.rasterizationSamples = p.rasterizationSamples
+                ? static_cast<VkSampleCountFlagBits>(p.rasterizationSamples)
+                : VK_SAMPLE_COUNT_1_BIT;
+            ms.sampleShadingEnable = p.sampleShadingEnable;
+            ms.minSampleShading = p.minSampleShading;
+            ms.pSampleMask = mask.empty() ? nullptr : mask.data();
+            ms.alphaToCoverageEnable = p.alphaToCoverageEnable;
+            ms.alphaToOneEnable = p.alphaToOneEnable;
+            ci.pMultisampleState = &ms;
+        }
+        // Depth stencil.
+        if (p.has_depth_stencil) {
+            VkPipelineDepthStencilStateCreateInfo& ds = ds_store[i];
+            ds = VkPipelineDepthStencilStateCreateInfo{};
+            ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+            ds.depthTestEnable = p.depthTestEnable;
+            ds.depthWriteEnable = p.depthWriteEnable;
+            ds.depthCompareOp = static_cast<VkCompareOp>(p.depthCompareOp);
+            ds.depthBoundsTestEnable = p.depthBoundsTestEnable;
+            ds.stencilTestEnable = p.stencilTestEnable;
+            auto to_stencil = [](const VkGenPipeStencilOp& s) {
+                VkStencilOpState o{};
+                o.failOp = static_cast<VkStencilOp>(s.failOp);
+                o.passOp = static_cast<VkStencilOp>(s.passOp);
+                o.depthFailOp = static_cast<VkStencilOp>(s.depthFailOp);
+                o.compareOp = static_cast<VkCompareOp>(s.compareOp);
+                o.compareMask = s.compareMask; o.writeMask = s.writeMask;
+                o.reference = s.reference; return o;
+            };
+            ds.front = to_stencil(p.front);
+            ds.back = to_stencil(p.back);
+            ds.minDepthBounds = p.minDepthBounds;
+            ds.maxDepthBounds = p.maxDepthBounds;
+            ci.pDepthStencilState = &ds;
+        }
+        // Color blend (per-attachment array + blendConstants[4]).
+        if (p.has_color_blend) {
+            auto& cba = cba_store[i]; cba.reserve(p.blend_attachments.size());
+            for (const auto& a : p.blend_attachments) {
+                VkPipelineColorBlendAttachmentState s{};
+                s.blendEnable = a.blendEnable;
+                s.srcColorBlendFactor = static_cast<VkBlendFactor>(a.srcColorBlendFactor);
+                s.dstColorBlendFactor = static_cast<VkBlendFactor>(a.dstColorBlendFactor);
+                s.colorBlendOp = static_cast<VkBlendOp>(a.colorBlendOp);
+                s.srcAlphaBlendFactor = static_cast<VkBlendFactor>(a.srcAlphaBlendFactor);
+                s.dstAlphaBlendFactor = static_cast<VkBlendFactor>(a.dstAlphaBlendFactor);
+                s.alphaBlendOp = static_cast<VkBlendOp>(a.alphaBlendOp);
+                s.colorWriteMask = a.colorWriteMask;
+                cba.push_back(s);
+            }
+            VkPipelineColorBlendStateCreateInfo& cb = cb_store[i];
+            cb = VkPipelineColorBlendStateCreateInfo{};
+            cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+            cb.logicOpEnable = p.logicOpEnable;
+            cb.logicOp = static_cast<VkLogicOp>(p.logicOp);
+            cb.attachmentCount = static_cast<uint32_t>(cba.size());
+            cb.pAttachments = cba.empty() ? nullptr : cba.data();
+            for (int j = 0; j < 4; ++j) cb.blendConstants[j] = p.blendConstants[j];
+            ci.pColorBlendState = &cb;
+        }
+        // Dynamic state.
+        if (p.has_dynamic_state) {
+            auto& dyn = dyn_store[i]; dyn.reserve(p.dynamic_states.size());
+            for (uint32_t d : p.dynamic_states) dyn.push_back(static_cast<VkDynamicState>(d));
+            VkPipelineDynamicStateCreateInfo& dy = dy_store[i];
+            dy = VkPipelineDynamicStateCreateInfo{};
+            dy.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+            dy.dynamicStateCount = static_cast<uint32_t>(dyn.size());
+            dy.pDynamicStates = dyn.empty() ? nullptr : dyn.data();
+            ci.pDynamicState = &dy;
+        }
+    }
+
+    std::vector<VkPipeline> out(n, VK_NULL_HANDLE);
+    VkResult r = vkCreateGraphicsPipelines(dev, cache, static_cast<uint32_t>(n),
+                                           cis.empty() ? nullptr : cis.data(), nullptr,
+                                           out.data());
+    // vkCreateGraphicsPipelines may return a partial-success code (e.g. VK_PIPELINE_COMPILE_
+    // REQUIRED) with some pipelines created and others VK_NULL_HANDLE; register every non-null
+    // pipeline regardless so vkCmdBindPipeline can translate the ones that succeeded. The guest
+    // assigned each a virtual id (pipes[i].vpipe, shipped in the per-pipeline header).
+    for (size_t i = 0; i < n; ++i) {
+        if (out[i] == VK_NULL_HANDLE) continue;
+        t.pipelines[pipes[i].vpipe] = out[i];
+        cmd_register_pipeline(st, pipes[i].vpipe, out[i]);  // so vkCmdBindPipeline can translate it
+    }
+    return r;
+}
+
+inline VkResult vk_gen_real_create_compute_pipelines(
+    VkDecodeState& st, uint32_t vdev, uint32_t vpcache,
+    const std::vector<VkGenPipeline>& pipes) {
+    auto dit = st.real_dev.find(vdev);
+    if (dit == st.real_dev.end()) return VK_ERROR_INITIALIZATION_FAILED;
+    VkDevice dev = dit->second.dev;
+    auto& t = gen_tables(st);
+
+    VkPipelineCache cache = VK_NULL_HANDLE;
+    if (vpcache) {
+        auto cit = t.pipeline_caches.find(vpcache);
+        if (cit != t.pipeline_caches.end()) cache = cit->second;
+    }
+
+    const size_t n = pipes.size();
+    std::vector<VkComputePipelineCreateInfo> cis(n);
+    // Compute carries exactly one stage and no fixed-function state. Stable storage for the
+    // single stage's name/spec, sized to the pipeline count.
+    std::vector<std::string> name_store;
+    std::vector<std::vector<VkSpecializationMapEntry>> spec_entry_store;
+    std::vector<std::vector<uint8_t>> spec_data_store;
+    std::vector<VkSpecializationInfo> spec_info_store;
+    name_store.reserve(n);
+    spec_entry_store.reserve(n);
+    spec_data_store.reserve(n);
+    spec_info_store.reserve(n);
+
+    for (size_t i = 0; i < n; ++i) {
+        const VkGenPipeline& p = pipes[i];
+        auto lit = t.pipeline_layouts.find(p.vlayout);
+        if (lit == t.pipeline_layouts.end()) return VK_ERROR_INITIALIZATION_FAILED;
+        if (p.stages.empty()) return VK_ERROR_INITIALIZATION_FAILED;  // compute needs its stage
+        VkShaderModule rm = VK_NULL_HANDLE;
+        auto mit = t.shader_modules.find(p.stages[0].vmodule);
+        if (mit == t.shader_modules.end()) return VK_ERROR_INITIALIZATION_FAILED;
+        rm = mit->second;
+        VkPipeline base = VK_NULL_HANDLE;
+        if (p.vbase) {
+            auto bit = t.pipelines.find(p.vbase);
+            if (bit != t.pipelines.end()) base = bit->second;
+        }
+        VkComputePipelineCreateInfo& ci = cis[i];
+        ci = VkComputePipelineCreateInfo{};
+        ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        ci.flags = p.flags;
+        vk_gen_build_stage(p.stages[0], ci.stage, rm, name_store, spec_entry_store,
+                           spec_data_store, spec_info_store);
+        ci.layout = lit->second;
+        ci.basePipelineHandle = base;
+        ci.basePipelineIndex = p.base_index;
+    }
+
+    std::vector<VkPipeline> out(n, VK_NULL_HANDLE);
+    VkResult r = vkCreateComputePipelines(dev, cache, static_cast<uint32_t>(n),
+                                          cis.empty() ? nullptr : cis.data(), nullptr,
+                                          out.data());
+    for (size_t i = 0; i < n; ++i) {
+        if (out[i] == VK_NULL_HANDLE) continue;
+        t.pipelines[pipes[i].vpipe] = out[i];
+        cmd_register_pipeline(st, pipes[i].vpipe, out[i]);  // so vkCmdBindPipeline can translate it
+    }
+    return r;
+}
+
+inline void vk_gen_real_destroy_pipeline(VkDecodeState& st, uint32_t vdev, uint32_t vpipe) {
+    auto& t = gen_tables(st);
+    auto it = t.pipelines.find(vpipe);
+    auto dit = st.real_dev.find(vdev);
+    if (it != t.pipelines.end() && dit != st.real_dev.end() && it->second != VK_NULL_HANDLE)
+        vkDestroyPipeline(dit->second.dev, it->second, nullptr);
+    t.pipelines.erase(vpipe);
+    // Drop the cmd-log band's mapping too (best-effort; a stale vid would resolve to a dead
+    // handle otherwise). cmd_register_pipeline with VK_NULL_HANDLE clears it.
+    cmd_register_pipeline(st, vpipe, VK_NULL_HANDLE);
 }
 
 }  // namespace alr::gpu

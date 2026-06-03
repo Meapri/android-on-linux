@@ -54,6 +54,8 @@ struct VkGenTables {
     // WAVE C render-pass / framebuffer handle tables.
     std::map<uint32_t, VkRenderPass> render_passes;     // vrpass   -> real
     std::map<uint32_t, VkFramebuffer> framebuffers;     // vfb      -> real
+    // WAVE D pipeline handle table (graphics + compute share one VkPipeline map).
+    std::map<uint32_t, VkPipeline> pipelines;           // vpipe    -> real
 #endif
     // Arena offset assigned to each device-memory virtual id (HOST_VISIBLE only).
     // UINT64_MAX == not arena-backed (e.g. a DEVICE_LOCAL alloc). Tracked even in
@@ -129,6 +131,67 @@ struct VkGenRpSubpass {
 struct VkGenRpDependency {
     uint32_t srcSubpass = 0, dstSubpass = 0, srcStageMask = 0, dstStageMask = 0;
     uint32_t srcAccessMask = 0, dstAccessMask = 0, dependencyFlags = 0;
+};
+// ---- Pipeline wire PODs (the deep nested create_pipelines structure; WAVE D). The
+// real body rebuilds the typed VkGraphics/ComputePipelineCreateInfo from these,
+// translating the module / layout / renderPass / basePipeline virtual handles via
+// VkGenTables. All-scalar (handles are u32 virtual ids), so no Vulkan headers here.
+struct VkGenPipeSpecEntry { uint32_t constantID = 0, offset = 0, size = 0; };
+struct VkGenPipeStage {
+    uint32_t stage = 0, vmodule = 0;
+    std::string name;                 // entry-point ("main" etc.)
+    bool has_spec = false;
+    std::vector<VkGenPipeSpecEntry> spec_entries;
+    std::vector<uint8_t> spec_data;
+};
+struct VkGenPipeVertexBinding { uint32_t binding = 0, stride = 0, inputRate = 0; };
+struct VkGenPipeVertexAttr { uint32_t location = 0, binding = 0, format = 0, offset = 0; };
+struct VkGenPipeViewport { float x = 0, y = 0, w = 0, h = 0, minDepth = 0, maxDepth = 0; };
+struct VkGenPipeScissor { int32_t offX = 0, offY = 0; uint32_t extW = 0, extH = 0; };
+struct VkGenPipeStencilOp {
+    uint32_t failOp = 0, passOp = 0, depthFailOp = 0, compareOp = 0;
+    uint32_t compareMask = 0, writeMask = 0, reference = 0;
+};
+struct VkGenPipeBlendAttachment {
+    uint32_t blendEnable = 0, srcColorBlendFactor = 0, dstColorBlendFactor = 0;
+    uint32_t colorBlendOp = 0, srcAlphaBlendFactor = 0, dstAlphaBlendFactor = 0;
+    uint32_t alphaBlendOp = 0, colorWriteMask = 0;
+};
+struct VkGenPipeline {
+    uint32_t vpipe = 0;  // the guest's virtual id for this pipeline
+    uint32_t flags = 0, vlayout = 0, vrenderpass = 0, subpass = 0, vbase = 0;
+    int32_t base_index = 0;
+    std::vector<VkGenPipeStage> stages;
+    // Fixed-function sub-states (graphics). has_* mirror the optional CreateInfo ptrs.
+    bool has_vertex_input = false;
+    std::vector<VkGenPipeVertexBinding> vbindings;
+    std::vector<VkGenPipeVertexAttr> vattrs;
+    bool has_input_assembly = false; uint32_t topology = 0, primitiveRestartEnable = 0;
+    bool has_tessellation = false; uint32_t patchControlPoints = 0;
+    bool has_viewport = false;
+    std::vector<VkGenPipeViewport> viewports;
+    std::vector<VkGenPipeScissor> scissors;
+    bool has_rasterization = false;
+    uint32_t depthClampEnable = 0, rasterizerDiscardEnable = 0, polygonMode = 0;
+    uint32_t cullMode = 0, frontFace = 0, depthBiasEnable = 0;
+    float depthBiasConstantFactor = 0, depthBiasClamp = 0, depthBiasSlopeFactor = 0;
+    float lineWidth = 1.0f;
+    bool has_multisample = false;
+    uint32_t rasterizationSamples = 1, sampleShadingEnable = 0;
+    float minSampleShading = 0;
+    uint32_t alphaToCoverageEnable = 0, alphaToOneEnable = 0;
+    std::vector<uint32_t> sample_mask;
+    bool has_depth_stencil = false;
+    uint32_t depthTestEnable = 0, depthWriteEnable = 0, depthCompareOp = 0;
+    uint32_t depthBoundsTestEnable = 0, stencilTestEnable = 0;
+    VkGenPipeStencilOp front{}, back{};
+    float minDepthBounds = 0, maxDepthBounds = 0;
+    bool has_color_blend = false;
+    uint32_t logicOpEnable = 0, logicOp = 0;
+    float blendConstants[4] = {0, 0, 0, 0};
+    std::vector<VkGenPipeBlendAttachment> blend_attachments;
+    bool has_dynamic_state = false;
+    std::vector<uint32_t> dynamic_states;
 };
 
 }  // namespace alr::gpu (block 1)
@@ -1325,6 +1388,239 @@ inline bool decode_vk_gen_op(uint8_t op, VkReader& r, VkDecodeState& st,
 #endif
             if (gp && gp->destroy_handle)
                 gp->destroy_handle(gp->ctx, ALR_VK_GEN_OP_DESTROY_FRAMEBUFFER, vdev, vhandle);
+            st.decoded++;
+            return true;
+        }
+        case ALR_VK_GEN_OP_CREATE_GRAPHICS_PIPELINES: {  // vkCreateGraphicsPipelines
+            uint32_t vdev = 0, vpcache = 0, pipeline_count = 0;
+            if (!r.u32(vdev) || !r.u32(vpcache) || !r.u32(pipeline_count)) {
+                st.ok = false; return true; }
+            if (pipeline_count > 4096) { st.ok = false; return true; }
+            std::vector<VkGenPipeline> pipes; pipes.reserve(pipeline_count);
+            for (uint32_t pi = 0; pi < pipeline_count; ++pi) {
+                VkGenPipeline p{};
+                uint32_t stage_count = 0;
+                if (!r.u32(p.vpipe) || !r.u32(p.flags) || !r.u32(p.vlayout) ||
+                    !r.u32(p.vrenderpass) || !r.u32(p.subpass) || !r.u32(p.vbase) ||
+                    !r.i32(p.base_index) || !r.u32(stage_count)) { st.ok = false; return true; }
+                if (stage_count > 4096) { st.ok = false; return true; }
+                p.stages.reserve(stage_count);
+                for (uint32_t si = 0; si < stage_count; ++si) {
+                    VkGenPipeStage s{};
+                    const uint8_t* nm = nullptr; uint32_t nlen = 0; uint32_t spec_present = 0;
+                    if (!r.u32(s.stage) || !r.u32(s.vmodule) || !r.blob(nm, nlen) ||
+                        !r.u32(spec_present)) { st.ok = false; return true; }
+                    if (nlen > 4096) { st.ok = false; return true; }
+                    s.name.assign(reinterpret_cast<const char*>(nm), nlen);
+                    if (spec_present) {
+                        s.has_spec = true;
+                        uint32_t me_count = 0, data_len = 0;
+                        if (!r.u32(me_count) || !r.u32(data_len)) { st.ok = false; return true; }
+                        if (me_count > 4096 || data_len > 1048576) {
+                            st.ok = false; return true; }
+                        s.spec_entries.reserve(me_count);
+                        for (uint32_t mi = 0; mi < me_count; ++mi) {
+                            VkGenPipeSpecEntry me{};
+                            if (!r.u32(me.constantID) || !r.u32(me.offset) || !r.u32(me.size)) {
+                                st.ok = false; return true; }
+                            s.spec_entries.push_back(me);
+                        }
+                        const uint8_t* sd = nullptr; uint32_t sdl = 0;
+                        if (!r.blob(sd, sdl) || sdl != data_len) { st.ok = false; return true; }
+                        s.spec_data.assign(sd, sd + sdl);
+                    }
+                    p.stages.push_back(std::move(s));
+                }
+                // ---- fixed-function sub-states (graphics), each behind a presence flag ----
+                uint32_t present = 0;
+                // vertex input
+                if (!r.u32(present)) { st.ok = false; return true; }
+                if (present) { p.has_vertex_input = true;
+                    uint32_t bc = 0, ac = 0;
+                    if (!r.u32(bc) || !r.u32(ac)) { st.ok = false; return true; }
+                    if (bc > 4096 || ac > 4096) { st.ok = false; return true; }
+                    p.vbindings.reserve(bc);
+                    for (uint32_t i = 0; i < bc; ++i) { VkGenPipeVertexBinding b{};
+                        if (!r.u32(b.binding) || !r.u32(b.stride) || !r.u32(b.inputRate)) {
+                            st.ok = false; return true; } p.vbindings.push_back(b); }
+                    p.vattrs.reserve(ac);
+                    for (uint32_t i = 0; i < ac; ++i) { VkGenPipeVertexAttr at{};
+                        if (!r.u32(at.location) || !r.u32(at.binding) || !r.u32(at.format) ||
+                            !r.u32(at.offset)) { st.ok = false; return true; } p.vattrs.push_back(at); }
+                }
+                // input assembly
+                if (!r.u32(present)) { st.ok = false; return true; }
+                if (present) { p.has_input_assembly = true;
+                    if (!r.u32(p.topology) || !r.u32(p.primitiveRestartEnable)) {
+                        st.ok = false; return true; } }
+                // tessellation
+                if (!r.u32(present)) { st.ok = false; return true; }
+                if (present) { p.has_tessellation = true;
+                    if (!r.u32(p.patchControlPoints)) { st.ok = false; return true; } }
+                // viewport
+                if (!r.u32(present)) { st.ok = false; return true; }
+                if (present) { p.has_viewport = true;
+                    uint32_t vc = 0, sc = 0;
+                    if (!r.u32(vc) || !r.u32(sc)) { st.ok = false; return true; }
+                    if (vc > 4096 || sc > 4096) { st.ok = false; return true; }
+                    p.viewports.reserve(vc);
+                    for (uint32_t i = 0; i < vc; ++i) { VkGenPipeViewport v{};
+                        if (!r.f32(v.x) || !r.f32(v.y) || !r.f32(v.w) || !r.f32(v.h) ||
+                            !r.f32(v.minDepth) || !r.f32(v.maxDepth)) { st.ok = false; return true; }
+                        p.viewports.push_back(v); }
+                    p.scissors.reserve(sc);
+                    for (uint32_t i = 0; i < sc; ++i) { VkGenPipeScissor s{};
+                        if (!r.i32(s.offX) || !r.i32(s.offY) || !r.u32(s.extW) || !r.u32(s.extH)) {
+                            st.ok = false; return true; } p.scissors.push_back(s); }
+                }
+                // rasterization
+                if (!r.u32(present)) { st.ok = false; return true; }
+                if (present) { p.has_rasterization = true;
+                    if (!r.u32(p.depthClampEnable) || !r.u32(p.rasterizerDiscardEnable) ||
+                        !r.u32(p.polygonMode) || !r.u32(p.cullMode) || !r.u32(p.frontFace) ||
+                        !r.u32(p.depthBiasEnable) || !r.f32(p.depthBiasConstantFactor) ||
+                        !r.f32(p.depthBiasClamp) || !r.f32(p.depthBiasSlopeFactor) ||
+                        !r.f32(p.lineWidth)) { st.ok = false; return true; } }
+                // multisample
+                if (!r.u32(present)) { st.ok = false; return true; }
+                if (present) { p.has_multisample = true;
+                    uint32_t mask_words = 0;
+                    if (!r.u32(p.rasterizationSamples) || !r.u32(p.sampleShadingEnable) ||
+                        !r.f32(p.minSampleShading) || !r.u32(mask_words) ||
+                        !r.u32(p.alphaToCoverageEnable) || !r.u32(p.alphaToOneEnable)) {
+                        st.ok = false; return true; }
+                    if (mask_words > 4096) { st.ok = false; return true; }
+                    p.sample_mask.reserve(mask_words);
+                    for (uint32_t i = 0; i < mask_words; ++i) { uint32_t w = 0;
+                        if (!r.u32(w)) { st.ok = false; return true; } p.sample_mask.push_back(w); } }
+                // depth stencil
+                if (!r.u32(present)) { st.ok = false; return true; }
+                if (present) { p.has_depth_stencil = true;
+                    if (!r.u32(p.depthTestEnable) || !r.u32(p.depthWriteEnable) ||
+                        !r.u32(p.depthCompareOp) || !r.u32(p.depthBoundsTestEnable) ||
+                        !r.u32(p.stencilTestEnable) || !r.f32(p.minDepthBounds) ||
+                        !r.f32(p.maxDepthBounds)) { st.ok = false; return true; }
+                    auto rd_stencil = [&](VkGenPipeStencilOp& so) -> bool {
+                        return r.u32(so.failOp) && r.u32(so.passOp) && r.u32(so.depthFailOp) &&
+                               r.u32(so.compareOp) && r.u32(so.compareMask) &&
+                               r.u32(so.writeMask) && r.u32(so.reference); };
+                    if (!rd_stencil(p.front) || !rd_stencil(p.back)) { st.ok = false; return true; } }
+                // color blend
+                if (!r.u32(present)) { st.ok = false; return true; }
+                if (present) { p.has_color_blend = true;
+                    uint32_t att = 0;
+                    if (!r.u32(p.logicOpEnable) || !r.u32(p.logicOp) || !r.u32(att) ||
+                        !r.f32(p.blendConstants[0]) || !r.f32(p.blendConstants[1]) ||
+                        !r.f32(p.blendConstants[2]) || !r.f32(p.blendConstants[3])) {
+                        st.ok = false; return true; }
+                    if (att > 4096) { st.ok = false; return true; }
+                    p.blend_attachments.reserve(att);
+                    for (uint32_t i = 0; i < att; ++i) { VkGenPipeBlendAttachment ba{};
+                        if (!r.u32(ba.blendEnable) || !r.u32(ba.srcColorBlendFactor) ||
+                            !r.u32(ba.dstColorBlendFactor) || !r.u32(ba.colorBlendOp) ||
+                            !r.u32(ba.srcAlphaBlendFactor) || !r.u32(ba.dstAlphaBlendFactor) ||
+                            !r.u32(ba.alphaBlendOp) || !r.u32(ba.colorWriteMask)) {
+                            st.ok = false; return true; } p.blend_attachments.push_back(ba); } }
+                // dynamic state
+                if (!r.u32(present)) { st.ok = false; return true; }
+                if (present) { p.has_dynamic_state = true;
+                    uint32_t dc = 0;
+                    if (!r.u32(dc)) { st.ok = false; return true; }
+                    if (dc > 4096) { st.ok = false; return true; }
+                    p.dynamic_states.reserve(dc);
+                    for (uint32_t i = 0; i < dc; ++i) { uint32_t d = 0;
+                        if (!r.u32(d)) { st.ok = false; return true; } p.dynamic_states.push_back(d); } }
+                pipes.push_back(std::move(p));
+            }
+            (void)vpcache;
+            int res = -1;
+#ifdef ALR_VK_DECODE_REAL
+            if (!gp) {
+                res = static_cast<int>(vk_gen_real_create_graphics_pipelines(st, vdev, vpcache, pipes));
+            }
+#endif
+            if (gp && gp->create_handle)
+                res = gp->create_handle(gp->ctx, ALR_VK_GEN_OP_CREATE_GRAPHICS_PIPELINES, vdev,
+                                        pipeline_count ? pipes[0].flags : 0,
+                                        pipeline_count, vpcache);
+            reply.u8(static_cast<uint8_t>(ALR_VK_REPLY_GEN_ESCAPE));
+            reply.u16(static_cast<uint16_t>(ALR_VK_GEN_REPLY_CREATE_GRAPHICS_PIPELINES));
+            reply.u32(pipeline_count);
+            reply.i32(res);
+            st.decoded++;
+            return true;
+        }
+        case ALR_VK_GEN_OP_CREATE_COMPUTE_PIPELINES: {  // vkCreateComputePipelines
+            uint32_t vdev = 0, vpcache = 0, pipeline_count = 0;
+            if (!r.u32(vdev) || !r.u32(vpcache) || !r.u32(pipeline_count)) {
+                st.ok = false; return true; }
+            if (pipeline_count > 4096) { st.ok = false; return true; }
+            std::vector<VkGenPipeline> pipes; pipes.reserve(pipeline_count);
+            for (uint32_t pi = 0; pi < pipeline_count; ++pi) {
+                VkGenPipeline p{};
+                uint32_t stage_count = 0;
+                if (!r.u32(p.vpipe) || !r.u32(p.flags) || !r.u32(p.vlayout) ||
+                    !r.u32(p.vrenderpass) || !r.u32(p.subpass) || !r.u32(p.vbase) ||
+                    !r.i32(p.base_index) || !r.u32(stage_count)) { st.ok = false; return true; }
+                if (stage_count > 4096) { st.ok = false; return true; }
+                p.stages.reserve(stage_count);
+                for (uint32_t si = 0; si < stage_count; ++si) {
+                    VkGenPipeStage s{};
+                    const uint8_t* nm = nullptr; uint32_t nlen = 0; uint32_t spec_present = 0;
+                    if (!r.u32(s.stage) || !r.u32(s.vmodule) || !r.blob(nm, nlen) ||
+                        !r.u32(spec_present)) { st.ok = false; return true; }
+                    if (nlen > 4096) { st.ok = false; return true; }
+                    s.name.assign(reinterpret_cast<const char*>(nm), nlen);
+                    if (spec_present) {
+                        s.has_spec = true;
+                        uint32_t me_count = 0, data_len = 0;
+                        if (!r.u32(me_count) || !r.u32(data_len)) { st.ok = false; return true; }
+                        if (me_count > 4096 || data_len > 1048576) {
+                            st.ok = false; return true; }
+                        s.spec_entries.reserve(me_count);
+                        for (uint32_t mi = 0; mi < me_count; ++mi) {
+                            VkGenPipeSpecEntry me{};
+                            if (!r.u32(me.constantID) || !r.u32(me.offset) || !r.u32(me.size)) {
+                                st.ok = false; return true; }
+                            s.spec_entries.push_back(me);
+                        }
+                        const uint8_t* sd = nullptr; uint32_t sdl = 0;
+                        if (!r.blob(sd, sdl) || sdl != data_len) { st.ok = false; return true; }
+                        s.spec_data.assign(sd, sd + sdl);
+                    }
+                    p.stages.push_back(std::move(s));
+                }
+                pipes.push_back(std::move(p));
+            }
+            (void)vpcache;
+            int res = -1;
+#ifdef ALR_VK_DECODE_REAL
+            if (!gp) {
+                res = static_cast<int>(vk_gen_real_create_compute_pipelines(st, vdev, vpcache, pipes));
+            }
+#endif
+            if (gp && gp->create_handle)
+                res = gp->create_handle(gp->ctx, ALR_VK_GEN_OP_CREATE_COMPUTE_PIPELINES, vdev,
+                                        pipeline_count ? pipes[0].flags : 0,
+                                        pipeline_count, vpcache);
+            reply.u8(static_cast<uint8_t>(ALR_VK_REPLY_GEN_ESCAPE));
+            reply.u16(static_cast<uint16_t>(ALR_VK_GEN_REPLY_CREATE_COMPUTE_PIPELINES));
+            reply.u32(pipeline_count);
+            reply.i32(res);
+            st.decoded++;
+            return true;
+        }
+        case ALR_VK_GEN_OP_DESTROY_PIPELINE: {  // vkDestroyPipeline
+            uint32_t vdev = 0, vhandle = 0;
+            if (!r.u32(vdev) || !r.u32(vhandle)) { st.ok = false; return true; }
+            (void)vdev;
+#ifdef ALR_VK_DECODE_REAL
+            if (!gp) {
+                vk_gen_real_destroy_pipeline(st, vdev, vhandle);
+            }
+#endif
+            if (gp && gp->destroy_handle)
+                gp->destroy_handle(gp->ctx, ALR_VK_GEN_OP_DESTROY_PIPELINE, vdev, vhandle);
             st.decoded++;
             return true;
         }

@@ -51,6 +51,22 @@ def _cxx():
     return None
 
 
+def _ndk_clangxx():
+    """The arm64-android clang++ from the pinned NDK (the device build's compiler), or None.
+    Used to type-check the ALR_VK_DECODE_REAL-gated real-Mali bodies against the NDK Vulkan
+    headers (Mali libvulkan isn't on the host, so compile-only, no link)."""
+    candidates = []
+    home = Path.home()
+    for base in (home / "Library/Android/sdk/ndk", home / "Android/Sdk/ndk",
+                 Path(os.environ["ANDROID_NDK_HOME"]) if os.environ.get("ANDROID_NDK_HOME")
+                 else None):
+        if base and base.exists():
+            candidates += list(base.glob(
+                "*/toolchains/llvm/prebuilt/*/bin/aarch64-linux-android*-clang++"))
+    candidates = sorted(candidates)
+    return str(candidates[-1]) if candidates else None
+
+
 def test_tool_and_registry_present():
     assert TOOL.exists(), "codegen tool missing"
     assert VK_XML.exists(), "vendored vk.xml missing"
@@ -140,3 +156,70 @@ def test_generated_wire_roundtrip_passes():
     assert run.returncode == 0 and "ALL PASS" in run.stdout, \
         f"generated wire test failed:\n{run.stdout}\n{run.stderr}"
     out.unlink(missing_ok=True)
+
+
+def test_pipeline_create_forwards_wired():
+    # WAVE D — the pipeline create-forwards (the last major create entrypoints ANGLE needs to
+    # render). The generated band ships graphics + compute pipeline creates + a pipeline destroy.
+    proto = GEN_PROTO.read_text()
+    for op in ("ALR_VK_GEN_OP_CREATE_GRAPHICS_PIPELINES",
+               "ALR_VK_GEN_OP_CREATE_COMPUTE_PIPELINES", "ALR_VK_GEN_OP_DESTROY_PIPELINE"):
+        assert op in proto, f"{op} missing from the generated proto"
+    icd = GEN_ICD.read_text()
+    for name in ("vkCreateGraphicsPipelines", "vkCreateComputePipelines", "vkDestroyPipeline"):
+        assert f'ALR_ENTRY("{name}"' in icd, f"{name} not wired into the ICD table"
+    # The heaviest CreateInfo's nested state must be marshalled (spot-check the sub-state
+    # encoders the graphics ICD function drives).
+    for enc in ("_stage_spec_entry", "_vertex_attr", "_viewport_elem", "_blend_attachment",
+                "_dynamic_elem", "_stencil_op"):
+        assert enc in proto, f"graphics pipeline sub-state encoder {enc} missing"
+
+
+def test_pipeline_real_body_wires_cmd_register_pipeline():
+    # The documented-missing SEAM CALLER: the hand-written real bodies, AFTER the real Mali
+    # vkCreate{Graphics,Compute}Pipelines returns the pipeline handle(s), call
+    # cmd_register_pipeline so vkCmdBindPipeline can translate the vid. This is the composition
+    # seam with the cmd-log band (alr_gpu_vk_cmdlog_real.hpp declares cmd_register_pipeline).
+    real = GEN_REAL.read_text()
+    assert "vk_gen_real_create_graphics_pipelines" in real
+    assert "vk_gen_real_create_compute_pipelines" in real
+    assert real.count("cmd_register_pipeline(st,") >= 2, (
+        "both pipeline real bodies must register each created pipeline via cmd_register_pipeline")
+    # Handles are translated via VkGenTables (module / layout / renderPass), never passed raw.
+    assert "shader_modules.find" in real and "pipeline_layouts.find" in real
+    assert "render_passes.find" in real
+
+
+def test_real_mali_pipeline_body_compiles_against_ndk_vulkan():
+    """The real-Mali pipeline create bodies (vk_gen_real_create_{graphics,compute}_pipelines +
+    vk_gen_real_destroy_pipeline) MUST type-check against the NDK <vulkan/vulkan.h> with the
+    device build's own arm64-android clang. These bodies are ALR_VK_DECODE_REAL-gated (absent
+    from the SDK-free host wire test), so this is THE syntax-verify of the deep nested-state
+    reconstruction. Mali libvulkan isn't on the host -> compile-only (-c), no link."""
+    clang = _ndk_clangxx()
+    if clang is None:
+        pytest.skip("no NDK arm64 clang++ found (set ANDROID_NDK_HOME)")
+    src = ROOT / "build" / "gen_real_pipe_probe.cpp"
+    src.parent.mkdir(exist_ok=True)
+    src.write_text(
+        "#define ALR_VK_DECODE_REAL 1\n"
+        # cmdlog_real.hpp defines the cmd_register_pipeline seam the bodies call.
+        '#include "alr_gpu/alr_gpu_vk_cmdlog_real.hpp"\n'
+        '#include "alr_gpu/generated/alr_gpu_vk_gen_decode.hpp"\n'
+        "using namespace alr::gpu;\n"
+        "void force_pipe(VkDecodeState& st, uint32_t vdev, uint32_t vpcache,\n"
+        "                const std::vector<VkGenPipeline>& pipes) {\n"
+        "    (void)vk_gen_real_create_graphics_pipelines(st, vdev, vpcache, pipes);\n"
+        "    (void)vk_gen_real_create_compute_pipelines(st, vdev, vpcache, pipes);\n"
+        "    vk_gen_real_destroy_pipeline(st, vdev, 5);\n"
+        "}\n")
+    obj = ROOT / "build" / "gen_real_pipe_probe.o"
+    comp = subprocess.run(
+        [clang, "-std=c++20", "-Wall", "-Wextra", "-Werror", "-c",
+         "-Iapp/src/main/cpp", str(src), "-o", str(obj)],
+        capture_output=True, text=True, cwd=str(ROOT))
+    assert comp.returncode == 0, (
+        "real-Mali pipeline create bodies do NOT compile against the NDK Vulkan headers:\n"
+        f"{comp.stderr}")
+    obj.unlink(missing_ok=True)
+    src.unlink(missing_ok=True)

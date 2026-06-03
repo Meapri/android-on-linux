@@ -290,9 +290,126 @@ int main() {
         check(!bok, "escape with unknown sub-opcode fails cleanly");
     }
 
+    // 7) WAVE D — the DEEPEST create: vkCreateGraphicsPipelines + vkCreateComputePipelines +
+    //    vkDestroyPipeline through the escape band. A graphics pipeline with one vertex stage
+    //    (+ a specialization-info: map entries + a data blob) and one fragment stage, then the
+    //    full fixed-function chain — vertex input (a binding + an attr), input assembly,
+    //    viewport (1 vp + 1 scissor), rasterization, multisample (+ a sample-mask word),
+    //    depth-stencil (front+back), color blend (1 attachment), dynamic state (2 states) —
+    //    with tessellation ABSENT (present=0). This exercises the lock-step nested decode end
+    //    to end (a wrong byte count anywhere desyncs + fails). The synthetic provider answers
+    //    via create_handle; the reply carries { pipeline_count, result }.
+    {
+        const uint32_t kVdev2 = 1001, kVgfx = 6000, kVcomp = 6001, kVlayout = 5000,
+                       kVrpass = 4000, kVmod = 2000, kVpcache2 = 3500;
+        std::vector<uint8_t> preq(4096);
+        AlrVkEncoder pe;
+        alr_vk_enc_init(&pe, preq.data(), static_cast<uint32_t>(preq.size()));
+        // ---- graphics ----
+        alr_vk_enc_gen_create_graphics_pipelines_begin(&pe, kVdev2, kVpcache2, /*count=*/1u);
+        alr_vk_enc_gen_create_graphics_pipelines_pipeline(&pe, kVgfx, /*flags=*/0u, kVlayout,
+                                                          kVrpass, /*subpass=*/0u, /*vbase=*/0u,
+                                                          /*base_index=*/-1, /*stage_count=*/2u);
+        // vertex stage with a specialization-info (2 map entries + 8 data bytes)
+        const char* vname = "main";
+        alr_vk_enc_gen_create_graphics_pipelines_stage(&pe, /*VERTEX=*/0x1u, kVmod, vname,
+                                                       (uint32_t)std::strlen(vname),
+                                                       /*spec_present=*/1u);
+        alr_vk_enc_gen_create_graphics_pipelines_stage_spec_begin(&pe, /*map_entries=*/2u,
+                                                                  /*data_len=*/8u);
+        alr_vk_enc_gen_create_graphics_pipelines_stage_spec_entry(&pe, /*id=*/0u, /*off=*/0u, /*sz=*/4u);
+        alr_vk_enc_gen_create_graphics_pipelines_stage_spec_entry(&pe, /*id=*/1u, /*off=*/4u, /*sz=*/4u);
+        const uint8_t spec_bytes[8] = {1, 0, 0, 0, 2, 0, 0, 0};
+        alr_vk_enc_gen_create_graphics_pipelines_stage_spec_data(&pe, spec_bytes, 8u);
+        // fragment stage, no spec
+        const char* fname = "main";
+        alr_vk_enc_gen_create_graphics_pipelines_stage(&pe, /*FRAGMENT=*/0x10u, kVmod, fname,
+                                                       (uint32_t)std::strlen(fname),
+                                                       /*spec_present=*/0u);
+        // fixed-function chain
+        alr_vk_enc_gen_create_graphics_pipelines_vertex_input(&pe, /*present=*/1u, /*bind=*/1u, /*attr=*/1u);
+        alr_vk_enc_gen_create_graphics_pipelines_vertex_binding(&pe, /*binding=*/0u, /*stride=*/16u, /*rate=*/0u);
+        alr_vk_enc_gen_create_graphics_pipelines_vertex_attr(&pe, /*loc=*/0u, /*bind=*/0u, /*fmt=*/103u, /*off=*/0u);
+        alr_vk_enc_gen_create_graphics_pipelines_input_assembly(&pe, /*present=*/1u, /*topology=*/3u, /*restart=*/0u);
+        alr_vk_enc_gen_create_graphics_pipelines_tessellation(&pe, /*present=*/0u, 0u);  // ABSENT
+        alr_vk_enc_gen_create_graphics_pipelines_viewport(&pe, /*present=*/1u, /*vp=*/1u, /*sc=*/1u);
+        alr_vk_enc_gen_create_graphics_pipelines_viewport_elem(&pe, 0.f, 0.f, 1920.f, 1080.f, 0.f, 1.f);
+        alr_vk_enc_gen_create_graphics_pipelines_scissor_elem(&pe, 0, 0, 1920u, 1080u);
+        alr_vk_enc_gen_create_graphics_pipelines_rasterization(&pe, /*present=*/1u, 0u, 0u, /*fill=*/0u,
+                                                               /*cull=*/2u, /*ccw=*/1u, 0u, 0.f, 0.f, 0.f, 1.f);
+        alr_vk_enc_gen_create_graphics_pipelines_multisample(&pe, /*present=*/1u, /*samples=*/1u, 0u, 0.f,
+                                                             /*mask_words=*/1u, 0u, 0u);
+        alr_vk_enc_gen_create_graphics_pipelines_sample_mask(&pe, 0xFFFFFFFFu);
+        alr_vk_enc_gen_create_graphics_pipelines_depth_stencil(&pe, /*present=*/1u, 1u, 1u, /*LE=*/3u, 0u, 0u, 0.f, 1.f);
+        alr_vk_enc_gen_create_graphics_pipelines_stencil_op(&pe, 0u, 0u, 0u, 0u, 0u, 0u, 0u);  // front
+        alr_vk_enc_gen_create_graphics_pipelines_stencil_op(&pe, 0u, 0u, 0u, 0u, 0u, 0u, 0u);  // back
+        alr_vk_enc_gen_create_graphics_pipelines_color_blend(&pe, /*present=*/1u, 0u, 0u, /*att=*/1u, 0.f, 0.f, 0.f, 0.f);
+        alr_vk_enc_gen_create_graphics_pipelines_blend_attachment(&pe, 0u, 0u, 0u, 0u, 0u, 0u, 0u, /*RGBA=*/0xFu);
+        alr_vk_enc_gen_create_graphics_pipelines_dynamic_state(&pe, /*present=*/1u, /*count=*/2u);
+        alr_vk_enc_gen_create_graphics_pipelines_dynamic_elem(&pe, /*VIEWPORT=*/0u);
+        alr_vk_enc_gen_create_graphics_pipelines_dynamic_elem(&pe, /*SCISSOR=*/1u);
+        // ---- compute (single stage, no fixed-function) ----
+        alr_vk_enc_gen_create_compute_pipelines_begin(&pe, kVdev2, /*vpcache=*/0u, /*count=*/1u);
+        alr_vk_enc_gen_create_compute_pipelines_pipeline(&pe, kVcomp, /*flags=*/0u, kVlayout,
+                                                         /*vrpass=*/0u, /*subpass=*/0u, /*vbase=*/0u,
+                                                         /*base_index=*/-1, /*stage_count=*/1u);
+        const char* cname = "main";
+        alr_vk_enc_gen_create_compute_pipelines_stage(&pe, /*COMPUTE=*/0x20u, kVmod, cname,
+                                                      (uint32_t)std::strlen(cname), /*spec_present=*/0u);
+        // ---- destroy both ----
+        alr_vk_enc_gen_destroy_pipeline(&pe, kVdev2, kVgfx);
+        alr_vk_enc_gen_destroy_pipeline(&pe, kVdev2, kVcomp);
+        alr_vk_enc_u8(&pe, static_cast<uint8_t>(ALR_VK_OP_END));
+        check(!pe.overflow, "pipeline batch encodes within buffer");
+
+        SynthGen syn2;
+        VkGenProvider gp2 = syn2.as_provider();
+        set_vk_gen_provider(&gp2);
+        VkDecodeState pst;
+        VkReplyEncoder preply;
+        const bool pok = decode_vk_batch(preq.data(), pe.len, pst, preply, nullptr);
+        set_vk_gen_provider(nullptr);
+        check(pok, "decode_vk_batch (graphics+compute pipelines, deep nested) ok");
+        // 2 creates + 2 destroys = 4 generated ops dispatched.
+        check(pst.decoded == 4, "4 pipeline ops dispatched through the escape");
+        check(syn2.destroyed == 2, "2 pipeline destroys dispatched");
+        // The reply stream carries one { pipeline_count=1, result=0 } per create.
+        VkReader pr(preply.bytes().data(), preply.bytes().size());
+        int pipe_replies = 0;
+        for (;;) {
+            uint8_t op = 0;
+            if (!pr.u8(op) || op == ALR_VK_REPLY_END) break;
+            check(op == ALR_VK_REPLY_GEN_ESCAPE, "pipeline reply rides the gen escape");
+            uint16_t sub = 0; uint32_t cnt = 0; int32_t res = 0;
+            if (!pr.u16(sub) || !pr.u32(cnt) || !pr.i32(res)) { check(false, "pipeline reply truncated"); break; }
+            check(sub == ALR_VK_GEN_REPLY_CREATE_GRAPHICS_PIPELINES ||
+                  sub == ALR_VK_GEN_REPLY_CREATE_COMPUTE_PIPELINES, "pipeline reply sub-op");
+            check(cnt == 1 && res == 0, "pipeline create reply: count=1 result=0");
+            ++pipe_replies;
+        }
+        check(pipe_replies == 2, "both pipeline creates replied");
+    }
+
+    // 8) Pipeline lock-step desync: a graphics _pipeline that promises 1 stage but is then
+    //    truncated mid-stage must fail-stop (proves the nested reader is bounded, not trusting).
+    {
+        std::vector<uint8_t> bad(64, 0);
+        AlrVkEncoder be;
+        alr_vk_enc_init(&be, bad.data(), static_cast<uint32_t>(bad.size()));
+        alr_vk_enc_gen_create_graphics_pipelines_begin(&be, 1u, 0u, /*count=*/1u);
+        alr_vk_enc_gen_create_graphics_pipelines_pipeline(&be, 7u, 0u, 5u, 4u, 0u, 0u, -1, /*stages=*/1u);
+        // ...and stop: no stage bytes follow. The decode must not over-read.
+        bad.resize(be.len);
+        VkDecodeState st4;
+        VkReplyEncoder reply4;
+        const bool bok = decode_vk_batch(bad.data(), bad.size(), st4, reply4, nullptr);
+        check(!bok, "truncated pipeline stage fails cleanly (bounded nested read)");
+    }
+
     if (failures == 0) {
-        printf("native_vk_gen_passthrough_test: ALL PASS (generated first render batch: "
-               "pool+memory(arena)+buffer+image+view marshalling through the escape band)\n");
+        printf("native_vk_gen_passthrough_test: ALL PASS (generated render batch: "
+               "pool+memory(arena)+buffer+image+view + the deep-nested graphics/compute "
+               "pipeline create-forwards, all marshalled through the escape band)\n");
         return 0;
     }
     printf("native_vk_gen_passthrough_test: %d FAILURE(S)\n", failures);
