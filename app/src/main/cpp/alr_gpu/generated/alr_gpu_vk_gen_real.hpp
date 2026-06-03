@@ -44,6 +44,23 @@ namespace alr::gpu {
 struct VkGenTables;
 VkGenTables& gen_tables(VkDecodeState& st);
 
+// Forward decls for the cmd-log band's registration seam (defined inline in
+// alr_gpu_vk_cmdlog_real.hpp). The vkCmd* command-recording replay keeps its OWN
+// vid->real-handle tables (VkCmdTables / cmd_tables(st)) because the handle kinds it
+// references — pipeline layout / descriptor set / render pass / framebuffer — live in
+// DIFFERENTLY-NAMED maps in VkGenTables, so the cmd band can't share them directly. Each
+// create-resource real body below therefore mirrors its freshly created real handle into the
+// cmd band by calling cmd_register_*(). Both this header (via gen_decode.hpp) and
+// cmdlog_real.hpp are pulled into the SAME on-device TU (alr_gpu_vk_host_service.hpp), so
+// these inline definitions resolve at link time; a forward decl here avoids an include cycle
+// (cmdlog_real.hpp -> gen_decode.hpp -> this file). NOTE: cmd_register_pipeline has no caller
+// yet — graphics/compute pipeline create-forwards are still deferred (wave-8); it is wired
+// the moment that create body lands.
+inline void cmd_register_layout(VkDecodeState& st, uint32_t vid, VkPipelineLayout h);
+inline void cmd_register_descset(VkDecodeState& st, uint32_t vid, VkDescriptorSet h);
+inline void cmd_register_renderpass(VkDecodeState& st, uint32_t vid, VkRenderPass h);
+inline void cmd_register_framebuffer(VkDecodeState& st, uint32_t vid, VkFramebuffer h);
+
 // ---- allowlisted pNext relink (mirrors vk_real_create_device2's chain rebuild). Each
 // struct begins with { VkStructureType sType; void* pNext; }; we keep only KNOWN sTypes
 // and relink them, so a malformed/unknown sType from the wire can never make the driver
@@ -681,7 +698,10 @@ inline VkResult vk_gen_real_create_pipeline_layout(
     ci.pPushConstantRanges = ranges.empty() ? nullptr : ranges.data();
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkResult r = vkCreatePipelineLayout(dit->second.dev, &ci, nullptr, &layout);
-    if (r == VK_SUCCESS) gen_tables(st).pipeline_layouts[vplayout] = layout;
+    if (r == VK_SUCCESS) {
+        gen_tables(st).pipeline_layouts[vplayout] = layout;
+        cmd_register_layout(st, vplayout, layout);  // so vkCmd{BindDescriptorSets,PushConstants} can translate it
+    }
     return r;
 }
 
@@ -768,8 +788,10 @@ inline VkResult vk_gen_real_allocate_descriptor_sets(
     std::vector<VkDescriptorSet> real_sets(real_layouts.size(), VK_NULL_HANDLE);
     VkResult r = vkAllocateDescriptorSets(dit->second.dev, &ai, real_sets.data());
     if (r != VK_SUCCESS) return r;
-    for (size_t i = 0; i < vsets.size(); ++i)
+    for (size_t i = 0; i < vsets.size(); ++i) {
         t.descriptor_sets[vsets[i]] = real_sets[i];
+        cmd_register_descset(st, vsets[i], real_sets[i]);  // so vkCmdBindDescriptorSets can translate it
+    }
     return VK_SUCCESS;
 }
 
@@ -963,7 +985,10 @@ inline VkResult vk_gen_real_create_render_pass(
     ci.pDependencies = deps.empty() ? nullptr : deps.data();
     VkRenderPass rp = VK_NULL_HANDLE;
     VkResult r = vkCreateRenderPass(dit->second.dev, &ci, nullptr, &rp);
-    if (r == VK_SUCCESS) gen_tables(st).render_passes[vrpass] = rp;
+    if (r == VK_SUCCESS) {
+        gen_tables(st).render_passes[vrpass] = rp;
+        cmd_register_renderpass(st, vrpass, rp);  // so vkCmdBeginRenderPass can translate it
+    }
     return r;
 }
 
@@ -1007,7 +1032,10 @@ inline VkResult vk_gen_real_create_framebuffer(
     ci.layers = layers ? layers : 1;
     VkFramebuffer fb = VK_NULL_HANDLE;
     VkResult r = vkCreateFramebuffer(dit->second.dev, &ci, nullptr, &fb);
-    if (r == VK_SUCCESS) gen_tables(st).framebuffers[vfb] = fb;
+    if (r == VK_SUCCESS) {
+        gen_tables(st).framebuffers[vfb] = fb;
+        cmd_register_framebuffer(st, vfb, fb);  // so vkCmdBeginRenderPass can translate it
+    }
     return r;
 }
 

@@ -406,7 +406,7 @@ int main() {
         std::vector<uint8_t> req3(256);
         AlrVkEncoder ge;  // the create-forwards encoder for a command-pool create (low band)
         alr_vk_enc_init(&ge, req3.data(), static_cast<uint32_t>(req3.size()));
-        alr_vk_enc_create_command_pool_begin(&ge, kVdev, 3000u, 0u, 0u);
+        alr_vk_enc_gen_create_command_pool_begin(&ge, kVdev, 3000u, 0u, 0u);
         alr_vk_gen_pnext_count(&ge, 0);
         // …followed by a cmd-log queue-wait-idle (0x4000 band) in the SAME batch.
         AlrVkCmdEncoder ce;
