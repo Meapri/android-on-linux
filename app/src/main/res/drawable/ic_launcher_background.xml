@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android on Linux — adaptive icon BACKGROUND.
+  Android-green (#3DDC84) radial gradient deepening to a dark forest green at the
+  edges, so the white foreground penguin/robot reads strongly at every mask shape
+  (circle / squircle / rounded-square). 108dp adaptive canvas; the central 72dp is
+  the always-visible safe zone.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:pathData="M0,0 h108 v108 h-108 z">
+        <aapt:attr xmlns:aapt="http://schemas.android.com/aapt"
+            name="android:fillColor">
+            <gradient
+                android:type="radial"
+                android:centerX="54"
+                android:centerY="46"
+                android:gradientRadius="78"
+                android:startColor="#FF3DDC84"
+                android:centerColor="#FF1FA968"
+                android:endColor="#FF0B3D26" />
+        </aapt:attr>
+    </path>
+</vector>

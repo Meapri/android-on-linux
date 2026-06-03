@@ -8,7 +8,9 @@
     <uses-feature android:name="android.hardware.usb.host" android:required="false" />
     <application
         android:allowBackup="false"
-        android:label="AndroLinux Runtime Lab"
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:theme="@style/AppTheme">
 
         <!-- Compose 런처 진입점: MAIN/LAUNCHER (integration-guide §2). -->
@@ -54,18 +56,15 @@
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|keyboardHidden|uiMode"
             android:resizeableActivity="true" />
 
-        <!-- Standalone Chromium 앱 진입점: 탭하면 MainActivity 가 LEAN chromium-only
-             경로(runChromiumStandalone)로 분기 — GPU/probe/GIMP/toolkit 전부 스킵해
-             메모리를 chromium(browser+renderer)에 양보. 별도 런처 아이콘 "ALR Chromium". -->
+        <!-- Standalone Chromium 내부 진입점: MainActivity 의 LEAN chromium-only 경로
+             (runChromiumStandalone — GPU/probe/GIMP/toolkit 스킵, 메모리를 browser+renderer
+             에 양보)를 가리키는 alias. "Android on Linux" 단일 런처 아이덴티티를 위해 별도
+             홈 아이콘(MAIN/LAUNCHER)을 제거했다 — alias 자체는 내부 타겟팅용으로 유지하되
+             exported=false 로 외부 진입을 닫는다(런처 진입은 ui.LauncherActivity 단일 경로). -->
         <activity-alias
             android:name=".ui.ChromiumStandalone"
             android:targetActivity=".MainActivity"
-            android:exported="true"
-            android:label="ALR Chromium">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity-alias>
+            android:exported="false"
+            android:label="ALR Chromium" />
     </application>
 </manifest>

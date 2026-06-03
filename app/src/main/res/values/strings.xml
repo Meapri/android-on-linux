@@ -1,0 +1,7 @@
+<resources>
+    <!-- 앱 정체성: 단일 통합 런처 "Android on Linux". 홈 화면 아이콘 라벨/앱 이름. -->
+    <string name="app_name">Android on Linux</string>
+    <!-- 런처 홈 브랜드 헤더(presentation only). -->
+    <string name="launcher_brand_title">Android on Linux</string>
+    <string name="launcher_brand_subtitle">Linux apps, natively</string>
+</resources>
