@@ -314,7 +314,7 @@ class MainActivity : Activity() {
         // is wired separately. Device test = CP-5.
         Thread {
             try {
-                for (name in listOf("sdl2", "netsurf", "qt6", "xwayland", "babl-gegl", "microbench", "interpose", "dpkg-db", "x11", "apt-config", "chromium-net", "nss", "chromium-gui", "pulse")) {
+                for (name in listOf("sdl2", "netsurf", "qt6", "xwayland", "x11app", "babl-gegl", "microbench", "interpose", "dpkg-db", "x11", "apt-config", "chromium-net", "nss", "chromium-gui", "pulse")) {
                     val tar = java.io.File("/data/local/tmp/$name-stage.tar")
                     val marker = java.io.File(rootfsStatus.rootfsDir, ".$name-staged-${tar.length()}")
                     if (tar.isFile && !marker.isFile) {
@@ -2005,6 +2005,81 @@ class MainActivity : Activity() {
                                         "${gate(gimpRendered)} (frames $framesBeforeGimp→$framesAfterGimp)",
                                 )
                                 view.append("\n\n--- ALR guest $crWinLabel ---\n$gimpGuiClient")
+                            }
+
+                            // WS-4 §5 M4 — ROOTFUL Xwayland (gated /data/local/tmp/.alr-xwayland).
+                            // ALR has no X server, so X11-only apps can't run. Here Xwayland is
+                            // launched as a NORMAL wl CLIENT in ROOTFUL mode: it makes ONE X
+                            // screen presented as a single wl_surface — the SAME persistent-client
+                            // path GIMP uses (wl_shm → SurfaceView), so the compositor needs NO
+                            // change. Rootful is the Xwayland default and (unlike -rootless) needs
+                            // NO X window manager. -shm forces the shared-memory backend (the
+                            // compositor is wl_shm-only) so glamor/DRI3/GBM/EGL stay inert — X apps
+                            // are software-rendered for this first rung. Xwayland exports DISPLAY=:0
+                            // (also set in the guest env, runtime_report.cpp); the X app connects
+                            // there. Xwayland+overlay ride /data/local/tmp/xwayland-stage.tar; the X
+                            // app rides x11app-stage.tar (both auto-extracted by the toolkit loop).
+                            // Marker content (optional) overrides the X app program-spec; default
+                            // `/usr/bin/xcalc`. Normal cold starts (no marker) are byte-identical.
+                            val xwMarker = java.io.File("/data/local/tmp/.alr-xwayland")
+                            if (xwMarker.isFile) {
+                                val rootfsDirX = java.io.File(java.io.File(filesDir, "rootfs"), rootfsManifest.name)
+                                val xwBin = java.io.File(rootfsDirX, "usr/bin/Xwayland")
+                                // bounded wait for the xwayland overlay to finish extracting
+                                var xwWaited = 0
+                                while (xwWaited < 60000 && !xwBin.isFile) { Thread.sleep(1000); xwWaited += 1000 }
+                                android.util.Log.i("alr_loader", "xwayland: bin=${xwBin.isFile} (waited ${xwWaited}ms)")
+                                if (xwBin.isFile) {
+                                    val framesBeforeXw = nativeWaylandCompositorStatus().intFieldAfter("alr wl frames=")
+                                    // Start the ROOTFUL X server on its OWN thread (it is a
+                                    // persistent wl client — it does not exit). argv (verified vs
+                                    // Xwayland(1)): `:0 -shm -geometry WxH`. DISPLAY :0; -shm = the
+                                    // wl_shm backend; -geometry sizes the rootful X screen to the
+                                    // device panel (outW x outH). No -rootless ⇒ rootful ⇒ no XWM.
+                                    Thread {
+                                        val xwServer = nativeAlrNativeLoaderProbe(
+                                            packageName,
+                                            applicationInfo.nativeLibraryDir,
+                                            filesDir.absolutePath,
+                                            cacheDir.absolutePath,
+                                            rootfsManifest.name,
+                                            "/usr/bin/Xwayland\n:0\n-shm\n-geometry\n${outW}x${outH}",
+                                        )
+                                        android.util.Log.i("alr_loader", "xwayland-server:\n$xwServer")
+                                    }.start()
+                                    // Wait (bounded) for the X socket to appear, then run the X app.
+                                    // Xwayland :0 binds /tmp/.X11-unix/X0 inside the rootfs (the X
+                                    // app shares it via the same ALR_ROOTFS path mediation).
+                                    val xSock = java.io.File(rootfsDirX, "tmp/.X11-unix/X0")
+                                    var xSockWaited = 0
+                                    while (xSockWaited < 20000 && !xSock.isFile) { Thread.sleep(500); xSockWaited += 500 }
+                                    android.util.Log.i("alr_loader", "xwayland: X0 socket=${xSock.isFile} (waited ${xSockWaited}ms)")
+                                    // X app program-spec: marker content (newline-argv) or default xcalc.
+                                    val xAppSpec = xwMarker.readText().trim().ifEmpty { "/usr/bin/xcalc" }
+                                    val xApp = nativeAlrNativeLoaderProbe(
+                                        packageName,
+                                        applicationInfo.nativeLibraryDir,
+                                        filesDir.absolutePath,
+                                        cacheDir.absolutePath,
+                                        rootfsManifest.name,
+                                        xAppSpec,
+                                    )
+                                    val xwStatus = nativeWaylandCompositorStatus()
+                                    val framesAfterXw = xwStatus.intFieldAfter("alr wl frames=")
+                                    val xwRendered = framesAfterXw > framesBeforeXw
+                                    android.util.Log.i("alr_loader", "xwayland-result: rendered=$xwRendered frames=$framesBeforeXw->$framesAfterXw app=$xAppSpec")
+                                    android.util.Log.i("alr_loader", "xwayland-app:\n$xApp")
+                                    android.util.Log.i("alr_loader", "xwayland-status:\n$xwStatus")
+                                    runOnUiThread {
+                                        view.append(
+                                            "\nALR XWAYLAND (ROOTFUL X11 app `$xAppSpec` → Xwayland :0 → wl_shm → SurfaceView): " +
+                                                "${gate(xwRendered)} (frames $framesBeforeXw→$framesAfterXw, X0=${gate(xSock.isFile)})",
+                                        )
+                                        view.append("\n\n--- ALR guest Xwayland X11 app ($xAppSpec) ---\n$xApp")
+                                    }
+                                } else {
+                                    android.util.Log.w("alr_loader", "xwayland: /usr/bin/Xwayland not staged (push xwayland-stage.tar)")
+                                }
                             }
                         }.start()
                     }, 14000)

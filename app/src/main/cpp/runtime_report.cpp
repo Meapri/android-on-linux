@@ -1611,6 +1611,16 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     guest_env.push_back("TERM=xterm-256color");
     guest_env.push_back("XDG_RUNTIME_DIR=" + xdg_runtime_dir);
     guest_env.push_back("WAYLAND_DISPLAY=wayland-0");
+    // X11 via Xwayland (WS-4 §5 M4, ROOTFUL): Xwayland is launched as a normal wl
+    // client serving display :0 (one X screen as a single wl_surface the compositor
+    // presents). X11 apps connect to that X display, so export DISPLAY=:0. Xwayland
+    // itself ignores DISPLAY (it is told its display number on the argv: `:0`); a
+    // Wayland-native guest also ignores it (it prefers WAYLAND_DISPLAY when set, and
+    // GDK_BACKEND=wayland / QT_QPA_PLATFORM=wayland / SDL_VIDEODRIVER=wayland pin the
+    // backend) — so this is harmless for the non-X guests and required for the X ones.
+    // The :0 X socket (/tmp/.X11-unix/X0) is shared because both Xwayland and the X
+    // app run in-process under the SAME rootfs path mediation (ALR_ROOTFS).
+    guest_env.push_back("DISPLAY=:0");
     // Audio (design android-audio-sink.md §4): point libpulse at the in-app
     // PulseAudio-native server's AF_UNIX socket inside the SAME XDG_RUNTIME_DIR
     // (bound by alr_audio at ${XDG_RUNTIME_DIR}/pulse/native). PULSE_SERVER beats
