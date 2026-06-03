@@ -8,12 +8,27 @@
  *
  *     eglGetProcAddress("eglGetPlatformDisplayEXT")
  *     eglGetPlatformDisplayEXT(EGL_PLATFORM_ANGLE_ANGLE, EGL_DEFAULT_DISPLAY,
- *                              { EGL_PLATFORM_ANGLE_TYPE_ANGLE =
- *                                    EGL_PLATFORM_ANGLE_TYPE_VULKAN_ANGLE })
+ *                              { TYPE = VULKAN_ANGLE, DEVICE_TYPE = HARDWARE,
+ *                                NATIVE_PLATFORM_TYPE = <pinned, see below> })
  *     eglInitialize → eglChooseConfig(EGL_PBUFFER_BIT) → eglCreatePbufferSurface
  *     eglCreateContext(GLES2) → eglMakeCurrent
  *     glClearColor(magenta) → glClear → glFinish → glReadPixels (verify the cleared
  *                              pixel came back) → swap.
+ *
+ * DISPLAY SELECTION (the load-bearing fix for "ANGLE past its WSI init"): ANGLE
+ * reaches its Vulkan renderer only after a DisplayVk subclass initializes, and which
+ * subclass it picks decides whether it needs a window system. We pin the choice with
+ * an explicit EGL_PLATFORM_ANGLE_NATIVE_PLATFORM_TYPE_ANGLE attribute (never leaving
+ * it to ANGLE's env-based default, which on this build dead-ends at Wayland) and try,
+ * in order: (1) EGL_PLATFORM_SURFACELESS_MESA → DisplayVkOffscreen (no X/Wayland —
+ * ideal, used when ANGLE compiled the offscreen backend); (2) EGL_PLATFORM_X11_EXT →
+ * DisplayVkXcb, which with $DISPLAY unset (the loader omits it under ALR_ANGLE) SKIPS
+ * xcb_connect and proceeds straight to vkCreateInstance. The first config whose
+ * eglInitialize() succeeds wins. On the shipped chromium-147 ANGLE the offscreen
+ * backend is NOT compiled (only DisplayVkXcb + DisplayVkWayland are), so rung (2)
+ * wins — and that is enough: ANGLE reaches vkCreateInstance → vkEnumeratePhysicalDevices
+ * → vkCreateDevice → vkGetDeviceQueue on our guest ICD, i.e. PAST display init, no
+ * error 12289. (Full offscreen draw then depends on the ICD's render entrypoints.)
  *
  * ANGLE's Vulkan backend then dlopen()s libvulkan.so.1 (our guest VK ICD, staged in
  * /usr/lib/androlinux next on LD_LIBRARY_PATH) and marshals every vk* call to the
@@ -78,6 +93,17 @@ typedef unsigned int  GLbitfield;
 #define EGL_PLATFORM_ANGLE_TYPE_VULKAN_ANGLE     0x3450
 #define EGL_PLATFORM_ANGLE_DEVICE_TYPE_ANGLE     0x3209
 #define EGL_PLATFORM_ANGLE_DEVICE_TYPE_HARDWARE_ANGLE 0x320A
+/* EGL_ANGLE_platform_angle: native-window-system selector. ANGLE's Vulkan backend
+ * picks its DisplayVk WSI sub-backend (DisplayVkXcb / DisplayVkWayland / the
+ * offscreen DisplayVkOffscreen) from this attribute; when it is 0/absent ANGLE
+ * instead consults the environment (WAYLAND_DISPLAY → Wayland, else X11), which is
+ * exactly the non-deterministic path we must avoid. Setting it pins the WSI choice. */
+#define EGL_PLATFORM_ANGLE_NATIVE_PLATFORM_TYPE_ANGLE 0x348F
+/* EGL_MESA_platform_surfaceless: the window-system-independent OFFSCREEN platform.
+ * As an ANGLE native-platform-type it routes to CreateVulkanOffscreenDisplay
+ * (DisplayVkOffscreen) — no X, no Wayland, no surface. Used as the FIRST display rung
+ * so, on any ANGLE built with the offscreen backend, we render fully headless. */
+#define EGL_PLATFORM_SURFACELESS_MESA            0x31DD
 
 #define GL_COLOR_BUFFER_BIT 0x00004000
 #define GL_DEPTH_BUFFER_BIT 0x00000100
@@ -120,6 +146,13 @@ int main(int argc, char **argv) {
     (void)argc; (void)argv;
     const int W = 64, H = 64;
 
+    /* Unbuffer stdout so our progress lines (esp. which display config won, and the
+     * GL_RENDERER) reach the loader's stdout tee EVEN IF ANGLE later SIGSEGVs in its
+     * own renderer-setup — a block-buffered stdout would otherwise be discarded on the
+     * crash, hiding exactly the diagnostics we need to see how far ANGLE got. */
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
     /* ANGLE advertises EGL_EXT_platform_angle on the NO_DISPLAY client-extension
      * string; resolve the platform-display entrypoint through eglGetProcAddress so
      * we never need the EXT symbol at link time. */
@@ -135,28 +168,71 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    /* Force ANGLE's VULKAN backend on hardware (NOT SwiftShader). */
-    const EGLint disp_attrs[] = {
-        EGL_PLATFORM_ANGLE_TYPE_ANGLE,        EGL_PLATFORM_ANGLE_TYPE_VULKAN_ANGLE,
-        EGL_PLATFORM_ANGLE_DEVICE_TYPE_ANGLE, EGL_PLATFORM_ANGLE_DEVICE_TYPE_HARDWARE_ANGLE,
-        EGL_NONE
+    /* Display selection — the crux of getting ANGLE past its WSI/X-display init.
+     *
+     * ANGLE's Vulkan backend (RendererVk) is reached only AFTER a DisplayVk subclass
+     * initializes. Which subclass it picks decides whether it needs a window system:
+     *   - DisplayVkOffscreen (EGL_PLATFORM_SURFACELESS_MESA): NO X / NO Wayland — pure
+     *     offscreen; the ideal first rung (proves ANGLE→our-Mali-ICD renders headless).
+     *   - DisplayVkXcb (X11): connects to an X server ONLY if $DISPLAY is non-empty;
+     *     with $DISPLAY unset it SKIPS the connect and proceeds straight to
+     *     vkCreateInstance on our ICD. (The loader deliberately leaves $DISPLAY unset
+     *     under ALR_ANGLE for exactly this reason.)
+     *   - If we pass NO native-platform-type, ANGLE consults the environment
+     *     (WAYLAND_DISPLAY → Wayland; this ANGLE build has NO functional libwayland
+     *     and no offscreen backend, so that path dead-ends) — non-deterministic. We
+     *     therefore ALWAYS pass an explicit native-platform-type.
+     *
+     * Try the configs in order; the first whose eglInitialize() succeeds wins. Each
+     * config pins TYPE=VULKAN + DEVICE=HARDWARE (never SwiftShader) and an explicit
+     * native-platform-type. eglGetPlatformDisplay only records attribs (cheap); the
+     * backend impl is built lazily in eglInitialize, so a config that selects an
+     * uncompiled backend fails there — we eglTerminate and fall through to the next. */
+    struct disp_cfg { const char *name; EGLint native_platform; };
+    const struct disp_cfg cfgs[] = {
+        /* 1) Headless offscreen — no surface at all. Works on any ANGLE that compiled
+         *    DisplayVkOffscreen; if not, eglInitialize fails and we fall through. */
+        { "surfaceless/offscreen", EGL_PLATFORM_SURFACELESS_MESA },
+        /* 2) X11/xcb backend but with $DISPLAY unset → DisplayVkXcb SKIPS xcb_connect
+         *    and proceeds to vkCreateInstance. This is the proven path on the shipped
+         *    chromium ANGLE (DisplayVkXcb + DisplayVkWayland are the only compiled WSI
+         *    backends; xcb is fully linked). */
+        { "x11/xcb (DISPLAY-unset → skip connect)", 0x31D5 /*EGL_PLATFORM_X11_EXT*/ },
     };
-    EGLDisplay dpy = getPlatformDisplay(EGL_PLATFORM_ANGLE_ANGLE,
-                                        EGL_DEFAULT_DISPLAY, disp_attrs);
-    if (dpy == EGL_NO_DISPLAY) {
-        fprintf(stderr, "alr-angle-vk: eglGetPlatformDisplayEXT(VULKAN) returned "
-                        "NO_DISPLAY (0x%x)\n", eglGetError());
-        return 3;
-    }
 
+    EGLDisplay dpy = EGL_NO_DISPLAY;
     EGLint egl_major = 0, egl_minor = 0;
-    if (!eglInitialize(dpy, &egl_major, &egl_minor)) {
-        fprintf(stderr, "alr-angle-vk: eglInitialize(VULKAN) failed (0x%x)\n",
-                eglGetError());
+    const char *won = NULL;
+    for (unsigned i = 0; i < sizeof(cfgs) / sizeof(cfgs[0]); ++i) {
+        const EGLint disp_attrs[] = {
+            EGL_PLATFORM_ANGLE_TYPE_ANGLE,        EGL_PLATFORM_ANGLE_TYPE_VULKAN_ANGLE,
+            EGL_PLATFORM_ANGLE_DEVICE_TYPE_ANGLE, EGL_PLATFORM_ANGLE_DEVICE_TYPE_HARDWARE_ANGLE,
+            EGL_PLATFORM_ANGLE_NATIVE_PLATFORM_TYPE_ANGLE, cfgs[i].native_platform,
+            EGL_NONE
+        };
+        EGLDisplay d = getPlatformDisplay(EGL_PLATFORM_ANGLE_ANGLE,
+                                          EGL_DEFAULT_DISPLAY, disp_attrs);
+        if (d == EGL_NO_DISPLAY) {
+            printf("alr-angle-vk: display[%s] getPlatformDisplay → NO_DISPLAY (0x%x), "
+                   "trying next\n", cfgs[i].name, eglGetError());
+            continue;
+        }
+        EGLint mj = 0, mn = 0;
+        if (eglInitialize(d, &mj, &mn)) {
+            dpy = d; egl_major = mj; egl_minor = mn; won = cfgs[i].name;
+            break;
+        }
+        printf("alr-angle-vk: display[%s] eglInitialize → fail (0x%x), trying next\n",
+               cfgs[i].name, eglGetError());
+        eglTerminate(d);   /* release the half-open display before the next attempt */
+    }
+    if (dpy == EGL_NO_DISPLAY) {
+        fprintf(stderr, "alr-angle-vk: no ANGLE Vulkan display config initialized "
+                        "(0x%x)\n", eglGetError());
         return 4;
     }
-    printf("alr-angle-vk: ANGLE Vulkan display initialized, EGL %d.%d\n",
-           (int)egl_major, (int)egl_minor);
+    printf("alr-angle-vk: ANGLE Vulkan display initialized via [%s], EGL %d.%d\n",
+           won, (int)egl_major, (int)egl_minor);
     const char *dpy_vendor = eglQueryString(dpy, 0x3053 /*EGL_EXTENSIONS*/);
     printf("alr-angle-vk: display EGL extensions = %.200s\n",
            dpy_vendor ? dpy_vendor : "(null)");

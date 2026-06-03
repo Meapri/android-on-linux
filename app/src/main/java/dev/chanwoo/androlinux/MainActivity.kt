@@ -3537,6 +3537,20 @@ class MainActivity : Activity() {
                 android.system.Os.setenv("ALR_ANGLE", "1", true)
                 android.system.Os.setenv("ALR_VK_ICD", "1", true)
                 android.system.Os.setenv("ALR_GPU_ACCEL", "1", true)
+                // DISPLAY must be EMPTY for the ANGLE-on-Vulkan path: the alr-angle-vk
+                // client pins ANGLE's WSI to the X11 backend (DisplayVkXcb) as its
+                // fallback rung, and DisplayVkXcb::initialize() only attempts
+                // xcb_connect() when $DISPLAY is non-empty — with it unset it SKIPS the
+                // X connection and proceeds straight to vkCreateInstance on our ICD
+                // (device-proven: reaches vkCreateDevice + vkGetDeviceQueue, no error
+                // 12289). The loader already omits DISPLAY under ALR_ANGLE, but this
+                // host-side guarantee defends against a DISPLAY leaking in from the app
+                // process env (e.g. a prior Xwayland launch in the same session that
+                // exported it). Harmless to non-ANGLE guests — scoped to this probe and
+                // restored below. The cube fallback (eglGetDisplay → ANGLE's GL/GLX
+                // default) still needs X and is expected to log 12289; that is
+                // documentary, not the Vulkan proof.
+                android.system.Os.unsetenv("DISPLAY")
                 android.system.Os.setenv("ALR_TEE_GUEST_STDOUT", "1", true)
                 android.system.Os.setenv("ALR_SHIM_DIAG", "1", true)
                 android.system.Os.setenv("VK_LOADER_DEBUG", "all", true)
