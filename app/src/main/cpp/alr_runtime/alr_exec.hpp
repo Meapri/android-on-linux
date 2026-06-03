@@ -200,6 +200,59 @@ ExecEnvpInjection decide_exec_envp_injection(
     const std::vector<std::string>& env_entries,
     bool fakeroot = false);
 
+// === CR-4: full-chromium child argv sandbox-disable injection decision model ===
+//
+// Full chromium (unlike content_shell --single-process) fork()+execve()s child
+// processes — its internal "/usr/lib/chromium/chromium --type=zygote|gpu-process|
+// utility …" and re-exec'd self-exe children. Those children DO NOT inherit the
+// launch command line's --no-sandbox / --disable-seccomp-filter-sandbox /
+// --disable-setuid-sandbox / --disable-namespace-sandbox / --disable-gpu-sandbox
+// flags: chromium rebuilds each child's argv from its OWN parsed command line and
+// drops switches it does not re-propagate. The child then finds no usable sandbox,
+// logs "No usable sandbox!" and brk()-crashes (SIGTRAP) inside an untrusted_app
+// domain where none of the sandbox transports can work — driving the crashpad/refork
+// re-map storm. FIX: when the supervisor re-maps such a chromium child, it rebuilds
+// the child's argv = [argv0, orig argv1.., + each MISSING sandbox-disable flag] and
+// points the trampoline argv register at it.
+//
+// This struct + function are the PURE, host-testable kernel of that decision: given
+// the child's program path and its current argv (read by the supervisor from tracee
+// memory), decide whether this is a chromium child that needs the flags and which
+// flags are missing. The supervisor owns the tracee-memory plumbing (read the char**
+// at the argv reg, build an augmented array + string blob in scratch, point the reg
+// at it); keeping the decision here lets host tests prove the logic with fixtures and
+// no real ptrace. argv[0] is preserved unchanged (ADR-003 §3 "argv[0] 불변").
+struct ChromiumChildArgv {
+    // True iff this exec is a chromium child that must carry the sandbox-disable
+    // flags AND at least one is missing (so the supervisor must rebuild argv). False
+    // => leave argv exactly as the guest set it (not chromium, or all flags already
+    // present — idempotent across the re-exec chain).
+    bool should_inject = false;
+    // The flag strings (e.g. "--no-sandbox") missing from the child's argv that the
+    // supervisor must APPEND after the original argv entries. Empty iff should_inject
+    // is false.
+    std::vector<std::string> add_flags;
+    // Diagnostic reason for the supervisor log / host-test assertions:
+    //   "inject"       chromium child, >=1 sandbox flag missing -> rebuild argv
+    //   "already"      chromium child, all sandbox flags already present (no-op)
+    //   "not-chromium" program path is not a chromium binary (no-op)
+    std::string reason;
+};
+
+// Decide whether to inject sandbox-disable flags into an exec'd chromium child's
+// argv. Pure in (program_path, argv); performs NO filesystem access. `program_path`
+// is the resolved exec target (the host rootfs path the supervisor will re-map, e.g.
+// "<rootfs>/usr/lib/chromium/chromium"); `argv` is the child's current argv as read
+// from tracee memory. A child is treated as chromium iff program_path's basename is
+// "chromium" or "chrome" (the full-browser binary; content_shell is "chromium-shell"
+// and is single-process so never forks a child needing this). The desired flag set is
+// the five sandbox-disable switches; any already present in argv (exact match) is not
+// re-added. Returns should_inject=false (reason "not-chromium") for any non-chromium
+// target, and (reason "already") for a chromium child whose argv already has all five.
+ChromiumChildArgv decide_chromium_child_argv(
+    std::string_view program_path,
+    const std::vector<std::string>& argv);
+
 // Resolve and classify the first executable path that ALR would hand to a
 // future guest loader. This is clean-room planning logic only; it deliberately
 // does not exec the guest program.

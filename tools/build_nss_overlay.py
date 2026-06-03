@@ -45,6 +45,15 @@ MODULES = (
     "libnssckbi.so",
     "libnssdbm3.so",
 )
+# libsoftokn3.so (NSS's SQLite-backed key/cert DB, "sql:" profile) has a DT_NEEDED on
+# libsqlite3.so.0 — which ships in a SEPARATE package (libsqlite3-0), not libnss3, and
+# is therefore ALSO dropped by the closure. Without it, libsoftokn3 fails to load and
+# full chromium FATALs at startup (device-confirmed, crypto/nss_util.cc:146
+# nss_error=-5925: "libsqlite3.so.0: cannot open shared object file"). Fetch it from
+# the same noble mirror and pack the versioned soname flat so the loader's
+# LD_LIBRARY_PATH resolves the DT_NEEDED. (soname only — no -dev symlink needed.)
+SQLITE_PACKAGE = "libsqlite3-0"
+SQLITE_SONAME = "libsqlite3.so.0"
 
 
 def _find_modules(root: Path) -> dict[str, Path]:
@@ -56,6 +65,32 @@ def _find_modules(root: Path) -> dict[str, Path]:
                 found[mod] = p
                 break
     return found
+
+
+def _fetch_sqlite(cache: Path, pkgs: dict) -> Path | None:
+    """Download libsqlite3-0 and return the path to libsqlite3.so.0 (versioned soname)
+    inside the extracted deb, or None if unavailable. Best-effort: kept separate from
+    the load-bearing NSS modules so a transient mirror miss is reported, not fatal."""
+    meta = pkgs.get(SQLITE_PACKAGE)
+    if not meta or not meta.get("Filename"):
+        return None
+    deb = _download_deb(MIRROR, meta["Filename"], cache)
+    td = tempfile.mkdtemp(prefix="alr-sqlite-")
+    root = extract_deb(deb, Path(td))
+    # The package ships the real lib as libsqlite3.so.0.8.6 with a libsqlite3.so.0
+    # symlink; rglob may return the symlink first, so prefer a regular file whose name
+    # starts with the soname (the real .so or the soname symlink target).
+    cand: Path | None = None
+    for p in root.rglob("libsqlite3.so.0*"):
+        if p.is_file() and not p.is_symlink():
+            cand = p
+            break
+    if cand is None:
+        for p in root.rglob(SQLITE_SONAME):
+            if p.exists():
+                cand = p.resolve()
+                break
+    return cand
 
 
 def build(out: Path, cache: Path) -> dict:
@@ -75,6 +110,14 @@ def build(out: Path, cache: Path) -> dict:
         for hard in ("libsoftokn3.so", "libfreebl3.so"):
             if hard not in mods:
                 raise SystemExit(f"required {hard} not found in {PACKAGE} .deb")
+        # libsqlite3.so.0 — libsoftokn3's DT_NEEDED, from a separate package. Required
+        # (full chromium FATALs without it), but fetched from its own deb so the error
+        # is specific if the mirror lacks it.
+        sqlite_src = _fetch_sqlite(cache, pkgs)
+        if sqlite_src is None:
+            raise SystemExit(
+                f"required {SQLITE_SONAME} not found ({SQLITE_PACKAGE} missing/empty)"
+            )
         with tarfile.open(out, "w") as tar:
             for mod, src in mods.items():
                 # Flat (dlopen-by-soname via LD_LIBRARY_PATH) AND nss/ (NSS search path).
@@ -85,13 +128,22 @@ def build(out: Path, cache: Path) -> dict:
                     ti.mode = 0o755
                     with open(src, "rb") as fh:
                         tar.addfile(ti, fh)
+            # libsqlite3.so.0 — flat only (DT_NEEDED soname resolved via LD_LIBRARY_PATH).
+            sq_arc = f"./{LIBDIR}/{SQLITE_SONAME}"
+            ti = tar.gettarinfo(str(sqlite_src), arcname=sq_arc)
+            ti.uid = ti.gid = 0
+            ti.uname = ti.gname = ""
+            ti.mode = 0o755
+            with open(sqlite_src, "rb") as fh:
+                tar.addfile(ti, fh)
         return {
             "out": str(out),
             "package": PACKAGE,
             "deb": deb.name,
             "modules": sorted(mods),
             "missing": missing,
-            "members": len(mods) * 2,
+            "sqlite": SQLITE_SONAME,
+            "members": len(mods) * 2 + 1,
         }
 
 
@@ -116,7 +168,8 @@ def main(argv=None) -> int:
     print(f"  modules: {len(info['modules'])} ({', '.join(info['modules'])})")
     if info["missing"]:
         print(f"  NOTE missing (best-effort): {', '.join(info['missing'])}")
-    print(f"  members: {info['members']} (flat + nss/ each)")
+    print(f"  sqlite: {info.get('sqlite', '-')} ({SQLITE_PACKAGE}, flat)")
+    print(f"  members: {info['members']} (NSS modules flat + nss/ each, + sqlite flat)")
     return 0
 
 

@@ -268,6 +268,71 @@ int main() {
         require(inj.reason == "already", "envp no-rootfs: reason");
     }
 
+    // === CR-4: decide_chromium_child_argv (full-chromium child sandbox flags) ===
+    const std::string chromium_bin = rootfs + "/usr/lib/chromium/chromium";
+    // (C1) chromium child with a bare argv (only argv0 + --type=) → all 5 sandbox
+    // flags missing, should_inject, reason "inject".
+    {
+        const std::vector<std::string> argv = {chromium_bin, "--type=zygote"};
+        const auto ci = alr::runtime::decide_chromium_child_argv(chromium_bin, argv);
+        require(ci.should_inject, "argv C1: should_inject");
+        require(ci.reason == "inject", "argv C1: reason");
+        require(ci.add_flags.size() == 5, "argv C1: all 5 flags missing");
+        require(ci.add_flags.front() == "--no-sandbox", "argv C1: first flag order");
+    }
+    // (C2) chromium child that ALREADY carries every sandbox flag → no-op (idempotent
+    // across the re-exec chain so the re-mapped child does not get duplicate flags).
+    {
+        const std::vector<std::string> argv = {
+            chromium_bin, "--type=gpu-process", "--no-sandbox",
+            "--disable-seccomp-filter-sandbox", "--disable-setuid-sandbox",
+            "--disable-namespace-sandbox", "--disable-gpu-sandbox",
+        };
+        const auto ci = alr::runtime::decide_chromium_child_argv(chromium_bin, argv);
+        require(!ci.should_inject, "argv C2: no-op when all present");
+        require(ci.reason == "already", "argv C2: reason");
+        require(ci.add_flags.empty(), "argv C2: nothing to add");
+    }
+    // (C3) chromium child with SOME flags present → only the missing ones are added.
+    {
+        const std::vector<std::string> argv = {
+            chromium_bin, "--type=utility", "--no-sandbox", "--disable-gpu-sandbox",
+        };
+        const auto ci = alr::runtime::decide_chromium_child_argv(chromium_bin, argv);
+        require(ci.should_inject, "argv C3: should_inject");
+        require(ci.add_flags.size() == 3, "argv C3: 3 flags missing");
+        // The two present flags must NOT be re-added.
+        for (const auto& f : ci.add_flags) {
+            require(f != "--no-sandbox" && f != "--disable-gpu-sandbox",
+                    "argv C3: present flag re-added");
+        }
+    }
+    // (C4) content_shell ("chromium-shell") is NOT a chromium browser child → no-op.
+    // It is --single-process and never forks a child needing these flags; the basename
+    // match must not treat it as the full browser.
+    {
+        const std::string shell = rootfs + "/usr/lib/chromium/chromium-shell";
+        const std::vector<std::string> argv = {shell, "--type=renderer"};
+        const auto ci = alr::runtime::decide_chromium_child_argv(shell, argv);
+        require(!ci.should_inject, "argv C4: content_shell no-op");
+        require(ci.reason == "not-chromium", "argv C4: reason");
+    }
+    // (C5) chrome_crashpad_handler is neutered elsewhere (exit0), never argv-injected.
+    {
+        const std::string cp = rootfs + "/usr/lib/chromium/chrome_crashpad_handler";
+        const std::vector<std::string> argv = {cp, "--monitor-self"};
+        const auto ci = alr::runtime::decide_chromium_child_argv(cp, argv);
+        require(!ci.should_inject, "argv C5: crashpad no-op");
+        require(ci.reason == "not-chromium", "argv C5: reason");
+    }
+    // (C6) basename "chrome" (alternate browser binary name) is also matched.
+    {
+        const std::string chrome = rootfs + "/opt/google/chrome/chrome";
+        const std::vector<std::string> argv = {chrome, "--type=zygote"};
+        const auto ci = alr::runtime::decide_chromium_child_argv(chrome, argv);
+        require(ci.should_inject, "argv C6: 'chrome' basename matched");
+    }
+
     std::filesystem::remove_all(root);
     std::cout << "alr runtime exec native test ok\n";
     return EXIT_SUCCESS;

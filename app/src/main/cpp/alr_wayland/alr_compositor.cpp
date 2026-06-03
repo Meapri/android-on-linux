@@ -1225,7 +1225,11 @@ void send_initial_configure(SurfaceState* s) {
             *st = v;
     };
     push_state(XDG_TOPLEVEL_STATE_ACTIVATED);
-    push_state(XDG_TOPLEVEL_STATE_FULLSCREEN);
+    // MAXIMIZED (not FULLSCREEN) fills the whole output while letting a browser keep
+    // its chrome: chromium/Chrome treat an xdg FULLSCREEN toplevel as F11 mode and
+    // auto-HIDE the tab strip + omnibox, so a maximized-but-not-fullscreen state is
+    // what shows "the Chromium we know". GTK/GIMP/foot fill the same under MAXIMIZED
+    // (they don't hide UI in fullscreen anyway) → regression-safe for them.
     push_state(XDG_TOPLEVEL_STATE_MAXIMIZED);
     if (s->xdg_toplevel) {
         xdg_toplevel_send_configure(s->xdg_toplevel, w, h, &states);

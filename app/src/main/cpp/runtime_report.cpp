@@ -1196,6 +1196,24 @@ __asm__(
     "1: .ascii \"ALR-REEXEC: inproc trampoline reached (no execve)\\n\"\n"
     "2:\n");
 
+// CR-4 crashpad gate. A resident, freestanding exit(0) routine the supervisor
+// PC-redirects a forked chrome_crashpad_handler child to (after cancelling its
+// execve via NT_ARM_SYSTEM_CALL=-1). It runs IN that child process — like
+// alr_inproc_reexec_probe, the loader .text is fork-inherited and &this function is
+// identical in supervisor and tracee, so the redirect reaches it with NO kernel
+// execve. The child then _exit(0)s cleanly: chromium sees the crashpad handler go
+// away (it is already --disable-crash-reporter) and does NOT refork it, breaking the
+// device-observed crashpad↔chromium re-map storm. Pure svc #0; no libc/TLS/stack use.
+extern "C" [[noreturn]] void alr_exit0_stub();
+__asm__(
+    ".globl alr_exit0_stub\n"
+    ".hidden alr_exit0_stub\n"
+    "alr_exit0_stub:\n"
+    "  mov x0, #0\n"           // exit code 0
+    "  mov x8, #94\n"          // __NR_exit_group
+    "  svc #0\n"
+    "  brk #0\n");             // unreachable
+
 // Install a SECOND seccomp filter (stacked on the zygote's) that SECCOMP_RET_TRACEs
 // ONLY the path-taking syscalls, so the parent supervisor can rewrite a guest path
 // to its rootfs host path before the kernel dereferences it. This is the
@@ -2265,6 +2283,25 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     std::string first_exec_x0;       // first exec target the guest requested
     std::string first_exec_reason;   // its mediation reason (rewrite/sysdir/…)
     std::string first_exec_envp_reason;  // first exec's envp-injection reason (B-3)
+    // === CR-4 full-chromium child supervision (this session) ===
+    // (CB) crashpad gate: chromium fork()+execve()s an ABSOLUTE-path
+    // chrome_crashpad_handler whenever a child IMMEDIATE_CRASHes. On the device that
+    // exec re-mapped a fresh ~258 MiB image AND the crashed child reforked, so the
+    // crashpad×chromium pair drove the 542→1.3 GiB RSS storm. crashpad is non-essential
+    // (we run --disable-crash-reporter/breakpad already), so we NEUTER its exec at the
+    // trap: cancel the execve (NT_ARM_SYSTEM_CALL=-1) and PC-redirect the forked child to
+    // a resident exit(0) stub — the child dies cleanly, no re-map, no refork loop.
+    int exec_crashpad_blocked = 0;
+    // (AB) child argv sandbox-disable injection: a chromium child the guest fork+execs
+    // (its internal "/usr/lib/chromium/chromium --type=… " zygote_host/gpu/utility, OR a
+    // re-exec'd self-exe child) does NOT inherit the launch argv's --no-sandbox /
+    // --disable-*-sandbox flags (chromium rebuilds child argv from its own command line,
+    // dropping ours). The child then logs "No usable sandbox!" and brk()-crashes. FIX:
+    // when we re-map such a chromium child, REBUILD its argv = [argv0, orig argv1.., +
+    // any missing sandbox-disable flag, NULL] in tracee scratch and point the trampoline
+    // argv reg (x20 / regs[20]) at it. Analogous to the B-3 envp rebuild; the host-tested
+    // flag set + idempotency live in alr_exec.cpp (decide_chromium_child_argv).
+    int exec_argv_sandbox_injected = 0;
     // M-R2 (ADR-002): storm decomposition — per-syscall-nr histograms at the two
     // EXISTING trap sites (no new ptrace op, no hot-loop pollution). trace_hist =
     // RET_TRACE/EVENT_SECCOMP (path-family + execve), emul_hist = SIGSYS-emulated
@@ -2774,7 +2811,55 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                                 // fails). We track the redirect with this flag so B-3 can
                                 // mirror its envp re-point into x21 (G1 fix).
                                 bool inproc_redirected_this_trap = false;
+                                // CR-4 crashpad gate result: when true the exec was a
+                                // chrome_crashpad_handler that we cancelled + redirected to
+                                // alr_exit0_stub, so ALL further exec mediation (inproc
+                                // re-map, reentry splice, B-1 path rewrite, B-3 envp) is
+                                // skipped for this trap — the forked child just exit(0)s.
+                                bool crashpad_neutered = false;
 #if defined(__aarch64__)
+                                // CR-4 crashpad gate (device-diagnosed re-map storm). full
+                                // chromium fork()+execve()s an absolute-path
+                                // chrome_crashpad_handler whenever a child crashes; each such
+                                // exec re-mapped a fresh ~258 MiB image and the crashed child
+                                // reforked, climbing RSS 542→1.3 GiB until the watchdog
+                                // SIGKILLed. crashpad is non-essential (launch argv already
+                                // has --disable-crash-reporter/breakpad), so NEUTER it: cancel
+                                // the execve (NT_ARM_SYSTEM_CALL=-1) and PC-redirect the forked
+                                // child to the resident exit(0) stub. The child dies cleanly,
+                                // no re-map, and chromium does not refork a handler that has
+                                // gone away — breaking the storm at its second source (the
+                                // first being the sandbox-crash child, fixed by argv injection
+                                // below). Match by basename so any path to the handler is
+                                // caught; runs only when inproc is on (the cronly/CR-4 path).
+                                if (inproc_reexec_on) {
+                                    const char* gpb = std::strrchr(gp, '/');
+                                    const char* gpn = gpb ? gpb + 1 : gp;
+                                    if (std::strcmp(gpn, "chrome_crashpad_handler") == 0) {
+                                        regs[32] = static_cast<uint64_t>(
+                                            reinterpret_cast<uintptr_t>(&alr_exit0_stub));
+                                        if (::ptrace(PTRACE_SETREGSET, w,
+                                                     reinterpret_cast<void*>(NT_PRSTATUS),
+                                                     &io) == 0) {
+                                            int newsys = -1;
+                                            struct iovec sio{&newsys, sizeof(newsys)};
+                                            if (::ptrace(PTRACE_SETREGSET, w,
+                                                         reinterpret_cast<void*>(
+                                                             NT_ARM_SYSTEM_CALL),
+                                                         &sio) == 0) {
+                                                crashpad_neutered = true;
+                                                ++exec_crashpad_blocked;
+                                                if (exec_crashpad_blocked == 1) {
+                                                    __android_log_print(
+                                                        ANDROID_LOG_INFO, "alr_loader",
+                                                        "alr CR4 crashpad NEUTERED (exec->"
+                                                        "exit0) tid=%d",
+                                                        static_cast<int>(w));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 // G1 seqint: SCOPE the inproc redirect. The trampoline can
                                 // only map a rootfs glibc target; redirecting everything
                                 // wedges the serialized supervision (device drain: onCreate
@@ -2799,7 +2884,7 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                                 // table: tools/proc_self_exe_model.py (is_self_exe_target /
                                 // decide_exec_trap), tests/test_proc_self_exe_gate.py.
                                 bool self_exe_subst = false;
-                                if (inproc_reexec_on) {
+                                if (inproc_reexec_on && !crashpad_neutered) {
                                     // (a) self-exe exec target: "/proc/self/exe" or
                                     // "/proc/<all-digits>/exe". Only these forms name "this
                                     // process's own binary" — divert them to the rootfs
@@ -2957,7 +3042,8 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                                         }
                                     }
                                 }
-                                if (inproc_reexec_on && inproc_skip_reason == nullptr) {
+                                if (inproc_reexec_on && inproc_skip_reason == nullptr &&
+                                    !crashpad_neutered) {
                                     // GATE-1: a self-exe target ("/proc/self/exe" etc.)
                                     // re-maps the launch guest's rootfs chrome (host_path),
                                     // NOT the literal /proc path (med.should_rewrite is false
@@ -2986,9 +3072,150 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                                             w2 == static_cast<ssize_t>(
                                                       rootfs.size() + 1)) {
                                             regs[19] = hp_addr;
-                                            regs[20] = is_at
-                                                ? static_cast<uint64_t>(regs[2])
-                                                : static_cast<uint64_t>(regs[1]);
+                                            // The trampoline reads the child argv from x20
+                                            // (regs[20]); default = the guest's original argv
+                                            // pointer (execve x1 / execveat x2), unchanged.
+                                            const uintptr_t orig_argv_addr =
+                                                is_at
+                                                    ? static_cast<uint64_t>(regs[2])
+                                                    : static_cast<uint64_t>(regs[1]);
+                                            uintptr_t argv_reg_val = orig_argv_addr;
+                                            // === CR-4 (AB): chromium child argv sandbox inj ===
+                                            // If this re-mapped target is the full chromium
+                                            // browser binary, its child argv drops our launch
+                                            // --no-sandbox/--disable-*-sandbox flags and the
+                                            // child crashes "No usable sandbox!". Rebuild argv =
+                                            // [argv0, orig argv1.., +missing sandbox flags] in a
+                                            // scratch window BELOW the B-3 envp window
+                                            // ([sp-128K, sp-2048)) so it collides with neither
+                                            // the host-path scratch (sp-2048..sp) nor the envp
+                                            // rebuild; then point x20 at it. Host-tested flag
+                                            // set + idempotency: alr_exec.cpp
+                                            // decide_chromium_child_argv (the re-exec chain is a
+                                            // no-op once the child already carries the flags).
+                                            if (orig_argv_addr != 0) {
+                                                constexpr std::size_t kArgvScan = 256;
+                                                std::vector<uintptr_t> orig_ptrs;
+                                                std::vector<std::string> orig_strs;
+                                                bool ok = true;
+                                                orig_ptrs.reserve(32);
+                                                for (std::size_t i = 0; i < kArgvScan; ++i) {
+                                                    uintptr_t p = 0;
+                                                    if (::pread(mfd, &p, sizeof(p),
+                                                                static_cast<off_t>(
+                                                                    orig_argv_addr +
+                                                                    i * sizeof(uintptr_t))) !=
+                                                        static_cast<ssize_t>(sizeof(p))) {
+                                                        ok = false;
+                                                        break;
+                                                    }
+                                                    if (p == 0) break;  // NULL terminator
+                                                    char ab[1024] = {0};
+                                                    ssize_t ar = ::pread(
+                                                        mfd, ab, sizeof(ab) - 1,
+                                                        static_cast<off_t>(p));
+                                                    if (ar <= 0) { ok = false; break; }
+                                                    ab[ar] = '\0';
+                                                    orig_ptrs.push_back(p);
+                                                    orig_strs.emplace_back(ab);
+                                                }
+                                                if (ok && !orig_strs.empty()) {
+                                                    const auto ci =
+                                                        alr::runtime::
+                                                            decide_chromium_child_argv(
+                                                                host, orig_strs);
+                                                    if (ci.should_inject) {
+                                                        // Window: strings then the new char*[]
+                                                        // array, growing up from str_base.
+                                                        const uintptr_t a_base =
+                                                            (sp - 256 * 1024) &
+                                                            ~static_cast<uintptr_t>(0xf);
+                                                        const uintptr_t a_end =
+                                                            sp - 130 * 1024;
+                                                        uintptr_t cur = a_base;
+                                                        std::vector<uintptr_t> new_ptrs;
+                                                        new_ptrs.reserve(
+                                                            orig_ptrs.size() +
+                                                            ci.add_flags.size() + 1);
+                                                        bool blob_ok = true;
+                                                        // Keep argv[0..N] pointers verbatim
+                                                        // (their strings already live in the
+                                                        // guest's own memory — no copy needed).
+                                                        for (uintptr_t p : orig_ptrs) {
+                                                            new_ptrs.push_back(p);
+                                                        }
+                                                        // Append each missing flag string.
+                                                        for (const auto& f : ci.add_flags) {
+                                                            const std::size_t n = f.size() + 1;
+                                                            if (cur + n > a_end) {
+                                                                blob_ok = false;
+                                                                break;
+                                                            }
+                                                            if (::pwrite(
+                                                                    mfd, f.c_str(), n,
+                                                                    static_cast<off_t>(cur)) !=
+                                                                static_cast<ssize_t>(n)) {
+                                                                blob_ok = false;
+                                                                break;
+                                                            }
+                                                            new_ptrs.push_back(cur);
+                                                            cur = (cur + n + 7) &
+                                                                  ~static_cast<uintptr_t>(7);
+                                                        }
+                                                        const uintptr_t arr_base =
+                                                            (cur + 7) &
+                                                            ~static_cast<uintptr_t>(7);
+                                                        const std::size_t arr_bytes =
+                                                            (new_ptrs.size() + 1) *
+                                                            sizeof(uintptr_t);
+                                                        if (blob_ok &&
+                                                            arr_base + arr_bytes <= a_end) {
+                                                            bool arr_ok = true;
+                                                            for (std::size_t i = 0;
+                                                                 i < new_ptrs.size(); ++i) {
+                                                                const uintptr_t v =
+                                                                    new_ptrs[i];
+                                                                if (::pwrite(
+                                                                        mfd, &v, sizeof(v),
+                                                                        static_cast<off_t>(
+                                                                            arr_base +
+                                                                            i * sizeof(v))) !=
+                                                                    static_cast<ssize_t>(
+                                                                        sizeof(v))) {
+                                                                    arr_ok = false;
+                                                                    break;
+                                                                }
+                                                            }
+                                                            const uintptr_t nul = 0;
+                                                            if (arr_ok &&
+                                                                ::pwrite(
+                                                                    mfd, &nul, sizeof(nul),
+                                                                    static_cast<off_t>(
+                                                                        arr_base +
+                                                                        new_ptrs.size() *
+                                                                            sizeof(nul))) ==
+                                                                    static_cast<ssize_t>(
+                                                                        sizeof(nul))) {
+                                                                argv_reg_val = arr_base;
+                                                                ++exec_argv_sandbox_injected;
+                                                                if (exec_argv_sandbox_injected
+                                                                        == 1) {
+                                                                    __android_log_print(
+                                                                        ANDROID_LOG_INFO,
+                                                                        "alr_loader",
+                                                                        "alr CR4 chromium "
+                                                                        "child argv +%zu "
+                                                                        "sandbox flags "
+                                                                        "tid=%d",
+                                                                        ci.add_flags.size(),
+                                                                        static_cast<int>(w));
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            regs[20] = argv_reg_val;
                                             regs[21] = is_at
                                                 ? static_cast<uint64_t>(regs[3])
                                                 : static_cast<uint64_t>(regs[2]);
@@ -3047,7 +3274,8 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                                     (gp_base != nullptr &&
                                      std::strcmp(gp_base, "/alr-reentry") == 0);
                                 bool spliced = false;
-                                if (exec_reentry_on && !already_stub) {
+                                if (exec_reentry_on && !already_stub &&
+                                    !crashpad_neutered) {
                                     const std::string target_host =
                                         med.should_rewrite ? med.host_path
                                                            : std::string(gp);
@@ -3171,7 +3399,8 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                                 }
                                 // B-1 fallback (reentry off, or splice could not be
                                 // built): plain x0 program-path rewrite into the rootfs.
-                                if (!spliced && med.should_rewrite) {
+                                if (!spliced && med.should_rewrite &&
+                                    !crashpad_neutered) {
                                     const uintptr_t sp =
                                         static_cast<uintptr_t>(regs[31]);
                                     const uintptr_t scratch =
@@ -3225,7 +3454,10 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                                 // parent we already injected inherits a satisfied envp
                                 // and the classifier returns a no-op (idempotent). Only
                                 // the envp register is touched — path/argv are unchanged.
-                                {
+                                // Skipped when the exec was a crashpad handler we already
+                                // cancelled + redirected to exit0 (a SETREGSET here would
+                                // clobber that redirect's PC/syscall-nr).
+                                if (!crashpad_neutered) {
                                     const uintptr_t envp_addr =
                                         is_at ? static_cast<uintptr_t>(regs[3])
                                               : static_cast<uintptr_t>(regs[2]);
@@ -3799,6 +4031,13 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         << " inproc=" << (inproc_reexec_on ? "on" : "off")
         << " inproc_redirected=" << exec_inproc_redirected
         << " inproc_skipped=" << exec_inproc_skipped;
+    // CR-4 full-chromium child supervision (this session). crashpad_blocked counts
+    // chrome_crashpad_handler execs neutered to exit0 (breaks the refork storm);
+    // argv_sandbox_injected counts chromium children whose argv we rebuilt with the
+    // missing --no-sandbox/--disable-*-sandbox flags (stops the "No usable sandbox!"
+    // child crash). Both >0 on a healthy full-chromium launch that forks children.
+    out << "\nalr CR4 crashpad_blocked=" << exec_crashpad_blocked
+        << " argv_sandbox_injected=" << exec_argv_sandbox_injected;
     // CR-4: self-exe (/proc/self/exe) re-map storm telemetry. self_exe_remaps is the
     // count of chromium children re-mapped from the launch chrome; cap is the runaway
     // bound; first type names the first child kind seen (gpu-process/utility/renderer/

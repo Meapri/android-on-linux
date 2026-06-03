@@ -468,6 +468,65 @@ ExecEnvpInjection decide_exec_envp_injection(
     return out;
 }
 
+namespace {
+
+// Basename of a path view: the substring after the last '/'. "a/b/chromium" ->
+// "chromium"; "chromium" (no slash) -> "chromium"; "a/b/" -> "" (trailing slash).
+std::string_view path_basename(std::string_view p) {
+    const std::size_t slash = p.find_last_of('/');
+    if (slash == std::string_view::npos) {
+        return p;
+    }
+    return p.substr(slash + 1);
+}
+
+}  // namespace
+
+ChromiumChildArgv decide_chromium_child_argv(
+    std::string_view program_path,
+    const std::vector<std::string>& argv) {
+    ChromiumChildArgv out;
+    // Only the full chromium browser binary forks children that drop our sandbox
+    // flags. content_shell ("chromium-shell") is --single-process and never does, and
+    // chrome_crashpad_handler is neutered separately — match the exact basenames so a
+    // helper like "chromium-shell" or "chrome_crashpad_handler" is NOT treated as a
+    // chromium browser child here.
+    const std::string_view base = path_basename(program_path);
+    if (base != "chromium" && base != "chrome") {
+        out.reason = "not-chromium";
+        return out;
+    }
+    // The sandbox-disable switches every chromium child must carry inside an
+    // untrusted_app domain (no usable sandbox transport exists there). Order matches
+    // the launch argv so a device log reads consistently.
+    static const char* const kSandboxFlags[] = {
+        "--no-sandbox",
+        "--disable-seccomp-filter-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-namespace-sandbox",
+        "--disable-gpu-sandbox",
+    };
+    for (const char* flag : kSandboxFlags) {
+        bool present = false;
+        for (const std::string& a : argv) {
+            if (a == flag) {
+                present = true;
+                break;
+            }
+        }
+        if (!present) {
+            out.add_flags.emplace_back(flag);
+        }
+    }
+    if (out.add_flags.empty()) {
+        out.reason = "already";  // chromium child, all flags already present
+        return out;
+    }
+    out.should_inject = true;
+    out.reason = "inject";
+    return out;
+}
+
 ExecutableResolution resolve_guest_executable(
     const RuntimeConfig& config,
     std::string_view requested_program) {

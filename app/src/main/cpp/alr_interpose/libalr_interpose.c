@@ -125,6 +125,7 @@
 #include <time.h>       /* struct timespec (utimensat) */
 #include <sys/types.h>
 #include <sys/socket.h> /* struct sockaddr, AF_NETLINK, socklen_t (bind workaround) */
+#include <sys/un.h>     /* struct sockaddr_un (chromium ProcessSingleton transform) */
 #include <sys/stat.h>   /* struct stat[64], struct statx, statx flags */
 
 /* PCGATE additions: raw UAPI seccomp/BPF + openat2, plus the SIGSYS-catching
@@ -1252,9 +1253,79 @@ ssize_t __readlinkat_chk(int dirfd, const char *path, char *buf, size_t bufsiz,
  * This is NOT a SELinux bypass — the kernel still enforces every syscall; we only
  * stop a kernel-denied connectivity PROBE from being misread as "offline". Real
  * AF_INET data sockets, and netlink binds that actually succeed, are untouched. */
+/* chromium ProcessSingleton (full browser, NOT content_shell) binds an AF_UNIX
+ * socket at "<TMPDIR>/.org.chromium.Chromium.XXXXXX/SingletonSocket" (reached via a
+ * symlink from "<user-data-dir>/SingletonSocket"). Under ALR this bind FAILS:
+ *   - mkdir/open of that dir are MEDIATED (rewritten to <rootfs>/tmp/... by rw()),
+ *     so the dir is created at the rootfs host location, but
+ *   - bind() is NOT a path syscall — neither the seccomp path-trap nor rw() touch
+ *     the sun_path — so the kernel resolves the literal "/tmp/..." against the bare
+ *     Android filesystem (no /tmp there) and bind() returns ENOENT. chromium then
+ *     "Failed to create a ProcessSingleton" and ABORTs (chrome_main_delegate.cc:515,
+ *     device exit=21) before painting any window.
+ * Rewriting sun_path with rw() does not help: <rootfs> (61 bytes) + chromium's
+ * singleton path (49 bytes) = 110 bytes, over the 108-byte sun_path limit.
+ * FIX: for the singleton socket ONLY (sun_path basename "SingletonSocket"), rebind
+ * to a Linux ABSTRACT-namespace socket (leading NUL, no filesystem entry) with a
+ * fixed name. Abstract sockets have no path-length-vs-filesystem split and fully
+ * support listen()/accept(); we are a SINGLE offline instance so a fixed name is
+ * unambiguous, and connect() below applies the SAME transform for symmetry. Scoped
+ * to the exact "SingletonSocket" basename so no other AF_UNIX socket (Wayland under
+ * the cache dir, X11, etc.) is affected. Returns 1 and fills *out if transformed. */
+/* The abstract name: a leading NUL (abstract-namespace marker) + a fixed label. As
+ * a C string literal "\0alr-..." its sizeof includes the trailing implicit NUL, so
+ * the abstract-name byte count we bind/connect with is (sizeof - 1) = leading NUL +
+ * label, identical on both sides. */
+#define ALR_CR_SINGLETON_ABSTRACT "\0alr-chromium-process-singleton"
+static int alr_cr_singleton_xform(const struct sockaddr *addr, socklen_t len,
+                                  struct sockaddr_un *out, socklen_t *out_len) {
+    if (!addr || addr->sa_family != AF_UNIX) return 0;
+    if (g_rootfs_len == 0) return 0;  /* interposer disabled -> never transform */
+    const struct sockaddr_un *un = (const struct sockaddr_un *)addr;
+    /* sun_path is a filesystem path (not already abstract: first byte != NUL) and
+     * its basename is exactly "SingletonSocket". len bounds the readable bytes. */
+    if (len <= (socklen_t)offsetof(struct sockaddr_un, sun_path)) return 0;
+    if (un->sun_path[0] == '\0') return 0;  /* already abstract */
+    size_t plen = 0;
+    const size_t cap = (size_t)len - offsetof(struct sockaddr_un, sun_path);
+    while (plen < cap && plen < sizeof(un->sun_path) && un->sun_path[plen] != '\0') ++plen;
+    /* Require the path to END with "/SingletonSocket". */
+    static const char suffix[] = "/SingletonSocket";
+    const size_t slen = sizeof(suffix) - 1;
+    if (plen < slen) return 0;
+    for (size_t i = 0; i < slen; ++i) {
+        if (un->sun_path[plen - slen + i] != suffix[i]) return 0;
+    }
+    /* Build the abstract address: family + leading-NUL name. addrlen = base +
+     * (NUL + name bytes) so the kernel reads exactly the abstract name. */
+    static const char abs[] = ALR_CR_SINGLETON_ABSTRACT;  /* "\0alr-..." */
+    const size_t abs_len = sizeof(abs) - 1;  /* leading NUL + label, no trailing NUL */
+    for (size_t i = 0; i < sizeof(out->sun_path); ++i) out->sun_path[i] = 0;
+    out->sun_family = AF_UNIX;
+    for (size_t i = 0; i < abs_len && i < sizeof(out->sun_path); ++i) {
+        out->sun_path[i] = abs[i];
+    }
+    *out_len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + abs_len);
+    return 1;
+}
+
 int bind(int fd, const struct sockaddr *addr, socklen_t len) {
     static int (*real)(int, const struct sockaddr *, socklen_t);
     ALR_REAL(real, int (*)(int, const struct sockaddr *, socklen_t), "bind");
+    /* chromium ProcessSingleton: rebind the SingletonSocket to an abstract socket
+     * (see alr_cr_singleton_xform) so the bind succeeds despite the mediation /
+     * sun_path-length wall — otherwise full chromium aborts before its first frame. */
+    struct sockaddr_un xun;
+    socklen_t xlen;
+    if (alr_cr_singleton_xform(addr, len, &xun, &xlen)) {
+        int xr = real(fd, (const struct sockaddr *)&xun, xlen);
+        if (xr == 0) {
+            alr_diag("cr-singleton bind->abstract", "SingletonSocket", 0, 0);
+            return 0;
+        }
+        /* Abstract bind failed (e.g. name already taken by a stale launch) — fall
+         * through to the real bind so chromium sees a truthful errno. */
+    }
     int r = real(fd, addr, len);
     if (r != 0 && (errno == EACCES || errno == EPERM) &&
         addr && addr->sa_family == AF_NETLINK) {
@@ -1262,6 +1333,21 @@ int bind(int fd, const struct sockaddr *addr, socklen_t len) {
         return 0;
     }
     return r;
+}
+
+/* connect(): symmetric to bind() above — a second chromium instance probes the
+ * SingletonSocket via connect() before binding. Transform the same singleton path
+ * to the same abstract name so the probe reaches the first instance's socket. Every
+ * other connect (Wayland, X11, AF_INET, …) is passed through byte-identically. */
+int connect(int fd, const struct sockaddr *addr, socklen_t len) {
+    static int (*real)(int, const struct sockaddr *, socklen_t);
+    ALR_REAL(real, int (*)(int, const struct sockaddr *, socklen_t), "connect");
+    struct sockaddr_un xun;
+    socklen_t xlen;
+    if (alr_cr_singleton_xform(addr, len, &xun, &xlen)) {
+        return real(fd, (const struct sockaddr *)&xun, xlen);
+    }
+    return real(fd, addr, len);
 }
 
 /* setsockopt(): CAP_NET_ADMIN routing-policy hints denied to untrusted_app.

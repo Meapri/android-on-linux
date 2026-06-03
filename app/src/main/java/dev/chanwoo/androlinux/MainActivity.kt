@@ -1900,9 +1900,16 @@ class MainActivity : Activity() {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        // Android re-shows the system bars after dialogs/notifications steal focus;
-        // re-hide them whenever we regain focus so the Linux GUI stays edge-to-edge.
-        if (hasFocus) applyImmersive()
+        if (!hasFocus) return
+        // Standalone Chromium app keeps the Android bars visible (normal-app frame);
+        // every other path re-hides them for an edge-to-edge Linux GUI.
+        if (componentName.className.endsWith("ChromiumStandalone") ||
+            java.io.File("/data/local/tmp/.alr-cronly").isFile
+        ) {
+            showSystemBars()
+        } else {
+            applyImmersive()
+        }
     }
 
     // Lean standalone Chromium browser window (see the onCreate gate). Stands up ONLY
@@ -1929,7 +1936,7 @@ class MainActivity : Activity() {
         // adb-push'd to /data/local/tmp; the base rootfs already ships the GTK/X/font
         // stack. No GPU shim / toolkit / GIMP overlays here (lean).
         Thread {
-            for (name in listOf("interpose", "nss", "chromium-net", "xkb-gegl", "content-shell")) {
+            for (name in listOf("interpose", "nss", "chromium-net", "xkb-gegl", "chromium-gui")) {
                 try {
                     val tar = File("/data/local/tmp/$name-stage.tar")
                     val marker = File(rootfsDir, ".$name-staged-${tar.length()}")
@@ -1974,13 +1981,18 @@ class MainActivity : Activity() {
                         // staging thread writes LAST (".chromium-gui-staged-<size>") AND on a
                         // late-tar dependency file, so launch only proceeds with the overlay
                         // fully in place.
-                        val chromiumBin = File(rootfsDir, "usr/lib/chromium/chromium-shell")
-                        val csTar = File("/data/local/tmp/content-shell-stage.tar")
-                        val csMarker = File(rootfsDir, ".content-shell-staged-${csTar.length()}")
+                        // CR-4 full chromium: gate on the FULL browser binary
+                        // (/usr/lib/chromium/chromium, NOT chromium-shell) + the
+                        // chromium-gui overlay extraction-complete marker + a late-tar
+                        // dependency (libopenh264) so launch only proceeds with the whole
+                        // ~337MB overlay in place (avoids the libopenh264 launch race).
+                        val chromiumBin = File(rootfsDir, "usr/lib/chromium/chromium")
+                        val cgTar = File("/data/local/tmp/chromium-gui-stage.tar")
+                        val cgMarker = File(rootfsDir, ".chromium-gui-staged-${cgTar.length()}")
                         val openh264 = File(rootfsDir, "usr/lib/aarch64-linux-gnu/libopenh264.so.7")
                         var waited = 0
                         while (waited < 180000 &&
-                            !(chromiumBin.isFile && csMarker.isFile && openh264.isFile)
+                            !(chromiumBin.isFile && cgMarker.isFile && openh264.isFile)
                         ) { Thread.sleep(500); waited += 500 }
                         try {
                             val demoSrc = File("/data/local/tmp/alr-demo.html")
@@ -2036,13 +2048,23 @@ class MainActivity : Activity() {
                             //   --disable-setuid-sandbox / --disable-namespace-sandbox /
                             //   --disable-gpu-sandbox : no SUID helper, no userns clone, no GPU
                             //       sandbox — none can work inside an untrusted_app domain.
-                            // content_shell (chromium-shell): a TRUE single-process embedder
-                            // (layout-test shell) — unlike full chromium it does NOT fork the
-                            // zygote_host / crashpad child that argc=10 storm came from, so the
-                            // "No usable sandbox" child-crash loop is sidestepped at the source.
-                            // Keep every sandbox layer off (content_shell still links the bpf
-                            // sandbox) + --single-process so the loader maps ONE address space.
-                            "/usr/lib/chromium/chromium-shell\n--ozone-platform=wayland" +
+                            // FULL chromium browser (/usr/lib/chromium/chromium — the real
+                            // tabbed UI with omnibox, NOT content_shell). Multiprocess by
+                            // nature, but --single-process collapses renderer+GPU+utility into
+                            // the ONE browser process so the loader maps ONE address space (no
+                            // per-child ~258MiB re-map storm). The two child forks full chromium
+                            // still does even single-process — chrome_crashpad_handler and any
+                            // residual --type= child — are handled at the LOADER (this session):
+                            //   * crashpad: runtime_report.cpp neuters its exec to exit0
+                            //     (--disable-crash-reporter/breakpad already set), breaking the
+                            //     device-observed crashpad↔chromium refork RSS storm.
+                            //   * sandbox: a chromium child's argv DROPS these --*-sandbox flags
+                            //     (chromium rebuilds child argv from its own cmdline), so the
+                            //     child logged "No usable sandbox!" and brk()-crashed. The loader
+                            //     now re-injects the missing sandbox-disable flags into the
+                            //     re-mapped child's argv (decide_chromium_child_argv). Keep them
+                            //     on the LAUNCH argv too so the browser process itself is covered.
+                            "/usr/lib/chromium/chromium\n--ozone-platform=wayland" +
                                 "\n--no-sandbox\n--disable-seccomp-filter-sandbox" +
                                 "\n--disable-setuid-sandbox\n--disable-namespace-sandbox" +
                                 "\n--disable-gpu-sandbox" +
@@ -2051,7 +2073,7 @@ class MainActivity : Activity() {
                                 "\n--disable-dev-shm-usage\n--user-data-dir=/tmp/cr4-profile" +
                                 "\n--no-first-run\n--no-default-browser-check" +
                                 "\n--disable-crash-reporter\n--disable-breakpad" +
-                                // demo.html is file:// (offline). content_shell still probes
+                                // demo.html is file:// (offline). full chromium still probes
                                 // DoH (https://dns.google) in the background → NSS init →
                                 // libsqlite3.so.0 (flat-path gap) → FATAL nss_error=-5925,
                                 // AFTER the window already painted. Kill ALL background net so
@@ -2059,9 +2081,25 @@ class MainActivity : Activity() {
                                 "\n--disable-background-networking" +
                                 "\n--disable-features=DnsOverHttps,AsyncDns" +
                                 "\n--no-pings\n--disable-component-update" +
-                                "\n--content-shell-hide-toolbar\n--ozone-override-screen-size=1200,1920" +
+                                // Match the ACTUAL compositor surface (device commits a
+                                // 1920x1200 landscape toplevel). The earlier 1200x1920
+                                // (portrait) mismatch made chromium lay its tab strip +
+                                // omnibox out for a 1200-wide window while the surface was
+                                // 1920 wide, pushing the top chrome partly off the visible
+                                // area. Sizing to 1920x1200 lets the full browser UI fit.
+                                "\n--start-maximized\n--window-size=1920,1200" +
+                                "\n--ozone-override-screen-size=1920,1200" +
                                 "\n--enable-logging=stderr\n--v=1" +
-                                "\nfile:///root/demo.html",
+                                // RENDER FIX (device-diagnosed): a file:///root/demo.html
+                                // load painted, but full chromium's FileURLLoader served it
+                                // as text/plain (the rootfs lacks /etc/mime.types and the
+                                // platform xdgmime query under ALR path mediation does not
+                                // resolve .html→text/html), so the page showed as SOURCE.
+                                // A data:text/html URL carries the MIME inline — no file
+                                // MIME lookup, no path mediation — so chromium renders the
+                                // actual page. The HTML is the same offline branded demo,
+                                // URL-encoded (spaces→%20, #→%23) into the single argv token.
+                                "\n" + chromiumDataUrl(),
                         )
                         android.util.Log.i("alr_loader", "cronly chromium exited:\n$out")
                     } catch (e: Throwable) {
@@ -2084,8 +2122,56 @@ class MainActivity : Activity() {
             true
         }
         setContentView(surfaceView)
-        applyImmersive()
+        // Standalone Chromium: keep the Android status bar + nav bar (soft keys) visible
+        // (normal-app frame), NOT immersive — chromium renders inside the inset content.
+        showSystemBars()
         surfaceView.post { surfaceView.requestFocus() }
+    }
+
+    // The offline CR-4 demo page as a data:text/html URL. Returned to the cronly launch
+    // argv as the single navigation token. We embed the MIME inline (data:text/html) so
+    // full chromium renders the page instead of MIME-sniffing a file:// load to
+    // text/plain (the rootfs has no /etc/mime.types and the platform xdgmime query does
+    // not resolve under ALR path mediation, device-confirmed showing the HTML as source).
+    // ZERO network: every byte is inline (no <link>/<script src>/<img>/web-font). A tiny
+    // inline-script clock makes the window visibly LIVE (proves a real renderer, not a
+    // static blit). Encoded minimally — only the bytes that break a URL token (space,
+    // '#', '%') — which keeps the data URL valid as one whitespace-free argv element.
+    private fun chromiumDataUrl(): String {
+        val html = buildString {
+            append("<!DOCTYPE html><html lang=en><head><meta charset=utf-8>")
+            append("<meta name=viewport content='width=device-width,initial-scale=1'>")
+            append("<title>ALR Chromium on Android</title>")
+            append("<style>")
+            append("html,body{margin:0;height:100%;font-family:system-ui,sans-serif}")
+            append("body{background:radial-gradient(1200px 800px at 25% -10%,#1c2a63,#0b1021 60%);")
+            append("color:#e9edff;display:flex;flex-direction:column;justify-content:center;padding:8vw}")
+            append("h1{font-size:7vw;margin:0 0 2vh;font-weight:800;letter-spacing:-.5px}")
+            append("p{font-size:3.2vw;margin:.4vh 0;color:#9fb0e0}")
+            append(".badge{display:inline-block;margin-top:3vh;padding:1.4vh 3vw;border-radius:999px;")
+            append("background:#8ad6ff;color:#06122c;font-weight:700;font-size:3vw}")
+            append(".dot{display:inline-block;width:2.4vw;height:2.4vw;border-radius:50%;background:#7fe07f;")
+            append("margin-right:1.4vw;vertical-align:middle;animation:pulse 1.2s infinite}")
+            append("@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}")
+            append("</style></head><body>")
+            append("<h1>ALR &mdash; Chromium on Android</h1>")
+            append("<p>Full chromium browser, rendered through the ALR Wayland compositor.</p>")
+            append("<p><span class=dot></span>Live render &bull; <span id=clk>--:--:--</span></p>")
+            append("<div class=badge>ALR-CR4-OK</div>")
+            append("<script>function t(){var d=new Date();")
+            append("document.getElementById('clk').textContent=d.toLocaleTimeString();}")
+            append("t();setInterval(t,1000);</script>")
+            append("</body></html>")
+        }
+        // Minimal URL-encoding: only characters that would terminate/confuse the single
+        // argv token or the data-URL grammar. The newline-delimited argv splits on '\n'
+        // (none here); spaces would split shell-style consumers, '#' starts a URL fragment,
+        // '%' is the escape introducer. Everything else (incl. < > " ' ; ,) is data-URL safe.
+        val enc = html
+            .replace("%", "%25")
+            .replace(" ", "%20")
+            .replace("#", "%23")
+        return "data:text/html,$enc"
     }
 
     // WS-4 §10(b): run apt/dpkg/X11 FUNCTIONALLY through the ALR native loader and emit
@@ -2680,6 +2766,22 @@ class MainActivity : Activity() {
                     View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
                     View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
                     View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION)
+        }
+    }
+
+    // Inverse of applyImmersive() for the standalone Chromium app: SHOW the Android
+    // status bar + nav bar (soft keys) and inset the content below/above them, so the
+    // browser reads like a normal Android app instead of an edge-to-edge fullscreen GUI.
+    private fun showSystemBars() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.setDecorFitsSystemWindows(true)
+            window.decorView.windowInsetsController?.let { c ->
+                c.show(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
+                c.systemBarsBehavior = WindowInsetsController.BEHAVIOR_DEFAULT
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
         }
     }
 
