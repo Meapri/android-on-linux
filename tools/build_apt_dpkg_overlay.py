@@ -100,6 +100,7 @@ DEFAULT_TARGETS = (
     "xz-utils",
     "zstd",
     "coreutils",
+    "sed",       # essential:yes the slim base dropped; apt-key escape_shell + maint scripts
     "bash",
     "dash",
     "gpgv",
@@ -315,30 +316,58 @@ def _append_admindir(out_tar: str | Path, *, include_status: bool = True) -> tup
 #
 # AUTHENTICATED-apt path (the gpgv/apt-key closure) — device-diagnosed gap.
 # -------------------------------------------------------------------------
-# noble apt is 2.7.14, whose `methods/gpgv` (apt-pkg/contrib/gpgv.cc ExecGPGV)
+# The shipped base rootfs's apt is **2.8.3** (host-verified from the libapt-pkg
+# SONAME version string), whose `methods/gpgv` (apt-pkg/contrib/gpgv.cc ExecGPGV)
 # ALWAYS exec()s `Dir::Bin::apt-key` (default /usr/bin/apt-key) to verify an
 # InRelease — it does NOT call gpgv directly even when the source pins `Signed-By`
-# (host-verified from the device binary's strings + the 2.7.14 source: ExecGPGV
-# does `Args.push_back(aptkey)` unconditionally, passing `--keyring <Signed-By>`).
+# (host-verified TWO ways: (i) the rootfs method binary's strings carry both the
+# direct-gpgv path AND "Unknown error executing apt-key"; (ii) the apt 2.8.3
+# source — salsa apt-pkg/contrib/gpgv.cc ExecGPGV — does, unconditionally:
+#     aptkey = _config->Find("Dir::Bin::apt-key", ".../apt-key");
+#     Args.push_back(aptkey); Args.push_back("--quiet"); ... "--keyring" <Signed-By>;
+#     execvp(Args[0], ...);   // Args[0] = /usr/bin/apt-key, ALWAYS
+# i.e. there is NO Signed-By short-circuit to a direct gpgv exec in this apt.)
 # So authenticated apt needs the WHOLE apt-key happy path present, not just gpgv:
 #   * `usr/bin/apt-key`  — the verify shell script (ships in the `apt` package),
 #   * `usr/lib/apt/methods/gpgv` — the method ELF that execs it (also in `apt`),
-#   * `usr/bin/gpgv`     — apt-key's `verify` resolves $GPGV and runs it,
+#   * `usr/bin/gpgv`     — apt-key's `verify` resolves $GPGV (from the apt.conf
+#     Apt::Key::gpgvcommand pin, else a bare-name PATH lookup) and runs it,
 #   * `usr/bin/apt-config` — apt-key reads Apt::Key::gpgvcommand via it,
 #   * a handful of COREUTILS apt-key shells out to on the `verify --keyring X.gpg`
-#     happy path: `mktemp`+`chmod` (create_gpg_home), `touch` (create_new_keyring),
-#     `rm`/`cat`/`readlink` (cleanup + merge), `head` (dearmor sniff). The slim
-#     base ships NONE of these (host-verified: only /usr/bin/env from coreutils),
-#     so without them apt-key dies at `mktemp` → the method reports
-#     "Unknown error executing apt-key" → "E: The repository is not signed".
-# We list the FULL set apt-key may touch (superset of the happy path — cut/sort/
-# comm/cp/mv/base64/expr/id are used by its add/update branches) so the overlay is
-# robust no matter which apt-key code path a given suite/key exercises. These all
-# ride in `coreutils` (already a DEFAULT_TARGET, so the closure ships them too;
-# this is the belt-and-suspenders 0o755 guarantee). gpg/gpgconf are NOT required
-# for a plain `.gpg` Signed-By keyring (dearmor of a .gpg is a no-op, the merge is
-# `cat`, and cleanup's gpgconf is `command_available`-guarded) — host-verified by
-# tracing the script — so we deliberately do NOT pull the heavy gnupg stack.
+#     happy path. Of these, host-tracing the apt-key script (set -e) shows the
+#     ORDER and which are FATAL-if-missing:
+#       - `mktemp`+`chmod` (create_gpg_home) — FATAL: `GPGHOMEDIR=$(mktemp …)`
+#         under `set -e` aborts the whole script (exit 127) if mktemp is absent,
+#         BEFORE gpgv is ever reached. This is the FIRST hard wall.
+#       - `gpgv` itself — if unresolved, apt-key exits 29 ("gpgv … required").
+#       - `cat`/`rm` (cleanup), `touch`/`cp` (create_new_keyring — only when the
+#         keyring file is ABSENT; our staged `.gpg` exists, so skipped), `head`
+#         (dearmor sniff — only for a non-`.gpg` keyring; skipped for our `.gpg`).
+#     SUBTLE (host-proven): `sed` (via escape_shell) and `awk`/`base64` (dearmor)
+#     are NOT fatal on the `verify --keyring <X.gpg>` path — escape_shell runs
+#     inside an `echo "…$(escape_shell …)…"` whose own exit is 0, so `set -e` does
+#     NOT abort when sed is missing (the resulting gpg.1.sh wrapper is empty but is
+#     never executed on the verify path, which runs $GPGV directly), and awk/base64
+#     only fire for an armored/`.asc` keyring (ours is binary `.gpg`). We ship `sed`
+#     anyway (it is an `essential:yes` package the slim base dropped, and a general
+#     `apt install`'s maintainer scripts + apt-key's adv/armored branches DO need
+#     it) — belt-and-suspenders, since the apt/dpkg closure does NOT pull it.
+# The shipped base actually HAS /usr/bin/{env,rm,apt-config} but LACKS
+# /usr/bin/{gpgv,mktemp,chmod,cat,touch,head,sed} (host-verified against the base
+# rootfs tar). So without this overlay authenticated apt dies at `mktemp` → the
+# method reports "Unknown error executing apt-key" → "E: The repository is not
+# signed" (NB: the keyring + InRelease themselves verify FINE in isolation — host
+# repro: `gpgv --keyring <staged> <real noble InRelease>` → GOODSIG, key
+# F6EC…C93C, exit 0 — so the blocker is purely this in-guest exec/staging gap, not
+# bad data). We list the FULL set apt-key may touch (superset of the happy path —
+# cut/sort/comm/cp/mv/base64/expr/id are used by its add/update branches) so the
+# overlay is robust no matter which apt-key code path a given suite/key exercises.
+# These ride in `coreutils`/`sed` (coreutils is a DEFAULT_TARGET, so the closure
+# ships its members too; this is the belt-and-suspenders 0o755 guarantee).
+# gpg/gpgconf are NOT required for a plain `.gpg` Signed-By keyring (dearmor of a
+# .gpg is a no-op, the merge is `cat`, and cleanup's gpgconf is
+# `command_available`-guarded) — host-verified by tracing the script — so we
+# deliberately do NOT pull the heavy gnupg stack.
 SELF_CONTAINED_BINS = {
     "dpkg": (
         "usr/bin/dpkg", "usr/bin/dpkg-deb", "usr/bin/dpkg-split",
@@ -356,6 +385,10 @@ SELF_CONTAINED_BINS = {
     "bash": ("usr/bin/bash",),
     "dash": ("usr/bin/dash", "bin/dash"),
     "gpgv": ("usr/bin/gpgv",),
+    # apt-key's escape_shell pipes through sed (non-fatal on the verify path, but
+    # essential:yes + needed by general maintainer scripts / apt-key adv branches);
+    # the slim base dropped it and the apt/dpkg closure doesn't pull it.
+    "sed": ("usr/bin/sed", "bin/sed"),
     # The coreutils apt-key's verify path shells out to (slim base lacks them all).
     "coreutils": (
         "usr/bin/mktemp", "usr/bin/chmod", "usr/bin/touch", "usr/bin/rm",
@@ -368,8 +401,13 @@ SELF_CONTAINED_BINS = {
 # The apt-key external-command happy path for `verify --keyring <X.gpg>` (the ONLY
 # branch authenticated `apt-get update` drives). Asserted present in the
 # self-contained set by the selftest so a future trim of SELF_CONTAINED_BINS can't
-# silently re-break authenticated apt. `gpg`/`gpgconf` are intentionally absent —
-# not needed for a plain .gpg keyring (see the SELF_CONTAINED_BINS note).
+# silently re-break authenticated apt. ORDER MATTERS (host-traced, set -e): the
+# method execs apt-key, which FIRST runs `mktemp`+`chmod` (create_gpg_home — a
+# mktemp miss aborts the script at exit 127 before gpgv is reached), then resolves
+# + runs `gpgv` (miss → exit 29). `touch`/`head` only fire for an absent/armored
+# keyring (skipped for our existing binary `.gpg`) but are cheap to assert.
+# `gpg`/`gpgconf` are intentionally absent — not needed for a plain .gpg keyring
+# (see the SELF_CONTAINED_BINS note).
 APT_KEY_VERIFY_DEPS = (
     "usr/bin/apt-key", "usr/lib/apt/methods/gpgv", "usr/bin/gpgv",
     "usr/bin/apt-config", "usr/bin/mktemp", "usr/bin/chmod", "usr/bin/touch",
@@ -690,11 +728,13 @@ def _selftest() -> int:
         print(f"  [{'PASS' if cond else 'FAIL'}] {label}")
 
     # --- closure resolution over a synthetic noble-like index --------------- #
+    # Versions mirror the shipped base (apt 2.8.3, host-verified) — synthetic test
+    # data, but kept consistent with the real rootfs the overlay targets.
     index = {
-        "apt": {"Version": "2.7.14", "Architecture": "arm64", "Size": "1336188",
+        "apt": {"Version": "2.8.3", "Architecture": "arm64", "Size": "1336188",
                 "Depends": "libapt-pkg6.0t64, gpgv, dpkg (>= 1.17.2)"},
-        "apt-utils": {"Version": "2.7.14", "Architecture": "arm64", "Size": "205248",
-                      "Depends": "apt (= 2.7.14), libapt-pkg6.0t64"},
+        "apt-utils": {"Version": "2.8.3", "Architecture": "arm64", "Size": "205248",
+                      "Depends": "apt (= 2.8.3), libapt-pkg6.0t64"},
         "dpkg": {"Version": "1.22.6", "Architecture": "arm64", "Size": "1265468",
                  "Depends": "tar, libzstd1"},
         "tar": {"Version": "1.35", "Architecture": "arm64", "Size": "247906"},
@@ -704,11 +744,12 @@ def _selftest() -> int:
         "zstd": {"Version": "1.5.5", "Architecture": "arm64", "Size": "574810",
                  "Depends": "libzstd1"},
         "coreutils": {"Version": "9.4", "Architecture": "arm64", "Size": "1362772"},
+        "sed": {"Version": "4.9", "Architecture": "arm64", "Size": "171910"},
         "bash": {"Version": "5.2", "Architecture": "arm64", "Size": "780262"},
         "dash": {"Version": "0.5.12", "Architecture": "arm64", "Size": "90376"},
         "gpgv": {"Version": "2.4.4", "Architecture": "arm64", "Size": "149882",
                  "Depends": "libgcrypt20"},
-        "libapt-pkg6.0t64": {"Version": "2.7.14", "Architecture": "arm64", "Size": "934734",
+        "libapt-pkg6.0t64": {"Version": "2.8.3", "Architecture": "arm64", "Size": "934734",
                              "Depends": "libzstd1, libgcrypt20"},
         "libgcrypt20": {"Version": "1.10", "Architecture": "arm64", "Size": "471954"},
         "libzstd1": {"Version": "1.5.5", "Architecture": "arm64", "Size": "271224"},
@@ -720,6 +761,8 @@ def _selftest() -> int:
     check("closure pulls apt-utils", "apt-utils" in plan.closure)
     check("closure pulls libapt-pkg (transitive dep)", "libapt-pkg6.0t64" in plan.closure)
     check("closure pulls gpgv (apt verifies)", "gpgv" in plan.closure)
+    check("closure pulls sed (essential:yes; apt-key escape_shell + maint scripts)",
+          "sed" in plan.closure)
     check("closure pulls libzstd1 (transitive)", "libzstd1" in plan.closure)
     check("closure pulls libgcrypt20 (transitive)", "libgcrypt20" in plan.closure)
     check("closure pulls the unpack toolchain (tar)", "tar" in plan.closure)
@@ -835,6 +878,8 @@ def _selftest() -> int:
               "usr/lib/apt/methods/gpgv" in flat)
         check("self-contained ships the gpgv BINARY (apt-key's actual verifier)",
               "usr/bin/gpgv" in flat)
+        check("self-contained ships sed (apt-key escape_shell + maint scripts; slim base dropped it)",
+              "usr/bin/sed" in flat)
         # gpg/gpgconf are deliberately NOT pulled (a plain .gpg keyring needs neither).
         check("self-contained does NOT drag in the heavy gnupg stack (gpg/gpgconf)",
               "usr/bin/gpg" not in flat and "usr/bin/gpgconf" not in flat)
