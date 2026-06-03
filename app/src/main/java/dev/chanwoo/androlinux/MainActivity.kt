@@ -2479,15 +2479,96 @@ class MainActivity : Activity() {
         )
     }
 
+    // CR-2 online apt: run `apt-get update` in-guest against the mirror pinned in /etc/hosts
+    // (apt-mirror overlay) on a DNS-blocked device. Reuses the fakeroot + interpose chain
+    // (apt writes /var/lib/apt/lists as uid=0; forks /usr/lib/apt/methods/http for the fetch).
+    // HTTP mirror (apt integrity = GPG, no TLS) sidesteps the TLS/NSS connect-brk; the
+    // /etc/hosts pin sidesteps the blocked DNS; host-curl already proved the pinned IP serves
+    // the apt index. Armed by `echo update > /data/local/tmp/.alr-aptdrain`.
+    private fun runAptUpdateProbe(rootfsDir: File, rootfsName: String) {
+        Thread {
+            try {
+                android.util.Log.i("alr_loader", "aptupdate: armed — staging fakeroot/apt-dpkg/dpkg-db/apt-mirror")
+                for (name in listOf("fakeroot", "apt-dpkg", "dpkg-db", "apt-mirror")) {
+                    val tar = java.io.File("/data/local/tmp/$name-stage.tar")
+                    val m = java.io.File(rootfsDir, ".aptdrain-$name-staged-${tar.length()}")
+                    if (tar.isFile && !m.isFile) {
+                        val ovr = RootfsInstaller(this@MainActivity).extractOverlayTar(tar, rootfsDir)
+                        m.writeText("staged\n")
+                        android.util.Log.i("alr_loader", "aptupdate: $name-stage done (extracted=${ovr.extracted} skipped=${ovr.skipped.size})")
+                    } else if (!tar.isFile) {
+                        android.util.Log.i("alr_loader", "aptupdate: $name-stage.tar absent (push it to /data/local/tmp)")
+                    }
+                }
+                val fakerootSo = java.io.File(rootfsDir, "usr/lib/androlinux/libalr_fakeroot.so")
+                val aptGetBin = java.io.File(rootfsDir, "usr/bin/apt-get")
+                val hostsFile = java.io.File(rootfsDir, "etc/hosts")
+                val srcFile = java.io.File(rootfsDir, "etc/apt/sources.list.d/alr-ports.sources")
+                // v2 interpose-stage race (device-root-caused, same as launchAptDrainProbe):
+                // the concurrent onCreate overlay thread (re)writes libalr_interpose.so IN
+                // PLACE; if apt-get's ld.so mmaps it mid-rewrite, the LD_PRELOAD ctor never
+                // runs → ZERO path mediation (traps=0) → apt reads the literal Android paths
+                // and dies "E: Error reading the CPU table" (exit 100). WAIT for the interpose
+                // .so to settle (the .interpose-staged-<len> marker is written only AFTER the
+                // extract fully completes) before launching apt-get.
+                val interposeSo = java.io.File(rootfsDir, "usr/lib/androlinux/libalr_interpose.so")
+                val interposeStageTar = java.io.File("/data/local/tmp/interpose-stage.tar")
+                val interposeStaging = {
+                    interposeStageTar.isFile &&
+                        (rootfsDir.listFiles { f -> f.name.startsWith(".interpose-staged-") }?.isEmpty() ?: true)
+                }
+                var w = 0
+                while (w < 40000 &&
+                    !(fakerootSo.isFile && aptGetBin.isFile && srcFile.isFile &&
+                        interposeSo.isFile && !interposeStaging())
+                ) { Thread.sleep(500); w += 500 }
+                android.util.Log.i(
+                    "alr_loader",
+                    "aptupdate: fakeroot.so=${fakerootSo.isFile} apt-get=${aptGetBin.isFile} hosts=${hostsFile.isFile} sources=${srcFile.isFile} (waited ${w}ms)",
+                )
+                android.system.Os.setenv("ALR_FAKEROOT", "1", true)
+                android.system.Os.setenv("ALR_REEXEC_INPROC", "1", true)
+                android.system.Os.setenv("ALR_INTERPOSE_DIAG", "1", true)
+                android.system.Os.setenv("ALR_TEE_GUEST_STDOUT", "1", true)
+                try {
+                    val out = nativeAlrNativeLoaderProbe(
+                        packageName,
+                        applicationInfo.nativeLibraryDir,
+                        filesDir.absolutePath,
+                        cacheDir.absolutePath,
+                        rootfsName,
+                        "/usr/bin/apt-get\n-o\nAcquire::ForceIPv4=true\nupdate",
+                    )
+                    val online = out.contains("InRelease") || out.contains("Get:") ||
+                        out.contains("Packages") || out.contains("Reading package lists")
+                    android.util.Log.i("alr_loader", "aptupdate: apt-get update online=$online")
+                    android.util.Log.i("alr_loader", "aptupdate-out:\n$out")
+                } finally {
+                    android.system.Os.unsetenv("ALR_FAKEROOT")
+                    android.system.Os.unsetenv("ALR_REEXEC_INPROC")
+                    android.system.Os.unsetenv("ALR_INTERPOSE_DIAG")
+                    android.system.Os.unsetenv("ALR_TEE_GUEST_STDOUT")
+                }
+            } catch (e: Throwable) {
+                android.util.Log.e("alr_loader", "aptupdate EXC: ${android.util.Log.getStackTraceString(e)}")
+            }
+        }.start()
+    }
+
     private fun launchAptDrainProbe(rootfsDir: File, rootfsName: String) {
         val marker = java.io.File("/data/local/tmp/.alr-aptdrain")
         if (!marker.isFile) return
         // The marker CONTENT names the package to install (default: hello). e.g.
         //   adb shell 'echo galculator > /data/local/tmp/.alr-aptdrain'
         // arms the galculator drain; an empty marker keeps the original hello proof.
-        val target = aptDrainTargetFor(
-            runCatching { marker.readText().trim() }.getOrDefault("").ifEmpty { "hello" },
-        )
+        // CR-2: marker content "update" instead runs `apt-get update` against the mirror
+        // pinned in /etc/hosts (apt-mirror overlay) — proves ONLINE apt on a DNS-blocked device.
+        val markerContent = runCatching { marker.readText().trim() }.getOrDefault("")
+        if (markerContent == "update") {
+            runAptUpdateProbe(rootfsDir, rootfsName)
+            return
+        }
+        val target = aptDrainTargetFor(markerContent.ifEmpty { "hello" })
         Thread {
             try {
                 android.util.Log.i("alr_loader", "aptdrain: marker present — v2 apt-pipeline drain armed (pkg=${target.pkg})")
