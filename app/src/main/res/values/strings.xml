@@ -4,4 +4,6 @@
     <!-- 런처 홈 브랜드 헤더(presentation only). -->
     <string name="launcher_brand_title">Android on Linux</string>
     <string name="launcher_brand_subtitle">Linux apps, natively</string>
+    <!-- 브랜드 헤더 우측 설정 액션 접근성 라벨(과거 런처 내부 바의 톱니를 재배치). -->
+    <string name="launcher_settings_action">설정</string>
 </resources>

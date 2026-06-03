@@ -23,8 +23,12 @@ package dev.chanwoo.androlinux.ui
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -135,15 +139,21 @@ private fun NavGraphBuilder.launcherDestination(
     // collectAsState 로 받아 *기존 Route 시그니처* 그대로 넘긴다(화면은 ViewModel 을 모름).
     val vm: LauncherViewModel = viewModel(factory = alrViewModelFactory { LauncherViewModel(runtime) })
     val state by vm.uiState.collectAsState()
-    // 브랜드 정체성 헤더("Android on Linux") — 최상위 scaffold chrome(presentation only).
+    // 브랜드 정체성 헤더("Android on Linux") — 런처 홈의 *유일한* 상단 바(presentation only).
+    // 과거 LauncherScreen.kt 가 자체 "AndroLinux" TopAppBar 를 그려 이중 바가 됐는데, 그 내부
+    // 바를 제거하고 설정 진입(톱니)을 이 브랜드 바의 우측 액션으로 재배치했다(여전히 도달 가능).
     // 앱-그리드 로직/런타임 결선은 불변; LauncherRoute 를 그대로 호출만 한다.
-    BrandedLauncherScaffold {
+    BrandedLauncherScaffold(
+        onOpenSettings = { navController.navigate(AlrRoutes.SETTINGS) },
+    ) {
         LauncherRoute(
             installedApps = state.installedApps,
             // 실행은 통합 측이 RunningSurface 결선과 함께 수행(onLaunchApp 위임) — ViewModel 의
             // launch 는 mock/세션 표현용이라 두 경로가 같은 launch 로 수렴한다.
             onLaunch = { app -> onLaunchApp(app.toLaunchRequest()) },
             onOpenCatalog = { navController.navigate(AlrRoutes.CATALOG) },
+            // 설정은 브랜드 바의 톱니 액션으로 도달한다 — 화면은 콜백을 받지만 내부 바를
+            // 더는 그리지 않으므로 여기서도 동일 목적지로 연결해 시그니처를 보존한다(무해).
             onOpenSettings = { navController.navigate(AlrRoutes.SETTINGS) },
             onOpenAppDetail = { appId -> navController.navigate(AlrRoutes.appDetail(appId)) },
         )
@@ -158,7 +168,10 @@ private fun NavGraphBuilder.launcherDestination(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun BrandedLauncherScaffold(content: @Composable () -> Unit) {
+private fun BrandedLauncherScaffold(
+    onOpenSettings: () -> Unit,
+    content: @Composable () -> Unit,
+) {
     Scaffold(
         topBar = {
             CenterAlignedTopAppBar(
@@ -174,6 +187,16 @@ private fun BrandedLauncherScaffold(content: @Composable () -> Unit) {
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             textAlign = TextAlign.Center,
+                        )
+                    }
+                },
+                // 설정 진입 — 과거 LauncherScreen 내부 바가 들고 있던 톱니를 단일 브랜드 바로
+                // 재배치(re-home)했다. 런처 홈에서 설정은 항상 이 우측 액션으로 도달한다.
+                actions = {
+                    IconButton(onClick = onOpenSettings) {
+                        Icon(
+                            imageVector = Icons.Filled.Settings,
+                            contentDescription = stringResource(R.string.launcher_settings_action),
                         )
                     }
                 },

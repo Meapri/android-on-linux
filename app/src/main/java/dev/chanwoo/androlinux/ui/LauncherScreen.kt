@@ -51,20 +51,17 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -107,20 +104,18 @@ fun LauncherRoute(
     installedApps: List<InstalledApp>,
     onLaunch: (InstalledApp) -> Unit,
     onOpenCatalog: () -> Unit,
-    onOpenSettings: () -> Unit,
+    // 시그니처 보존: 설정 진입은 이제 단일 브랜드 바(AlrApp.BrandedLauncherScaffold)의
+    // 톱니 액션이 담당한다. 이 화면은 더 이상 자체 바/톱니를 그리지 않으므로 이 콜백을
+    // 본문에서 직접 쓰진 않지만, 호출부(AlrApp)·Preview 와의 계약을 위해 파라미터는 유지한다.
+    @Suppress("UNUSED_PARAMETER") onOpenSettings: () -> Unit,
     onOpenAppDetail: (String) -> Unit,
 ) {
+    // 상단 헤더(TopAppBar)는 더 이상 여기서 그리지 않는다 — 단일 브랜드 헤더
+    // "Android on Linux"(AlrApp.BrandedLauncherScaffold)가 런처 홈의 유일한 상단 바이며,
+    // 과거 이 화면이 가졌던 "AndroLinux" 내부 바를 함께 두면 이중 바가 됐다. 설정 진입
+    // (onOpenSettings)은 그 브랜드 바의 우측 톱니 액션으로 재배치했다(여전히 도달 가능).
+    // 이 Scaffold 는 FAB(앱 설치) 호스팅 + 본문 패딩 계산만 담당한다(topBar 없음).
     Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("AndroLinux") },
-                actions = {
-                    IconButton(onClick = onOpenSettings) {
-                        Icon(Icons.Filled.Settings, contentDescription = "설정")
-                    }
-                },
-            )
-        },
         floatingActionButton = {
             // 빈 상태에서는 본문 CTA 가 카탈로그로 안내하므로 FAB 는 숨겨 중복을 피한다.
             if (installedApps.isNotEmpty()) {
