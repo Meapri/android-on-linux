@@ -38,11 +38,14 @@ import android.util.DisplayMetrics
 import android.util.Log
 import android.view.SurfaceHolder
 import dev.chanwoo.androlinux.RootfsInstaller
+import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.map
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -122,35 +125,132 @@ class NativeAlrRuntime(private val appContext: Context) : AlrRuntime {
     }
 
     // ----------------------------------------------------------------------- //
-    // catalog / install / uninstall — Phase-1 minimal (DISCOVERY + RUN is the goal)
+    // catalog / install / uninstall — ONLINE apt install wired (the in-app loop)
     // ----------------------------------------------------------------------- //
 
     /**
-     * Phase 1: expose the discovered installed apps as a catalog (mapped to CatalogApp),
-     * so the catalog screen shows what is present and offers [open]. A real apt/bundle
-     * index is a later phase. TODO(phase-2): merge a bundled + apt-synthesized catalog.
+     * Catalog = the BUNDLED installable set (BundledCatalog — galculator/htop/… apt apps)
+     * merged with whatever is already discovered installed (mapped to CatalogApp), so the
+     * catalog screen shows BOTH "tap to install" apps and present "[open]" ones. Discovered
+     * entries win on appId collision (they carry the resolved binary/icon). install(appId)
+     * resolves the apt package from the bundled entry's RootfsDep(kind=APT).
      */
-    override fun catalog(): Flow<List<CatalogApp>> = flow {
-        emit(_installedApps.value.map { it.toCatalogApp() })
+    override fun catalog(): Flow<List<CatalogApp>> = _installedApps.map { installed ->
+        val byId = LinkedHashMap<String, CatalogApp>()
+        for (c in BundledCatalog.apps) byId[c.appId] = c
+        for (a in installed) byId[a.appId] = a.toCatalogApp()   // installed view wins
+        byId.values.toList()
     }
 
     /**
-     * Phase 1: online/overlay install is NOT wired here (it is gated on exec-re-entry +
-     * the in-guest apt path, a later phase). Emit a clear terminal "not yet" so the UI
-     * surfaces it instead of hanging. If the app is already present (discovered), report
-     * Done idempotently. TODO(phase-2): delegate to the stage-tar / in-guest dpkg path.
+     * ONLINE apt install of [appId]'s package: resolve appId → apt ref from the bundled
+     * catalog, run the device-proven AptInstaller pipeline (apt-get update + install, with
+     * the top-level dpkg -i completion), mapping apt's stdout phases to a monotonic percent.
+     * On success rescan `.desktop` so the new app appears as a launcher tile WITHOUT a
+     * restart; on failure emit Failed with the apt error. Idempotent if already installed.
+     *
+     * Demo-trust apt (the apt-mirror overlay ships `Trusted: yes`); authenticated gpgv is a
+     * separate spawn-tasked gap — not blocked on here.
      */
-    override fun install(appId: String): Flow<InstallProgress> = flow {
+    override fun install(appId: String): Flow<InstallProgress> = callbackFlow {
+        // Already installed → Done idempotently (the SSOT is installedApps).
         if (_installedApps.value.any { it.appId == appId }) {
-            emit(InstallProgress.Done(appId))
-        } else {
-            emit(InstallProgress.Failed(appId, "설치는 다음 단계에서 지원됩니다 (Phase 1: 탐색·실행)"))
+            trySend(InstallProgress.Done(appId)); close(); return@callbackFlow
         }
+        val aptRef = BundledCatalog.aptRefFor(appId)
+        if (aptRef == null) {
+            trySend(InstallProgress.Failed(appId, "이 앱은 apt 설치 대상이 아닙니다: $appId")); close()
+            return@callbackFlow
+        }
+        val worker = Thread({
+            try {
+                val rootfs = awaitRootfs()
+                if (rootfs == null) {
+                    trySend(InstallProgress.Failed(appId, "rootfs 준비 실패")); close(); return@Thread
+                }
+                val (rootfsDir, rootfsName) = rootfs
+                trySend(InstallProgress.Running(appId, PCT_RESOLVING, InstallStage.RESOLVING))
+                val result = AptInstaller.install(
+                    host = aptHost(),
+                    rootfsDir = rootfsDir,
+                    rootfsName = rootfsName,
+                    pkg = aptRef,
+                ) { phase ->
+                    // apt stdout phase → monotonic percent + UI stage label.
+                    val (pct, stage) = when (phase) {
+                        AptInstaller.Phase.RESOLVING -> PCT_RESOLVING to InstallStage.RESOLVING
+                        AptInstaller.Phase.DOWNLOADING -> PCT_DOWNLOADING to InstallStage.DOWNLOADING
+                        AptInstaller.Phase.UNPACKING -> PCT_UNPACKING to InstallStage.UNPACKING
+                        AptInstaller.Phase.CONFIGURING -> PCT_CONFIGURING to InstallStage.CONFIGURING
+                        AptInstaller.Phase.REGISTERING -> PCT_REGISTERING to InstallStage.REGISTERING
+                    }
+                    trySend(InstallProgress.Running(appId, pct, stage))
+                }
+                if (result.installed) {
+                    // The keystone: re-scan .desktop so the newly-installed app becomes a tile
+                    // in installedApps NOW (no app restart), then report Done.
+                    refreshInstalledApps()
+                    Log.i(TAG, "install($appId): installed=true; rescanned → ${_installedApps.value.size} app(s)")
+                    trySend(InstallProgress.Done(appId))
+                } else {
+                    Log.w(TAG, "install($appId): failed: ${result.error}")
+                    trySend(InstallProgress.Failed(appId, result.error ?: "설치 실패"))
+                }
+            } catch (e: Throwable) {
+                Log.e(TAG, "install($appId) EXC: ${Log.getStackTraceString(e)}")
+                trySend(InstallProgress.Failed(appId, e.message ?: "설치 중 오류"))
+            } finally {
+                close()
+            }
+        }, "alr-install-$appId")
+        worker.start()
+        awaitClose { /* the worker runs to completion; nothing to cancel mid-apt safely */ }
     }
 
-    /** Phase 1: uninstall (overlay/marker removal) is not wired. TODO(phase-2). */
-    override fun uninstall(appId: String): Flow<InstallProgress> = flow {
-        emit(InstallProgress.Failed(appId, "제거는 다음 단계에서 지원됩니다 (Phase 1: 탐색·실행)"))
+    /**
+     * Minimal `apt-get remove -y <pkg>` + rescan. Resolves the apt ref (from the bundled
+     * catalog, else the appId itself as a fallback package name), removes, then rescans so
+     * the tile disappears. Emits REMOVING progress then Done/Failed.
+     */
+    override fun uninstall(appId: String): Flow<InstallProgress> = callbackFlow {
+        val aptRef = BundledCatalog.aptRefFor(appId) ?: appId
+        val worker = Thread({
+            try {
+                val rootfs = awaitRootfs()
+                if (rootfs == null) {
+                    trySend(InstallProgress.Failed(appId, "rootfs 준비 실패")); close(); return@Thread
+                }
+                val (rootfsDir, rootfsName) = rootfs
+                trySend(InstallProgress.Running(appId, 50, InstallStage.REMOVING))
+                val removed = AptInstaller.remove(aptHost(), rootfsDir, rootfsName, aptRef)
+                refreshInstalledApps()
+                if (removed) trySend(InstallProgress.Done(appId))
+                else trySend(InstallProgress.Failed(appId, "제거를 완료하지 못했습니다"))
+            } catch (e: Throwable) {
+                Log.e(TAG, "uninstall($appId) EXC: ${Log.getStackTraceString(e)}")
+                trySend(InstallProgress.Failed(appId, e.message ?: "제거 중 오류"))
+            } finally {
+                close()
+            }
+        }, "alr-uninstall-$appId")
+        worker.start()
+        awaitClose { }
+    }
+
+    /** AptInstaller.Host backed by the runtime's AlrNative JNI facade + app dirs. */
+    private fun aptHost() = object : AptInstaller.Host {
+        override val packageName: String get() = this@NativeAlrRuntime.packageName
+        override val nativeLibraryDir: String get() = this@NativeAlrRuntime.nativeLibraryDir
+        override val filesDir: String get() = this@NativeAlrRuntime.filesDirPath
+        override val cacheDir: String get() = this@NativeAlrRuntime.cacheDirPath
+        override fun loaderProbe(rootfsName: String, program: String): String =
+            AlrNative.nativeAlrNativeLoaderProbe(
+                packageName, nativeLibraryDir, filesDir, cacheDir, rootfsName, program,
+            )
+        override fun extractOverlay(tar: File, rootfsDir: File): Pair<Int, Int> {
+            val ovr = this@NativeAlrRuntime.extractOverlay(tar, rootfsDir)
+            return ovr.extracted to ovr.skipped.size
+        }
     }
 
     // ----------------------------------------------------------------------- //
@@ -258,6 +358,13 @@ class NativeAlrRuntime(private val appContext: Context) : AlrRuntime {
     companion object {
         /** Max wait for rootfs extraction before a launch gives up (extraction is one-time). */
         private const val ROOTFS_WAIT_MS = 120_000
+
+        // Monotonic percents for the apt install phases (UI shows a rising bar).
+        private const val PCT_RESOLVING = 10
+        private const val PCT_DOWNLOADING = 35
+        private const val PCT_UNPACKING = 65
+        private const val PCT_CONFIGURING = 85
+        private const val PCT_REGISTERING = 97
     }
 }
 
@@ -278,3 +385,62 @@ internal fun InstalledApp.toCatalogApp(): CatalogApp = CatalogApp(
     installSizeBytes = installedSizeBytes,
     source = AppSource.BUNDLED,
 )
+
+// --------------------------------------------------------------------------- //
+// BundledCatalog — the installable apt apps the launcher offers (appId → apt ref)
+// --------------------------------------------------------------------------- //
+
+/**
+ * The set of apps the in-app catalog can INSTALL via `apt-get install` (online, from the
+ * pinned ports.ubuntu.com mirror). appId is the stable launch key = the `.desktop` basename
+ * the package ships, so after a successful install the SAME appId surfaces as an InstalledApp
+ * tile (DesktopEntryScanner reads the now-present `.desktop`). The RootfsDep(kind=APT) `ref`
+ * is the exact apt package name install() hands to AptInstaller.
+ *
+ * SSOT for the entrypoint/.desktop/apt-name is tools/build_app_stage.py APPS (galculator:
+ * apt=galculator, /usr/bin/galculator, /usr/share/applications/galculator.desktop). The
+ * heavier GUI stack (GTK3) is already in the base rootfs (it powers GIMP), so galculator's
+ * apt closure is essentially just its own leaf — a clean one-package install + launch, the
+ * in-app loop's proving app (dpkg configured=true device-proven per project memory).
+ */
+object BundledCatalog {
+
+    val apps: List<CatalogApp> = listOf(
+        // galculator — the in-app loop demo: a light GTK3 calculator. GTK3 is base-provided,
+        // so `apt-get install galculator` is a single-leaf install, then it runs windowed on
+        // the ALR Wayland compositor (GDK Wayland backend).
+        CatalogApp(
+            appId = "galculator",
+            name = "Galculator",
+            summary = "가벼운 GTK 계산기",
+            entry = LaunchEntry(LaunchEntry.EntryKind.EXEC, "/usr/bin/galculator"),
+            category = AppCategory.UTILITY,
+            description = "GTK3 기반의 가벼운 데스크톱 계산기. apt 로 설치되어 ALR Wayland " +
+                "컴포지터 위 창으로 실행됩니다 — 인앱 설치→런처 등장→실행 루프의 데모 앱.",
+            rootfsDeps = listOf(RootfsDep(RootfsDepKind.APT, "galculator", 1_200_000L)),
+            display = DisplaySpec(DisplaySpec.DisplayMode.WINDOWED),
+            installSizeBytes = 1_200_000L,
+            source = AppSource.APT,
+        ),
+        // htop — ncurses process viewer; ships a .desktop. Lightweight apt install proof.
+        CatalogApp(
+            appId = "htop",
+            name = "htop",
+            summary = "인터랙티브 프로세스 뷰어",
+            entry = LaunchEntry(LaunchEntry.EntryKind.EXEC, "/usr/bin/htop"),
+            category = AppCategory.SYSTEM,
+            description = "터미널에서 도는 인터랙티브 프로세스 모니터(ncurses). apt 로 설치.",
+            rootfsDeps = listOf(RootfsDep(RootfsDepKind.APT, "htop", 1_100_000L)),
+            display = DisplaySpec(DisplaySpec.DisplayMode.WINDOWED),
+            installSizeBytes = 1_100_000L,
+            source = AppSource.APT,
+        ),
+    )
+
+    private val aptRefByAppId: Map<String, String> =
+        apps.mapNotNull { c -> c.rootfsDeps.firstOrNull { it.kind == RootfsDepKind.APT }?.ref?.let { c.appId to it } }
+            .toMap()
+
+    /** appId → apt package name, or null if [appId] is not a bundled apt-installable app. */
+    fun aptRefFor(appId: String): String? = aptRefByAppId[appId]
+}
