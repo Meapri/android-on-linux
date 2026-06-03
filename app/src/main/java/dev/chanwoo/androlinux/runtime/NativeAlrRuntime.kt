@@ -435,58 +435,95 @@ object BundledCatalog {
             installSizeBytes = 1_100_000L,
             source = AppSource.APT,
         ),
-        // gedit — GNOME 의 가벼운 GTK3 텍스트 편집기. galculator 와 같은 부류(GTK3 base-
-        // provided, software-rendered, systemd 하드 의존 없음) — `apt-get install gedit` 후
-        // ALR Wayland 컴포지터 위 창으로 실행. appId 는 noble 이 까는 .desktop basename
-        // (org.gnome.gedit.desktop) 과 일치해야 설치 후 DesktopEntryScanner 가 같은 타일로
-        // 재조정한다. Exec=`gedit %U`(%U 는 스캐너가 strip), 바이너리 /usr/bin/gedit.
+        // mousepad — Xfce 의 가벼운 GTK3 텍스트 편집기. galculator 와 같은 부류(독립형
+        // Xfce 앱, GTK3 base-provided, systemd/dbus-activation/appstream 하드 의존 0).
+        // noble depends 닫힘: dconf-gsettings-backend, libglib2.0-0t64, libgspell-1-2
+        // (→ libenchant-2-2, 데몬 없음), libgtk-3-0t64, libmousepad0 — gnome-calculator
+        // 가 끌던 systemd/dbus/appstream/PAM 유지보수 스크립트(dpkg exit-73 원인)가 전혀
+        // 없어 galculator 처럼 install+configure 가 끝까지 통과한다. appId 는 noble 이
+        // 까는 .desktop basename(org.xfce.mousepad.desktop) 과 일치 — 설치 후
+        // DesktopEntryScanner 가 같은 타일로 재조정. Exec=`mousepad %F`(%F 스캐너 strip),
+        // 바이너리 /usr/bin/mousepad.
         CatalogApp(
-            appId = "org.gnome.gedit",
-            name = "gedit",
-            summary = "GNOME 텍스트 편집기",
-            entry = LaunchEntry(LaunchEntry.EntryKind.EXEC, "/usr/bin/gedit"),
+            appId = "org.xfce.mousepad",
+            name = "Mousepad",
+            summary = "가벼운 Xfce 텍스트 편집기",
+            entry = LaunchEntry(LaunchEntry.EntryKind.EXEC, "/usr/bin/mousepad"),
             category = AppCategory.UTILITY,
-            description = "GNOME 의 가벼운 GTK3 텍스트 편집기. apt 로 설치되어 ALR Wayland " +
-                "컴포지터 위 창으로 실행됩니다(GDK Wayland 백엔드, 소프트웨어 렌더). " +
-                "noble 패키지 gedit → /usr/share/applications/org.gnome.gedit.desktop.",
-            rootfsDeps = listOf(RootfsDep(RootfsDepKind.APT, "gedit", 8_000_000L)),
+            description = "Xfce 의 가벼운 GTK3 텍스트 편집기(독립형, GNOME 플랫폼 비의존). " +
+                "apt 로 설치되어 ALR Wayland 컴포지터 위 창으로 실행됩니다(GDK Wayland " +
+                "백엔드, 소프트웨어 렌더). systemd/dbus-activation/appstream 유지보수 " +
+                "스크립트가 없어 galculator 처럼 dpkg configure 가 끝까지 통과한다. " +
+                "noble 패키지 mousepad → /usr/share/applications/org.xfce.mousepad.desktop.",
+            rootfsDeps = listOf(RootfsDep(RootfsDepKind.APT, "mousepad", 2_400_000L)),
             display = DisplaySpec(DisplaySpec.DisplayMode.WINDOWED),
-            installSizeBytes = 8_000_000L,
+            installSizeBytes = 2_400_000L,
             source = AppSource.APT,
         ),
-        // gnome-calculator — GNOME 의 GTK3 계산기. galculator 와 동급(GTK3 base, software-
-        // rendered). appId 는 noble .desktop basename(org.gnome.Calculator.desktop, 대문자 C)
-        // 과 일치 — 이게 설치 후 surfacing 키. Exec=`gnome-calculator`, 바이너리
-        // /usr/bin/gnome-calculator(추가로 /usr/bin/gcalccmd CLI 도 깔리나 .desktop 은 GUI).
+        // l3afpad — leafpad 의 GTK3 포크. 카탈로그에서 가장 작은 GUI 닫힘:
+        // libc6, libcairo2, libglib2.0-0t64, libgtk-3-0t64, libpango-1.0-0,
+        // libpangocairo-1.0-0 만 — systemd/dbus/appstream/policykit 전무. 전부 base
+        // rootfs(GTK3 스택)에 이미 있어 사실상 단일-leaf 설치 → galculator 동급으로
+        // configure 통과. appId 는 .desktop basename(l3afpad.desktop) 과 일치.
+        // Exec=`l3afpad %f`(%f strip), 바이너리 /usr/bin/l3afpad.
         CatalogApp(
-            appId = "org.gnome.Calculator",
-            name = "GNOME 계산기",
-            summary = "GNOME GTK 계산기",
-            entry = LaunchEntry(LaunchEntry.EntryKind.EXEC, "/usr/bin/gnome-calculator"),
+            appId = "l3afpad",
+            name = "L3afpad",
+            summary = "초경량 GTK 텍스트 편집기",
+            entry = LaunchEntry(LaunchEntry.EntryKind.EXEC, "/usr/bin/l3afpad"),
             category = AppCategory.UTILITY,
-            description = "GNOME 의 GTK3 계산기. apt 로 설치되어 ALR Wayland 컴포지터 위 " +
-                "창으로 실행됩니다(GDK Wayland 백엔드, 소프트웨어 렌더). noble 패키지 " +
-                "gnome-calculator → /usr/share/applications/org.gnome.Calculator.desktop.",
-            rootfsDeps = listOf(RootfsDep(RootfsDepKind.APT, "gnome-calculator", 6_000_000L)),
+            description = "leafpad 의 GTK3 포크 — 카탈로그에서 가장 작은 닫힘(cairo/pango/" +
+                "glib/gtk3 6개 라이브러리뿐). apt 로 설치되어 ALR Wayland 컴포지터 위 " +
+                "창으로 실행됩니다. systemd/dbus/appstream 유지보수 스크립트가 없어 " +
+                "galculator 처럼 dpkg configure 가 끝까지 통과한다. noble 패키지 l3afpad " +
+                "→ /usr/share/applications/l3afpad.desktop.",
+            rootfsDeps = listOf(RootfsDep(RootfsDepKind.APT, "l3afpad", 600_000L)),
             display = DisplaySpec(DisplaySpec.DisplayMode.WINDOWED),
-            installSizeBytes = 6_000_000L,
+            installSizeBytes = 600_000L,
             source = AppSource.APT,
         ),
-        // eog — Eye of GNOME 이미지 뷰어(GTK3). galculator 와 동급(GTK3 base, software-
-        // rendered). appId 는 noble .desktop basename(org.gnome.eog.desktop) 과 일치.
-        // Exec=`eog %U`(%U strip), 바이너리 /usr/bin/eog — 푸시한 test.png 를 인자로 연다.
+        // gpicview — LXDE 의 가벼운 GTK3 이미지 뷰어. eog 가 끌던 GNOME-desktop 닫힘
+        // (libgnome-desktop-3, gsettings-desktop-schemas, shared-mime-info, librsvg2-
+        // common, webp-pixbuf-loader, peas/gir introspection) 대신, gpicview 닫힘은
+        // libcairo2, libgdk-pixbuf-2.0-0, libglib2.0-0t64, libgtk-3-0t64, libjpeg8,
+        // libx11-6 만 — systemd/dbus/appstream/policykit 전무, GNOME 플랫폼 비의존.
+        // appId 는 .desktop basename(gpicview.desktop) 과 일치. Exec=`gpicview %U`(strip),
+        // 바이너리 /usr/bin/gpicview — 푸시한 test.png 를 인자로 연다.
         CatalogApp(
-            appId = "org.gnome.eog",
-            name = "Eye of GNOME",
-            summary = "GNOME 이미지 뷰어",
-            entry = LaunchEntry(LaunchEntry.EntryKind.EXEC, "/usr/bin/eog"),
+            appId = "gpicview",
+            name = "GPicView",
+            summary = "가벼운 LXDE 이미지 뷰어",
+            entry = LaunchEntry(LaunchEntry.EntryKind.EXEC, "/usr/bin/gpicview"),
             category = AppCategory.GRAPHICS,
-            description = "Eye of GNOME — GTK3 이미지 뷰어. apt 로 설치되어 ALR Wayland " +
-                "컴포지터 위 창으로 실행됩니다(GDK Wayland 백엔드, 소프트웨어 렌더). " +
-                "noble 패키지 eog → /usr/share/applications/org.gnome.eog.desktop.",
-            rootfsDeps = listOf(RootfsDep(RootfsDepKind.APT, "eog", 7_000_000L)),
+            description = "LXDE 의 가벼운 GTK3 이미지 뷰어(독립형, GNOME 플랫폼 비의존). " +
+                "apt 로 설치되어 ALR Wayland 컴포지터 위 창으로 실행됩니다(GDK Wayland " +
+                "백엔드, 소프트웨어 렌더). eog 와 달리 systemd/dbus/appstream/gnome-" +
+                "desktop 닫힘이 없어 galculator 처럼 dpkg configure 가 끝까지 통과한다. " +
+                "noble 패키지 gpicview → /usr/share/applications/gpicview.desktop.",
+            rootfsDeps = listOf(RootfsDep(RootfsDepKind.APT, "gpicview", 700_000L)),
             display = DisplaySpec(DisplaySpec.DisplayMode.WINDOWED),
-            installSizeBytes = 7_000_000L,
+            installSizeBytes = 700_000L,
+            source = AppSource.APT,
+        ),
+        // xarchiver — GTK3 아카이브 관리자(독립형, 데스크톱 비종속). noble depends 닫힘:
+        // libc6, libgdk-pixbuf-2.0-0, libglib2.0-0t64, libgtk-3-0t64 만 — systemd/dbus/
+        // appstream/policykit 전무. base GTK3 스택에 이미 다 있어 단일-leaf 설치 →
+        // galculator 동급 configure 통과. appId 는 .desktop basename(xarchiver.desktop)
+        // 과 일치. Exec=`xarchiver %F`(%F strip), 바이너리 /usr/bin/xarchiver.
+        CatalogApp(
+            appId = "xarchiver",
+            name = "Xarchiver",
+            summary = "가벼운 GTK 압축 관리자",
+            entry = LaunchEntry(LaunchEntry.EntryKind.EXEC, "/usr/bin/xarchiver"),
+            category = AppCategory.UTILITY,
+            description = "GTK3 아카이브(zip/tar/…) 관리자 — 독립형, 데스크톱 환경 비종속. " +
+                "apt 로 설치되어 ALR Wayland 컴포지터 위 창으로 실행됩니다. depends 가 " +
+                "gtk3/glib/gdk-pixbuf 뿐이라 systemd/dbus/appstream 유지보수 스크립트가 " +
+                "없어 galculator 처럼 dpkg configure 가 끝까지 통과한다. noble 패키지 " +
+                "xarchiver → /usr/share/applications/xarchiver.desktop.",
+            rootfsDeps = listOf(RootfsDep(RootfsDepKind.APT, "xarchiver", 1_300_000L)),
+            display = DisplaySpec(DisplaySpec.DisplayMode.WINDOWED),
+            installSizeBytes = 1_300_000L,
             source = AppSource.APT,
         ),
     )
