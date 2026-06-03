@@ -184,3 +184,16 @@ cxx="${CXX:-g++}"
   -o /tmp/alr-native-vk-marshal-test
 
 /tmp/alr-native-vk-marshal-test
+
+# GENERATED Vulkan passthrough render batch (Phase 4 codegen): the first render-batch
+# entrypoints emitted by tools/gen_vk_passthrough.py from vk.xml — device memory (the
+# same-process MAP_SHARED arena, so vkMapMemory is a zero-copy local pointer), buffers,
+# images, image views + their reqs/bind/destroy — driven through the SAME decode_vk_batch
+# escape hand-off with a synthetic Mali provider (NO Vulkan SDK). Proves the generated
+# encode/decode round trip AND the arena pointer is real + writable.
+"$cxx" -std=c++20 -Wall -Wextra -Werror \
+  -Iapp/src/main/cpp \
+  tests/native_vk_gen_passthrough_test.cpp \
+  -o /tmp/alr-native-vk-gen-passthrough-test
+
+/tmp/alr-native-vk-gen-passthrough-test

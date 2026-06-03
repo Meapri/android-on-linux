@@ -56,6 +56,7 @@ class VkReader {
 public:
     VkReader(const uint8_t* p, size_t n) : p_(p), n_(n) {}
     bool u8(uint8_t& v) { return take(&v, 1); }
+    bool u16(uint16_t& v) { return take(&v, 2); }  // generated sub-opcode width
     bool u32(uint32_t& v) { return take(&v, 4); }
     bool u64(uint64_t& v) { return take(&v, 8); }
     bool i32(int32_t& v) { return take(&v, 4); }
@@ -88,6 +89,7 @@ private:
 class VkReplyEncoder {
 public:
     void u8(uint8_t v) { buf_.push_back(v); }
+    void u16(uint16_t v) { raw(&v, 2); }  // generated reply sub-opcode width
     void u32(uint32_t v) { raw(&v, 4); }
     void u64(uint64_t v) { raw(&v, 8); }
     void i32(int32_t v) { raw(&v, 4); }
@@ -2046,6 +2048,31 @@ struct VkProvider {
     void* ctx = nullptr;
 };
 
+// ---------------------------------------------------------------------------
+// GENERATED-OP SEAM. The 300.. opcode band is implemented by the codegen output
+// (alr_gpu/generated/alr_gpu_vk_gen_decode.hpp::decode_vk_gen_op). To avoid a circular
+// include (the generated decoder needs VkDecodeState/VkReader from THIS header), the
+// generated header REGISTERS its dispatcher here via a function pointer. decode_vk_batch's
+// default case calls it before fail-stopping, so an unknown op in the generated band is
+// handled, and a truly-unknown op still fail-stops. `gen_provider` is an opaque pointer the
+// caller may set (the wire test's synthetic Mali for the generated ops); on device it is
+// null and the generated decoder uses the real-Mali path. Returns true if `op` was a
+// generated op it handled (consuming its operands off `r`), false otherwise.
+using VkGenDispatchFn = bool (*)(uint8_t op, VkReader& r, VkDecodeState& st,
+                                 VkReplyEncoder& reply, const void* gen_provider);
+inline VkGenDispatchFn& vk_gen_dispatch() {
+    static VkGenDispatchFn fn = nullptr;
+    return fn;
+}
+inline void set_vk_gen_dispatch(VkGenDispatchFn fn) { vk_gen_dispatch() = fn; }
+// Optional opaque generated-provider pointer (wire test injects its synthetic Mali; device
+// leaves it null). decode_vk_batch forwards it to the registered generated dispatcher.
+inline const void*& vk_gen_provider_ptr() {
+    static const void* p = nullptr;
+    return p;
+}
+inline void set_vk_gen_provider(const void* p) { vk_gen_provider_ptr() = p; }
+
 inline bool decode_vk_batch(const uint8_t* data, size_t len, VkDecodeState& st,
                             VkReplyEncoder& reply, const VkProvider* provider = nullptr) {
     VkReader r(data, len);
@@ -2561,11 +2588,19 @@ inline bool decode_vk_batch(const uint8_t* data, size_t len, VkDecodeState& st,
                 break;
             }
 
-            default:
-                // Unknown opcode: fail-stop (same policy as the GLES decoder) — never
-                // emit an op not in alr_gpu_vk_proto.hpp.
+            default: {
+                // First give the generated 300.. band a chance (if its dispatcher is
+                // registered). It reads the op's operands off the SAME reader and appends
+                // its reply. If it handled the op, continue; otherwise fall through to the
+                // fail-stop (same policy as the GLES decoder — never accept an off-contract
+                // op). The hand-written 200..229 cases above always win for their numbers.
+                VkGenDispatchFn gd = vk_gen_dispatch();
+                if (gd && gd(op, r, st, reply, vk_gen_provider_ptr())) {
+                    break;  // handled by the generated decoder (st.ok reflects its result)
+                }
                 st.ok = false;
                 break;
+            }
         }
     }
     reply.u8(static_cast<uint8_t>(ALR_VK_REPLY_END));
