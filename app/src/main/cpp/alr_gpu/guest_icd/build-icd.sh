@@ -29,7 +29,11 @@ TARGET="aarch64-linux-gnu.2.34"
 CC=(zig cc -target "$TARGET")
 # The ICD TU is pure C; the .hpp wire header is C-clean (extern "C" guarded). The
 # generated proto header is C-clean too (extern "C" + plain enums/static-inline encoders).
-CFLAGS=(-std=c11 -O2 -fPIC -Wall -Wextra -fvisibility=default
+# -D_DEFAULT_SOURCE: expose the POSIX/glibc clock+sleep decls (nanosleep) the ICD's
+# ring-roundtrip wait uses. With -std=c11 (strict ISO) glibc's <time.h> hides nanosleep
+# behind _POSIX_C_SOURCE; _DEFAULT_SOURCE turns the full glibc surface on TU-wide,
+# independent of system-header include order. (alr_icd_runtime.h spin-then-yield fix.)
+CFLAGS=(-std=c11 -O2 -fPIC -Wall -Wextra -fvisibility=default -D_DEFAULT_SOURCE
         -I"$HERE" -I"$ALR_GPU_DIR" -I"$GUEST_SHIM_DIR" -I"$CPP_ROOT")
 
 mkdir -p "$OUT"

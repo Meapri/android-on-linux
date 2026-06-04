@@ -447,3 +447,97 @@ untouched.
    export, or does the in-process path use plain `VkImage` handles (no external
    memory) — which our ICD already backs? (Determines whether GAP-2 is actually
    exercised.)
+
+---
+
+## 6. DEVICE RUN RESULTS (Mali-G615, R5KL20B6S3X, chromium 147.0.7727.137)
+
+Four marker-gated runs. Ladder reached **R3 (our ICD loaded, Mali-G615 enumerated
+with real props)**; walled at the GL-substrate gate **before R4 (vkCreateDevice)**.
+The wall is NOT in our Vulkan ICD — our ICD's instance/enumerate/props path is healthy
+end-to-end (it correctly hands chromium a Mali physical device). The wall is a
+chromium-Android **architectural requirement that the compositor's shared/virtualized
+context is GL-rooted**, which needs a working EGL display our stack does not yet provide
+to chromium's bundled ANGLE.
+
+### 6.1 Walls found + fixes (in order up the ladder)
+
+- **WALL A — `gpu_init.cc:217` "Vulkan not supported with in process gpu"** (run #1).
+  chromium-147 `GpuInit::InitializeInProcess` (the path `--single-process`/
+  `--in-process-gpu` take) calls `DisableInProcessGpuVulkan()` on Android, which
+  force-sets `use_vulkan=kNone` + `gr_context_type=kGL` — UNLESS
+  `switches::kWebViewDrawFunctorUsesVulkan` is set, in which case it calls
+  `InitializeVulkan()` directly. **FIX (MainActivity flag):**
+  `--webview-draw-functor-uses-vulkan` (+ dropped `--use-gl=disabled`, which would
+  `LOG(FATAL)` since the Android in-process path runs `InitializeGL*` unconditionally;
+  + `SkipVulkanBlocklist` feature so a build-info/dEQP edge can't demote Mali). This is
+  the SOLE in-process Vulkan door on Android. → cleared, Vulkan init proceeded.
+
+- **WALL B — ICD `vkEnumeratePhysicalDevices` reply-pipeline desync** (run #2,
+  OUR ICD, tractable, FIXED). The loader's `setup_loader_term_phys_devs` count-query
+  returned 0 then the fill returned 1 → `VK_INCOMPLETE` (loader error 5) → Mali dropped.
+  Root cause: `alr_icd_roundtrip` (`alr_icd_runtime.h`) used a FIXED busy-spin bound;
+  on the cold first call (`vkCreateInstance`) the host servicer thread wasn't scheduled
+  before the spin exhausted, so it returned `got=0` with the reply UNDRAINED, and every
+  later roundtrip was skewed by one reply (the count-query drained the stale INSTANCE
+  reply → count 0). **FIX (`alr_icd_runtime.h`):** wait until the host actually acks
+  (`reply_seq >= want`) before draining — spin briefly then `nanosleep`-yield, ~8s
+  deadlock backstop; and only consume the reply when acked (never drain a non-ours
+  reply). + `build-icd.sh` `-D_DEFAULT_SOURCE` for the `nanosleep` decl. → device
+  re-run: `count-query -> 1`, `fill ... -> VK_SUCCESS`, loader sees Mali-G615. **R3 hit.**
+
+- **WALL C — `gpu_channel_manager.cc:922` "Failed to create shared context for
+  virtualization" → `shared_image_stub.cc:599` "unable to create context"** (runs #2/#3,
+  the standing wall). `GpuChannelManager::GetSharedContextState` calls
+  `gl::init::CreateGLContext()` **unconditionally** (GL-rooted SharedContextState) even
+  when `gr_context_type==kVulkan`; the Vulkan device is created LATER, only after this GL
+  context succeeds. Our run never reached `vkCreateDevice` because GL init failed first:
+  chromium's **bundled ANGLE** (`/usr/lib/chromium/libEGL.so`, `--use-angle=gles-egl`)
+  fails with `angle_platform_impl.cc:47 ... error 12289: Failed to get system egl
+  display` → `InitializeGLNoExtensionsOneOff failed`. Adding `--use-gl=angle
+  --use-angle=gles-egl` (run #3, intending ANGLE→our gpushim Mali GLES) flipped ANGLE to
+  the `OpenGLESEGL` backend but it still can't get a system EGL display from gpushim.
+
+### 6.2 The architectural finding (the honest verdict)
+
+**chromium-Android's in-process compositor ALWAYS requires a working GL/EGL context,
+even when the Skia GrContext is Vulkan** (`GetSharedContextState` → unconditional
+`CreateGLContext`). So the native-Vulkan-on-Mali compositor is GATED on a working
+GL display for chromium's bundled ANGLE. On our stack that means ANGLE must initialize
+an EGL display on gpushim (Mali GLES) — and chromium's bundled ANGLE `gles-egl` backend
+currently fails to get a display from gpushim's `libEGL` (error 12289 = the same
+"no system EGL" class as the standalone-ANGLE X11 fallback). **This is a gpushim /
+chromium-ANGLE-EGL bring-up problem in the GLES-shim layer, NOT a Vulkan-ICD gap** — our
+ICD is proven correct up to and including physical-device enumeration with real Mali
+props, and would create the device the moment the GL substrate comes up.
+
+GAP-2 (the doc's predicted first wall) is **NOT a wall on this path**: Android's
+`VulkanImplementationAndroid::GetRequiredDeviceExtensions()` returns `{}` (empty) — the
+external-memory/semaphore/AHB exts are all *optional* (`vulkan_device_queue.cc` only
+`return false`s on missing *required* exts), so our ICD's lean ext list would not be
+rejected at device creation. The wall moved EARLIER (the GL substrate), before device
+creation is even attempted.
+
+### 6.3 Ladder scorecard
+
+| rung | result |
+|---|---|
+| R0 staging | YES — `vk-icd`/`vk-loader` overlays extracted |
+| R1 loader VK env | YES — `NATIVE-VULKAN path (ALR_VK_ICD=1, no ANGLE)` |
+| R2 chromium selects Vulkan | YES (after WALL-A fix) — Vulkan init proceeds, no in-process-disable |
+| R3 ICD loaded + Mali | YES — loader finds `libalr_mali_icd.so`, ICD ctor, `vkCreateInstance OK`, `vkEnumeratePhysicalDevices -> 1`, `[0] Mali-G615 MC2`, real props/limits/features forwarded |
+| R4 vkCreateDevice | NO — **not reached**; GL-substrate (WALL-C) fails first; SharedContextState's unconditional `CreateGLContext` aborts before Viz creates the Vulkan device |
+| R5 Skia/Viz GrVk | NO — blocked by R4 |
+| R6 composited frame | NO — blocked by R4 |
+
+### 6.4 Next rung (for the GLES-shim / gpushim owner)
+
+Make chromium's bundled ANGLE (`--use-angle=gles-egl`) initialize an EGL display on
+gpushim: chromium's ANGLE dlopens a system `libEGL.so.1` and calls
+`eglGetDisplay(EGL_DEFAULT_DISPLAY)`+`eglInitialize`; gpushim's `libEGL` must return a
+valid display there (likely needs the `WAYLAND_DISPLAY`/platform-display wiring the
+gpushim EGL expects, the way glmark2 connects). The moment GL comes up, this same flag
+set should reach `vkCreateDevice` on our ICD (R4) and the tractable ICD-side regime
+(GAP-5 vkCmd* recorders, etc.). Alternative: a software-GL display for the SharedContext
+(chromium ships only software *Vulkan* `libvk_swiftshader.so`, no software GLES, so this
+needs a SwiftShader-GLES overlay or ANGLE's null/vulkan display backend on our ICD).
