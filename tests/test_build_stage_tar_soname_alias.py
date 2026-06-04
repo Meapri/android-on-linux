@@ -212,6 +212,41 @@ def test_no_alias_when_filename_matches_dt_soname(tmp_path):
     assert so_members == ["usr/lib/aarch64-linux-gnu/libfoo.so.1"], so_members
 
 
+def test_subdir_lib_sibling_alias_survives_flattening_and_resolves(tmp_path):
+    """FIX 2 — a DT_NEEDED lib that Debian installs into a private SUBDIR (libproxy's
+    libpxbackend-1.0.so, reached on-system only via libproxy's absolute DT_RPATH, which
+    the in-process ld.so does NOT search) is surfaced onto a dir on the loader's
+    LD_LIBRARY_PATH via a SIBLING symlink. This is exactly the layout
+    build_minimal_overlay(extra_symlinks=...) produces; here we prove build_stage_tar
+    keeps the sibling alias (parse_solib returns None for the `-1.0.so` name, so it is a
+    plain dev-symlink kept as-is) AND the real subdir file, and the alias is a relative,
+    in-tree symlink pointing into the subdir."""
+    src = tmp_path / "src"
+    libdir = _libdir(src)
+    subdir = libdir / "libproxy"
+    subdir.mkdir()
+    # the real backend in the private subdir
+    (subdir / "libpxbackend-1.0.so").write_bytes(
+        _make_so("libpxbackend-1.0.so", needed=("libc.so.6",))
+    )
+    # the sibling alias on the parent dir (== build_minimal_overlay's extra_symlinks step)
+    (libdir / "libpxbackend-1.0.so").symlink_to("libproxy/libpxbackend-1.0.so")
+
+    out = tmp_path / "qt6-gui-stage.tar"
+    build_stage_tar(src, out)
+    norm = {m.lstrip("./"): i for m, i in _tar_members(str(out)).items()}
+
+    alias = "usr/lib/aarch64-linux-gnu/libpxbackend-1.0.so"
+    real = "usr/lib/aarch64-linux-gnu/libproxy/libpxbackend-1.0.so"
+    assert real in norm and norm[real].isreg(), "real subdir backend must survive"
+    assert alias in norm, "the sibling alias on the LD_LIBRARY_PATH dir must be shipped"
+    assert norm[alias].issym(), "the alias must be a symlink, not a copy of the 67KB lib"
+    # relative, in-tree target descending into the subdir → §5-E safe + resolves
+    assert norm[alias].linkname == "libproxy/libpxbackend-1.0.so"
+    assert not norm[alias].linkname.startswith("/")
+    assert ".." not in norm[alias].linkname
+
+
 def test_alias_not_emitted_when_dt_soname_group_already_present(tmp_path):
     """If the overlay ALSO ships a real lib whose own flat name equals the alias
     target soname, we must not double-emit / collide. (Defensive: a hypothetical

@@ -50,6 +50,30 @@ def test_qt6_gui_is_a_windowed_qt_quick_app():
     assert all(not TOOLKITS[n].gui for n in ("netsurf", "qt6", "sdl2"))
 
 
+def test_qt6_gui_aliases_libpxbackend_onto_ld_library_path():
+    """FIX 2 — qmleasing died at startup `libpxbackend-1.0.so: cannot open shared object
+    file` (exit 127): libQt6Network → libproxy.so.1 → DT_NEEDED libpxbackend-1.0.so, which
+    Debian ships in the libproxy/ SUBDIR (found on-system via libproxy's absolute DT_RPATH
+    /usr/lib/aarch64-linux-gnu/libproxy — a path the in-process ld.so does NOT search). The
+    recipe must add a sibling symlink on usr/lib/aarch64-linux-gnu/ (which IS on the loader's
+    LD_LIBRARY_PATH) so the bare-soname DT_NEEDED lookup resolves."""
+    from pathlib import PurePosixPath
+
+    qg = TOOLKITS["qt6-gui"]
+    assert (
+        "usr/lib/aarch64-linux-gnu/libpxbackend-1.0.so",
+        "libproxy/libpxbackend-1.0.so",
+    ) in qg.subdir_lib_symlinks
+    # the alias must live on a dir the loader actually searches (runtime_report.cpp puts
+    # <rootfs>/usr/lib/aarch64-linux-gnu on LD_LIBRARY_PATH), and stay inside the tree.
+    for link_rel, target_rel in qg.subdir_lib_symlinks:
+        assert PurePosixPath(link_rel).parent.as_posix() == "usr/lib/aarch64-linux-gnu"
+        assert not target_rel.startswith("/")
+        assert ".." not in PurePosixPath(target_rel).parts
+    # no other toolkit needs a subdir alias (no libproxy-style DT_NEEDED-into-subdir case)
+    assert all(not TOOLKITS[n].subdir_lib_symlinks for n in ("netsurf", "qt6", "sdl2"))
+
+
 def test_every_exec_path_is_rootfs_absolute():
     for name, tk in TOOLKITS.items():
         assert tk.exec_path.startswith("/"), name

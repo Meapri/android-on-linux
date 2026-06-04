@@ -24,8 +24,12 @@
  *     (dpkg unpacks all, then configures in dependency order) + `dpkg --configure -a` to
  *     flush any deferred configure — so a MULTI-DEP app (not just a single leaf) installs
  *     end-to-end without relying on apt's blocked in-line unpack (GAP 2),
- *   - verify via `dpkg --status <pkg>` ("Status: install ok installed"), and log any dep
- *     that did not reach "installed" so a partial closure is honestly visible.
+ *   - judge success by reading the dpkg admin DB FILE directly (var/lib/dpkg/status parsed
+ *     in-process for the pkg's "Status: install ok installed" stanza — NO dpkg-query re-exec,
+ *     which on-device is a non-PIE ELF that exits 73 EMPTY through the in-proc re-exec and
+ *     would falsely report a PHYSICALLY-installed package as installed=false); the exec
+ *     `dpkg --status` stdout is kept only as corroboration + for its error line, and any dep
+ *     that did not reach "installed" (per the DB file) is logged so a partial closure shows.
  *
  * OFFLINE/STAGED path: [installStaged] installs a PRE-STAGED `<pkg>-stage.tar` (built by
  * tools/build_install_stage.py — it ships the leaf `.deb` at var/cache/apt/archives/ plus the
@@ -335,9 +339,17 @@ object AptInstaller {
             val nowPresent = candidateBins.filter { File(rootfsDir, it).isFile }
             Log.i(TAG, "aptinstall: post-install binaries present=$nowPresent (was $preExisting)")
 
+            // VERDICT (robust): the dpkg admin DB FILE is authoritative (read directly, no
+            // guest exec) — `dpkg --status` stdout is only corroboration because on-device
+            // dpkg-query exits 73 EMPTY through the in-proc re-exec. So an apt install that
+            // unpacked+configured in-line is judged installed here straight off the DB stanza
+            // even when statusOut is empty. (We still keep statusOut for the error line.)
             val statusOut = host.loaderProbe(rootfsName, "/usr/bin/dpkg\n--status\n" + pkg)
-            var installed = statusOut.contains("Status: install ok installed")
-            Log.i(TAG, "aptinstall: installed=$installed (dpkg --status $pkg)")
+            var installed = verdictInstalled(
+                rootfsDir, pkg, statusOut,
+                binaryPresent = candidateBins.any { File(rootfsDir, it).isFile },
+            )
+            Log.i(TAG, "aptinstall: installed=$installed (DB-file verdict; dpkg --status corroboration)")
             Log.i(TAG, "aptinstall-status:\n$statusOut")
 
             // COMPLETION via top-level dpkg on the apt-downloaded .deb SET (proven re-entry).
@@ -405,18 +417,24 @@ object AptInstaller {
                     if (cfgConfiguredTarget) onProgress(Phase.CONFIGURING)
 
                     val statusOut2 = host.loaderProbe(rootfsName, "/usr/bin/dpkg\n--status\n" + pkg)
-                    installed = statusOut2.contains("Status: install ok installed")
                     val nowPresent2 = candidateBins.filter { File(rootfsDir, it).isFile }
+                    // Robust verdict again: DB-file stanza authoritative, dpkg --status stdout
+                    // (likely empty via the non-PIE dpkg-query) only corroborates. This is the
+                    // KEYSTONE of FIX 1 — the top-level `dpkg -i` PHYSICALLY configures the
+                    // package (DB gets "install ok installed"), and we must report that even
+                    // though the subsequent `dpkg --status` re-exec returns empty.
+                    installed = verdictInstalled(
+                        rootfsDir, pkg, statusOut2, binaryPresent = nowPresent2.isNotEmpty(),
+                    )
                     Log.i(TAG, "aptinstall: after dpkg -i(set)+configure-a installed=$installed binaries=$nowPresent2")
                     Log.i(TAG, "aptinstall-status2:\n$statusOut2")
                     // Honesty: report any dep that did NOT reach "installed" so a partial
                     // closure is visible, not silently treated as success on the leaf alone.
                     if (installed && deps.isNotEmpty()) {
                         val depNames = deps.map { it.name.substringBefore('_') }.distinct()
-                        val unconfigured = depNames.filter { dn ->
-                            val s = host.loaderProbe(rootfsName, "/usr/bin/dpkg\n--status\n" + dn)
-                            !s.contains("Status: install ok installed")
-                        }
+                        // Read each dep's state from the DB FILE (no per-dep dpkg-query exec,
+                        // which would falsely report "not configured" when dpkg-query exits 73).
+                        val unconfigured = depNames.filter { dn -> !dpkgDbInstalled(rootfsDir, dn) }
                         if (unconfigured.isNotEmpty()) {
                             Log.w(TAG, "aptinstall: closure target installed but these deps are NOT configured: $unconfigured")
                         } else {
@@ -586,11 +604,15 @@ object AptInstaller {
             Log.i(TAG, "aptinstall-staged: dpkg --configure -a settingUpTarget=${cfgOut.contains("Setting up $pkg")}")
             Log.i(TAG, "aptinstall-staged-dpkgconfig-out:\n$cfgOut")
 
-            // VERDICT: the admin DB, not the exit code. This is the whole fix.
+            // VERDICT: the admin DB, not the exit code — and read the DB FILE directly rather
+            // than re-exec'ing dpkg-query (which exits 73 EMPTY on-device through the in-proc
+            // re-exec, so the exec verdict would falsely report installed=false for a package
+            // that physically unpacked+configured). The exec `dpkg --status` is kept only for
+            // its stdout (error line + corroboration once the non-PIE dpkg-query fix lands).
             val statusOut = host.loaderProbe(rootfsName, "/usr/bin/dpkg\n--status\n" + pkg)
-            val installed = statusOut.contains("Status: install ok installed")
             val binaryPresent = candidateBins.any { File(rootfsDir, it).isFile }
-            Log.i(TAG, "aptinstall-staged: FINAL pkg=$pkg installed=$installed binary=$binaryPresent (dpkg --status)")
+            val installed = verdictInstalled(rootfsDir, pkg, statusOut, binaryPresent)
+            Log.i(TAG, "aptinstall-staged: FINAL pkg=$pkg installed=$installed binary=$binaryPresent (DB-file verdict)")
             Log.i(TAG, "aptinstall-staged-status:\n$statusOut")
             if (installed) onProgress(Phase.REGISTERING)
             val err = if (installed) null
@@ -638,11 +660,11 @@ object AptInstaller {
                 "/usr/bin/apt-get\n-o\nAPT::Sandbox::User=root\nremove\n-y\n" + pkg,
             )
             Log.i(TAG, "aptremove-out:\n$out")
-            val statusOut = host.loaderProbe(rootfsName, "/usr/bin/dpkg\n--status\n" + pkg)
-            // dpkg --status of a removed package: "not installed" / "Status: ... not-installed",
-            // or an error that the package is unknown. Treat any non-"install ok installed" as gone.
-            val stillInstalled = statusOut.contains("Status: install ok installed")
-            Log.i(TAG, "aptremove: stillInstalled=$stillInstalled")
+            // Read the DB FILE directly (not a dpkg-query re-exec, which exits 73 EMPTY): a
+            // removed package's stanza is gone or flips to a non-"install ok installed" state
+            // (e.g. "deinstall ok config-files"), so dpkgDbInstalled returns false → removed.
+            val stillInstalled = dpkgDbInstalled(rootfsDir, pkg)
+            Log.i(TAG, "aptremove: stillInstalled=$stillInstalled (DB-file verdict)")
             return !stillInstalled
         } finally {
             Os.unsetenv("ALR_FAKEROOT")
@@ -675,4 +697,78 @@ object AptInstaller {
     /** First apt error line ("E: …") in [out], trimmed, or null. */
     private fun aptErrorLine(out: String): String? =
         out.lineSequence().firstOrNull { it.startsWith("E:") }?.trim()
+
+    /**
+     * ROBUST verdict signal #1 — read the dpkg admin DB FILE directly (no guest exec).
+     *
+     * `<rootfs>/var/lib/dpkg/status` is a plain RFC822-ish text file: blank-line-separated
+     * stanzas, each with `Package: <name>` and `Status: <want> <eflag> <state>`. dpkg writes
+     * the installed package's stanza with `Status: install ok installed` once `dpkg -i` (or
+     * `--configure`) has unpacked+configured it — exactly the state the verdict needs. We
+     * parse it HERE in Kotlin (a host-side file read) instead of re-exec'ing `dpkg --status`
+     * because on-device `dpkg-query` (which `dpkg --status` execs) is a non-PIE ELF that exits
+     * 73 with EMPTY stdout through the in-proc re-exec — so the exec-based verdict reports
+     * installed=FALSE for a package that PHYSICALLY installed (DB stanza present + binary on
+     * disk). This file read is independent of that loader gap, so the product reports success
+     * correctly while the non-PIE dpkg-query fix lands separately.
+     *
+     * Stanza matching is EXACT on the `Package:` field (so `galculator` never matches
+     * `galculator-common`). Returns true iff [pkg]'s stanza exists AND its `Status:` line
+     * ends in `install ok installed`. Any IO/parse failure → false (caller falls back to the
+     * exec-based corroboration). Mirrors the stanza split the in-file normalizeStatus uses.
+     */
+    fun dpkgDbInstalled(rootfsDir: File, pkg: String): Boolean = runCatching {
+        val statusFile = File(rootfsDir, "var/lib/dpkg/status")
+        if (!statusFile.isFile) return@runCatching false
+        for (stanza in statusFile.readText().split("\n\n")) {
+            if (stanza.isBlank()) continue
+            var isThisPkg = false
+            var installedOk = false
+            for (line in stanza.split("\n")) {
+                // Field lines start at column 0; continuation lines are indented — skip those.
+                if (line.startsWith(" ") || line.startsWith("\t")) continue
+                val colon = line.indexOf(':')
+                if (colon <= 0) continue
+                val key = line.substring(0, colon).trim()
+                val value = line.substring(colon + 1).trim()
+                when (key) {
+                    "Package" -> isThisPkg = (value == pkg)
+                    // dpkg Status is "<want> <eflag> <state>"; "installed" is the 3rd word.
+                    // Match the canonical fully-installed line exactly.
+                    "Status" -> installedOk = (value == "install ok installed")
+                }
+            }
+            if (isThisPkg) return@runCatching installedOk
+        }
+        false
+    }.getOrElse {
+        Log.w(TAG, "aptinstall: dpkgDbInstalled($pkg) read failed: $it")
+        false
+    }
+
+    /**
+     * The ROBUST install verdict, decoupled from re-exec'ing dpkg-query. True iff EITHER
+     * (a) the dpkg admin DB FILE reports [pkg] as `install ok installed` (the authoritative
+     * signal, read directly — see [dpkgDbInstalled]), OR (b) the exec-based `dpkg --status`
+     * stdout still says so (corroboration that works once the non-PIE dpkg-query loader fix
+     * lands). The package's main binary being present in the rootfs is an ADDITIONAL
+     * confirmation we log, but a configured package with its `install ok installed` stanza is
+     * authoritatively installed even if its binary lives at a non-standard path the candidate
+     * list misses — so the DB-file stanza alone suffices for the verdict (binary presence is
+     * corroboration, not a gate). [statusOut] is the captured `dpkg --status` stdout (possibly
+     * empty when dpkg-query exited 73); pass "" when no exec was run.
+     */
+    private fun verdictInstalled(
+        rootfsDir: File,
+        pkg: String,
+        statusOut: String,
+        binaryPresent: Boolean,
+    ): Boolean {
+        val dbOk = dpkgDbInstalled(rootfsDir, pkg)
+        val execOk = statusOut.contains("Status: install ok installed")
+        val installed = dbOk || execOk
+        Log.i(TAG, "aptinstall: verdict pkg=$pkg → installed=$installed " +
+            "(dbFile=$dbOk execStatus=$execOk binaryPresent=$binaryPresent)")
+        return installed
+    }
 }

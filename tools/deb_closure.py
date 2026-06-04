@@ -694,6 +694,7 @@ def build_minimal_overlay(
     prune=DEFAULT_PRUNE_PREFIXES,
     keep_prefixes=(),
     exclude_leaf=None,
+    extra_symlinks=(),
     opener=_urlopen_ua,
 ) -> dict:
     """DT_NEEDED-MINIMAL overlay: keep the leaf package's own files + ONLY the shared
@@ -712,6 +713,18 @@ def build_minimal_overlay(
     a wl_shm-only Qt build excludes the wayland-egl platform/integration plugins so
     Qt never dlopens EGL (and libQt6WaylandEglClientHwIntegration + libEGL never enter
     the overlay), forcing the generic SHM QPA platform. Default keeps everything.
+
+    ``extra_symlinks`` (optional) is an iterable of ``(link_rel, target_rel)`` pairs:
+    after pruning, create a symlink at ``link_rel`` (rootfs-relative) pointing at
+    ``target_rel`` (a path RELATIVE to the link's own directory, kept inside the tree
+    so it survives the §5-E safe-symlink check). Use this to surface a DT_NEEDED lib
+    that Debian installs into a private SUBDIR (resolved on-system via the producer's
+    DT_RPATH) onto a directory the ALR loader actually has on LD_LIBRARY_PATH — the
+    canonical case is libproxy.so.1's DT_NEEDED ``libpxbackend-1.0.so``, shipped at
+    ``usr/lib/aarch64-linux-gnu/libproxy/`` (an absolute DT_RPATH the in-process ld.so
+    does not search) → a sibling symlink at ``usr/lib/aarch64-linux-gnu/`` makes the
+    bare-soname lookup resolve. The target file must already be in the kept set (this
+    only adds an alias, never new payload). No-op when empty (default).
     """
     from tools.elf_needed import read_elf_dynamic  # lazy: parser may post-date this import
 
@@ -807,6 +820,27 @@ def build_minimal_overlay(
     skipped_base = sorted(set(skipped_sonames) | set(skipped_paths))
     pruned = prune_paths(merged_root, prune)
 
+    # Surface DT_NEEDED libs that live in a private subdir (Debian resolves them via
+    # the producer's DT_RPATH, which the in-process ld.so does not search) onto a dir
+    # the loader has on LD_LIBRARY_PATH — a sibling symlink to the real file. Done
+    # AFTER prune/base-drop so the target is final; the symlink target stays RELATIVE
+    # (inside the tree) so build_stage_tar's §5-E safe-symlink check keeps it.
+    linked: list[str] = []
+    for link_rel, target_rel in extra_symlinks:
+        link_rel = link_rel.lstrip("/")
+        link_full = merged_root / link_rel
+        # The target is relative to the link's directory; verify it resolves to a real
+        # kept file (we only ALIAS existing payload, never invent a dangling link).
+        resolved = (link_full.parent / target_rel).resolve()
+        if not resolved.is_file():
+            unsupported.append(f"extra_symlink {link_rel} -> {target_rel} (target absent)")
+            continue
+        link_full.parent.mkdir(parents=True, exist_ok=True)
+        if link_full.exists() or link_full.is_symlink():
+            link_full.unlink()
+        os.symlink(target_rel, link_full)
+        linked.append(link_rel)
+
     result = build_stage_tar(merged_root, out_tar)
     violations = scan_overlay_violations(base, out_tar)
 
@@ -818,6 +852,7 @@ def build_minimal_overlay(
         "dropped_unreachable": len(dropped),
         "skipped_base": len(skipped_base),
         "pruned": len(pruned),
+        "extra_symlinks": linked,
         "unsupported": unsupported,
         "out_tar": result.out_tar,
         "sidecar": result.sidecar,

@@ -52,7 +52,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from tools.deb_closure import build_minimal_overlay
 
@@ -98,6 +98,17 @@ class Toolkit:
     # True for a windowed GUI toolkit binary (qt6-gui): launched DISPLAY/Wayland-backed on
     # the compositor (the probe asserts a frame rendered), not a display-free CLI smoke.
     gui: bool = False
+    # (link_rel, target_rel) pairs: after pruning, add a symlink at link_rel pointing at
+    # target_rel (RELATIVE to link_rel's dir, kept inside the tree). Surfaces a DT_NEEDED
+    # lib that Debian installs into a private SUBDIR (found on-system only via the
+    # producer's absolute DT_RPATH, which the in-process ld.so does NOT search) onto a dir
+    # the ALR loader has on LD_LIBRARY_PATH. qt6-gui case: libproxy.so.1 DT_NEEDEDs
+    # libpxbackend-1.0.so, shipped at usr/lib/aarch64-linux-gnu/libproxy/ (DT_RPATH
+    # /usr/lib/aarch64-linux-gnu/libproxy) → without this, qmleasing dies at startup
+    # "libpxbackend-1.0.so: cannot open shared object file" (exit 127). A sibling symlink
+    # at usr/lib/aarch64-linux-gnu/ (on LD_LIBRARY_PATH) makes the bare-soname lookup
+    # resolve. Empty (default) for every other toolkit. See build_minimal_overlay.
+    subdir_lib_symlinks: tuple[tuple[str, str], ...] = ()
 
 
 # The matrix. Order = easiest→hardest (matches STAGE_TAR_SPEC §5 M2 order).
@@ -183,6 +194,15 @@ TOOLKITS: dict[str, Toolkit] = {
             "wayland-egl", "egl-server", "dmabuf", "vulkan-server",
             "eglstream", "drm-egl",
         ),
+        # libQt6Network → libproxy.so.1 → DT_NEEDED libpxbackend-1.0.so, which Debian ships
+        # in the libproxy/ SUBDIR (resolved on-system via libproxy's absolute DT_RPATH
+        # /usr/lib/aarch64-linux-gnu/libproxy — a path the in-process ld.so does not search).
+        # Without a fix, qmleasing dies at startup "libpxbackend-1.0.so: cannot open shared
+        # object file" (exit 127). Add a sibling symlink on usr/lib/aarch64-linux-gnu/ (which
+        # IS on the loader's LD_LIBRARY_PATH) so the bare-soname DT_NEEDED lookup resolves.
+        subdir_lib_symlinks=(
+            ("usr/lib/aarch64-linux-gnu/libpxbackend-1.0.so", "libproxy/libpxbackend-1.0.so"),
+        ),
     ),
 }
 
@@ -244,6 +264,7 @@ def build_toolkit_overlay(
         cache_dir=cache_dir,
         keep_prefixes=toolkit.keep_prefixes,
         exclude_leaf=exclude_leaf,
+        extra_symlinks=toolkit.subdir_lib_symlinks,
     )
 
     # structural §5-E conformance (composes overlay_guard) for the final verdict.
@@ -410,6 +431,20 @@ def _selftest() -> int:
           _pred("usr/lib/aarch64-linux-gnu/qt6/plugins/platforms/libqwayland-egl.so"))
     check("qt6-gui exclude predicate KEEPS the generic wl_shm platform plugin",
           not _pred("usr/lib/aarch64-linux-gnu/qt6/plugins/platforms/libqwayland-generic.so"))
+    # libpxbackend resolution: qt6-gui must alias the subdir DT_NEEDED lib onto a dir on
+    # LD_LIBRARY_PATH (libQt6Network→libproxy.so.1→libpxbackend-1.0.so, shipped in libproxy/).
+    check("qt6-gui aliases libpxbackend-1.0.so onto usr/lib/aarch64-linux-gnu (LD_LIBRARY_PATH)",
+          ("usr/lib/aarch64-linux-gnu/libpxbackend-1.0.so", "libproxy/libpxbackend-1.0.so")
+          in qg.subdir_lib_symlinks)
+    check("the libpxbackend alias link dir is on the loader's LD_LIBRARY_PATH (usr/lib/aarch64-linux-gnu)",
+          all(PurePosixPath(lr).parent.as_posix() == "usr/lib/aarch64-linux-gnu"
+              for lr, _ in qg.subdir_lib_symlinks))
+    check("the libpxbackend alias target stays inside the tree (relative, no '..')",
+          all(not tr.startswith("/") and ".." not in PurePosixPath(tr).parts
+              for _, tr in qg.subdir_lib_symlinks))
+    # The other three toolkits add no subdir aliases (no libproxy DT_NEEDED-into-subdir case).
+    check("non-Qt toolkits add no subdir lib symlinks",
+          all(not TOOLKITS[n].subdir_lib_symlinks for n in ("netsurf", "qt6", "sdl2")))
 
     # --- overlay_has_exec --------------------------------------------------
     with tempfile.TemporaryDirectory() as tmp:
