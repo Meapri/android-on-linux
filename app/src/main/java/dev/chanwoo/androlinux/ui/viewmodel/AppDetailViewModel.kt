@@ -28,11 +28,13 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dev.chanwoo.androlinux.runtime.AlrRuntime
 import dev.chanwoo.androlinux.runtime.AppSession
+import dev.chanwoo.androlinux.runtime.BundledCatalog
 import dev.chanwoo.androlinux.runtime.CatalogApp
 import dev.chanwoo.androlinux.runtime.InstallProgress
 import dev.chanwoo.androlinux.runtime.InstalledApp
 import dev.chanwoo.androlinux.runtime.LaunchRequest
 import dev.chanwoo.androlinux.runtime.SessionState
+import dev.chanwoo.androlinux.runtime.SurfaceProtocol
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -142,11 +144,16 @@ class AppDetailViewModel(
     // 실행(설치된 앱 열기) — onOpen 위임 경로의 ViewModel 측 진입(통합이 RunningSurface 결선).
     // ----------------------------------------------------------------------- //
 
-    /** 설치된 앱 실행 — INV-2 양도는 런타임 소관. installedApp 이 있을 때만. */
+    /** 설치된 앱 실행 — INV-2 양도는 런타임 소관. installedApp 이 있을 때만. X11-only 앱
+     *  (BundledCatalog.needsXwayland by appId)은 protocol=X11 로 라우팅(상세 화면 실행 경로). */
     fun open(): AppSession? {
         val app = uiState.value.installedApp ?: return null
         return runtime.launch(
-            LaunchRequest(appId = app.appId, entryPath = app.entry.target, args = app.entry.args),
+            LaunchRequest(
+                appId = app.appId, entryPath = app.entry.target, args = app.entry.args,
+                protocol = if (BundledCatalog.needsXwayland(app.appId)) SurfaceProtocol.X11
+                else SurfaceProtocol.WAYLAND,
+            ),
         )
     }
 

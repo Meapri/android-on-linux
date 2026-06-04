@@ -70,6 +70,31 @@ siblings **`xfonts-utils`, `xfonts-encodings`, `xfonts-base`, `xserver-common`**
 > unaffected (it audits MISSING, not HEAVY). The trigger is specifically the
 > debconf/init-script postinst set in the *apt-install* delta.
 
+### 2a′. SUPERSEDED — those buckets split into NEUTRALIZED vs GENUINELY-HEAVY
+
+The sections above are the FORENSIC HISTORY (how each trigger was discovered). The CURRENT
+model re-classifies them, because the **general maintscript-shim** is now staged for EVERY
+apt install (`AptInstaller.MAINTSCRIPT_SHIM_OVERLAY`, generalized from gnome-only — see
+`docs/research/maintscript-shim-generalization.md`). The shim's no-op stubs (confmodule,
+`policy-rc.d`, `ucf`, `update-rc.d`/`invoke-rc.d`, `deb-systemd-helper`, `dpkg-reconfigure`,
+`dpkg-maintscript-helper`) drive exactly the DEBCONF / INIT-SCRIPT / CONFFILE-MAINTSCRIPT /
+registration class to exit 0. So:
+
+* **NEUTRALIZED_BY_SHIM** (no longer a trigger): the entire **X11 debconf/init bucket** above
+  (`x11-common`, `libpaper1`, `xfonts-*`, `xserver-common`), the conffile-maintscript class
+  (`appstream`/`libappstream*`), `session-migration`, and the gsettings/gio registration
+  (`gsettings-desktop-schemas`, `glib-networking*`). An app HEAVY *only* for these is now
+  LIKELY-PASS — this is the X11-image-viewer (`nsxiv`/`feh`/`qiv`/`xpdf`) + apt-Qt-GUI
+  (`qpdfview`) + gnome-calculator unlock.
+* **CASCADE_TRIGGERS** (GENUINELY-heavy, the shim cannot fake): the **perl/dict**,
+  **sandbox** (`bubblewrap`/`ghostscript`), and **daemon** buckets. These stay HEAVY.
+
+Device ground truth still holds: `gnome-calculator` FLIPS to reachable (its blockers were all
+the neutralized class); `mousepad`/`gedit` stay HEAVY (perl/dict); `eog`/`nautilus`/`evince`
+stay HEAVY (**bubblewrap** — even with their gsettings neutralized, the sandbox postinst
+remains). The discriminator that keeps eog HEAVY while gnome-calculator flips is precisely
+`bubblewrap` ∈ eog's delta, ∉ gnome-calculator's.
+
 ### 2b. The ALREADY-INSTALLED short-circuit (why gimp stays PASS)
 
 Adding x11-common/libpaper1 as triggers exposed a subtlety: **gimp's *closure* drags both**

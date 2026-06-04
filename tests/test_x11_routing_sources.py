@@ -51,9 +51,10 @@ def test_catalog_app_has_needs_xwayland_flag(models_text: str):
     assert "val needsXwayland: Boolean = false" in models_text
 
 
-def test_xzgv_and_xli_are_marked_needs_xwayland(runtime_text: str):
-    # The two X11-only LIKELY-PASS viewers must carry the flag (xzgv re-marked, xli added).
-    for app_id in ("xzgv", "xli"):
+def test_x11_only_viewers_are_marked_needs_xwayland(runtime_text: str):
+    # Every X11-only / Qt-xcb viewer must carry the flag: xzgv/xli (kept) + nsxiv/feh/qiv/xpdf
+    # (X11) + qpdfview (Qt-xcb) re-added via the general maintscript-shim install unlock.
+    for app_id in ("xzgv", "xli", "nsxiv", "feh", "qiv", "xpdf", "qpdfview"):
         i = runtime_text.index(f'appId = "{app_id}"')
         # the CatalogApp(...) for this app closes at the next "source = AppSource"
         j = runtime_text.index("source = AppSource", i)
@@ -75,13 +76,40 @@ def test_wayland_apps_not_marked_needs_xwayland(runtime_text: str):
         )
 
 
-def test_nsxiv_still_dropped(runtime_text: str):
-    # nsxiv is X11-only but its INSTALL is HEAVY (x11-common/libpaper1) — it stays DROPPED
-    # (no CatalogApp entry) and the source documents the routing≠install distinction.
-    assert 'appId = "nsxiv"' not in runtime_text
-    assert "nsxiv" in runtime_text  # documented in a comment
-    # the re-audit must name the orthogonality + the install blocker
+def test_nsxiv_readded_via_general_shim(runtime_text: str):
+    # nsxiv was previously DROPPED (X11-only but install HEAVY for x11-common/libpaper1). Once
+    # the maintscript-shim is generalized to EVERY install, those postinsts are neutralized →
+    # nsxiv is RE-ADDED as a needsXwayland=true entry. The source must document the unlock.
+    assert 'appId = "nsxiv"' in runtime_text
     assert "x11-common" in runtime_text and "libpaper1" in runtime_text
+    assert "maintscript-shim" in runtime_text
+
+
+def test_catalog_exposes_xwayland_ssot(runtime_text: str):
+    # BundledCatalog must expose the needsXwayland SSOT (derived from the entries) so the UI
+    # layer can set protocol=X11 without duplicating the app-id list. This is what makes the
+    # catalog flag the single edit needed to route a new X11 app.
+    assert "val xwaylandAppIds" in runtime_text
+    assert "fun needsXwayland(appId: String)" in runtime_text
+    assert "apps.filter { it.needsXwayland }" in runtime_text
+
+
+def test_ui_sets_x11_protocol_for_needs_xwayland_apps():
+    # The launch-request builders must set protocol=X11 for needsXwayland apps so
+    # XwaylandLaunch.needsX11 fires via its `protocol == SurfaceProtocol.X11` branch (the
+    # routing works without editing the chromium-owned NativeAppSession X11_ONLY_APP_IDS set).
+    alr_app = (ROOT / "app/src/main/java/dev/chanwoo/androlinux/ui/AlrApp.kt").read_text("utf-8")
+    launcher_vm = (
+        ROOT / "app/src/main/java/dev/chanwoo/androlinux/ui/viewmodel/LauncherViewModel.kt"
+    ).read_text("utf-8")
+    detail_vm = (
+        ROOT / "app/src/main/java/dev/chanwoo/androlinux/ui/viewmodel/AppDetailViewModel.kt"
+    ).read_text("utf-8")
+    # CatalogApp uses its own field; InstalledApp paths look up the catalog SSOT by appId.
+    assert "if (needsXwayland) SurfaceProtocol.X11" in alr_app
+    assert "BundledCatalog.needsXwayland(appId)" in alr_app
+    assert "BundledCatalog.needsXwayland(appId)" in launcher_vm
+    assert "BundledCatalog.needsXwayland(app.appId)" in detail_vm
 
 
 # --------------------------------------------------------------------------- #

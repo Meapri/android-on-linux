@@ -30,9 +30,11 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dev.chanwoo.androlinux.runtime.AlrRuntime
 import dev.chanwoo.androlinux.runtime.AppSession
+import dev.chanwoo.androlinux.runtime.BundledCatalog
 import dev.chanwoo.androlinux.runtime.InstalledApp
 import dev.chanwoo.androlinux.runtime.LaunchRequest
 import dev.chanwoo.androlinux.runtime.SessionState
+import dev.chanwoo.androlinux.runtime.SurfaceProtocol
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
@@ -149,9 +151,12 @@ internal fun buildState(
     )
 }
 
-/** InstalledApp.entry → LaunchRequest(런처 실행 경로). AlrApp.toLaunchRequest 와 같은 규약. */
+/** InstalledApp.entry → LaunchRequest(런처 실행 경로). AlrApp.toLaunchRequest 와 같은 규약 —
+ *  X11-only 앱(BundledCatalog.needsXwayland by appId)은 protocol=X11 로 라우팅(타일 실행 경로). */
 internal fun InstalledApp.toLauncherRequest(): LaunchRequest = LaunchRequest(
     appId = appId,
     entryPath = entry.target,
     args = entry.args,
+    protocol = if (BundledCatalog.needsXwayland(appId)) SurfaceProtocol.X11
+    else SurfaceProtocol.WAYLAND,
 )

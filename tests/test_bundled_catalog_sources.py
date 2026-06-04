@@ -172,27 +172,54 @@ def test_no_stale_no_systemd_dbus_closure_claim(catalog_block: str):
 # --------------------------------------------------------------------------- #
 def test_new_likely_pass_apps_present(catalog_block: str):
     ids = {e["appId"] for e in _entries(catalog_block)}
-    # The galculator-class LIKELY-PASS set (xpdf + nsxiv DROPPED — see below — because the
-    # corrected audit flags their x11-common+libpaper1 postinsts), plus the gnome-platform
-    # TASK-A addition org.gnome.Calculator.
+    # The galculator-class LIKELY-PASS set, the gnome-platform org.gnome.Calculator, AND the
+    # general-maintscript-shim re-adds: the X11-image-viewer class (nsxiv/feh/qiv/xpdf) + the
+    # apt-Qt-GUI class (qpdfview), all now LIKELY-PASS (x11-common/libpaper1 shim-neutralized).
     expected = {
         "galculator", "htop", "sakura", "l3afpad", "gpicview", "xarchiver",
-        "viewnior", "xzgv", "qalculate-gtk", "org.gnome.Calculator",
+        "viewnior", "xzgv", "xli", "qalculate-gtk", "mate-calc", "geany",
+        "org.gnome.Calculator",
+        # re-added via the general shim:
+        "nsxiv", "feh", "qiv", "xpdf", "qpdfview",
     }
     missing = expected - ids
     assert not missing, f"catalog missing expected entries: {sorted(missing)}"
 
 
-def test_xpdf_and_nsxiv_dropped_for_x11_postinst(catalog_block: str):
-    # xpdf + nsxiv were DROPPED as catalog *entries* (device-proven x11-common exit 127 +
-    # libpaper1 exit 2). They must NOT appear as installable CatalogApp entries, but the
-    # source must DOCUMENT why (the corrected audit, the x11-common/libpaper1 postinsts).
+def test_x11_viewer_and_qt_apps_readded_via_general_shim(catalog_block: str):
+    # xpdf + nsxiv (+ feh/qiv) were RE-ADDED once the maintscript-shim was generalized to every
+    # install: their only blocker (x11-common exit 127 + libpaper1 exit 2) is now neutralized.
+    # qpdfview is the new apt-Qt-GUI entry (x11-common-only blocker). The source must document
+    # the unlock (the general shim, the empirical exit codes it neutralizes).
     ids = {e["appId"] for e in _entries(catalog_block)}
-    assert "xpdf" not in ids, "xpdf must be dropped (device-proven configure FAIL)"
-    assert "nsxiv" not in ids, "nsxiv must be dropped (same x11-common+libpaper1 reason)"
-    # the drop must be explained with the empirical exit codes + trigger packages.
+    for app in ("xpdf", "nsxiv", "feh", "qiv", "qpdfview"):
+        assert app in ids, f"{app} must be RE-ADDED (general maintscript-shim unlock)"
+    # the unlock must be explained with the empirical exit codes + the general-shim mechanism.
     assert "x11-common" in catalog_block and "libpaper1" in catalog_block
     assert "exit 127" in catalog_block and "exit 2" in catalog_block
+    assert "maintscript-shim" in catalog_block
+    # qpdfview must note it is the apt-Qt-GUI class routed through Xwayland.
+    assert "qpdfview" in catalog_block and "Qt" in catalog_block
+
+
+def test_readded_x11_apps_marked_needs_xwayland(catalog_block: str):
+    # The re-added X11/Qt apps must be flagged needsXwayland=true so XwaylandLaunch routes them
+    # (libX11/Motif/Qt-xcb, no libwayland-client). Scrape each entry's needsXwayland line.
+    for m in re.finditer(r"CatalogApp\(", catalog_block):
+        i = m.end()
+        depth = 1
+        while i < len(catalog_block) and depth:
+            if catalog_block[i] == "(":
+                depth += 1
+            elif catalog_block[i] == ")":
+                depth -= 1
+            i += 1
+        body = catalog_block[m.end():i]
+        am = re.search(r'appId\s*=\s*"([^"]+)"', body)
+        if am and am.group(1) in ("nsxiv", "feh", "qiv", "xpdf", "qpdfview", "xzgv", "xli"):
+            assert "needsXwayland = true" in body, (
+                f"{am.group(1)} (X11-only/Qt-xcb) must be needsXwayland=true for routing"
+            )
 
 
 def test_gnome_calculator_documents_the_two_part_fix(catalog_block: str):
