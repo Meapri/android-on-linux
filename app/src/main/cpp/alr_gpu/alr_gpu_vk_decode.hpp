@@ -31,6 +31,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>   // std::getenv (ALR_VK_HOST_TRACE first-texture create-chain diagnostic)
 #include <cstring>
 #include <map>
 #include <string>
@@ -2257,6 +2258,44 @@ inline void set_vk_gen_provider(const void* p) { vk_gen_provider_ptr() = p; }
 // ALR_VK_OP_GEN_ESCAPE in the generated proto header — defined locally here so this
 // lower-level decoder doesn't depend on the generated header; the value is the wire ABI).
 inline constexpr uint8_t kVkGenEscapeOp = 230;
+
+// Readable name for a generated sub-opcode (the create/resource band, AlrVkGenOp in the
+// generated proto header). Used ONLY by the ALR_VK_HOST_TRACE first-texture diagnostic
+// above; kept local so the decoder doesn't pull in the generated header. The numbers are
+// the wire ABI (append-only); unlisted ops show "#<n>". Covers the resource ops ANGLE
+// issues on the glTexImage2D path (the ones whose absence/ordering the crash pin needs).
+inline const char* alr_vk_gen_op_name(uint16_t sub) {
+    switch (sub) {
+        case 1:  return "create_command_pool";
+        case 3:  return "allocate_memory";
+        case 4:  return "map_memory";
+        case 7:  return "free_memory";
+        case 8:  return "create_buffer";
+        case 10: return "get_buffer_memory_requirements";
+        case 11: return "bind_buffer_memory";
+        case 12: return "create_image";
+        case 13: return "destroy_image";
+        case 14: return "get_image_memory_requirements";
+        case 15: return "bind_image_memory";
+        case 16: return "create_image_view";
+        case 18: return "create_shader_module";
+        case 20: return "create_pipeline_cache";
+        case 22: return "create_sampler";
+        case 24: return "create_fence";
+        case 26: return "create_semaphore";
+        case 28: return "create_event";
+        case 30: return "create_query_pool";
+        case 32: return "create_descriptor_set_layout";
+        case 34: return "create_pipeline_layout";
+        case 36: return "create_descriptor_pool";
+        case 38: return "allocate_descriptor_sets";
+        case 40: return "create_render_pass";
+        case 42: return "create_framebuffer";
+        case 44: return "create_graphics_pipelines";
+        case 46: return "create_compute_pipelines";
+        default: return "?";
+    }
+}
 using VkCmdDispatchFn = bool (*)(uint8_t op, VkReader& r, VkDecodeState& st,
                                  VkReplyEncoder& reply, const void* cmd_provider);
 inline VkCmdDispatchFn& vk_cmd_dispatch() {
@@ -2827,6 +2866,35 @@ inline bool decode_vk_batch(const uint8_t* data, size_t len, VkDecodeState& st,
                     uint16_t sub = 0;
                     if (!r.u16(sub)) { st.ok = false; break; }
                     r.seek(save);  // rewind: the chosen dispatcher re-reads the sub-opcode
+                    // FIRST-TEXTURE CREATE-CHAIN TRACE (gated on ALR_VK_HOST_TRACE): the ANGLE
+                    // first-glTexImage2D NULL-deref pin. ANGLE's create/req/alloc/bind ops ride
+                    // this escape band; logging each sub-op (1..0x3fff) names EXACTLY which
+                    // generated Vulkan op ANGLE issues during texture setup (create_buffer=8,
+                    // create_image=12, get_image_reqs=14, allocate_memory=3, bind_image=15,
+                    // create_image_view=16, create_sampler=22 …) and IN WHAT ORDER, right up to
+                    // the call before the crash — the ground truth that HYP-A/HYP-B require. The
+                    // cmd-log band (>=0x4000) is the vkCmd* record stream; skipped (too chatty).
+                    // Default-absent → zero cost on a no-regression run.
+                    if (sub < 0x4000u) {
+                        static const bool s_host_trace = [] {
+                            const char* e = std::getenv("ALR_VK_HOST_TRACE");
+                            return e && e[0] && e[0] != '0';
+                        }();
+                        if (s_host_trace) {
+                            // stderr always (host self-test + device, the loader tees guest
+                            // stderr to logcat); android-log additionally on the device build
+                            // (ALR_VK_DECODE_REAL, where <android/log.h> is pulled) so it lands
+                            // under the alr-vk-host tag next to create_device2.
+                            std::fprintf(stderr, "[alr-vk-host] GEN-OP sub=%u (%s) reqpos=%zu\n",
+                                         (unsigned)sub, alr_vk_gen_op_name(sub), save);
+                            std::fflush(stderr);
+#ifdef ALR_VK_DECODE_REAL
+                            __android_log_print(ANDROID_LOG_INFO, "alr-vk-host",
+                                "GEN-OP sub=%u (%s) reqpos=%zu", (unsigned)sub,
+                                alr_vk_gen_op_name(sub), save);
+#endif
+                        }
+                    }
                     if (sub >= 0x4000u) {
                         VkCmdDispatchFn cd = vk_cmd_dispatch();
                         if (cd && cd(op, r, st, reply, vk_cmd_provider_ptr_seam())) break;

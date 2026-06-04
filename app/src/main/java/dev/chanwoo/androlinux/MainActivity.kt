@@ -3624,6 +3624,15 @@ class MainActivity : Activity() {
                 android.system.Os.setenv("ALR_TEE_GUEST_STDOUT", "1", true)
                 android.system.Os.setenv("ALR_SHIM_DIAG", "1", true)
                 android.system.Os.setenv("VK_LOADER_DEBUG", "all", true)
+                // FIRST-TEXTURE CREATE-CHAIN host trace (gated on /data/local/tmp/.alr-angle-
+                // hosttrace): our in-app VK servicer (decode_vk_batch, alr_gpu_vk_decode.hpp)
+                // logs each generated create/req/alloc/bind sub-op ANGLE issues during the
+                // glTexImage2D path under the alr-vk-host tag ("GEN-OP sub=N (name)"). Pins
+                // EXACTLY which Vulkan ops ANGLE reaches before the first-texture NULL-deref —
+                // the ground truth distinguishing HYP-A/HYP-B (handle vs memreqs) from an
+                // ANGLE-internal pre-CreateImage fault. Default-absent → no-regression.
+                if (java.io.File("/data/local/tmp/.alr-angle-hosttrace").isFile)
+                    android.system.Os.setenv("ALR_VK_HOST_TRACE", "1", true)
                 // DIAGNOSTIC (codegen device-iterate): hand ANGLE a logging trampoline for
                 // any unimplemented device fn it CALLS (instead of NULL), so the guest's
                 // [alr-icd] "TRAP CALLED <name>" trace reveals the exact next entrypoint to

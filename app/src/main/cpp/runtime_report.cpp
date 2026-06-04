@@ -4470,29 +4470,76 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                 }
                 auto resolve = [&maps](unsigned long long a) -> std::string {
                     if (a == 0 || maps.empty()) return std::string();
-                    size_t pos = 0;
-                    while (pos < maps.size()) {
-                        size_t eol = maps.find('\n', pos);
-                        if (eol == std::string::npos) eol = maps.size();
-                        std::string line = maps.substr(pos, eol - pos);
-                        pos = eol + 1;
-                        unsigned long long lo = 0, hi = 0, off = 0;
-                        char perms[8] = {0};
-                        // addr-addr perms offset dev inode pathname
-                        if (std::sscanf(line.c_str(), "%llx-%llx %7s %llx",
-                                        &lo, &hi, perms, &off) >= 4 &&
-                            a >= lo && a < hi) {
-                            size_t sl = line.rfind('/');
-                            std::string base =
-                                (sl == std::string::npos) ? std::string("[anon]")
-                                                          : line.substr(sl + 1);
-                            char res[256];
-                            std::snprintf(res, sizeof(res), "%s+0x%llx",
-                                          base.c_str(), (a - lo) + off);
-                            return std::string(res);
+                    // Find the mapping that contains `a` (its path + start), AND the module's
+                    // LOAD BIAS = the lowest mapped start over ALL segments of that same path.
+                    // Reporting `a - load_bias` yields the ELF VIRTUAL ADDRESS — the value
+                    // llvm-objdump / addr2line / readelf use — NOT the file offset. These
+                    // differ whenever a segment's p_vaddr != p_offset (e.g. the 64KiB-aligned
+                    // gap ANGLE's libGLESv2 has between its r-- and r-x LOAD segments: the
+                    // OLD `(a-lo)+seg_off` formula under-reported every .text PC by exactly
+                    // that gap (0x10000), so prior waves disassembled the wrong instruction
+                    // — the reported "+0x1f6db4" was a data-area b.eq; the REAL faulting
+                    // `ldr x12,[x8,#0x390]` is at vaddr +0x206db4). Two-pass over the same
+                    // (already in-memory) maps text; cheap, runs once per fault address.
+                    std::string hit_path;     // pathname of the mapping containing `a`
+                    bool have_hit = false;
+                    {
+                        size_t pos = 0;
+                        while (pos < maps.size()) {
+                            size_t eol = maps.find('\n', pos);
+                            if (eol == std::string::npos) eol = maps.size();
+                            std::string line = maps.substr(pos, eol - pos);
+                            pos = eol + 1;
+                            unsigned long long lo = 0, hi = 0, off = 0;
+                            char perms[8] = {0};
+                            if (std::sscanf(line.c_str(), "%llx-%llx %7s %llx",
+                                            &lo, &hi, perms, &off) >= 4 &&
+                                a >= lo && a < hi) {
+                                size_t sl = line.find('/');
+                                hit_path = (sl == std::string::npos) ? std::string()
+                                                                     : line.substr(sl);
+                                have_hit = true;
+                                break;
+                            }
                         }
                     }
-                    return std::string("<unmapped>");
+                    if (!have_hit) return std::string("<unmapped>");
+                    // load_bias = min start over all mappings whose pathname == hit_path. For an
+                    // anonymous mapping (no path) we can't span segments, so fall back to its own
+                    // start (offset is then just a-lo, the best we can do for [anon]).
+                    unsigned long long load_bias = a;  // safe default (yields +0x0)
+                    {
+                        bool found_bias = false;
+                        size_t pos = 0;
+                        while (pos < maps.size()) {
+                            size_t eol = maps.find('\n', pos);
+                            if (eol == std::string::npos) eol = maps.size();
+                            std::string line = maps.substr(pos, eol - pos);
+                            pos = eol + 1;
+                            unsigned long long lo = 0, hi = 0, off = 0;
+                            char perms[8] = {0};
+                            if (std::sscanf(line.c_str(), "%llx-%llx %7s %llx",
+                                            &lo, &hi, perms, &off) < 4)
+                                continue;
+                            std::string path;
+                            size_t sl = line.find('/');
+                            if (sl != std::string::npos) path = line.substr(sl);
+                            const bool same = hit_path.empty()
+                                                  ? (lo <= a && a < hi)   // [anon]: only its own seg
+                                                  : (path == hit_path);
+                            if (same && (!found_bias || lo < load_bias)) {
+                                load_bias = lo;
+                                found_bias = true;
+                            }
+                        }
+                    }
+                    size_t sl = hit_path.rfind('/');
+                    std::string base = hit_path.empty()
+                                           ? std::string("[anon]")
+                                           : hit_path.substr(sl + 1);
+                    char res[256];
+                    std::snprintf(res, sizeof(res), "%s+0x%llx", base.c_str(), a - load_bias);
+                    return std::string(res);
                 };
                 fault_pc_map = resolve(fault_pc);
                 fault_lr_map = resolve(fault_lr);
