@@ -162,6 +162,20 @@ data class CatalogApp(
     /** 스크린샷 rootfs/원격 경로(AppDetail 갤러리). 빈 리스트면 미제공. */
     val screenshots: List<String> = emptyList(),
     val source: AppSource = AppSource.BUNDLED,
+    /**
+     * X11 전용 앱 라우팅 플래그(TASK-A). true 면 이 앱은 libwayland-client 를 링크하지
+     * 않고 libX11/libxcb 만 링크하는 **X11-only** 클라이언트라, ALR 의 네이티브 Wayland
+     * 컴포지터에 직접 붙을 수 없다(DISPLAY 없음 → "cannot open display"). 런치 경로
+     * (NativeAppSession.XwaylandLaunch)가 이 앱에 한해 ROOTFUL Xwayland :0 을 띄우고
+     * DISPLAY=:0 를 게스트 환경에 주입해, X11 클라이언트가 Xwayland→wl_shm→SurfaceView
+     * 로 렌더되게 한다(xcalc 가 device-proven 으로 검증한 경로). Wayland-가능 앱(GTK3/GTK4/
+     * Qt-wayland 등)은 false 로 두어 종전과 바이트 동일하게 컴포지터에 직접 붙는다.
+     *
+     * 판별 근거(host): tools/elf_needed.needed_of 로 EXEC 바이너리의 DT_NEEDED 를 보면
+     * X11-only 앱은 libX11.so.6(±libgtk-x11-2.0)만 있고 libwayland-client.so.0 가 없다
+     * (xzgv/xli device-host-audited). 카탈로그 엔트리에 명시하여 런치 라우팅을 결정한다.
+     */
+    val needsXwayland: Boolean = false,
 ) {
     /**
      * 카탈로그 UI 의 "다운로드 X MB" 단일 숫자 — alr_manifest.total_install_size_bytes 미러:

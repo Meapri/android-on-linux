@@ -26,9 +26,28 @@ from tools.build_toolkit_overlays import (
 )
 
 
-def test_three_toolkits_defined():
-    assert set(TOOLKITS) == {"netsurf", "qt6", "sdl2"}
+def test_toolkit_matrix_defined():
+    # netsurf/qt6/sdl2 are the display-free CLI smokes; qt6-gui (TASK-B) is the windowed
+    # Qt6 Quick-on-Wayland app-class (the lightest REACHABLE Qt GUI — apt Qt-GUI is closure-
+    # blocked by libqt6gui6→libice6→x11-common, so it ships as an overlay, not BundledCatalog).
+    assert set(TOOLKITS) == {"netsurf", "qt6", "sdl2", "qt6-gui"}
     assert all(isinstance(tk, Toolkit) for tk in TOOLKITS.values())
+
+
+def test_qt6_gui_is_a_windowed_qt_quick_app():
+    """qt6-gui ships the real qmleasing Qt6 Quick GUI binary + the qtwayland platform
+    plugin, forcing the generic wl_shm QPA (EGL/dmabuf integration excluded)."""
+    qg = TOOLKITS["qt6-gui"]
+    assert qg.gui is True
+    assert "qt6-declarative-dev-tools" in qg.leaf_packages  # ships qmleasing
+    assert qg.exec_path == "/usr/lib/qt6/bin/qmleasing"
+    assert "qt6-wayland" in qg.leaf_packages                # the platform plugin
+    assert "qml6-module-qtquick" in qg.leaf_packages        # QtQuick QML module (dlopen'd)
+    # wl_shm-only: the EGL/dmabuf wayland integration must be excluded so Qt picks generic SHM.
+    assert "wayland-egl" in qg.exclude_leaf_substrings
+    assert "dmabuf" in qg.exclude_leaf_substrings
+    # the other three are display-free CLI smokes (gui defaults False)
+    assert all(not TOOLKITS[n].gui for n in ("netsurf", "qt6", "sdl2"))
 
 
 def test_every_exec_path_is_rootfs_absolute():

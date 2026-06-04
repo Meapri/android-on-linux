@@ -449,18 +449,35 @@ internal fun InstalledApp.toCatalogApp(): CatalogApp = CatalogApp(
  * FAIL) AND the device-proven xpdf FAIL. Proof status per entry:
  *   DEVICE-PROVEN (installs+configures exit-0 on device): galculator, l3afpad.
  *   HOST-AUDITED LIKELY-PASS (delta is galculator-class: 0 cascade triggers; device-test
- *     pending): gpicview, xarchiver, sakura, viewnior, xzgv, qalculate-gtk.
+ *     pending): gpicview, xarchiver, sakura, viewnior, qalculate-gtk, mate-calc, geany.
  *     (htop = proven-class ncurses leaf, 5-pkg delta, 0 triggers.)
+ *   X11-ONLY + LIKELY-PASS → ROUTED THROUGH XWAYLAND (TASK-A; needsXwayland=true): xzgv
+ *     (delta 16) + xli (delta 4). Their EXEC binaries link libX11 but NOT libwayland-client
+ *     (host: tools/elf_needed), so they cannot bind the native Wayland compositor directly;
+ *     NativeAppSession.XwaylandLaunch starts a ROOTFUL Xwayland :0 and injects DISPLAY=:0
+ *     (Xwayland → wl_shm → SurfaceView, the xcalc device-proven path). Install is clean
+ *     (0 cascade triggers), so unlike nsxiv they are KEPT.
  *   GNOME-PLATFORM, shim-unlocked (TASK-A; host artifacts built, device-verify pending):
  *     org.gnome.Calculator — install-configure neutralizer (maintscript-shim overlay) +
  *     host-precompiled gschemas (gnome-schemas overlay) + runtime session-dbus shim
  *     (dbus-daemon overlay + GnomePlatformShim). See AptInstaller + NativeAppSession.
  *   DROPPED (device-proven / audit FAIL): xpdf + nsxiv — x11-common+libpaper1 postinsts.
+ *     nsxiv RE-AUDITED (TASK-A): it IS X11-only so the routing would apply, but its INSTALL
+ *     is still HEAVY (x11-common/libpaper1) and the neutralizer is gnome-only in AptInstaller
+ *     (other-owned) — so it stays dropped until that generalizes. Routing ≠ install.
+ * The Qt toolkit class (TASK-B) is NOT a catalog entry: EVERY apt Qt-GUI app is closure-
+ * blocked (libqt6gui6t64 → libsm6/libice6 → x11-common, the device-proven exit-127 postinst;
+ * tools/app_closure_audit.py --live confirms qt6-wayland/keepassxc/qjackctl/… all HEAVY), and
+ * the neutralizer is gnome-only. The lightest REACHABLE Qt-on-Wayland app is delivered as an
+ * OVERLAY instead (tools/build_toolkit_overlays.py `qt6-gui` → qmleasing + qtwayland generic
+ * wl_shm plugin), launched via MainActivity's qt6 GUI probe — apt never runs, so x11-common's
+ * postinst never fires. See docs/research/qt-toolkit-app-class.md.
  * appId == the `.desktop` basename so a successful install self-reconciles a launcher tile via
- * DesktopEntryScanner — EXCEPT Terminal=true entries (htop, sakura), which the scanner drops;
- * those still install+launch via this catalog's explicit appId→apt map but do not auto-surface
- * a scanned tile (noted on each such entry). The GNOME entry's appId is the reverse-DNS
- * .desktop basename (org.gnome.Calculator) while its apt pkg/binary is gnome-calculator.
+ * DesktopEntryScanner — EXCEPT Terminal=true entries (htop, sakura) and the no-.desktop X11
+ * viewer xli, which the scanner drops/never sees; those still install+launch via this catalog's
+ * explicit appId→apt map but do not auto-surface a scanned tile (noted on each such entry). The
+ * GNOME entry's appId is the reverse-DNS .desktop basename (org.gnome.Calculator) while its apt
+ * pkg/binary is gnome-calculator.
  */
 object BundledCatalog {
 
@@ -627,26 +644,62 @@ object BundledCatalog {
             installSizeBytes = 703_488L,
             source = AppSource.APT,
         ),
-        // xzgv — GTK 썸네일 이미지 뷰어(독립형). HOST-AUDITED LIKELY-PASS
+        // xzgv — GTK2 썸네일 이미지 뷰어(독립형, X11-ONLY). HOST-AUDITED LIKELY-PASS
         // (tools/app_closure_audit.py): 설치 DELTA 16-패키지, exit-73 maintainer-script
         // 트리거 0 — 카탈로그 이미지 뷰어 중 가장 작은 닫힘에 속한다(썸네일 그리드 + 단일
         // 뷰). 닫힘이 GTK 경유로 systemd/dbus 를 끌지만 galculator 가 inert 증명 → 동급
         // 통과(device 미검증). appId 는 .desktop basename(xzgv.desktop) 과 일치(NoDisplay=
         // false → 타일 재조정). Exec=`xzgv %F`(strip), 바이너리 /usr/bin/xzgv.
+        // ★ needsXwayland=true (TASK-A): xzgv 의 EXEC 바이너리는 libgtk-x11-2.0.so.0 +
+        // libX11.so.6 만 링크하고 libwayland-client.so.0 가 없는 **X11-only** 클라이언트라
+        // (host: tools/elf_needed) ALR 의 네이티브 Wayland 컴포지터에 직접 붙을 수 없다 —
+        // DISPLAY 없이 보내면 "cannot open display" 로 죽는다. 런치 경로(NativeAppSession.
+        // XwaylandLaunch)가 이 앱에 한해 ROOTFUL Xwayland :0 을 띄우고 DISPLAY=:0 를 주입해
+        // Xwayland→wl_shm→SurfaceView 로 렌더되게 한다(xcalc device-proven 경로와 동일).
         CatalogApp(
             appId = "xzgv",
             name = "xzgv",
-            summary = "가벼운 썸네일 이미지 뷰어",
+            summary = "가벼운 썸네일 이미지 뷰어(X11)",
             entry = LaunchEntry(LaunchEntry.EntryKind.EXEC, "/usr/bin/xzgv"),
             category = AppCategory.GRAPHICS,
-            description = "GTK 기반의 가벼운 썸네일/단일 이미지 뷰어. apt 로 설치되어 ALR " +
-                "Wayland 컴포지터 위 창으로 실행됩니다. 설치 delta(16 패키지)가 galculator " +
-                "동급(exit-73 트리거 0)이라 dpkg configure 가 끝까지 통과한다(host-audited). " +
-                "noble 패키지 xzgv → /usr/share/applications/xzgv.desktop.",
+            description = "GTK2/X11 기반의 가벼운 썸네일/단일 이미지 뷰어. libX11 만 링크하는 " +
+                "X11-only 앱이라 ROOTFUL Xwayland :0 경유로(DISPLAY=:0 → wl_shm → SurfaceView) " +
+                "ALR 컴포지터 위 창으로 실행됩니다(xcalc 와 동일 경로). 설치 delta(16 패키지)가 " +
+                "galculator 동급(exit-73 트리거 0)이라 dpkg configure 가 끝까지 통과한다" +
+                "(host-audited). noble 패키지 xzgv → /usr/share/applications/xzgv.desktop.",
             rootfsDeps = listOf(RootfsDep(RootfsDepKind.APT, "xzgv", 326_656L)),
             display = DisplaySpec(DisplaySpec.DisplayMode.WINDOWED),
             installSizeBytes = 326_656L,
             source = AppSource.APT,
+            needsXwayland = true,
+        ),
+        // xli — 고전 Xlib 이미지 뷰어(독립형, X11-ONLY). TASK-C: delta-cascade 검증
+        // (tools/app_closure_audit.py --live) LIKELY-PASS — 설치 DELTA 단 4-패키지
+        // (libjpeg8/libpng16/libx11-6/libxext6 중 base 미제공분), exit-73 maintainer-script
+        // 트리거 0. 카탈로그 전체에서 가장 작은 닫힘(16-패키지)에 속한다. EXEC 바이너리
+        // /usr/bin/xli 는 libX11.so.6 만 링크하는 X11-only 클라이언트라(host: tools/elf_needed,
+        // libwayland-client 없음) needsXwayland=true 로 표시 → XwaylandLaunch 가 ROOTFUL
+        // Xwayland :0 경유로 렌더한다(xzgv 와 동일). ⚠ xli 패키지는 .desktop 을 ship 하지
+        // 않으므로(htop/sakura 처럼) 설치 후 DesktopEntryScanner 가 타일을 자동 재조정하지
+        // 않는다; 본 카탈로그의 명시 appId→apt 맵으로 설치/실행만 가능. appId=apt=바이너리
+        // basename(xli) 일치. xli 는 인자로 이미지 경로를 받는다(예 `xli test.png`).
+        CatalogApp(
+            appId = "xli",
+            name = "xli",
+            summary = "고전 Xlib 이미지 뷰어(X11)",
+            entry = LaunchEntry(LaunchEntry.EntryKind.EXEC, "/usr/bin/xli"),
+            category = AppCategory.GRAPHICS,
+            description = "X11(Xlib) 기반의 초경량 이미지 뷰어 — JPEG/PNG/GIF/TIFF 등을 연다. " +
+                "libX11 만 링크하는 X11-only 앱이라 ROOTFUL Xwayland :0 경유로(DISPLAY=:0 → " +
+                "wl_shm → SurfaceView) ALR 컴포지터 위 창으로 실행됩니다. 설치 delta 가 단 4 " +
+                "패키지(exit-73 트리거 0)로 카탈로그 최소 닫힘에 속해 dpkg configure 가 끝까지 " +
+                "통과한다(host-audited LIKELY-PASS). ⚠ .desktop 미동봉(터미널 호출형)이라 설치 " +
+                "후 타일 자동 재조정은 안 되며 명시 맵으로 실행. noble 패키지 xli → /usr/bin/xli.",
+            rootfsDeps = listOf(RootfsDep(RootfsDepKind.APT, "xli", 406_528L)),
+            display = DisplaySpec(DisplaySpec.DisplayMode.WINDOWED),
+            installSizeBytes = 406_528L,
+            source = AppSource.APT,
+            needsXwayland = true,
         ),
         // ⚠ xpdf — DROPPED (was HOST-AUDITED LIKELY-PASS, but DEVICE-PROVEN FAIL). The
         // audit model (tools/app_closure_audit.py) UNDER-COUNTED it: `apt install xpdf`
@@ -686,12 +739,70 @@ object BundledCatalog {
             installSizeBytes = 6_804_480L,
             source = AppSource.APT,
         ),
-        // ⚠ nsxiv — DROPPED (was HOST-AUDITED LIKELY-PASS, but its delta pulls the SAME
-        // x11-common + libpaper1 debconf/init-script postinsts that device-proved-FAIL for
-        // xpdf — plus xfonts-utils/xfonts-encodings). With the corrected audit model it now
-        // audits HEAVY(x11-common, libpaper1, xfonts-*). Drop it for the same reason as
-        // xpdf; re-add only after the x11-common/libpaper1 install-configure neutralizer is
-        // device-verified.
+        // mate-calc — MATE 데스크톱의 GTK3 계산기(독립형, GNOME 플랫폼 비의존). TASK-C:
+        // delta-cascade 검증(tools/app_closure_audit.py --live) LIKELY-PASS — 설치 DELTA
+        // 56-패키지, exit-73 maintainer-script 트리거 0. gnome-calculator 와 결정적 차이는
+        // appstream/gsettings-desktop-schemas/session-migration 미의존(galculator 동급).
+        // EXEC 바이너리 /usr/bin/mate-calc 는 순수 libgtk-3.so.0 만 링크하고 libX11 가 없는
+        // **Wayland-가능** 앱이라(host: tools/elf_needed) GDK Wayland 백엔드로 ALR 컴포지터에
+        // 직접 붙는다 — needsXwayland 불필요(기본 false). appId=apt=바이너리 basename(mate-calc)
+        // 일치 + mate-calc.desktop ship(NoDisplay=false → 설치 후 타일 재조정). 인자 없음.
+        CatalogApp(
+            appId = "mate-calc",
+            name = "MATE Calculator",
+            summary = "MATE GTK3 계산기(기본·과학·금융)",
+            entry = LaunchEntry(LaunchEntry.EntryKind.EXEC, "/usr/bin/mate-calc"),
+            category = AppCategory.UTILITY,
+            description = "MATE 데스크톱의 GTK3 계산기 — 기본·과학·금융·프로그래밍 모드. apt 로 " +
+                "설치되어 ALR Wayland 컴포지터 위 창으로 실행됩니다(순수 GTK3, GDK Wayland " +
+                "백엔드 — libX11 비링크). gnome-calculator 와 달리 appstream/gsettings-desktop-" +
+                "schemas/session-migration 같은 exit-73 트리거가 설치 delta(56 패키지)에 없어 " +
+                "galculator 동급으로 dpkg configure 가 끝까지 통과한다(host-audited LIKELY-PASS). " +
+                "noble 패키지 mate-calc → /usr/share/applications/mate-calc.desktop.",
+            rootfsDeps = listOf(RootfsDep(RootfsDepKind.APT, "mate-calc", 542_720L)),
+            display = DisplaySpec(DisplaySpec.DisplayMode.WINDOWED),
+            installSizeBytes = 542_720L,
+            source = AppSource.APT,
+        ),
+        // geany — GTK3 경량 IDE/프로그래머 텍스트 편집기(독립형). TASK-C: delta-cascade
+        // 검증(tools/app_closure_audit.py --live) LIKELY-PASS — 설치 DELTA 54-패키지,
+        // exit-73 maintainer-script 트리거 0. l3afpad 보다 무겁지만(코드 폴딩·플러그인·
+        // 빌드 실행) 닫힘 부류는 galculator 동급(perl/appstream/gsettings 트리거 0). EXEC
+        // 바이너리 /usr/bin/geany 는 libgeany.so.0(→GTK3 전이) 경유라 libX11 직접 링크가
+        // 없는 **Wayland-가능** 앱(host: tools/elf_needed) → GDK Wayland 백엔드로 ALR
+        // 컴포지터에 직접 붙는다(needsXwayland 불필요). appId=apt=바이너리 basename(geany)
+        // 일치 + geany.desktop ship(NoDisplay=false → 타일 재조정). Exec=`geany %F`(strip).
+        CatalogApp(
+            appId = "geany",
+            name = "Geany",
+            summary = "가벼운 GTK IDE/코드 편집기",
+            entry = LaunchEntry(LaunchEntry.EntryKind.EXEC, "/usr/bin/geany"),
+            category = AppCategory.UTILITY,
+            description = "GTK3 기반의 가벼운 IDE — 구문 강조·코드 폴딩·심볼 목록·빌드 실행을 " +
+                "지원하는 프로그래머 편집기. apt 로 설치되어 ALR Wayland 컴포지터 위 창으로 " +
+                "실행됩니다(libgeany→GTK3, GDK Wayland 백엔드, libX11 직접 비링크). 설치 " +
+                "delta(54 패키지)가 galculator 동급(exit-73 트리거 0)이라 dpkg configure 가 " +
+                "끝까지 통과한다(host-audited LIKELY-PASS). noble 패키지 geany → " +
+                "/usr/share/applications/geany.desktop.",
+            rootfsDeps = listOf(RootfsDep(RootfsDepKind.APT, "geany", 4_129_792L)),
+            display = DisplaySpec(DisplaySpec.DisplayMode.WINDOWED),
+            installSizeBytes = 4_129_792L,
+            source = AppSource.APT,
+        ),
+        // ⚠ nsxiv — DROPPED, RE-AUDITED (TASK-A). nsxiv IS X11-only (its EXEC binary links
+        // libX11.so.6, no libwayland-client — host: tools/elf_needed), so the needsXwayland
+        // ROUTING would be correct for it. But routing is ORTHOGONAL to INSTALL: nsxiv's
+        // apt closure still audits HEAVY (tools/app_closure_audit.py --live: delta 33,
+        // triggers libpaper1 + x11-common + xfonts-encodings + xfonts-utils) — the SAME
+        // x11-common(exit 127)+libpaper1(exit 2) debconf/init-script postinsts that device-
+        // proved-FAIL for xpdf. It therefore cannot be INSTALLED on the base today: the
+        // install-configure neutralizer (maintscript-shim overlay) that already fixes those
+        // postinsts is gated to gnome-platform pkgs in AptInstaller (other-owned). So nsxiv
+        // stays DROPPED as a catalog ENTRY (it would never reach a launch), even though its
+        // X11-routing is solved. Contrast xzgv/xli (above): X11-only AND LIKELY-PASS install
+        // (0 cascade triggers) → marked needsXwayland and KEPT. Re-add nsxiv only once the
+        // x11-common/libpaper1 neutralizer is generalized beyond gnome-platform + device-
+        // verified. (feh/qiv audit the same HEAVY-X11 way — same gate.)
         // ----------------------------------------------------------------------------- //
         // gnome-calculator — GNOME-platform GTK4 계산기. TASK-A: gnome-platform 클래스의
         // 첫 해금 대상. 설치 DELTA(78)가 gsettings-desktop-schemas + libappstream5 +
