@@ -184,6 +184,7 @@ typedef struct { Elf64_Addr r_offset; Elf64_Xword r_info; Elf64_Sxword r_addend;
 #define SEEK_END 2
 #define AT_FDCWD (-100)
 #define F_GETFD     1        // fcntl: get the fd flags (returns FD_CLOEXEC bit)
+#define F_SETFD     2        // fcntl: set the fd flags (clear FD_CLOEXEC on the status fd)
 #define FD_CLOEXEC  1        // close-on-exec flag
 #define PROT_NONE  0
 #define PROT_READ  1
@@ -396,10 +397,10 @@ ALR_FREESTANDING static MappedImage map_elf_image(const char* img, size_t len,
     diag(tag); diag("span="); diag_hex("", (unsigned long)span);
 
     // ONE reservation for the whole image. ET_DYN: kernel picks the base (we map at
-    // 0 then bias). ET_EXEC: reserve AT the fixed min_v with MAP_FIXED_NOREPLACE so
-    // a pre-existing mapping at the fixed range is reported (EEXIST) rather than
-    // silently clobbered. The reservation is RW so we can memcpy; per-segment
-    // mprotect below tightens to final perms (W^X-safe: RX/RO set after copy).
+    // 0 then bias). ET_EXEC (NON-PIE): the vaddrs are ABSOLUTE — the image MUST land
+    // at its fixed min_v (canonically 0x400000), there are no relocations to move it.
+    // The reservation is RW so we can memcpy; per-segment mprotect below tightens to
+    // final perms (W^X-safe: RX/RO set after copy).
     uintptr_t base = 0;
     void* reserve;
     if (eh->e_type == ET_DYN) {
@@ -408,19 +409,57 @@ ALR_FREESTANDING static MappedImage map_elf_image(const char* img, size_t len,
         if (reserve == MAP_FAILED) { diag(tag); diag("RESERVE_FAIL\n"); return R; }
         base = (uintptr_t)reserve - min_v;
     } else {
-        // Fixed-address ET_EXEC: ask for exactly min_v, fail loudly on collision.
+        // === FIX 1: NON-PIE ET_EXEC at its fixed vaddr, execve-replacement aware ===
+        // First try MAP_FIXED_NOREPLACE: when [min_v,min_v+span) is FREE this claims it
+        // without clobbering anything (the common case — Android maps the app/bionic/
+        // loader at HIGH randomized addresses, so the canonical 0x400000 text base is
+        // free). If it FAILS (EEXIST), the range is occupied — but the ONLY thing that
+        // can legitimately sit at an ET_EXEC's fixed low vaddr is a PREVIOUS ET_EXEC
+        // guest WE mapped earlier in this very process (the root cause of the verdict-
+        // readback bug: dpkg is a non-PIE ELF mapped at 0x400000; when it fork+execs
+        // dpkg-query — ALSO non-PIE at 0x400000 — the child's address space still holds
+        // dpkg there, so the old NOREPLACE bailed -> "prog map fail" -> exit 73 -> empty
+        // dpkg-query stdout -> every dpkg --status verdict read FALSE). A real execve
+        // UNCONDITIONALLY replaces the whole address space, so the stale prior image
+        // MUST be evicted. We do exactly that with MAP_FIXED (atomic unmap+map), but
+        // ONLY after proving the occupied range does NOT contain our live execution
+        // state (this trampoline's own .text / the guest stack we are running on, both
+        // at HIGH addresses) — so we never clobber the code mid-jump. If the fixed range
+        // ever overlapped that live state we bail (a real, diagnosable wall), never
+        // corrupt.
         reserve = (void*)sys6_(SYS_mmap, min_v, span, PROT_READ | PROT_WRITE,
                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-        if (reserve == MAP_FAILED) {
-            // The fixed range is occupied (the loader/guest already mapped 0x400000..).
-            // MAP_FIXED would silently clobber it -> corruption; refuse instead.
-            diag(tag); diag("EXEC_FIXED_OCCUPIED@"); diag_hex("", (unsigned long)min_v);
-            return R;
-        }
-        if ((uintptr_t)reserve != min_v) {
-            // Kernel ignored the hint (no NOREPLACE support); that's not the fixed
-            // address the ET_EXEC needs — bail rather than run at the wrong base.
-            diag(tag); diag("EXEC_FIXED_MOVED\n"); return R;
+        if (reserve == MAP_FAILED || (uintptr_t)reserve != min_v) {
+            // NOREPLACE refused (range occupied) OR the kernel ignored the hint and
+            // moved the mapping (no NOREPLACE support). Either way we do NOT have the
+            // fixed address the absolute vaddrs require. If the kernel MOVED it, drop
+            // that stray mapping first so we don't leak it.
+            if (reserve != MAP_FAILED && (uintptr_t)reserve != min_v) {
+                sys3(SYS_munmap, (long)reserve, (long)span, 0);
+            }
+            // Guard: refuse to MAP_FIXED-replace a range that holds our live PC or SP
+            // (would pull the rug out from under the running trampoline / its stack).
+            // map_elf_image's own frame address approximates the current SP; &base is a
+            // stack local. The trampoline .text is far above 0x400000 too, but the SP
+            // check is the load-bearing one (we execute on the guest stack here).
+            uintptr_t cur_sp;
+            __asm__ volatile("mov %0, sp" : "=r"(cur_sp));
+            const uintptr_t lo = min_v, hi = min_v + span;
+            const uintptr_t self = (uintptr_t)&base;
+            if ((cur_sp >= lo && cur_sp < hi) || (self >= lo && self < hi) ||
+                ((uintptr_t)&map_elf_image >= lo && (uintptr_t)&map_elf_image < hi)) {
+                diag(tag); diag("EXEC_FIXED_HITS_LIVE@"); diag_hex("", (unsigned long)min_v);
+                return R;
+            }
+            // Safe: evict the stale prior guest image at the fixed range, exactly as an
+            // execve would replace it. MAP_FIXED atomically unmaps the occupant and maps
+            // our fresh anon span in its place.
+            diag(tag); diag("EXEC_FIXED_REPLACE@"); diag_hex("", (unsigned long)min_v);
+            reserve = (void*)sys6_(SYS_mmap, min_v, span, PROT_READ | PROT_WRITE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+            if (reserve == MAP_FAILED || (uintptr_t)reserve != min_v) {
+                diag(tag); diag("EXEC_FIXED_REPLACE_FAIL\n"); return R;
+            }
         }
         base = 0;  // ET_EXEC vaddrs are absolute
     }
@@ -722,6 +761,66 @@ ALR_FREESTANDING static int fd_is_cloexec(long fd) {
     long fl = sys3(SYS_fcntl, fd, F_GETFD, 0);
     return (fl >= 0) && (fl & FD_CLOEXEC);
 }
+
+// ---- FIX 2: parse the apt/gpgv `--status-fd N` argument from the guest argv -----
+// The status fd is the pipe write end apt set up for gpgv's `[GNUPG:] GOODSIG …`.
+// apt does NOT use a hard-wired fd 3: it picks whatever number the pipe got and
+// passes it as `--status-fd <N>` (or `--status-fd=<N>`). When the supervisor leaks a
+// capture-pipe fd into the guest (out_pipe/diag_pipe — now CLOEXEC'd, but historically
+// non-CLOEXEC), apt's pipe() lands the status end on a HIGHER number than the native
+// fd 3, so a hard-coded-3 audit/protect looks at the wrong fd. We therefore parse the
+// REAL number from argv. Returns the fd (>= 0) or -1 if no `--status-fd` is present.
+// Small, allocation-free: a few string compares over a bounded argv.
+ALR_FREESTANDING static int s_eq(const char* a, const char* b) {
+    while (*a && *b) { if (*a != *b) return 0; ++a; ++b; }
+    return *a == *b;
+}
+ALR_FREESTANDING static long parse_decimal(const char* s) {
+    if (!s || s[0] < '0' || s[0] > '9') return -1;
+    long v = 0;
+    for (const char* p = s; *p; ++p) {
+        if (*p < '0' || *p > '9') return -1;
+        v = v * 10 + (*p - '0');
+        if (v > ALR_FD_LINEAR_CAP) return -1;  // implausible fd number — ignore
+    }
+    return v;
+}
+ALR_FREESTANDING static long find_status_fd(char** argv) {
+    if (!argv) return -1;
+    for (int i = 0; argv[i] && i < MAX_ARGV; ++i) {
+        const char* a = argv[i];
+        if (s_eq(a, "--status-fd")) {
+            // value is the NEXT argv element.
+            if (argv[i + 1]) { long v = parse_decimal(argv[i + 1]); if (v >= 0) return v; }
+        } else if (a[0]=='-'&&a[1]=='-'&&a[2]=='s'&&a[3]=='t'&&a[4]=='a'&&a[5]=='t'&&
+                   a[6]=='u'&&a[7]=='s'&&a[8]=='-'&&a[9]=='f'&&a[10]=='d'&&a[11]=='=') {
+            long v = parse_decimal(a + 12);  // --status-fd=<N>
+            if (v >= 0) return v;
+        }
+    }
+    return -1;
+}
+
+// Clear FD_CLOEXEC on the named status fd so the CLOEXEC sweep KEEPS it through this
+// re-mapped exec — exactly what apt does (it clears CLOEXEC on the status fd right
+// before the real execve so gpgv inherits it). A real kernel-exec'd gpgv inherits
+// fd N because apt made it non-CLOEXEC; if some intermediate process in the deep
+// apt → apt-key(sh) → gpgv chain left it CLOEXEC, the sweep would wrongly drop it and
+// gpgv's `--status-fd N` write would EBADF (no GOODSIG → "the repository is not
+// signed"). Protecting the argv-named fd restores the gpgv-inherits-it invariant. Only
+// touches an OPEN fd that the guest itself named on its command line (no blind whitelist).
+// Returns 1 if it cleared CLOEXEC on an open status fd, 0 otherwise (diagnostic).
+ALR_FREESTANDING static int protect_status_fd(long fd) {
+    if (fd < 0) return 0;
+    long fl = sys3(SYS_fcntl, fd, F_GETFD, 0);
+    if (fl < 0) return 0;                 // not open in this process — nothing to protect
+    if (fl & FD_CLOEXEC) {
+        sys3(SYS_fcntl, fd, F_SETFD, fl & ~(long)FD_CLOEXEC);
+        return 1;
+    }
+    return 0;
+}
+
 ALR_FREESTANDING static unsigned long close_cloexec_fds(void) {
     unsigned long closed = 0;
     // Primary: enumerate only the open fds via /proc/self/fd.
@@ -782,15 +881,23 @@ ALR_FREESTANDING static unsigned long close_cloexec_fds(void) {
 //       and LOCALIZE a regression to the precise depth if it ever returns. It only
 //       READS fd state (fcntl F_GETFD) — no side effects, never closes anything.
 // Returns the count of OPEN non-CLOEXEC fds with number >= 3 (the would-be extra
-// status-pipe write ends; the invariant wants this == 1, i.e. only fd 3 itself).
-ALR_FREESTANDING static unsigned long audit_status_fd(void) {
-    // fd 3 state: -1 = closed (no write end -> gpgv's --status-fd 3 write EBADFs ->
-    // no GOODSIG), 0 = open & NOT cloexec (the wanted live write end), 1 = open &
-    // cloexec (would have been closed by a real execve; a sweep miss).
-    long f3 = sys3(SYS_fcntl, 3, F_GETFD, 0);
-    if (f3 < 0) diag("ALR-INPROC: status-fd3=CLOSED\n");
-    else if (f3 & FD_CLOEXEC) diag("ALR-INPROC: status-fd3=OPEN-cloexec(LEAK)\n");
-    else diag("ALR-INPROC: status-fd3=OPEN-keep\n");
+// status-pipe write ends; the invariant wants this == 1, i.e. only the status fd
+// itself). `status_fd` is the argv-parsed `--status-fd N` (or 3 if none was named) —
+// so the report names the fd apt actually uses, not a hard-wired 3.
+ALR_FREESTANDING static unsigned long audit_status_fd(long status_fd) {
+    const long sfd = (status_fd < 0) ? 3 : status_fd;  // none named -> canonical 3
+    // Report the ACTUAL fd number apt named (so a perturbed-number case is visible).
+    diag_hex("ALR-INPROC: status-fd-num=", (unsigned long)sfd);
+    // status fd state: -1 = closed (no write end -> gpgv's --status-fd N write EBADFs
+    // -> no GOODSIG), 0 = open & NOT cloexec (the wanted live write end), 1 = open &
+    // cloexec (would have been closed by a real execve; a sweep miss). The token stays
+    // `status-fd3=` (the device-drain grep + host source-invariant contract) for the
+    // fd-3 case; a non-3 status fd uses `status-fdN=` so both are localizable.
+    long f3 = sys3(SYS_fcntl, sfd, F_GETFD, 0);
+    const char* tok = (sfd == 3) ? "ALR-INPROC: status-fd3=" : "ALR-INPROC: status-fdN=";
+    if (f3 < 0) { diag(tok); diag("CLOSED\n"); }
+    else if (f3 & FD_CLOEXEC) { diag(tok); diag("OPEN-cloexec(LEAK)\n"); }
+    else { diag(tok); diag("OPEN-keep\n"); }
     // Count surviving non-CLOEXEC fds >= 3 via /proc/self/fd (these are exactly the
     // fds the re-mapped gpgv inherits as potential pipe write ends). > 1 means a
     // stray inheritable fd lingers besides fd 3 -> a candidate EOF break.
@@ -1109,24 +1216,42 @@ void alr_inproc_reexec_worker(const char* target, char** argv,
     void* tcb = (tcb_region == MAP_FAILED) ? (void*)0 : (void*)((char*)tcb_region + 8192);
     diag_hex("ALR-INPROC: tcb@", (unsigned long)tcb);
 
+    // ---- FIX 2: protect the apt/gpgv status fd BEFORE the CLOEXEC sweep --------
+    // apt passes the gpgv status pipe write end as `--status-fd N` (N is the pipe's
+    // own fd number, NOT hard-wired 3). A real kernel-exec'd gpgv inherits it because
+    // apt cleared CLOEXEC on it; if any process in the deep apt → apt-key(sh) → gpgv
+    // re-map chain left it CLOEXEC (or a leaked supervisor capture-pipe fd perturbed
+    // the numbering), the sweep below would WRONGLY drop it and gpgv's `--status-fd N`
+    // write would EBADF → no GOODSIG → "the repository is not signed". We parse the
+    // argv-named N and clear its CLOEXEC so the sweep KEEPS it — replicating apt's own
+    // pre-exec clear for our no-execve re-map. Only an OPEN, guest-named fd is touched
+    // (no blind whitelist). On any non-apt guest find_status_fd returns -1 → no-op.
+    long status_fd = find_status_fd(argv);
+    int status_fd_protected = protect_status_fd(status_fd);
+    if (status_fd >= 0) {
+        diag_hex("ALR-INPROC: status-fd-arg=", (unsigned long)status_fd);
+        diag(status_fd_protected ? "ALR-INPROC: status-fd-uncloexec=yes\n"
+                                 : "ALR-INPROC: status-fd-uncloexec=no\n");
+    }
+
     // ---- execve FD_CLOEXEC emulation (the fd-table fix) -----------------------
     // A real execve closes every FD_CLOEXEC fd at this exact boundary; we did NOT
     // execve, so do it ourselves now — right before the jump, after every transient
     // worker fd (target/interp maps, auxv) is already closed and before the guest
-    // image runs. This is what lets apt's gpgv --status-fd 3 pipe reach EOF (GOODSIG
+    // image runs. This is what lets apt's gpgv --status-fd N pipe reach EOF (GOODSIG
     // accepted) and the X server's xkbcomp keymap pipe reach EOF (keymap compiles),
     // because the caller's CLOEXEC-marked extra pipe ends finally close. The guest's
-    // intentionally-inherited fds (NOT CLOEXEC: fd 3, stdio, the dup2'd status fd)
+    // intentionally-inherited fds (NOT CLOEXEC: stdio, the just-protected status fd)
     // are untouched. Runs unconditionally (a guest with no CLOEXEC fds closes none).
     unsigned long cloexec_closed = close_cloexec_fds();
     diag_hex("ALR-INPROC: cloexec_closed=", cloexec_closed);
 
-    // Audit the post-sweep fd table for the apt gpgv --status-fd 3 invariant (fd 3
-    // open & not-cloexec, no stray inheritable fd >= 3). Diagnostic only — proves
-    // GOODSIG-via-fd-3 survives THIS re-map (method->apt-key->gpgv) on a device
-    // drain and localizes any future EOF regression to the exact depth. No effect
-    // on a guest that has no fd 3 (status-fd3=CLOSED, survivors typically 0).
-    audit_status_fd();
+    // Audit the post-sweep fd table for the apt gpgv --status-fd N invariant (the
+    // status fd open & not-cloexec, no stray inheritable fd >= 3). Diagnostic only —
+    // proves GOODSIG-via-status-fd survives THIS re-map (method->apt-key->gpgv) on a
+    // device drain and localizes any future EOF regression to the exact depth. No
+    // effect on a guest that has no status fd (status-fd3=CLOSED, survivors typically 0).
+    audit_status_fd(status_fd);
 
     enter_guest((void*)start, (void*)jump_entry, tcb);
     sys_exit(99);  // unreachable

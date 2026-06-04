@@ -107,6 +107,79 @@ def test_separated_code_has_no_wx_page():
 
 
 # --------------------------------------------------------------------------
+# (1b) FIX 1 — NON-PIE ET_EXEC fixed-range reservation (execve-replacement aware).
+# Locks in the verdict-readback root cause + fix: a non-PIE ET_EXEC at 0x400000 must
+# land at its fixed vaddr; when a STALE prior non-PIE guest already occupies it (dpkg
+# then dpkg-query, both @ 0x400000), the re-map must EVICT it like execve — not bail.
+# --------------------------------------------------------------------------
+def test_etexec_fixed_range_free_is_claimed_no_replace():
+    # The common case: nothing mapped at 0x400000 (Android maps high) → NOREPLACE wins.
+    img = M.fixture_static_etexec_relro()
+    assert M.model_etexec_fixed_claim(img, occupied_ranges=()) == M.EXEC_FIXED_FREE
+
+
+def test_etexec_fixed_range_stale_prior_guest_is_replaced():
+    # THE verdict-readback case: dpkg (non-PIE) already mapped at [0x400000, 0x411000)
+    # in this process; now dpkg-query (also non-PIE @ 0x400000) is re-mapped. The fixed
+    # range is occupied by a STALE prior guest → evict it with MAP_FIXED (execve does
+    # the same). The old NOREPLACE-then-bail returned prog-map-fail → exit 73 → empty
+    # dpkg-query stdout → FALSE verdicts. Now it REPLACES and maps cleanly.
+    img = M.fixture_static_etexec_relro()
+    stale = ((0x400000, 0x411000),)  # the previous dpkg image's span
+    assert M.model_etexec_fixed_claim(img, occupied_ranges=stale) == M.EXEC_FIXED_REPLACE
+
+
+def test_etexec_fixed_range_never_clobbers_live_pc_or_sp():
+    # Safety guard: if the fixed range somehow overlapped our live SP (the guest stack
+    # we execute on) or the trampoline .text, REPLACE would pull the rug out — so we
+    # bail instead (a clean, diagnosable refusal, never silent corruption). In reality
+    # SP/text are at HIGH addresses, far from 0x400000, so this never fires; the test
+    # pins the guard by placing a synthetic live SP inside the fixed span.
+    img = M.fixture_static_etexec_relro()
+    span = M.model_span(img)
+    sp_in_range = span.min_v + 0x800  # pretend we are running on a stack at 0x400800
+    assert (
+        M.model_etexec_fixed_claim(
+            img, occupied_ranges=((span.min_v, span.min_v + span.span),),
+            live_sp=sp_in_range,
+        )
+        == M.EXEC_FIXED_HITS_LIVE
+    )
+    # A high SP (the real case) does NOT trip the guard → stale range is replaced.
+    assert (
+        M.model_etexec_fixed_claim(
+            img, occupied_ranges=((span.min_v, span.min_v + span.span),),
+            live_sp=0x7000_0000_0000,
+        )
+        == M.EXEC_FIXED_REPLACE
+    )
+
+
+def test_etexec_partial_overlap_counts_as_occupied():
+    # Even a PARTIAL overlap of the fixed span means the absolute vaddrs cannot be
+    # claimed free — it must go through the replace path (or the live-state guard).
+    img = M.fixture_static_etexec_relro()
+    span = M.model_span(img)
+    # A range covering just the last page of the span still collides.
+    tail = ((span.min_v + span.span - M.PAGE, span.min_v + span.span + M.PAGE),)
+    assert M.model_etexec_fixed_claim(img, occupied_ranges=tail) == M.EXEC_FIXED_REPLACE
+
+
+def test_reexec_c_etexec_replaces_stale_fixed_range():
+    # Source-invariant: the C must REPLACE a stale-occupied ET_EXEC fixed range
+    # (execve semantics) guarded by a live-PC/SP check — NOT bail with the old
+    # NOREPLACE-only path that produced "prog map fail" for dpkg-query.
+    src = open(REEXEC_C, encoding="utf-8").read()
+    assert "MAP_FIXED_NOREPLACE" in src             # still tries the safe free-claim first
+    assert "EXEC_FIXED_REPLACE@" in src             # then evicts a stale prior guest
+    assert "MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0" in src  # the atomic replace map
+    assert "EXEC_FIXED_HITS_LIVE@" in src           # guarded by the live-state check
+    assert 'mov %0, sp' in src                      # reads live SP for the guard
+    # The old hard bail token must be GONE (the bug was bailing instead of replacing).
+    assert "EXEC_FIXED_OCCUPIED" not in src
+
+
+# --------------------------------------------------------------------------
 # (2) PT_GNU_RELRO — identified, and the trampoline leaves it RW.
 # --------------------------------------------------------------------------
 def test_relro_segment_identified():
@@ -453,18 +526,124 @@ def test_reexec_c_actually_honors_cloexec():
 
 
 def test_reexec_c_audits_status_fd3_before_jump():
-    # Source-invariant: the worker must AUDIT the gpgv --status-fd 3 invariant after
-    # the CLOEXEC sweep and before the jump, so a device drain can PROVE fd 3 reached
-    # gpgv (and localize an EOF regression). Diagnostic-only (no behavior change).
+    # Source-invariant: the worker must AUDIT the gpgv --status-fd invariant after the
+    # CLOEXEC sweep and before the jump, so a device drain can PROVE the status fd
+    # reached gpgv (and localize an EOF regression). Diagnostic-only (no behavior change).
     src = open(REEXEC_C, encoding="utf-8").read()
     assert "audit_status_fd" in src              # the audit helper exists + is called
-    assert "status-fd3=" in src                  # reports fd 3's open/cloexec state
+    assert "status-fd3=" in src                  # reports fd 3's open/cloexec state (kept token)
     assert "inheritable_fds>=3=" in src          # reports the survivor count
-    # Audit runs AFTER the sweep and BEFORE entering the guest.
+    # Audit runs AFTER the sweep and BEFORE entering the guest. The audit is now
+    # parameterized by the argv-parsed status fd (FIX 2): audit_status_fd(status_fd).
     sweep_idx = src.find("cloexec_closed = close_cloexec_fds()")
-    audit_idx = src.find("audit_status_fd();")
+    audit_idx = src.find("audit_status_fd(status_fd)")
     enter_idx = src.find("enter_guest((void*)start")
     assert -1 < sweep_idx < audit_idx < enter_idx
+
+
+# --------------------------------------------------------------------------
+# FIX 2 — apt/gpgv `--status-fd N` parse + protect (the fd-3 survival fix).
+# apt does NOT hard-wire fd 3 for the gpgv status pipe: it picks the pipe's own fd
+# number and passes `--status-fd N`. The in-process re-map must (a) parse the REAL
+# N from the guest argv (so a perturbed number — e.g. shifted by a leaked supervisor
+# capture-pipe fd — is still found), and (b) clear CLOEXEC on fd N before the sweep
+# so the sweep KEEPS it (replicating apt's own pre-exec clear) → gpgv inherits the
+# live status write end → GOODSIG reaches apt. These mirror the C find_status_fd /
+# protect_status_fd, host-regression-guarded device-lessly.
+# --------------------------------------------------------------------------
+def test_find_status_fd_parses_separate_and_eq_forms():
+    # gpgv argv carries `--status-fd 3` (separate) — the load-bearing apt-key form.
+    assert M.find_status_fd_model(
+        ["gpgv", "--status-fd", "3", "--homedir", "/t", "--keyring", "/k", "s", "d"]
+    ) == 3
+    # `--status-fd=5` (joined) form.
+    assert M.find_status_fd_model(["gpgv", "--status-fd=5", "sig", "data"]) == 5
+    # A higher (perturbed) number is honoured, not clamped to 3.
+    assert M.find_status_fd_model(["gpgv", "--status-fd", "11"]) == 11
+
+
+def test_find_status_fd_absent_or_malformed_returns_minus_one():
+    # apt-key's own intermediate argv (sh /usr/bin/apt-key verify …) names no status fd.
+    assert M.find_status_fd_model(["/bin/sh", "/usr/bin/apt-key", "verify", "--keyring", "/k"]) == -1
+    assert M.find_status_fd_model(["gpgv"]) == -1
+    assert M.find_status_fd_model(["gpgv", "--status-fd"]) == -1          # value missing
+    assert M.find_status_fd_model(["gpgv", "--status-fd", "x"]) == -1     # non-numeric
+    assert M.find_status_fd_model([]) == -1
+
+
+def test_protect_then_sweep_keeps_named_status_fd_even_if_cloexec():
+    # The core FIX-2 invariant: a status fd left CLOEXEC by an intermediate re-map
+    # would be wrongly dropped by the sweep; protecting (un-CLOEXEC) the argv-named fd
+    # first makes it survive. Status fd = 3, marked CLOEXEC, plus a leaked CLOEXEC fd 8.
+    table = {0: 0, 1: 0, 2: 0, 3: M.FD_CLOEXEC, 8: M.FD_CLOEXEC}
+    protected = M.protect_status_fd_model(table, status_fd=3)
+    assert protected[3] == 0, "status fd 3 had CLOEXEC cleared"
+    surviving, closed = M.close_cloexec_fds_model(protected)
+    assert 3 in surviving and 8 in closed            # fd 3 kept, the leak closed
+    assert M.inheritable_status_fds_after_remap(protected) == 1  # exactly fd 3 survives
+
+
+def test_protect_status_fd_is_noop_when_absent_or_already_clean():
+    # No status fd named (non-apt guest) -> protect is a no-op (table unchanged).
+    table = {0: 0, 1: 0, 2: 0}
+    assert M.protect_status_fd_model(table, status_fd=-1) == table
+    # status fd already non-CLOEXEC (the healthy apt case) -> unchanged.
+    healthy = {0: 0, 1: 0, 2: 0, 3: 0, 8: M.FD_CLOEXEC}
+    assert M.protect_status_fd_model(healthy, status_fd=3) == healthy
+
+
+def test_perturbed_status_fd_number_still_protected_and_audited():
+    # Leaked supervisor fds shifted apt's status pipe to fd 5 (not the native 3); apt
+    # passes `--status-fd 5`. Parsing argv finds 5; protecting fd 5 keeps it; the audit
+    # of fd 5 (not the empty fd 3) reports the live write end. A hard-coded-3 audit
+    # would have falsely reported CLOSED while the real status fd (5) was fine.
+    argv = ["gpgv", "--status-fd", "5", "--keyring", "/k", "sig", "data"]
+    n = M.find_status_fd_model(argv)
+    assert n == 5
+    table = {0: 0, 1: 0, 2: 0, 5: M.FD_CLOEXEC}   # fd 5 = status, left CLOEXEC upstream
+    protected = M.protect_status_fd_model(table, status_fd=n)
+    surviving, _ = M.close_cloexec_fds_model(protected)
+    assert 5 in surviving
+    assert M.inheritable_status_fds_after_remap(protected) == 1
+
+
+def test_reexec_c_parses_and_protects_status_fd():
+    # Source-invariant: the worker must PARSE --status-fd from argv and PROTECT
+    # (un-CLOEXEC) it BEFORE the sweep, so the named status fd survives the deep gpgv
+    # re-map. Without this, an intermediate-rung CLOEXEC on the status fd drops it.
+    src = open(REEXEC_C, encoding="utf-8").read()
+    assert "find_status_fd" in src               # parses --status-fd N / =N from argv
+    assert "protect_status_fd" in src            # clears CLOEXEC on the named fd
+    assert "F_SETFD" in src                       # via fcntl(F_SETFD) to clear the bit
+    # protect runs BEFORE the sweep (else the sweep closes the still-CLOEXEC status fd).
+    parse_idx = src.find("status_fd = find_status_fd(argv)")
+    protect_idx = src.find("protect_status_fd(status_fd)")
+    sweep_idx = src.find("cloexec_closed = close_cloexec_fds()")
+    assert -1 < parse_idx <= protect_idx < sweep_idx
+
+
+def test_reexec_c_launch_child_gives_clean_fd_table():
+    # Source-invariant (runtime_report.cpp launch child): the redundant out_pipe[1]
+    # copy is CLOSED after dup2 onto stdout/stderr, and the diag pipe (dg) is marked
+    # CLOEXEC — so the guest sees a clean fd table (no leaked non-CLOEXEC capture-pipe
+    # write ends that would survive every re-map and inflate the gpgv survivor count).
+    rr = os.path.join(
+        os.path.dirname(_HERE), "app", "src", "main", "cpp", "runtime_report.cpp"
+    )
+    src = open(rr, encoding="utf-8").read()
+    # The close of the redundant out_pipe[1] appears AFTER the two dup2s onto stdio.
+    # (out_pipe[1] is also closed in other fork paths/the parent — search FROM the
+    # dup2s so we match the launch child's post-dup2 close specifically.)
+    dup_out = src.find("::dup2(out_pipe[1], STDOUT_FILENO)")
+    dup_err = src.find("::dup2(out_pipe[1], STDERR_FILENO)")
+    close_red = src.find("::close(out_pipe[1]);", dup_err)
+    assert -1 < dup_out < dup_err < close_red
+    # The close is right after the dup2s (within the child's fd-setup block, not pages
+    # away in the parent), and BEFORE the guest jump (JUMPING; marker).
+    jump = src.find('"JUMPING;"', dup_err)
+    assert dup_err < close_red < jump
+    # dg is set CLOEXEC in the launch child.
+    assert "::fcntl(dg, F_SETFD, ::fcntl(dg, F_GETFD, 0) | FD_CLOEXEC)" in src
 
 
 if __name__ == "__main__":
