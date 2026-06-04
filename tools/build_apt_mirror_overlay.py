@@ -52,18 +52,35 @@ it is strictly heavier than HTTP here.
 Signature trust — DEMO-TRUST default; authenticated (gpgv) opt-in
 ----------------------------------------------------------------
 Integrity is only real if apt **verifies the signature** on that ``InRelease``.
-The overlay CAN ship a full authenticated path, BUT it is **not the default**: as
-of this writing authenticated ``apt-get update`` is BROKEN ON DEVICE. noble apt's
-``gpgv`` method execs ``/usr/bin/apt-key`` — a ``#!/bin/sh`` POSIX script — and the
-loader's in-process exec-re-map historically rejected any ``#!``-interpreter target
-(it sys_exit(72)'d on the non-ELF magic), so the verify chain failed closed
-("Unknown error executing apt-key" → "E: The repository is not signed"). A
-companion loader fix (app/src/main/cpp/alr_inproc_reexec.c: emulate binfmt_script —
-map the rootfs interpreter and splice the script path into argv) removes that wall,
-but until it is DEVICE-PROVEN the safe, working default is **demo-trust**
-(``Trusted: yes`` + ``AllowUnauthenticated``). Authenticated mode is the explicit
-opt-in (``--authenticated`` / ``trusted=False``); flip the default back once the
-apt-key→gpgv chain shows a real ``gpgv`` "Good signature" on device.
+The overlay CAN ship a full authenticated path, but the default stays **demo-trust**
+until authenticated ``apt-get update`` is DEVICE-PROVEN end-to-end. The loader chain
+the authenticated path needs has been built up across waves and is NOW COMPLETE in
+the loader (all four rungs land in HEAD):
+
+  1. ``#!``-interpreter re-map — noble apt's ``gpgv`` method execs ``/usr/bin/apt-key``
+     (a ``#!/bin/sh`` POSIX script); the in-process exec-re-map emulates binfmt_script
+     (maps the rootfs interpreter + splices the script path into argv) so apt-key runs
+     at all (was: sys_exit(72) on the non-ELF magic → "Unknown error executing apt-key").
+  2. CLOEXEC sweep — the re-map does NO execve, so it must close every FD_CLOEXEC fd
+     itself or the gpgv ``--status-fd 3`` pipe never EOFs (extra write end lingers) →
+     "not signed". The worker sweeps (and now AUDITS, see audit_status_fd) the table.
+  3. cred-drop SIGSYS emul — apt's gpgv-method fork drops privileges
+     (``setgid(getgid())``/``setuid(getuid())``) before execve; the Android base
+     seccomp SECCOMP_RET_TRAPs the cred family, killing the grandchild ONE SYSCALL
+     before the exec our tracer would redirect. The supervisor now emulates the
+     setuid/setgid family (nr 143-159) as SUCCESS(0), so the guard passes and gpgv
+     actually spawns + is re-mapped (device-proven: ``worker target=…/gpgv``).
+  4. realpath guest-canon — apt-key mints its temp gpg home as a guest path then
+     realpath's it; the interposer now returns a GUEST-consistent canonical so the
+     ``--homedir``/``--keyring`` it hands gpgv match (was: host/guest path-split →
+     gpgv NODATA → "not signed").
+
+So the historical "BROKEN ON DEVICE — loader can't load a shebang interpreter" framing
+is OUT OF DATE: the loader walls are down. The default is demo-trust purely as the
+conservative posture until a device run shows a real ``gpgv`` "Good signature" through
+fd 3 (an honest gate, not a known loader defect). Authenticated mode is the explicit
+opt-in (``--authenticated`` / ``trusted=False``); flip the default once that device
+GOODSIG lands (the DEVICE-VERIFY checklist in this module's commit covers it).
 
 DEMO-TRUST (default): ``Trusted: yes`` on the stanza + ``AllowUnauthenticated`` in
 apt.conf — apt SKIPS signature verification. This is UNAUTHENTICATED: a MITM on the
@@ -416,15 +433,16 @@ def build_apt_conf_body(
     """The apt.conf drop-in for the DNS-less, single-mirror apt path.
 
     DEFAULT = DEMO-TRUST (``trusted=True``). The authenticated path (gpgv via
-    apt-key) is currently BROKEN ON DEVICE: noble apt's gpgv method execs
-    ``/usr/bin/apt-key`` — a ``#!/bin/sh`` script — and the loader's in-process
-    exec-re-map historically could not load a ``#!``-interpreter target, so the
-    verify chain failed closed ("Unknown error executing apt-key" → "is not
-    signed"). Until that fix is DEVICE-PROVEN, shipping authenticated-by-default is
-    a footgun (every ``apt-get update`` fails), so the default is the demo
-    ``Trusted: yes`` + ``AllowUnauthenticated`` skip and authenticated is explicit
-    opt-in (``--authenticated`` / ``trusted=False``). See the module docstring and
-    the loader shebang fix in app/src/main/cpp/alr_inproc_reexec.c.
+    apt-key) needs the loader's in-process exec-re-map to survive apt's deep
+    ``method → apt-key(#!/bin/sh) → {mktemp,…,gpgv}`` grandchild chain. All four
+    loader rungs that chain needs are now in HEAD (binfmt_script re-map, CLOEXEC
+    fd-3 sweep, cred-drop SIGSYS→0, realpath guest-canon — see the module
+    docstring). The default stays demo-trust as the conservative posture until a
+    device run shows a real ``gpgv`` "Good signature" through fd 3 — NOT because of
+    a known loader defect. Authenticated mode is the explicit opt-in
+    (``--authenticated`` / ``trusted=False``); flip the default once that device
+    GOODSIG lands. The demo ``Trusted: yes`` + ``AllowUnauthenticated`` skip is the
+    fallback for environments without the verifier staged.
 
     Three concerns, all device-proven necessary (see the run logs in
     ``docs/research/cr2-online-apt-integration.md`` / the commit body):
@@ -502,7 +520,8 @@ def build_apt_conf_body(
         "// (1) Dir::Etc isolates apt to the ports stanza in sources.list.alr.d (ignores the",
         "//     base cloud-init ubuntu.sources + github-cli/tailscale). (2) Signature: DEMO-TRUST",
         "//     by default (stanza Trusted:yes + the unauthenticated skip — authenticated gpgv is",
-        "//     opt-in via --authenticated, broken on device pending the loader apt-key#!/sh fix).",
+        "//     opt-in via --authenticated; the loader apt-key#!/sh→gpgv chain is now complete,",
+        "//     default stays demo-trust until a device gpgv GOODSIG is observed).",
         "//     (3) Dir::State::status pins the dpkg DB to its absolute rootfs path.",
         "//     (4) Blank the PackageKit/c-n-f Post-Invoke hooks + run as root (no _apt user):",
         "//     those hooks exec gdbus/dbus that this headless rootfs lacks, which otherwise",
@@ -796,11 +815,14 @@ def build_apt_mirror_overlay(
     rootfs path baked into the absolute Dir::Etc::sourceparts / Dir::State::status
     (None => relative sourceparts + no status pin). ``trusted`` toggles the DEMO
     signature skip (default **True = demo-trust**; the authenticated path is opt-in
-    via ``trusted=False`` / ``--authenticated`` because it is currently broken on
-    device — noble apt's gpgv method execs the ``/usr/bin/apt-key`` ``#!/bin/sh``
-    script; see ``build_sources_body`` / ``build_apt_conf_body`` and the loader
-    shebang fix). ``keyring_bytes`` overrides the embedded archive keyring (e.g.
-    re-extracted via :func:`keyring_from_rootfs`).
+    via ``trusted=False`` / ``--authenticated``). The loader chain authenticated mode
+    needs — noble apt's gpgv method execs the ``/usr/bin/apt-key`` ``#!/bin/sh`` script,
+    which forks ``mktemp``/…/``gpgv`` grandchildren — is now complete (binfmt_script
+    re-map + CLOEXEC fd-3 sweep + cred-drop SIGSYS→0 + realpath guest-canon); the
+    default stays demo-trust until a device ``gpgv`` GOODSIG is observed. See
+    ``build_sources_body`` / ``build_apt_conf_body`` and the module docstring.
+    ``keyring_bytes`` overrides the embedded archive keyring (e.g. re-extracted via
+    :func:`keyring_from_rootfs`).
     """
     m = resolve_mirror(mirror)
     if bootstrap_ips:

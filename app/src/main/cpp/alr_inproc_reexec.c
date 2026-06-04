@@ -767,6 +767,64 @@ ALR_FREESTANDING static unsigned long close_cloexec_fds(void) {
     return closed;
 }
 
+// ---- fd-3 (gpgv --status-fd) survival audit (the load-bearing apt invariant) -
+// After the CLOEXEC sweep above, the apt authenticated-update chain depends on a
+// PRECISE fd-table shape at the gpgv re-map:
+//   (a) fd 3 — the gpgv status pipe's write end apt dup2'd and CLEARED CLOEXEC on —
+//       must REMAIN OPEN, so gpgv can write `[GNUPG:] GOODSIG …` to `--status-fd 3`;
+//   (b) NO OTHER write end of that pipe may remain (any leaked fd >= 3 that the
+//       sweep failed to close keeps the pipe from EOF-ing, so apt's read of the
+//       status pipe blocks/never finalizes the GOODSIG -> "the repository is not
+//       signed"). apt marks every fd >= 3 CLOEXEC (close_range(3,~0U,CLOSE_RANGE_
+//       CLOEXEC)) before dup2'ing onto 3, so a CORRECT sweep leaves EXACTLY fd 3
+//       open among {>=3}. This audit reports both facts to the diag pipe so a device
+//       drain can PROVE the invariant at the exact re-map (method->apt-key->gpgv),
+//       and LOCALIZE a regression to the precise depth if it ever returns. It only
+//       READS fd state (fcntl F_GETFD) — no side effects, never closes anything.
+// Returns the count of OPEN non-CLOEXEC fds with number >= 3 (the would-be extra
+// status-pipe write ends; the invariant wants this == 1, i.e. only fd 3 itself).
+ALR_FREESTANDING static unsigned long audit_status_fd(void) {
+    // fd 3 state: -1 = closed (no write end -> gpgv's --status-fd 3 write EBADFs ->
+    // no GOODSIG), 0 = open & NOT cloexec (the wanted live write end), 1 = open &
+    // cloexec (would have been closed by a real execve; a sweep miss).
+    long f3 = sys3(SYS_fcntl, 3, F_GETFD, 0);
+    if (f3 < 0) diag("ALR-INPROC: status-fd3=CLOSED\n");
+    else if (f3 & FD_CLOEXEC) diag("ALR-INPROC: status-fd3=OPEN-cloexec(LEAK)\n");
+    else diag("ALR-INPROC: status-fd3=OPEN-keep\n");
+    // Count surviving non-CLOEXEC fds >= 3 via /proc/self/fd (these are exactly the
+    // fds the re-mapped gpgv inherits as potential pipe write ends). > 1 means a
+    // stray inheritable fd lingers besides fd 3 -> a candidate EOF break.
+    unsigned long survivors = 0;
+    long dfd = sys4(SYS_openat, AT_FDCWD, "/proc/self/fd",
+                    O_RDONLY | O_DIRECTORY, 0);
+    if (dfd >= 0) {
+        char dbuf[2048];
+        for (;;) {
+            long n = sys3(SYS_getdents64, dfd, dbuf, sizeof(dbuf));
+            if (n <= 0) break;
+            long off = 0;
+            while (off < n) {
+                unsigned short reclen =
+                    (unsigned short)((unsigned char)dbuf[off + 16] |
+                                     ((unsigned char)dbuf[off + 17] << 8));
+                if (reclen == 0) break;
+                const char* name = dbuf + off + 19;
+                long fd = 0;
+                int ok = (name[0] >= '0' && name[0] <= '9');
+                for (const char* p = name; *p; ++p) {
+                    if (*p < '0' || *p > '9') { ok = 0; break; }
+                    fd = fd * 10 + (*p - '0');
+                }
+                if (ok && fd >= 3 && fd != dfd && !fd_is_cloexec(fd)) ++survivors;
+                off += reclen;
+            }
+        }
+        sys1(SYS_close, dfd);
+    }
+    diag_hex("ALR-INPROC: inheritable_fds>=3=", survivors);
+    return survivors;
+}
+
 // ===========================================================================
 //  alr_inproc_reexec_worker — the C worker. Entered from the naked asm shim with
 //  the entry ABI already unpacked into the SysV arg regs:
@@ -1062,6 +1120,13 @@ void alr_inproc_reexec_worker(const char* target, char** argv,
     // are untouched. Runs unconditionally (a guest with no CLOEXEC fds closes none).
     unsigned long cloexec_closed = close_cloexec_fds();
     diag_hex("ALR-INPROC: cloexec_closed=", cloexec_closed);
+
+    // Audit the post-sweep fd table for the apt gpgv --status-fd 3 invariant (fd 3
+    // open & not-cloexec, no stray inheritable fd >= 3). Diagnostic only — proves
+    // GOODSIG-via-fd-3 survives THIS re-map (method->apt-key->gpgv) on a device
+    // drain and localizes any future EOF regression to the exact depth. No effect
+    // on a guest that has no fd 3 (status-fd3=CLOSED, survivors typically 0).
+    audit_status_fd();
 
     enter_guest((void*)start, (void*)jump_entry, tcb);
     sys_exit(99);  // unreachable

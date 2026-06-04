@@ -403,6 +403,24 @@ def test_apt_status_fd3_survives_only_after_sweep():
     assert M.apt_status_fd_survives_remap(bad, status_fd=3) is False
 
 
+def test_status_fd_audit_counts_only_inheritable_high_fds():
+    # Mirror of the C audit_status_fd() survivor count. The authenticated-apt
+    # invariant at the gpgv re-map: EXACTLY one inheritable (non-CLOEXEC) fd >= 3
+    # survives the sweep — fd 3 itself (the dup2'd status write end). The leaked
+    # pre-dup write end (fd 8, CLOEXEC) is closed and does NOT count.
+    healthy = {0: 0, 1: 0, 2: 0, 3: 0, 8: M.FD_CLOEXEC}
+    assert M.inheritable_status_fds_after_remap(healthy) == 1
+    # A stray inheritable fd 5 (NOT CLOEXEC) lingers beside fd 3 -> the status pipe
+    # never EOFs -> apt "not signed". The audit count climbs to 2, localizing it.
+    leaky = {0: 0, 1: 0, 2: 0, 3: 0, 5: 0, 8: M.FD_CLOEXEC}
+    assert M.inheritable_status_fds_after_remap(leaky) == 2
+    # fd 3 wrongly CLOEXEC -> closed -> count 0 -> gpgv's --status-fd 3 write EBADFs.
+    no_fd3 = {0: 0, 1: 0, 2: 0, 3: M.FD_CLOEXEC, 8: M.FD_CLOEXEC}
+    assert M.inheritable_status_fds_after_remap(no_fd3) == 0
+    # A pure-stdio guest (no status pipe) has zero high inheritable fds — no-op.
+    assert M.inheritable_status_fds_after_remap({0: 0, 1: 0, 2: 0}) == 0
+
+
 def test_xkbcomp_keymap_pipe_write_end_pruned():
     # X server marks its sockets/extra fds CLOEXEC so xkbcomp inherits only the
     # keymap pipe ends it set up. Modeled: every CLOEXEC server fd is closed at the
@@ -432,6 +450,21 @@ def test_reexec_c_actually_honors_cloexec():
     call_idx = src.find("cloexec_closed = close_cloexec_fds()")
     enter_idx = src.find("enter_guest((void*)start")
     assert call_idx != -1 and enter_idx != -1 and call_idx < enter_idx
+
+
+def test_reexec_c_audits_status_fd3_before_jump():
+    # Source-invariant: the worker must AUDIT the gpgv --status-fd 3 invariant after
+    # the CLOEXEC sweep and before the jump, so a device drain can PROVE fd 3 reached
+    # gpgv (and localize an EOF regression). Diagnostic-only (no behavior change).
+    src = open(REEXEC_C, encoding="utf-8").read()
+    assert "audit_status_fd" in src              # the audit helper exists + is called
+    assert "status-fd3=" in src                  # reports fd 3's open/cloexec state
+    assert "inheritable_fds>=3=" in src          # reports the survivor count
+    # Audit runs AFTER the sweep and BEFORE entering the guest.
+    sweep_idx = src.find("cloexec_closed = close_cloexec_fds()")
+    audit_idx = src.find("audit_status_fd();")
+    enter_idx = src.find("enter_guest((void*)start")
+    assert -1 < sweep_idx < audit_idx < enter_idx
 
 
 if __name__ == "__main__":
