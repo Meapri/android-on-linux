@@ -63,6 +63,16 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         System.loadLibrary("alr_loader")
 
+        // GPU ANGLE first-texture WALL diagnostic (gated on /data/local/tmp/.alr-angle, so a
+        // normal launch is unaffected): turn on the HOST servicer's GEN-OP create-chain trace
+        // (alr_gpu_vk_decode.hpp reads getenv("ALR_VK_HOST_TRACE") ONCE) so each ANGLE
+        // vkCreate*/getReqs op + its host-side result is logged under tag alr-vk-host — the
+        // ground truth for which Vulkan op precedes the libGLESv2+0x206db4 NULL-deref. Must run
+        // BEFORE the host servicer thread first decodes a GEN op (the static latches once).
+        if (java.io.File("/data/local/tmp/.alr-angle").isFile) {
+            try { android.system.Os.setenv("ALR_VK_HOST_TRACE", "1", true) } catch (_: Throwable) {}
+        }
+
         // Standalone Chromium app entry (launched via the .ui.ChromiumStandalone
         // activity-alias "ALR Chromium", or the adb marker /data/local/tmp/.alr-cronly):
         // a LEAN chromium-only path that SKIPS the entire heavy MainActivity onCreate
@@ -3678,6 +3688,41 @@ class MainActivity : Activity() {
                 markerEnv("/data/local/tmp/.alr-angle-feat-enabled", "ANGLE_FEATURE_OVERRIDES_ENABLED")
                 markerEnv("/data/local/tmp/.alr-angle-icd-override", "ALR_VK_ICD_OVERRIDE")
                 markerEnv("/data/local/tmp/.alr-angle-apiver-cap", "ALR_ICD_APIVER_CAP")
+                // VENDOR-ID FLIP decisive experiment (wave-17). Our guest VK ICD advertises a
+                // NON-ARM vendorID/driverID to ANGLE (so its RendererVk::initFeatures takes a
+                // known-good non-Mali FeaturesVk path) while the ring still drives the REAL Mali
+                // GPU — the one cheap test for whether the first-glTexImage2D NULL-deref is a
+                // Mali/ARM-vendor-conditional ANGLE code path. The marker's first line is a token
+                // (swiftshader|google|nvidia|amd|intel|arm|off). TRANSPORT: runtime_report.cpp's
+                // guest-env forward allowlist is out of scope this wave, so besides setenv (used
+                // if a forward exists) we ALSO write the token to <rootfs>/.alr-icd-vendor-override
+                // — a host-absolute file the guest ICD reads via $ALR_ROOTFS (always forwarded),
+                // needing no loader change. Default-absent → no file written, ICD reports real Mali
+                // (strict no-regression).
+                markerEnv("/data/local/tmp/.alr-angle-vendor-override", "ALR_ICD_VENDOR_OVERRIDE")
+                run {
+                    val vf = java.io.File("/data/local/tmp/.alr-angle-vendor-override")
+                    val dst = java.io.File(rootfsDir, ".alr-icd-vendor-override")
+                    try {
+                        if (vf.isFile) {
+                            val tok = vf.readText().lineSequence().map { it.trim() }
+                                .firstOrNull { it.isNotEmpty() }
+                            if (!tok.isNullOrEmpty()) {
+                                if (!dst.isFile || dst.readText().trim() != tok) {
+                                    dst.writeText(tok + "\n"); dst.setReadable(true, false)
+                                }
+                                android.util.Log.i("alr_loader", "angle-gles: vendor-override token=$tok -> ${dst.absolutePath}")
+                            }
+                        } else if (dst.isFile) {
+                            // marker removed → clear the stale rootfs override so the next run is
+                            // real Mali again (the A/B "off" arm without leaving residue).
+                            dst.delete()
+                            android.util.Log.i("alr_loader", "angle-gles: vendor-override marker absent → cleared ${dst.absolutePath}")
+                        }
+                    } catch (e: Throwable) {
+                        android.util.Log.e("alr_loader", "angle-gles: vendor-override wire EXC: ${android.util.Log.getStackTraceString(e)}")
+                    }
+                }
                 // Part B: surface the interposer's dlopen-redirect diag ("dlopen
                 // vulkan->loader …") so a device run can prove whether ANGLE's
                 // dlopen("libvulkan.so.1") was rewritten to the staged Khronos loader.

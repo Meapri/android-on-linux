@@ -68,15 +68,20 @@ inline void cmd_register_framebuffer(VkDecodeState& st, uint32_t vid, VkFramebuf
 // walk a bogus chain. Returns the chain head (or null), with storage owned by `store`. ----
 inline bool vk_gen_pnext_stype_allowed(uint32_t s_type) {
     switch (s_type) {
-        // External-memory create-info structs ANGLE chains onto image/buffer creates.
+        // POINTERLESS create-info structs the guest ships VERBATIM (LEAD-1): these match the
+        // guest's alr_icd_create_pnext_struct_size table one-for-one (whole-struct, no inner
+        // pointer), so relinking only the pNext header field yields a valid struct for Mali.
         case VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO:
         case VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO:
         case VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO:
         case VK_STRUCTURE_TYPE_BUFFER_OPAQUE_CAPTURE_ADDRESS_CREATE_INFO:
         case VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO:
-        case VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO:
-        case VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO:
             return true;
+        // NOTE: pointer-bearing structs (IMAGE_FORMAT_LIST_CREATE_INFO.pViewFormats,
+        // DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS.pBindingFlags, SAMPLER_YCBCR_CONVERSION_INFO)
+        // are deliberately NOT verbatim-allowlisted: a verbatim ship would carry a dangling
+        // guest pointer. Binding-flags is reconstructed in vk_gen_real_create_descriptor_set_layout
+        // from an inline flags array; the others are dropped until they get the same treatment.
         default:
             return false;
     }
@@ -627,7 +632,6 @@ inline VkResult vk_gen_real_create_descriptor_set_layout(
     const std::vector<VkGenElem_create_descriptor_set_layout_bindings>& bindings,
     const std::vector<uint32_t>& pnext_types,
     const std::vector<std::vector<uint8_t>>& pnext_bytes) {
-    (void)pnext_types; (void)pnext_bytes;
     auto dit = st.real_dev.find(vdev);
     if (dit == st.real_dev.end()) return VK_ERROR_INITIALIZATION_FAILED;
     std::vector<VkDescriptorSetLayoutBinding> vb;
@@ -646,6 +650,32 @@ inline VkResult vk_gen_real_create_descriptor_set_layout(
     ci.flags = flags;
     ci.bindingCount = static_cast<uint32_t>(vb.size());
     ci.pBindings = vb.empty() ? nullptr : vb.data();
+    // LEAD-1 (TOP): RECONSTRUCT VkDescriptorSetLayoutBindingFlagsCreateInfo from the inline
+    // flags array the guest shipped (sType=BINDING_FLAGS, blob = { u32 bindingCount, u32
+    // flags[bindingCount] }). The guest could not ship the struct verbatim (its pBindingFlags
+    // is a guest pointer); here we rebuild it with a host-owned array and chain it. Without this
+    // the created layout silently loses ANGLE's update-after-bind / partially-bound / variable-
+    // -count binding flags -> ANGLE's RendererVk builds an allocator/format member against a
+    // capability the real layout lacks -> first-glTexImage2D NULL-deref (libGLESv2+0x206db4).
+    std::vector<VkDescriptorBindingFlags> bind_flags;  // host-owned backing for pBindingFlags
+    VkDescriptorSetLayoutBindingFlagsCreateInfo bfci{};
+    for (size_t i = 0; i < pnext_types.size() && i < pnext_bytes.size(); ++i) {
+        if (pnext_types[i] != VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO)
+            continue;
+        const std::vector<uint8_t>& blob = pnext_bytes[i];
+        if (blob.size() < 4) continue;
+        uint32_t cnt = 0; std::memcpy(&cnt, blob.data(), 4);
+        if (cnt > 4096) continue;
+        if (blob.size() < 4u + static_cast<size_t>(cnt) * 4u) continue;
+        bind_flags.resize(cnt);
+        if (cnt) std::memcpy(bind_flags.data(), blob.data() + 4, static_cast<size_t>(cnt) * 4u);
+        bfci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
+        bfci.pNext = nullptr;
+        bfci.bindingCount = cnt;
+        bfci.pBindingFlags = bind_flags.empty() ? nullptr : bind_flags.data();
+        ci.pNext = &bfci;  // chain it onto the real create
+        break;             // ANGLE chains at most one binding-flags struct
+    }
     VkDescriptorSetLayout layout = VK_NULL_HANDLE;
     VkResult r = vkCreateDescriptorSetLayout(dit->second.dev, &ci, nullptr, &layout);
     if (r == VK_SUCCESS) gen_tables(st).dsl[vdsl] = layout;
