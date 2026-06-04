@@ -21,8 +21,16 @@ DT_NEEDED evidence (`tools/elf_needed.needed_of` on each `.deb`'s EXEC binary):
 | xzgv | `libgtk-x11-2.0.so.0`, `libgdk-x11-2.0.so.0`, **`libX11.so.6`**, _(no wayland)_ | **yes** |
 | xli  | **`libX11.so.6`**, `libjpeg`, `libpng16`, _(no wayland)_ | **yes** |
 | nsxiv| **`libX11.so.6`**, _(no wayland)_ | **yes** |
+| feh  | **`libX11.so.6`**, _(no wayland)_ | **yes** |
+| qiv  | `libgdk-x11-2.0.so.0`, **`libX11.so.6`**, _(no wayland)_ | **yes** |
+| xpdf | `libXm`/`libXt`/`libX11` (Motif/Xt closure), _(no wayland)_ | **yes** |
+| qpdfview | Qt6 (xcb platform plugin at runtime; **no `qt6-wayland`** in closure) | yes (via Xwayland) |
 | mate-calc | `libgtk-3.so.0` _(no libX11, no direct wayland — GTK3 picks wayland at runtime)_ | no |
 | geany | `libgeany.so.0` → GTK3 _(no direct libX11)_ | no |
+
+> **UPDATE (general maintscript-shim):** nsxiv/feh/qiv/xpdf/qpdfview are now RE-ADDED to the
+> catalog (all `needsXwayland=true`). See §2′ below + `docs/research/maintscript-shim-
+> generalization.md`. The routing helper is unchanged; only their INSTALL became reachable.
 
 A GTK3 app (gpicview/viewnior/mate-calc/geany) does NOT link `libwayland-client` directly
 either, but GDK **dlopens** its wayland backend (present in the base) and picks it via
@@ -67,22 +75,29 @@ memory).
 | appId | install verdict (`--live`) | delta | display | needsXwayland | in catalog? |
 |-------|----------------------------|------:|---------|:-------------:|:-----------:|
 | **xzgv** | LIKELY-PASS | 16 | X11-only → Xwayland | **true** | KEPT (marked) |
-| **xli** | LIKELY-PASS | 4 | X11-only → Xwayland | **true** | **ADDED** (TASK-A+C) |
-| **mate-calc** | LIKELY-PASS | 56 | GTK3 Wayland | false | **ADDED** (TASK-C) |
-| **geany** | LIKELY-PASS | 54 | GTK3 Wayland | false | **ADDED** (TASK-C) |
-| nsxiv | **HEAVY** (x11-common, libpaper1, xfonts-*) | 33 | X11-only | (n/a) | **DROPPED** (re-audited) |
+| **xli** | LIKELY-PASS | 4 | X11-only → Xwayland | **true** | ADDED |
+| **mate-calc** | LIKELY-PASS | 56 | GTK3 Wayland | false | ADDED |
+| **geany** | LIKELY-PASS | 54 | GTK3 Wayland | false | ADDED |
+| **nsxiv** | LIKELY-PASS (was HEAVY; shim-neutralized) | 33 | X11-only → Xwayland | **true** | **RE-ADDED** |
+| **feh** | LIKELY-PASS (was HEAVY; shim-neutralized) | 37 | X11-only → Xwayland | **true** | **RE-ADDED** |
+| **qiv** | LIKELY-PASS (was HEAVY; shim-neutralized) | 40 | X11-only → Xwayland | **true** | **RE-ADDED** |
+| **xpdf** | LIKELY-PASS (was HEAVY; shim-neutralized) | 18 | X11 (Motif) → Xwayland | **true** | **RE-ADDED** |
+| **qpdfview** | LIKELY-PASS (was HEAVY; shim-neutralized) | 77 | Qt6-xcb → Xwayland | **true** | **ADDED** (apt-Qt-GUI) |
 
-### nsxiv re-audit (TASK-A asked to re-audit it)
+### 2′. nsxiv/feh/qiv/xpdf/qpdfview RE-ADDED (the general-shim unlock — supersedes the drop)
 
-nsxiv IS X11-only, so the `needsXwayland` ROUTING would be correct for it. But routing is
-**orthogonal to install**: nsxiv's apt closure still audits HEAVY — its delta (33) drags
-`libpaper1`(exit 2) + `x11-common`(exit 127) + `xfonts-encodings` + `xfonts-utils`, the
-SAME debconf/init-script postinsts that device-proved-FAIL for `xpdf`. The neutralizer
-that fixes those (`maintscript-shim` overlay) is gated to gnome-platform pkgs in
-`AptInstaller` (other-owned). So nsxiv **cannot be installed** on the base today and stays
-DROPPED as a catalog entry — it would never reach a launch. Contrast xzgv/xli: X11-only AND
-a clean install (0 cascade triggers) → KEPT and routed. (`feh`/`qiv` audit the same
-HEAVY-X11 way — same gate; not added.)
+The earlier pass DROPPED nsxiv (and held back feh/qiv/xpdf) because their apt closure audited
+HEAVY — delta drags `libpaper1`(exit 2) + `x11-common`(exit 127) + `xfonts-*`, the SAME
+debconf/init-script postinsts that device-proved-FAIL for `xpdf` — and the neutralizer was
+gated to gnome-platform pkgs. **That gate is now removed:** the `maintscript-shim` overlay is
+staged for EVERY install (`AptInstaller.MAINTSCRIPT_SHIM_OVERLAY`), so those postinsts exit 0
+and the X11-image-viewer class audits LIKELY-PASS (`tools/app_closure_audit.py --live`). All
+are re-added with `needsXwayland=true`; `qpdfview` is the apt-Qt-GUI representative (only
+blocker `x11-common` via libsm6; no `qt6-wayland` plugin → Qt's xcb plugin connects to the
+rootful Xwayland). Routing wiring SSOT: `BundledCatalog.needsXwayland(appId)` drives the UI
+launch-request builders to set `protocol=X11` (so no edit to the chromium-owned
+`NativeAppSession.X11_ONLY_APP_IDS` is needed). Full model:
+`docs/research/maintscript-shim-generalization.md`.
 
 ### Why xli (TASK-C)
 
@@ -143,5 +158,7 @@ plus per-app the install is online apt.
   binaries.
 - The `XwaylandLaunch` helper does NOT itself verify a frame rendered (the session has no
   frame-counter accessor); the device checklist's frame/window check is the render gate.
-- nsxiv/feh/qiv install remains blocked until the `x11-common`/`libpaper1` neutralizer is
-  generalized beyond gnome-platform (AptInstaller, other-owned) and device-verified.
+- ✅ RESOLVED: the `x11-common`/`libpaper1` neutralizer has been GENERALIZED beyond
+  gnome-platform (`AptInstaller.MAINTSCRIPT_SHIM_OVERLAY`, staged for every install), so
+  nsxiv/feh/qiv/xpdf/qpdfview are RE-ADDED + audit LIKELY-PASS (host). Their install→render is
+  the device-verify checklist in `docs/research/maintscript-shim-generalization.md` §6.

@@ -81,26 +81,52 @@ object AptInstaller {
     private val STAGED_TOOLING_OVERLAYS = listOf("fakeroot", "apt-dpkg", "dpkg-db")
 
     /**
-     * GNOME-platform install-configure unlock (TASK-A1). These extra overlays are staged
-     * ONLY when the package being installed is a gnome-platform app: `maintscript-shim`
-     * (no-op confmodule + policy-rc.d + ucf/update-rc.d/… stubs so the libpaper1/x11-common/
-     * session-migration postinsts exit 0 instead of the exit-73 cascade) and `gnome-schemas`
-     * (the host-precompiled gschemas.compiled so the app's GSettings schemas resolve at
-     * runtime). Built by tools/build_maintscript_shim_overlay.py + tools/build_common_data_
-     * overlay.py --schemas. No-op when their tars are absent (graceful degradation).
+     * The GENERAL maintainer-script neutralizer overlay — applied to EVERY apt install
+     * (TASK: generalized from gnome-only). `maintscript-shim` ships no-op stubs (confmodule
+     * with db_* → exit 0, policy-rc.d=101, ucf/ucfr, update-rc.d/invoke-rc.d, deb-systemd-
+     * helper/-invoke, dpkg-reconfigure, and a dpkg-maintscript-helper that answers
+     * `supports`→0 + every rm_conffile/mv_conffile operation→0) so the DEBCONF / INIT-SCRIPT /
+     * CONFFILE-MAINTSCRIPT class of postinst/preinst exits 0 instead of the device-proven
+     * exit-73 cascade. This is the SAME stub set that already unblocked gnome-calculator's
+     * appstream PREINST; generalizing WHEN it is staged (always, not gnome-gated) unblocks the
+     * X11-image-viewer class (nsxiv/feh/qiv/xpdf: x11-common exit 127 + libpaper1 exit 2 +
+     * xfonts-* postinsts) and the apt Qt-GUI class (libqt6gui6t64 → libsm6 → x11-common).
+     *
+     * SAFETY: every member is a successful no-op for state that is meaningless in a non-root,
+     * no-systemd, single-process guest — there is no init to register into, no debconf db to
+     * seed, no systemd unit to enable, and the conffile churn dpkg-maintscript-helper performs
+     * is an upgrade-time cleanup (cosmetic for a from-scratch install). It changes NO syscall
+     * behaviour and weakens NO sandbox (cf. build_maintscript_shim_overlay.py docstring). So it
+     * is correct to stage for ALL installs: a galculator-class app (whose delta has none of the
+     * neutralized triggers) simply never sources these stubs, so its install is byte-identical;
+     * an app that DOES pull x11-common/libpaper1/appstream now configures clean instead of
+     * cascading. No-op when the tar is absent (graceful degradation). Built by
+     * tools/build_maintscript_shim_overlay.py.
      */
-    private val GNOME_CONFIGURE_OVERLAYS = listOf("maintscript-shim", "gnome-schemas")
+    private val MAINTSCRIPT_SHIM_OVERLAY = listOf("maintscript-shim")
 
     /**
-     * apt package names that are gnome-platform apps needing the install-configure unlock.
-     * Kept in lock-step with NativeAlrRuntime.BundledCatalog's gnome entries. Detection is by
-     * the apt package name (what install() receives), not the appId.
+     * GNOME-platform-SPECIFIC overlays — staged ON TOP of the always-applied maintscript-shim
+     * ONLY when the package is a gnome-platform app. `gnome-schemas` is the host-precompiled
+     * gschemas.compiled so the GTK4 app's GSettings schemas resolve at runtime (the schema
+     * COMPILE that the base's missing libglib2.0-bin/glib-compile-schemas cannot do); the
+     * runtime session-dbus shim (dbus-run-session) is wired separately in NativeAppSession.
+     * These carry the gnome dbus/schema baggage a plain X11/Qt app must NOT get. Built by
+     * tools/build_common_data_overlay.py --schemas. No-op when the tar is absent.
+     */
+    private val GNOME_CONFIGURE_OVERLAYS = listOf("gnome-schemas")
+
+    /**
+     * apt package names that are gnome-platform apps needing the gnome-SPECIFIC overlays
+     * (precompiled gschemas) on top of the general shim. Kept in lock-step with
+     * NativeAlrRuntime.BundledCatalog's gnome entries. Detection is by the apt package name
+     * (what install() receives), not the appId.
      */
     private val GNOME_PLATFORM_PKGS = setOf(
         "gnome-calculator", "gnome-text-editor", "eog", "file-roller", "gedit",
     )
 
-    /** True iff [pkg]'s configure needs the gnome-platform postinst neutralizer + schemas. */
+    /** True iff [pkg]'s configure needs the gnome-SPECIFIC overlays (precompiled schemas). */
     private fun isGnomePlatformPkg(pkg: String): Boolean =
         pkg in GNOME_PLATFORM_PKGS
 
@@ -161,12 +187,19 @@ object AptInstaller {
         stageInterpose(host, rootfsDir)
 
         // --- stage the apt overlays (size-keyed, idempotent) ------------------------------
-        val overlaysToStage = APT_OVERLAYS + (
+        // The maintscript-shim (general postinst/preinst neutralizer) is staged for EVERY
+        // install now (TASK: generalized from gnome-only) — it is a successful no-op for a
+        // galculator-class app and is what lets the x11-common/libpaper1/appstream/maintscript
+        // class configure clean (unblocks the X11-viewer + apt-Qt-GUI classes). The
+        // GNOME-SPECIFIC overlays (precompiled gschemas) stay gated to gnome-platform pkgs so a
+        // plain X11/Qt app does NOT pull the gnome schema/dbus baggage.
+        val overlaysToStage = APT_OVERLAYS + MAINTSCRIPT_SHIM_OVERLAY + (
             if (isGnomePlatformPkg(pkg)) GNOME_CONFIGURE_OVERLAYS else emptyList()
         )
+        Log.i(TAG, "aptinstall: staging general maintscript-shim (always) for pkg=$pkg")
         if (isGnomePlatformPkg(pkg)) {
-            Log.i(TAG, "aptinstall: pkg=$pkg is gnome-platform — also staging " +
-                "$GNOME_CONFIGURE_OVERLAYS (postinst neutralizer + precompiled gschemas)")
+            Log.i(TAG, "aptinstall: pkg=$pkg is gnome-platform — ALSO staging " +
+                "$GNOME_CONFIGURE_OVERLAYS (precompiled gschemas on top of the shim)")
         }
         for (name in overlaysToStage) {
             val tar = File("/data/local/tmp/$name-stage.tar")
@@ -253,15 +286,15 @@ object AptInstaller {
         Os.setenv("ALR_PERSIST_GUEST", "1", true)
         Os.setenv("ALR_INTERPOSE_DIAG", "1", true)
         Os.setenv("ALR_TEE_GUEST_STDOUT", "1", true)
-        // GNOME-platform configure: run debconf in noninteractive mode so the (stubbed)
-        // confmodule + dpkg-reconfigure never block on a prompt and the postinsts proceed.
-        // Inert for non-GNOME installs but harmless, so set unconditionally — apt/dpkg
-        // already prefer noninteractive in a headless install.
+        // Run debconf in noninteractive mode for EVERY install now (the maintscript-shim's
+        // stub confmodule is always staged): any postinst that sources confmodule + reads a
+        // debconf default (libpaper1/x11-common, not just gnome apps) proceeds without blocking
+        // on a prompt. Inert/harmless when no closure package uses debconf (apt/dpkg already
+        // prefer noninteractive headless), so set unconditionally. `gnomeConfigure` now only
+        // gates the gnome-SPECIFIC overlays/shim (precompiled gschemas), not this env.
+        Os.setenv("DEBIAN_FRONTEND", "noninteractive", true)
+        Os.setenv("DEBCONF_NONINTERACTIVE_SEEN", "true", true)
         val gnomeConfigure = isGnomePlatformPkg(pkg)
-        if (gnomeConfigure) {
-            Os.setenv("DEBIAN_FRONTEND", "noninteractive", true)
-            Os.setenv("DEBCONF_NONINTERACTIVE_SEEN", "true", true)
-        }
         try {
             // STEP 1 — apt-get update: fetch the index from the pinned mirror.
             val upOut = host.loaderProbe(
@@ -407,10 +440,8 @@ object AptInstaller {
             Os.unsetenv("ALR_PERSIST_GUEST")
             Os.unsetenv("ALR_INTERPOSE_DIAG")
             Os.unsetenv("ALR_TEE_GUEST_STDOUT")
-            if (gnomeConfigure) {
-                Os.unsetenv("DEBIAN_FRONTEND")
-                Os.unsetenv("DEBCONF_NONINTERACTIVE_SEEN")
-            }
+            Os.unsetenv("DEBIAN_FRONTEND")
+            Os.unsetenv("DEBCONF_NONINTERACTIVE_SEEN")
         }
     }
 
@@ -453,8 +484,12 @@ object AptInstaller {
         // The staged path needs only the dpkg tooling (fakeroot uid=0 + dpkg/tar admindir) plus
         // the app's own <pkg>-stage.tar (its .deb + closure). apt-mirror is deliberately NOT
         // staged — there is no fetch, so the offline install is unaffected by the mirror/apt-key
-        // gap that can block the online path. Order: tooling (scaffold order) THEN <pkg>-stage.
-        val stageNames = STAGED_TOOLING_OVERLAYS + pkg
+        // gap that can block the online path. The general maintscript-shim IS staged (after the
+        // tooling so its dpkg-maintscript-helper stub overwrites apt-dpkg's real one) because the
+        // staged `dpkg -i` runs the package's maintainer scripts too — a staged X11/Qt app gets
+        // the same x11-common/libpaper1/appstream neutralizer the online path now gets. Order:
+        // tooling (scaffold order) THEN maintscript-shim THEN <pkg>-stage.
+        val stageNames = STAGED_TOOLING_OVERLAYS + MAINTSCRIPT_SHIM_OVERLAY + pkg
         for (name in stageNames) {
             val tar = File("/data/local/tmp/$name-stage.tar")
             val m = File(rootfsDir, ".aptdrain-$name-staged-${tar.length()}")
@@ -524,11 +559,12 @@ object AptInstaller {
         Os.setenv("ALR_REEXEC_INPROC", "1", true)
         Os.setenv("ALR_PERSIST_GUEST", "1", true)
         Os.setenv("ALR_TEE_GUEST_STDOUT", "1", true)
-        val gnomeConfigure = isGnomePlatformPkg(pkg)
-        if (gnomeConfigure) {
-            Os.setenv("DEBIAN_FRONTEND", "noninteractive", true)
-            Os.setenv("DEBCONF_NONINTERACTIVE_SEEN", "true", true)
-        }
+        // Always noninteractive (the maintscript-shim's stub confmodule is staged for staged
+        // installs too) — same rationale as install(). (The offline/staged path does not stage
+        // the gnome-specific precompiled-gschemas overlay; gnome apps install via the online
+        // path. The general maintscript-shim IS staged here — see stageNames above.)
+        Os.setenv("DEBIAN_FRONTEND", "noninteractive", true)
+        Os.setenv("DEBCONF_NONINTERACTIVE_SEEN", "true", true)
         try {
             val debRel = "/var/cache/apt/archives/${deb.name}"
             onProgress(Phase.UNPACKING)
@@ -567,10 +603,8 @@ object AptInstaller {
             Os.unsetenv("ALR_REEXEC_INPROC")
             Os.unsetenv("ALR_PERSIST_GUEST")
             Os.unsetenv("ALR_TEE_GUEST_STDOUT")
-            if (gnomeConfigure) {
-                Os.unsetenv("DEBIAN_FRONTEND")
-                Os.unsetenv("DEBCONF_NONINTERACTIVE_SEEN")
-            }
+            Os.unsetenv("DEBIAN_FRONTEND")
+            Os.unsetenv("DEBCONF_NONINTERACTIVE_SEEN")
         }
     }
 
@@ -582,7 +616,10 @@ object AptInstaller {
     fun remove(host: Host, rootfsDir: File, rootfsName: String, pkg: String): Boolean {
         Log.i(TAG, "aptremove: pkg=$pkg")
         stageInterpose(host, rootfsDir)
-        for (name in APT_OVERLAYS) {
+        // Stage the general maintscript-shim too: a package's prerm/postrm can also call
+        // dpkg-maintscript-helper (rm_conffile on remove) under set -e — the stub keeps remove
+        // from aborting the same way install would. Idempotent + cheap (markers gate re-extract).
+        for (name in APT_OVERLAYS + MAINTSCRIPT_SHIM_OVERLAY) {
             val tar = File("/data/local/tmp/$name-stage.tar")
             val m = File(rootfsDir, ".aptdrain-$name-staged-${tar.length()}")
             if (tar.isFile && !m.isFile) {

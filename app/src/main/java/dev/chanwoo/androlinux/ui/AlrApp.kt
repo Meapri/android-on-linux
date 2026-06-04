@@ -52,9 +52,11 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import dev.chanwoo.androlinux.runtime.AlrRuntime
+import dev.chanwoo.androlinux.runtime.BundledCatalog
 import dev.chanwoo.androlinux.runtime.CatalogApp
 import dev.chanwoo.androlinux.runtime.InstalledApp
 import dev.chanwoo.androlinux.runtime.LaunchRequest
+import dev.chanwoo.androlinux.runtime.SurfaceProtocol
 import dev.chanwoo.androlinux.ui.theme.AlrTheme
 import dev.chanwoo.androlinux.ui.viewmodel.AppDetailViewModel
 import dev.chanwoo.androlinux.ui.viewmodel.CatalogViewModel
@@ -338,16 +340,22 @@ private fun RunningSurfacePlaceholder(onBack: () -> Unit) {
 // --------------------------------------------------------------------------- //
 
 /** InstalledApp.entry → LaunchRequest. DESKTOP 진입은 런타임이 Exec= 를 해석하므로
- *  target(.desktop 경로)을 entryPath 로 넘기고 args 는 비운다(매니페스트 규약). */
+ *  target(.desktop 경로)을 entryPath 로 넘기고 args 는 비운다(매니페스트 규약).
+ *  X11-only 앱(BundledCatalog.needsXwayland)은 protocol=X11 로 표시 → XwaylandLaunch 가
+ *  ROOTFUL Xwayland :0 으로 라우팅(InstalledApp 엔 needsXwayland 필드가 없어 appId 로 조회). */
 fun InstalledApp.toLaunchRequest(): LaunchRequest = LaunchRequest(
     appId = appId,
     entryPath = entry.target,
     args = entry.args,
+    protocol = if (BundledCatalog.needsXwayland(appId)) SurfaceProtocol.X11
+    else SurfaceProtocol.WAYLAND,
 )
 
-/** CatalogApp.entry → LaunchRequest(설치된 앱을 카탈로그/상세에서 바로 열 때). */
+/** CatalogApp.entry → LaunchRequest(설치된 앱을 카탈로그/상세에서 바로 열 때). X11-only
+ *  엔트리(needsXwayland=true)는 protocol=X11 로 라우팅한다. */
 fun CatalogApp.toLaunchRequest(): LaunchRequest = LaunchRequest(
     appId = appId,
     entryPath = entry.target,
     args = entry.args,
+    protocol = if (needsXwayland) SurfaceProtocol.X11 else SurfaceProtocol.WAYLAND,
 )

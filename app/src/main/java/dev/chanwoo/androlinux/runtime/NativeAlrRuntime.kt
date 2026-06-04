@@ -436,42 +436,57 @@ internal fun InstalledApp.toCatalogApp(): CatalogApp = CatalogApp(
  * device-PROVEN closure (157 pkgs) drags systemd + dbus + dconf-service + libpam-systemd
  * (via libgtk-3-0t64's Depends), and galculator STILL installs+configures exit-0. Those
  * packages are inert here (ldconfig runs, no daemon is started, configure exits 0). The real
- * exit-73 trigger is a small set of MAINTAINER-SCRIPT packages in the install DELTA (closure
- * minus the base's reconstructed-dpkg-DB installed-set): perl-base / dictionaries-common /
- * emacsen-common (mousepad/gedit), gsettings-desktop-schemas / appstream / session-migration /
- * glib-networking (gnome-calculator/eog), bubblewrap / ghostscript / gstreamer1.0-plugins-*,
- * and — device-corrected — the X11 debconf/init-script postinsts x11-common (exit 127) +
- * libpaper1 (exit 2) + xfonts-* (xpdf class). An entry is LIKELY-PASS iff its delta has ZERO
- * such triggers (== galculator's delta class); a BASE-PROVIDED target (gimp) is ALREADY-
- * INSTALLED (apt no-op, its postinsts never run — that is why gimp passes despite x11-common/
- * libpaper1 in its closure). This model reproduces the device PASS/FAIL ground truth 10/10
- * (galculator/l3afpad/htop/gimp/foot/netsurf-gtk PASS; mousepad/gnome-calculator/gedit/eog
- * FAIL) AND the device-proven xpdf FAIL. Proof status per entry:
+ * exit-73 trigger split into TWO classes (tools/app_closure_audit.py — re-classified for the
+ * GENERAL maintscript-shim): (a) NEUTRALIZED_BY_SHIM — the DEBCONF / INIT-SCRIPT / CONFFILE-
+ * MAINTSCRIPT / registration class the now-ALWAYS-applied maintscript-shim drives to exit 0:
+ * x11-common (was exit 127) / libpaper1 (was exit 2) / xfonts-* / appstream (rm_conffile
+ * PREINST) / session-migration / gsettings-desktop-schemas / glib-networking* — these NO
+ * LONGER make an app HEAVY; (b) the GENUINELY-unsatisfiable class the shim CANNOT fake:
+ * perl-base / dictionaries-common / emacsen-common (mousepad/gedit), bubblewrap / ghostscript
+ * (eog/evince/nautilus), gstreamer1.0-plugins-* and the live daemons (polkit / accountsservice
+ * / cups / avahi / colord). An entry is LIKELY-PASS iff its delta has ZERO class-(b) triggers
+ * (class-(a) members in the delta are fine — the shim handles them); a BASE-PROVIDED target
+ * (gimp) is ALREADY-INSTALLED (apt no-op, its postinsts never run). This re-classified model
+ * still reproduces the device PASS/FAIL ground truth (galculator/l3afpad/htop/gimp/foot/
+ * netsurf-gtk PASS; mousepad/gedit/eog STAY HEAVY for their real perl/sandbox reasons) AND now
+ * FLIPS the shim-unlocked classes: gnome-calculator + xpdf/nsxiv/feh/qiv (x11-common/libpaper1
+ * only) + qpdfview (x11-common only) → LIKELY-PASS. Proof status per entry:
  *   DEVICE-PROVEN (installs+configures exit-0 on device): galculator, l3afpad.
- *   HOST-AUDITED LIKELY-PASS (delta is galculator-class: 0 cascade triggers; device-test
- *     pending): gpicview, xarchiver, sakura, viewnior, qalculate-gtk, mate-calc, geany.
+ *   HOST-AUDITED LIKELY-PASS (delta has 0 genuinely-heavy triggers; device-test pending):
+ *     gpicview, xarchiver, sakura, viewnior, qalculate-gtk, mate-calc, geany.
  *     (htop = proven-class ncurses leaf, 5-pkg delta, 0 triggers.)
- *   X11-ONLY + LIKELY-PASS → ROUTED THROUGH XWAYLAND (TASK-A; needsXwayland=true): xzgv
- *     (delta 16) + xli (delta 4). Their EXEC binaries link libX11 but NOT libwayland-client
- *     (host: tools/elf_needed), so they cannot bind the native Wayland compositor directly;
- *     NativeAppSession.XwaylandLaunch starts a ROOTFUL Xwayland :0 and injects DISPLAY=:0
- *     (Xwayland → wl_shm → SurfaceView, the xcalc device-proven path). Install is clean
- *     (0 cascade triggers), so unlike nsxiv they are KEPT.
- *   GNOME-PLATFORM, shim-unlocked (TASK-A; host artifacts built, device-verify pending):
- *     org.gnome.Calculator — install-configure neutralizer (maintscript-shim overlay) +
+ *   X11-ONLY + LIKELY-PASS → ROUTED THROUGH XWAYLAND (needsXwayland=true): xzgv (delta 16),
+ *     xli (delta 4), and — NOW RE-ADDED via the GENERAL maintscript-shim — nsxiv (delta 33),
+ *     feh (delta 37), qiv (delta 40), xpdf (delta 18). Their EXEC binaries link libX11 (or a
+ *     Motif/Xt closure for xpdf) but NOT libwayland-client (host: tools/elf_needed), so they
+ *     cannot bind the native Wayland compositor directly; NativeAppSession.XwaylandLaunch
+ *     starts a ROOTFUL Xwayland :0 and injects DISPLAY=:0 (Xwayland → wl_shm → SurfaceView,
+ *     the xcalc device-proven path). Install is now clean: their ONLY blockers were the
+ *     x11-common(exit 127)+libpaper1(exit 2)+xfonts-* debconf/init postinsts, which the
+ *     ALWAYS-applied maintscript-shim (AptInstaller.MAINTSCRIPT_SHIM_OVERLAY, generalized from
+ *     gnome-only) drives to exit 0 → app_closure_audit.py --live now audits them LIKELY-PASS.
+ *   apt Qt-GUI + LIKELY-PASS → ROUTED THROUGH XWAYLAND (needsXwayland=true): qpdfview (delta
+ *     77) — a Qt6 PDF viewer whose ONLY install blocker was x11-common (libqt6gui6t64 → libsm6
+ *     → x11-common), now shim-neutralized. It ships NO qt6-wayland platform plugin in its
+ *     closure, so Qt's xcb plugin connects to the rootful Xwayland (DISPLAY=:0). This is the
+ *     apt-Qt-GUI install class unlocked by the general shim (distinct from the OVERLAY-delivered
+ *     qmleasing Qt-on-Wayland demo below — that one needs no apt at all).
+ *   GNOME-PLATFORM, shim-unlocked (host artifacts built, device-verify pending):
+ *     org.gnome.Calculator — its blockers (appstream/session-migration/gsettings-desktop-
+ *     schemas/glib-networking*) are now ALL maintscript-shim-neutralized → it FLIPS to
+ *     LIKELY-PASS (app_closure_audit.py --live). The gnome-SPECIFIC overlays stay gnome-gated:
  *     host-precompiled gschemas (gnome-schemas overlay) + runtime session-dbus shim
  *     (dbus-daemon overlay + GnomePlatformShim). See AptInstaller + NativeAppSession.
- *   DROPPED (device-proven / audit FAIL): xpdf + nsxiv — x11-common+libpaper1 postinsts.
- *     nsxiv RE-AUDITED (TASK-A): it IS X11-only so the routing would apply, but its INSTALL
- *     is still HEAVY (x11-common/libpaper1) and the neutralizer is gnome-only in AptInstaller
- *     (other-owned) — so it stays dropped until that generalizes. Routing ≠ install.
- * The Qt toolkit class (TASK-B) is NOT a catalog entry: EVERY apt Qt-GUI app is closure-
- * blocked (libqt6gui6t64 → libsm6/libice6 → x11-common, the device-proven exit-127 postinst;
- * tools/app_closure_audit.py --live confirms qt6-wayland/keepassxc/qjackctl/… all HEAVY), and
- * the neutralizer is gnome-only. The lightest REACHABLE Qt-on-Wayland app is delivered as an
- * OVERLAY instead (tools/build_toolkit_overlays.py `qt6-gui` → qmleasing + qtwayland generic
- * wl_shm plugin), launched via MainActivity's qt6 GUI probe — apt never runs, so x11-common's
- * postinst never fires. See docs/research/qt-toolkit-app-class.md.
+ * The general maintscript-shim is the keystone of this catalog's breadth: it is cosmetic-safe
+ * (no init/systemd in the guest → conffile/init/registration churn is a no-op) and is staged
+ * for EVERY install, so the X11-image-viewer (nsxiv/feh/qiv/xpdf) + apt-Qt-GUI (qpdfview) +
+ * gnome (gnome-calculator) classes all install cleanly. Apps that stay HEAVY do so for REAL
+ * reasons the shim cannot fake: perl/dict registration (mousepad/gedit), a setuid/namespace
+ * sandbox (eog/evince/nautilus → bubblewrap), or a live daemon (gstreamer-codecs, polkit,
+ * accountsservice). The OVERLAY-delivered Qt-on-Wayland demo (tools/build_toolkit_overlays.py
+ * `qt6-gui` → qmleasing + qtwayland generic wl_shm plugin, launched via MainActivity's qt6 GUI
+ * probe) remains a SEPARATE no-apt path. See docs/research/maintscript-shim-generalization.md +
+ * docs/research/qt-toolkit-app-class.md.
  * appId == the `.desktop` basename so a successful install self-reconciles a launcher tile via
  * DesktopEntryScanner — EXCEPT Terminal=true entries (htop, sakura) and the no-.desktop X11
  * viewer xli, which the scanner drops/never sees; those still install+launch via this catalog's
@@ -701,19 +716,34 @@ object BundledCatalog {
             source = AppSource.APT,
             needsXwayland = true,
         ),
-        // ⚠ xpdf — DROPPED (was HOST-AUDITED LIKELY-PASS, but DEVICE-PROVEN FAIL). The
-        // audit model (tools/app_closure_audit.py) UNDER-COUNTED it: `apt install xpdf`
-        // fails `dpkg --configure` with `x11-common` postinst exit 127 (sources the debconf
-        // confmodule + calls update-rc.d/invoke-rc.d, neither in the base) + `libpaper1`
-        // postinst exit 2 (`. /usr/share/debconf/confmodule; db_get; ucf` under set -e with
-        // NO debconf frontend / NO ucf). The fix added x11-common + libpaper1 (+ xfonts-*/
-        // xserver-common siblings) to CASCADE_TRIGGERS, so xpdf now correctly audits HEAVY.
-        // NOTE this is NOT "all X11": xcalc (package x11-apps) is not even in noble main+
-        // universe — it runs via the dedicated x11-stage overlay, never this apt path — so
-        // it is unaffected. PDF viewing remains reachable only once the install-configure
-        // postinst-neutralizer (the gnome-platform AptInstaller fix) is generalized to the
-        // x11-common/libpaper1 postinsts and device-verified. (nsxiv DROPPED below for the
-        // same x11-common+libpaper1 reason.)
+        // ✅ xpdf — RE-ADDED (was DROPPED for device-proven x11-common exit 127 + libpaper1
+        // exit 2). Those are EXACTLY the debconf/init-script postinsts the GENERAL maintscript-
+        // shim now neutralizes (AptInstaller stages it for EVERY install), so xpdf's delta(18)
+        // has 0 genuinely-heavy triggers → app_closure_audit.py --live audits it LIKELY-PASS.
+        // xpdf is a Motif/Xt PDF viewer: its EXEC binary pulls libXm/libXt/libX11 (no libwayland-
+        // client; host: tools/elf_needed) → X11-only → needsXwayland=true (ROOTFUL Xwayland :0,
+        // DISPLAY=:0 → wl_shm → SurfaceView, the xcalc path). ⚠ ships NO .desktop (terminal-call
+        // style, like htop/xli) → no auto-tile; install/launch via the explicit appId→apt map.
+        // Takes a PDF path arg (`xpdf doc.pdf`). appId=apt=binary basename(xpdf).
+        CatalogApp(
+            appId = "xpdf",
+            name = "Xpdf",
+            summary = "가벼운 X11 PDF 뷰어(Motif)",
+            entry = LaunchEntry(LaunchEntry.EntryKind.EXEC, "/usr/bin/xpdf"),
+            category = AppCategory.GRAPHICS,
+            description = "Motif/Xt(X11) 기반의 가벼운 PDF 뷰어. libXm/libX11 만 링크하는 " +
+                "X11-only 앱이라 ROOTFUL Xwayland :0 경유로(DISPLAY=:0 → wl_shm → SurfaceView) " +
+                "ALR 컴포지터 위 창으로 실행됩니다(xcalc 와 동일 경로). 설치 delta(18 패키지)의 " +
+                "유일한 차단 요인이던 x11-common(exit 127)+libpaper1(exit 2) debconf/init-script " +
+                "postinst 가 GENERAL maintscript-shim 으로 무력화되어 dpkg configure 가 끝까지 " +
+                "통과한다(host-audited LIKELY-PASS). ⚠ .desktop 미동봉 → 명시 맵으로 실행. " +
+                "noble 패키지 xpdf → /usr/bin/xpdf.",
+            rootfsDeps = listOf(RootfsDep(RootfsDepKind.APT, "xpdf", 6_950_912L)),
+            display = DisplaySpec(DisplaySpec.DisplayMode.WINDOWED),
+            installSizeBytes = 6_950_912L,
+            source = AppSource.APT,
+            needsXwayland = true,
+        ),
         // qalculate-gtk — GTK3 강력 계산기(단위/통화/대수/플롯). galculator 보다 기능이
         // 월등하나 닫힘 부류는 같다. HOST-AUDITED LIKELY-PASS (tools/app_closure_audit.py):
         // 설치 DELTA 62-패키지가 galculator envelope ⊕ {qalculate leaf + libqalculate}이고
@@ -789,20 +819,109 @@ object BundledCatalog {
             installSizeBytes = 4_129_792L,
             source = AppSource.APT,
         ),
-        // ⚠ nsxiv — DROPPED, RE-AUDITED (TASK-A). nsxiv IS X11-only (its EXEC binary links
-        // libX11.so.6, no libwayland-client — host: tools/elf_needed), so the needsXwayland
-        // ROUTING would be correct for it. But routing is ORTHOGONAL to INSTALL: nsxiv's
-        // apt closure still audits HEAVY (tools/app_closure_audit.py --live: delta 33,
-        // triggers libpaper1 + x11-common + xfonts-encodings + xfonts-utils) — the SAME
-        // x11-common(exit 127)+libpaper1(exit 2) debconf/init-script postinsts that device-
-        // proved-FAIL for xpdf. It therefore cannot be INSTALLED on the base today: the
-        // install-configure neutralizer (maintscript-shim overlay) that already fixes those
-        // postinsts is gated to gnome-platform pkgs in AptInstaller (other-owned). So nsxiv
-        // stays DROPPED as a catalog ENTRY (it would never reach a launch), even though its
-        // X11-routing is solved. Contrast xzgv/xli (above): X11-only AND LIKELY-PASS install
-        // (0 cascade triggers) → marked needsXwayland and KEPT. Re-add nsxiv only once the
-        // x11-common/libpaper1 neutralizer is generalized beyond gnome-platform + device-
-        // verified. (feh/qiv audit the same HEAVY-X11 way — same gate.)
+        // ✅ nsxiv — RE-ADDED (was DROPPED for x11-common+libpaper1+xfonts-*). nsxiv IS
+        // X11-only (EXEC binary links libX11.so.6, no libwayland-client — host: tools/
+        // elf_needed) so needsXwayland=true. Its apt delta(33) was HEAVY ONLY for the
+        // x11-common(exit 127)+libpaper1(exit 2)+xfonts-encodings+xfonts-utils debconf/init
+        // postinsts — EXACTLY the class the GENERAL maintscript-shim now neutralizes (staged
+        // for every install in AptInstaller) → app_closure_audit.py --live now audits it
+        // LIKELY-PASS. ⚠ nsxiv ships a .desktop with NoDisplay/MimeType so the scanner may not
+        // surface a tile; install/launch via the explicit appId→apt map. Takes an image path
+        // arg (`nsxiv test.png`). appId=apt=binary basename(nsxiv).
+        CatalogApp(
+            appId = "nsxiv",
+            name = "nsxiv",
+            summary = "초경량 X11 이미지 뷰어(suckless)",
+            entry = LaunchEntry(LaunchEntry.EntryKind.EXEC, "/usr/bin/nsxiv"),
+            category = AppCategory.GRAPHICS,
+            description = "suckless 계열의 초경량 X11 이미지 뷰어(neo simple X image viewer). " +
+                "libX11 만 링크하는 X11-only 앱이라 ROOTFUL Xwayland :0 경유로(DISPLAY=:0 → " +
+                "wl_shm → SurfaceView) ALR 컴포지터 위 창으로 실행됩니다. 설치 delta(33)의 유일한 " +
+                "차단 요인이던 x11-common+libpaper1+xfonts-* debconf/init postinst 가 GENERAL " +
+                "maintscript-shim 으로 무력화되어 dpkg configure 가 끝까지 통과한다(host-audited " +
+                "LIKELY-PASS). noble 패키지 nsxiv → /usr/bin/nsxiv.",
+            rootfsDeps = listOf(RootfsDep(RootfsDepKind.APT, "nsxiv", 1_011_712L)),
+            display = DisplaySpec(DisplaySpec.DisplayMode.WINDOWED),
+            installSizeBytes = 1_011_712L,
+            source = AppSource.APT,
+            needsXwayland = true,
+        ),
+        // ✅ feh — RE-ADDED (same shim unlock). Classic X11 image viewer/wallpaper setter.
+        // EXEC binary links libX11.so.6 (no libwayland-client) → needsXwayland=true. apt
+        // delta(37) HEAVY ONLY for x11-common+libpaper1+xfonts-* → maintscript-shim-neutralized
+        // → app_closure_audit.py --live LIKELY-PASS. ⚠ no .desktop (terminal-call) → explicit
+        // map. Takes an image path arg (`feh test.png`). appId=apt=binary basename(feh).
+        CatalogApp(
+            appId = "feh",
+            name = "feh",
+            summary = "고전 X11 이미지 뷰어",
+            entry = LaunchEntry(LaunchEntry.EntryKind.EXEC, "/usr/bin/feh"),
+            category = AppCategory.GRAPHICS,
+            description = "Imlib2 기반의 빠르고 가벼운 X11 이미지 뷰어(슬라이드쇼·몽타주·배경 " +
+                "설정). libX11 만 링크하는 X11-only 앱이라 ROOTFUL Xwayland :0 경유로(DISPLAY=:0 " +
+                "→ wl_shm → SurfaceView) ALR 컴포지터 위 창으로 실행됩니다. 설치 delta(37)의 " +
+                "유일한 차단 요인이던 x11-common+libpaper1+xfonts-* postinst 가 GENERAL " +
+                "maintscript-shim 으로 무력화되어 dpkg configure 가 통과한다(host-audited " +
+                "LIKELY-PASS). ⚠ .desktop 미동봉 → 명시 맵으로 실행. noble 패키지 feh → /usr/bin/feh.",
+            rootfsDeps = listOf(RootfsDep(RootfsDepKind.APT, "feh", 1_400_832L)),
+            display = DisplaySpec(DisplaySpec.DisplayMode.WINDOWED),
+            installSizeBytes = 1_400_832L,
+            source = AppSource.APT,
+            needsXwayland = true,
+        ),
+        // ✅ qiv — RE-ADDED (same shim unlock). Quick Image Viewer (GTK2/Imlib2, X11). EXEC
+        // binary links libgdk-x11-2.0+libX11 (no libwayland-client) → needsXwayland=true. apt
+        // delta(40) HEAVY ONLY for x11-common+libpaper1+xfonts-* → maintscript-shim-neutralized
+        // → app_closure_audit.py --live LIKELY-PASS. ⚠ no .desktop → explicit map. Takes an
+        // image path arg (`qiv test.png`). appId=apt=binary basename(qiv).
+        CatalogApp(
+            appId = "qiv",
+            name = "qiv",
+            summary = "빠른 X11 이미지 뷰어(GTK2)",
+            entry = LaunchEntry(LaunchEntry.EntryKind.EXEC, "/usr/bin/qiv"),
+            category = AppCategory.GRAPHICS,
+            description = "GTK2/Imlib2 기반의 빠른 X11 이미지 뷰어(Quick Image Viewer). " +
+                "libgdk-x11/libX11 을 링크하는 X11-only 앱이라 ROOTFUL Xwayland :0 경유로 " +
+                "(DISPLAY=:0 → wl_shm → SurfaceView) ALR 컴포지터 위 창으로 실행됩니다. 설치 " +
+                "delta(40)의 유일한 차단 요인이던 x11-common+libpaper1+xfonts-* postinst 가 " +
+                "GENERAL maintscript-shim 으로 무력화되어 dpkg configure 가 통과한다(host-audited " +
+                "LIKELY-PASS). ⚠ .desktop 미동봉 → 명시 맵으로 실행. noble 패키지 qiv → /usr/bin/qiv.",
+            rootfsDeps = listOf(RootfsDep(RootfsDepKind.APT, "qiv", 401_408L)),
+            display = DisplaySpec(DisplaySpec.DisplayMode.WINDOWED),
+            installSizeBytes = 401_408L,
+            source = AppSource.APT,
+            needsXwayland = true,
+        ),
+        // ✅ qpdfview — NEW (apt Qt-GUI class, unlocked by the GENERAL shim). A Qt6 PDF viewer
+        // (tabbed, poppler). Its ONLY install blocker was x11-common (libqt6gui6t64 → libsm6 →
+        // x11-common, the device-proven exit-127 postinst), now maintscript-shim-neutralized →
+        // app_closure_audit.py --live audits it LIKELY-PASS (delta 77, 0 genuinely-heavy
+        // triggers). It ships NO qt6-wayland platform plugin in its closure (host: only
+        // libqt6gui6t64; the libwayland-client0 it drags is a transitive .so, not the Qt
+        // wayland plugin), so Qt's xcb platform plugin connects to the ROOTFUL Xwayland :0 →
+        // needsXwayland=true (DISPLAY=:0 → wl_shm → SurfaceView). This is the apt-Qt-GUI
+        // install class, distinct from the OVERLAY-delivered qmleasing Qt-on-Wayland demo
+        // (no apt). qpdfview ships qpdfview.desktop(NoDisplay=false) → tile auto-reconciles.
+        // Takes a PDF path arg (`qpdfview doc.pdf`). appId=apt=binary basename(qpdfview).
+        CatalogApp(
+            appId = "qpdfview",
+            name = "qpdfview",
+            summary = "탭형 Qt PDF 뷰어",
+            entry = LaunchEntry(LaunchEntry.EntryKind.EXEC, "/usr/bin/qpdfview"),
+            category = AppCategory.GRAPHICS,
+            description = "Qt6/poppler 기반의 탭형 PDF 뷰어. apt 로 설치되며, 유일한 설치 차단 " +
+                "요인이던 x11-common(libqt6gui6t64→libsm6→x11-common, exit 127) postinst 가 " +
+                "GENERAL maintscript-shim 으로 무력화되어 dpkg configure 가 통과한다(host-audited " +
+                "LIKELY-PASS, delta 77). qt6-wayland 플랫폼 플러그인을 닫힘에 포함하지 않으므로 " +
+                "Qt 의 xcb 플러그인이 ROOTFUL Xwayland :0 에 연결된다 → needsXwayland=true " +
+                "(DISPLAY=:0 → wl_shm → SurfaceView). noble 패키지 qpdfview → " +
+                "/usr/share/applications/qpdfview.desktop.",
+            rootfsDeps = listOf(RootfsDep(RootfsDepKind.APT, "qpdfview", 5_500_000L)),
+            display = DisplaySpec(DisplaySpec.DisplayMode.WINDOWED),
+            installSizeBytes = 5_500_000L,
+            source = AppSource.APT,
+            needsXwayland = true,
+        ),
         // ----------------------------------------------------------------------------- //
         // gnome-calculator — GNOME-platform GTK4 계산기. TASK-A: gnome-platform 클래스의
         // 첫 해금 대상. 설치 DELTA(78)가 gsettings-desktop-schemas + libappstream5 +
@@ -848,4 +967,18 @@ object BundledCatalog {
 
     /** appId → apt package name, or null if [appId] is not a bundled apt-installable app. */
     fun aptRefFor(appId: String): String? = aptRefByAppId[appId]
+
+    /**
+     * SSOT for the X11-only routing flag, DERIVED from the catalog entries' `needsXwayland`
+     * (so the set can never drift from the entries). An X11-only app (libX11/Motif, no
+     * libwayland-client) must be launched through a ROOTFUL Xwayland :0 — the UI layer reads
+     * this by appId to set `LaunchRequest.protocol = SurfaceProtocol.X11`, which
+     * NativeAppSession.XwaylandLaunch.needsX11 already honors. Kept here (the catalog file) as
+     * the single source so adding an X11 entry above is the ONLY edit needed to route it.
+     */
+    val xwaylandAppIds: Set<String> =
+        apps.filter { it.needsXwayland }.map { it.appId }.toSet()
+
+    /** True iff [appId] is an X11-only catalog app that must be routed through Xwayland. */
+    fun needsXwayland(appId: String): Boolean = appId in xwaylandAppIds
 }
