@@ -2024,7 +2024,24 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         ::close(go_pipe[1]);  // child reads the SEIZE-ready byte from go_pipe[0]
         ::dup2(out_pipe[1], STDOUT_FILENO);
         ::dup2(out_pipe[1], STDERR_FILENO);  // capture guest stderr too (ld.so/glib errors)
+        // FIX 2 (apt fd-3): the guest must see the SAME clean fd table a real kernel-
+        // execve'd process would — only stdio (+ the deliberately-inherited GPU/VK ring
+        // fds). The original out_pipe[1] is REDUNDANT once dup2'd onto stdout/stderr;
+        // leaving it open leaks a non-CLOEXEC pipe WRITE END into the guest that (a)
+        // survives every in-process re-map sweep (it is not CLOEXEC) → permanently
+        // inflates the gpgv `--status-fd` survivor count (a stray status-pipe-like write
+        // end → the apt status pipe never EOFs → "the repository is not signed"), and
+        // (b) shifts the guest's low fd numbers so apt's status pipe no longer lands on
+        // the native fd. Close the redundant copy now (stdout/stderr keep the output).
+        ::close(out_pipe[1]);
         const int dg = diag_pipe[1];
+        // dg stays OPEN for the launch child's own diags up to the jump, but a real
+        // execve'd guest would NOT inherit the launcher's private diag pipe. Mark it
+        // CLOEXEC so the in-process re-map's execve-emulating sweep drops it at the
+        // guest's FIRST child exec (it is harmless in the launch guest itself, which is
+        // entered by a direct jump, but must not ride into the re-mapped apt-key/gpgv
+        // grandchildren as an extra inheritable fd that breaks the status-fd EOF audit).
+        ::fcntl(dg, F_SETFD, ::fcntl(dg, F_GETFD, 0) | FD_CLOEXEC);
         // SEIZE attach handshake (replaces TRACEME + raise(SIGSTOP)). Under
         // PTRACE_SEIZE the PARENT attaches us — the child issues no PTRACE_TRACEME and
         // is never self-stopped. Instead we BLOCK here reading one byte the parent

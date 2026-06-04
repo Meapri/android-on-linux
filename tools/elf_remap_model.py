@@ -198,6 +198,58 @@ def model_span(img: ElfImage) -> SpanModel:
 
 
 # --------------------------------------------------------------------------
+# (1b) FIX 1 — NON-PIE ET_EXEC fixed-range reservation (execve-replacement aware).
+#
+# A non-PIE ET_EXEC has ABSOLUTE vaddrs (canonically a 0x400000 text base) and NO
+# relocations to move it: it MUST be mapped at its fixed min_v. In the live in-process
+# address space the fixed range is usually FREE (Android maps the app/bionic/loader at
+# high randomized addresses), so a MAP_FIXED_NOREPLACE claim succeeds without clobber.
+# But the in-process re-map EMULATES execve, and execve unconditionally REPLACES the
+# whole address space. The one thing that can legitimately occupy an ET_EXEC's fixed
+# low vaddr is a PREVIOUS non-PIE guest WE mapped earlier in this very process — the
+# root cause of the verdict-readback bug: dpkg (non-PIE @ 0x400000) fork+execs
+# dpkg-query (ALSO non-PIE @ 0x400000); the child still holds dpkg there, so the old
+# NOREPLACE-then-bail returned "prog map fail" (exit 73 → empty dpkg-query stdout →
+# every `dpkg --status` verdict read FALSE). The fix: when the fixed range is occupied
+# by a stale prior image, EVICT it with MAP_FIXED (atomic unmap+map, exactly as execve
+# would) — but ONLY after proving the range holds NONE of our live execution state
+# (the trampoline .text / the guest stack we run on, both at HIGH addresses); if it
+# ever did, bail (a real, diagnosable wall) rather than corrupt.
+
+# Outcomes of the ET_EXEC fixed-range claim (mirror the C diag tokens).
+EXEC_FIXED_FREE = "free"          # NOREPLACE succeeded — range was free, no clobber
+EXEC_FIXED_REPLACE = "replace"    # range held a stale prior guest — MAP_FIXED evicted it
+EXEC_FIXED_HITS_LIVE = "hits_live"  # range overlaps our live PC/SP — bail (never corrupt)
+
+
+def model_etexec_fixed_claim(
+    img: ElfImage,
+    occupied_ranges: tuple[tuple[int, int], ...] = (),
+    live_sp: int | None = None,
+    live_text: int | None = None,
+) -> str:
+    """Model alr_inproc_reexec.c:map_elf_image's ET_EXEC reservation decision for a
+    NON-PIE image, given which [lo,hi) ranges are already mapped in the process and
+    where our live SP / trampoline .text sit.
+
+    Returns one of EXEC_FIXED_FREE / EXEC_FIXED_REPLACE / EXEC_FIXED_HITS_LIVE. Only
+    meaningful for ET_EXEC (an ET_DYN image relocates to a kernel-chosen base and never
+    takes this path)."""
+    assert img.e_type == ET_EXEC, "fixed-range claim only applies to non-PIE ET_EXEC"
+    span = model_span(img)
+    lo, hi = span.min_v, span.min_v + span.span
+    overlaps = any(not (r_hi <= lo or r_lo >= hi) for (r_lo, r_hi) in occupied_ranges)
+    if not overlaps:
+        return EXEC_FIXED_FREE  # MAP_FIXED_NOREPLACE claims the free range
+    # Occupied. A real execve must replace it — UNLESS our live execution state is in it.
+    if (live_sp is not None and lo <= live_sp < hi) or (
+        live_text is not None and lo <= live_text < hi
+    ):
+        return EXEC_FIXED_HITS_LIVE
+    return EXEC_FIXED_REPLACE  # evict the stale prior guest with MAP_FIXED (execve-like)
+
+
+# --------------------------------------------------------------------------
 # (2) PT_GNU_RELRO identification + "must end RO" invariant.
 # --------------------------------------------------------------------------
 @dataclass
@@ -695,12 +747,62 @@ def inheritable_status_fds_after_remap(fd_table: dict[int, int]) -> int:
 
     These are exactly the fds a re-mapped gpgv inherits as candidate write ends of
     the apt status pipe. The load-bearing invariant for authenticated apt is that
-    this count is EXACTLY 1 (only fd 3 itself — the dup2'd, CLOEXEC-cleared status
-    write end). A count of 0 means fd 3 was wrongly closed (gpgv's `--status-fd 3`
-    write EBADFs -> no GOODSIG); > 1 means a stray inheritable fd lingered besides
-    fd 3 (the status pipe never EOFs -> apt reports "not signed"). The C audit is a
-    device-drain diagnostic; this models the same number for a host regression test.
+    this count is EXACTLY 1 (only the status fd itself — the dup2'd, CLOEXEC-cleared
+    status write end). A count of 0 means the status fd was wrongly closed (gpgv's
+    `--status-fd N` write EBADFs -> no GOODSIG); > 1 means a stray inheritable fd
+    lingered besides it (the status pipe never EOFs -> apt reports "not signed"). The
+    C audit is a device-drain diagnostic; this models the same number for a host test.
     """
     surviving, _closed = close_cloexec_fds_model(fd_table)
     return sum(1 for fd, flags in surviving.items()
                if fd >= 3 and not (flags & FD_CLOEXEC))
+
+
+# ---------------------------------------------------------------------------
+# FIX 2 — apt/gpgv `--status-fd N` parse + protect (the fd-3 survival fix).
+#
+# WHY: apt does NOT hard-wire fd 3 for the gpgv status pipe — it uses the pipe's own
+# fd number and passes it as `--status-fd N` (or `--status-fd=N`). A real kernel-
+# exec'd gpgv inherits fd N because apt cleared CLOEXEC on it before the exec. Under
+# the no-execve in-process re-map, if any process in the deep apt → apt-key(sh) →
+# gpgv chain leaves fd N CLOEXEC (or a leaked supervisor capture-pipe fd perturbs the
+# numbering so the status pipe lands above the native fd 3), the CLOEXEC sweep would
+# WRONGLY drop it → gpgv's `--status-fd N` write EBADFs → no GOODSIG → "the
+# repository is not signed". The trampoline therefore (1) parses the REAL N from the
+# guest argv and (2) clears CLOEXEC on fd N before the sweep, replicating apt's own
+# pre-exec clear. These mirror alr_inproc_reexec.c:find_status_fd / protect_status_fd.
+
+
+def find_status_fd_model(argv: list[str]) -> int:
+    """Parse `--status-fd N` / `--status-fd=N` from a guest argv exactly as
+    alr_inproc_reexec.c:find_status_fd. Returns the fd number, or -1 if absent or the
+    value is missing/non-numeric. Only the FIRST occurrence is honoured (gpgv passes
+    it once). A bounded, allocation-free scan in the C; a list scan here."""
+    for i, a in enumerate(argv):
+        if a == "--status-fd":
+            if i + 1 < len(argv):
+                v = argv[i + 1]
+                if v.isdigit():
+                    return int(v)
+            return -1
+        if a.startswith("--status-fd="):
+            v = a[len("--status-fd="):]
+            if v.isdigit():
+                return int(v)
+            return -1
+    return -1
+
+
+def protect_status_fd_model(
+    fd_table: dict[int, int], status_fd: int
+) -> dict[int, int]:
+    """Model alr_inproc_reexec.c:protect_status_fd. If `status_fd` is named (>= 0) AND
+    open in the table, clear its FD_CLOEXEC bit so the subsequent CLOEXEC sweep KEEPS
+    it (replicating apt's pre-exec clear). Returns a NEW table (the input is not
+    mutated). A no-op when status_fd is -1, not open, or already non-CLOEXEC — and it
+    NEVER touches any other fd (no blind whitelist; only the guest-named status fd)."""
+    if status_fd < 0 or status_fd not in fd_table:
+        return dict(fd_table)
+    out = dict(fd_table)
+    out[status_fd] = out[status_fd] & ~FD_CLOEXEC
+    return out
