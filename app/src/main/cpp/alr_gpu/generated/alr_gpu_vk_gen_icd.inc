@@ -126,11 +126,15 @@ static VkResult VKAPI_CALL alr_vkCreateBuffer(VkDevice device, const VkBufferCre
     uint32_t vid; int32_t res = 0;
     if (!dev || !pCreateInfo || !pHandle) return VK_ERROR_INITIALIZATION_FAILED;
     vid = alr_alloc(&g_next_vbuf, 1);
+    ALR_ICD_DIAG("vkCreateBuffer enter vbuf=%u size=%llu usage=0x%x pNext=%p",
+                 vid, (unsigned long long)pCreateInfo->size, (unsigned)pCreateInfo->usage, (void *)pCreateInfo->pNext);
     if (alr_icd_ring_ok()) {
-        uint8_t req[256]; AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
+        uint8_t req[384]; AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
         alr_vk_enc_init(&e, req, sizeof(req));
         alr_vk_enc_gen_create_buffer_begin(&e, dev->vdev, vid, (uint32_t)pCreateInfo->flags, (uint64_t)pCreateInfo->size, (uint32_t)pCreateInfo->usage, (uint32_t)pCreateInfo->sharingMode);
-        alr_vk_gen_pnext_count(&e, 0);  // first batch: no pNext forwarded yet
+        // LEAD-1: forward ANGLE's allowlisted pNext (e.g. ExternalMemoryBufferCreateInfo) verbatim.
+        { uint32_t pnb = 0; uint32_t pnc = alr_icd_count_create_pnext(pCreateInfo->pNext, "vkCreateBuffer", &pnb);
+          alr_icd_emit_create_pnext(&e, pCreateInfo->pNext, pnc); }
         alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
         if (!e.overflow) {
             uint32_t rlen = alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
@@ -180,6 +184,13 @@ static void VKAPI_CALL alr_vkGetBufferMemoryRequirements(VkDevice device, VkBuff
             }
         }
     }
+    // LEAD-2: dump the per-buffer memreqs (the 7-probe memory-type map ANGLE builds). vh ties
+    // back to the vkCreateBuffer enter line (same virtual id order) so usage->memoryTypeBits is
+    // recoverable; a wrong/identical bits across distinct usages would corrupt ANGLE's map.
+    ALR_ICD_DIAG("vkGetBufferMemoryRequirements vbuf=%u -> size=%llu align=%llu memoryTypeBits=0x%x",
+                 vh, (unsigned long long)pMemoryRequirements->size,
+                 (unsigned long long)pMemoryRequirements->alignment,
+                 (unsigned)pMemoryRequirements->memoryTypeBits);
 }
 
 static VkResult VKAPI_CALL alr_vkBindBufferMemory(VkDevice device, VkBuffer buffer,
@@ -208,12 +219,18 @@ static VkResult VKAPI_CALL alr_vkCreateImage(VkDevice device, const VkImageCreat
     AlrIcdDevice *dev = (AlrIcdDevice *)device;
     uint32_t vid; int32_t res = 0;
     if (!dev || !pCreateInfo || !pHandle) return VK_ERROR_INITIALIZATION_FAILED;
+    ALR_ICD_DIAG("vkCreateImage enter fmt=%u type=%u %ux%u usage=0x%x tiling=%u pNext=%p",
+                 (unsigned)pCreateInfo->format, (unsigned)pCreateInfo->imageType,
+                 (unsigned)pCreateInfo->extent.width, (unsigned)pCreateInfo->extent.height,
+                 (unsigned)pCreateInfo->usage, (unsigned)pCreateInfo->tiling, (void *)pCreateInfo->pNext);
     vid = alr_alloc(&g_next_vimg, 1);
     if (alr_icd_ring_ok()) {
-        uint8_t req[256]; AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
+        uint8_t req[384]; AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
         alr_vk_enc_init(&e, req, sizeof(req));
         alr_vk_enc_gen_create_image_begin(&e, dev->vdev, vid, (uint32_t)pCreateInfo->flags, (uint32_t)pCreateInfo->imageType, (uint32_t)pCreateInfo->format, (uint32_t)pCreateInfo->extent.width, (uint32_t)pCreateInfo->extent.height, (uint32_t)pCreateInfo->extent.depth, (uint32_t)pCreateInfo->mipLevels, (uint32_t)pCreateInfo->arrayLayers, (uint32_t)pCreateInfo->samples, (uint32_t)pCreateInfo->tiling, (uint32_t)pCreateInfo->usage, (uint32_t)pCreateInfo->sharingMode, (uint32_t)pCreateInfo->initialLayout);
-        alr_vk_gen_pnext_count(&e, 0);  // first batch: no pNext forwarded yet
+        // LEAD-1: forward ANGLE's allowlisted image pNext (ExternalMemoryImage / StencilUsage) verbatim.
+        { uint32_t pnb = 0; uint32_t pnc = alr_icd_count_create_pnext(pCreateInfo->pNext, "vkCreateImage", &pnb);
+          alr_icd_emit_create_pnext(&e, pCreateInfo->pNext, pnc); }
         alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
         if (!e.overflow) {
             uint32_t rlen = alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
@@ -293,10 +310,12 @@ static VkResult VKAPI_CALL alr_vkCreateImageView(VkDevice device, const VkImageV
     if (!dev || !pCreateInfo || !pHandle) return VK_ERROR_INITIALIZATION_FAILED;
     vid = alr_alloc(&g_next_vview, 1);
     if (alr_icd_ring_ok()) {
-        uint8_t req[256]; AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
+        uint8_t req[384]; AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
         alr_vk_enc_init(&e, req, sizeof(req));
         alr_vk_enc_gen_create_image_view_begin(&e, dev->vdev, vid, (uint32_t)pCreateInfo->flags, (uint32_t)(uintptr_t)pCreateInfo->image, (uint32_t)pCreateInfo->viewType, (uint32_t)pCreateInfo->format, (uint32_t)pCreateInfo->components.r, (uint32_t)pCreateInfo->components.g, (uint32_t)pCreateInfo->components.b, (uint32_t)pCreateInfo->components.a, (uint32_t)pCreateInfo->subresourceRange.aspectMask, (uint32_t)pCreateInfo->subresourceRange.baseMipLevel, (uint32_t)pCreateInfo->subresourceRange.levelCount, (uint32_t)pCreateInfo->subresourceRange.baseArrayLayer, (uint32_t)pCreateInfo->subresourceRange.layerCount);
-        alr_vk_gen_pnext_count(&e, 0);  // first batch: no pNext forwarded yet
+        // LEAD-1: forward ANGLE's allowlisted image-view pNext (ImageViewUsageCreateInfo) verbatim.
+        { uint32_t pnb = 0; uint32_t pnc = alr_icd_count_create_pnext(pCreateInfo->pNext, "vkCreateImageView", &pnb);
+          alr_icd_emit_create_pnext(&e, pCreateInfo->pNext, pnc); }
         alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
         if (!e.overflow) {
             uint32_t rlen = alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
@@ -552,6 +571,8 @@ static VkResult VKAPI_CALL alr_vkCreateDescriptorSetLayout(VkDevice device, cons
     AlrIcdDevice *dev = (AlrIcdDevice *)device;
     uint32_t vid; int32_t res = 0; uint32_t ai;
     if (!dev || !pCreateInfo || !pHandle) return VK_ERROR_INITIALIZATION_FAILED;
+    ALR_ICD_DIAG("vkCreateDescriptorSetLayout enter bindingCount=%u flags=0x%x pNext=%p",
+                 pCreateInfo->bindingCount, (unsigned)pCreateInfo->flags, (void *)pCreateInfo->pNext);
     vid = alr_alloc(&g_next_vdsl, 1);
     if (alr_icd_ring_ok()) {
         AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
@@ -565,7 +586,37 @@ static VkResult VKAPI_CALL alr_vkCreateDescriptorSetLayout(VkDevice device, cons
           alr_vk_enc_gen_create_descriptor_set_layout_bindings_count(&e, n);
           for (ai = 0; ai < n; ++ai) {
               alr_vk_enc_gen_create_descriptor_set_layout_bindings_elem(&e, (uint32_t)pCreateInfo->pBindings[ai].binding, (uint32_t)pCreateInfo->pBindings[ai].descriptorType, (uint32_t)pCreateInfo->pBindings[ai].descriptorCount, (uint32_t)pCreateInfo->pBindings[ai].stageFlags); } }
-        alr_vk_gen_pnext_count(&e, 0);
+        // LEAD-1 (TOP): the LAST create before the first-texture NULL-deref. ANGLE chains
+        // VkDescriptorSetLayoutBindingFlagsCreateInfo here (update-after-bind / partially-bound /
+        // variable-count binding flags) — DROPPED until now (hardcoded pnext_count=0). It is
+        // pointer-bearing (pBindingFlags), so it canNOT ride the verbatim path; ship the FLAGS
+        // ARRAY INLINE as the pNext blob for sType=BINDING_FLAGS, and let the DSL host-forward
+        // (vk_gen_real_create_descriptor_set_layout) rebuild the struct with a host-side array.
+        { const VkBaseInStructure *bf = NULL; uint32_t bf_count = 0; const uint32_t *bf_flags = NULL;
+          for (const VkBaseInStructure *p = (const VkBaseInStructure *)pCreateInfo->pNext; p; p = p->pNext) {
+              uint32_t st = (uint32_t)p->sType;
+              if (st == VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO_VAL) {
+                  bf = p; /* { sType; pad; pNext; u32 bindingCount; pad; const VkDescriptorBindingFlags* pBindingFlags } */
+                  bf_count = *(const uint32_t *)((const uint8_t *)p + 16);
+                  bf_flags = *(const uint32_t *const *)((const uint8_t *)p + 24);
+                  ALR_ICD_DIAG("vkCreateDescriptorSetLayout pNext sType=%u DescriptorSetLayoutBindingFlagsCreateInfo FWD-INLINE bindingCount=%u", st, bf_count);
+              } else {
+                  ALR_ICD_DIAG("vkCreateDescriptorSetLayout pNext sType=%u %s DROP", st, alr_icd_pnext_stype_name(st));
+              }
+          }
+          if (bf && bf_count && bf_flags && bf_count <= 4096) {
+              if (bf_count > pCreateInfo->bindingCount) bf_count = pCreateInfo->bindingCount;
+              alr_vk_gen_pnext_count(&e, 1);
+              /* blob = { u32 bindingCount, u32 flags[bindingCount] } — the host DSL-forward
+               * recognizes this sType and rebuilds the real struct with a host array. */
+              alr_vk_enc_u32(&e, (uint32_t)VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO_VAL);
+              alr_vk_enc_u32(&e, 4u + bf_count * 4u);   /* blob length */
+              alr_vk_enc_u32(&e, bf_count);
+              for (ai = 0; ai < bf_count; ++ai) alr_vk_enc_u32(&e, bf_flags[ai]);
+          } else {
+              alr_vk_gen_pnext_count(&e, 0);
+          }
+        }
         alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
         if (!e.overflow) {
             uint32_t rlen = alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));

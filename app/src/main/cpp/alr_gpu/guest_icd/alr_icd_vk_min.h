@@ -225,6 +225,69 @@ typedef struct VkBaseOutStructure {
 #define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT_VAL 1000377000
 #define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT_VAL 1000190002
 
+/* ====================================================================================
+ * CREATE-CALL pNext extension structs (LEAD-1: the create-forwards DROPPED ANGLE's pNext
+ * chain — every alr_vkCreate* hardcoded pnext_count=0, so e.g. the binding-flags ANGLE
+ * chains onto vkCreateDescriptorSetLayout never reached real Mali; ANGLE then built a
+ * RendererVk allocator/format member against a feature the created object lacked → the
+ * first-glTexImage2D NULL-deref at libGLESv2+0x206db4). Two ABI classes below:
+ *   (A) POINTERLESS structs — the whole struct is inline scalars; ship it VERBATIM and let
+ *       the host relink (vk_gen_relink_pnext) fix only the pNext header field.
+ *   (B) POINTER-BEARING structs (BindingFlags.pBindingFlags, FormatList.pViewFormats) —
+ *       the struct holds a guest pointer that is meaningless host-side. These are NOT
+ *       shipped verbatim; the entrypoint inlines the pointed-to array on the wire and the
+ *       host reconstructs the struct with a host-side array (see alr_vkCreateDescriptorSetLayout
+ *       + vk_gen_real_create_descriptor_set_layout). The size table returns 0 for class (B)
+ *       so the generic verbatim path never ships a dangling pointer. */
+#define VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO_VAL 1000072001
+#define VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO_VAL 1000072002
+#define VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO_VAL 1000246000
+#define VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO_VAL 1000117002
+#define VK_STRUCTURE_TYPE_BUFFER_OPAQUE_CAPTURE_ADDRESS_CREATE_INFO_VAL 1000257002
+/* Pointer-bearing (class B): given _VAL so the entrypoints can match the sType, but the
+ * size table returns 0 (never shipped verbatim — handled by a dedicated inline encoding). */
+#define VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO_VAL 1000161000
+#define VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO_VAL 1000147000
+
+/* LEAD-3 (the first-glTexImage2D NULL-deref): the OUT-pNext struct ANGLE chains onto
+ * vkGetPhysicalDeviceFormatProperties2 to read the 64-bit VkFormatFeatureFlags2. Our ICD used
+ * to fill ONLY the embedded v1 formatProperties and leave this chained struct UNTOUCHED, so
+ * ANGLE read all-zero optimal/linear/buffer features for RGBA8 -> it built a degenerate
+ * vk::Format whose per-format helper member stayed NULL -> the deref at libGLESv2+0x206db4
+ * (contextVk->getRenderer()->[+0x138]). VkFormatProperties3 = { sType, pNext,
+ * linearTilingFeatures(u64), optimalTilingFeatures(u64), bufferFeatures(u64) }; the low 32
+ * bits of VkFormatFeatureFlags2 are bit-compatible with the v1 VkFormatFeatureFlags, so we
+ * fill it by widening the SAME real-Mali v1 flags. */
+#define VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3_VAL 1000360000
+typedef uint64_t VkFormatFeatureFlags2Min;  /* VkFormatFeatureFlags2 (64-bit) */
+typedef struct VkFormatProperties3Min {
+    int32_t                    sType;
+    int32_t                    _pad;
+    void                      *pNext;
+    VkFormatFeatureFlags2Min   linearTilingFeatures;
+    VkFormatFeatureFlags2Min   optimalTilingFeatures;
+    VkFormatFeatureFlags2Min   bufferFeatures;
+} VkFormatProperties3Min;
+
+/* ABI-EXACT byte size (arm64 LP64) of a POINTERLESS create-call pNext struct, so the guest
+ * can ship the WHOLE struct verbatim. Each begins with the 16-byte VkBaseInStructure header
+ * { u32 sType; u32 pad; void* pNext } then inline scalars; the whole struct is 8-byte aligned.
+ * Returns 0 for unknown OR pointer-bearing sTypes (caller must skip / handle specially). */
+static inline uint32_t alr_icd_create_pnext_struct_size(uint32_t s_type) {
+    switch (s_type) {
+        /* {hdr; VkExternalMemoryHandleTypeFlags handleTypes(u32)} -> 16 + 4, pad to 24. */
+        case VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO_VAL:  return 24u;
+        case VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO_VAL: return 24u;
+        /* {hdr; VkImageUsageFlags stencilUsage(u32)} -> 24. */
+        case VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO_VAL:    return 24u;
+        /* {hdr; VkImageUsageFlags usage(u32)} -> 24. */
+        case VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO_VAL:       return 24u;
+        /* {hdr; VkBool32 opaqueCaptureAddress? no — u64 opaqueCaptureAddress} -> 16 + 8 = 24. */
+        case VK_STRUCTURE_TYPE_BUFFER_OPAQUE_CAPTURE_ADDRESS_CREATE_INFO_VAL: return 24u;
+        default: return 0u;  /* unknown OR pointer-bearing (class B): never ship verbatim */
+    }
+}
+
 /* Selected VK-M4 enum values the guest app may set (passed opaquely to the ICD). */
 #define VK_SHADER_STAGE_VERTEX_BIT 0x00000001u
 #define VK_SHADER_STAGE_FRAGMENT_BIT 0x00000010u

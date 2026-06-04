@@ -63,6 +63,16 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         System.loadLibrary("alr_loader")
 
+        // GPU ANGLE first-texture WALL diagnostic (gated on /data/local/tmp/.alr-angle, so a
+        // normal launch is unaffected): turn on the HOST servicer's GEN-OP create-chain trace
+        // (alr_gpu_vk_decode.hpp reads getenv("ALR_VK_HOST_TRACE") ONCE) so each ANGLE
+        // vkCreate*/getReqs op + its host-side result is logged under tag alr-vk-host — the
+        // ground truth for which Vulkan op precedes the libGLESv2+0x206db4 NULL-deref. Must run
+        // BEFORE the host servicer thread first decodes a GEN op (the static latches once).
+        if (java.io.File("/data/local/tmp/.alr-angle").isFile) {
+            try { android.system.Os.setenv("ALR_VK_HOST_TRACE", "1", true) } catch (_: Throwable) {}
+        }
+
         // Standalone Chromium app entry (launched via the .ui.ChromiumStandalone
         // activity-alias "ALR Chromium", or the adb marker /data/local/tmp/.alr-cronly):
         // a LEAN chromium-only path that SKIPS the entire heavy MainActivity onCreate

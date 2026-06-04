@@ -65,6 +65,56 @@ static int alr_icd_diag_on(void) {
 #define ALR_ICD_DIAG(...) do { if (alr_icd_diag_on()) { \
     fprintf(stderr, "[alr-icd] " __VA_ARGS__); fputc('\n', stderr); fflush(stderr); } } while (0)
 
+/* ====================================================================================
+ * LEAD-1 create-call pNext FORWARDING. Every alr_vkCreate* used to hardcode
+ * alr_vk_gen_pnext_count(&e, 0), DROPPING ANGLE's whole pNext chain. This helper ships the
+ * POINTERLESS allowlisted structs VERBATIM (the host relinks them into the real Mali create),
+ * and ALWAYS diag-logs every chained sType (FWD/DROP) under ALR_ICD_DIAG so a device run names
+ * EXACTLY which extension structs ANGLE attaches to each create — ground truth for the
+ * first-texture wall. POINTER-BEARING structs (binding-flags, format-list) are class (B):
+ * the size table returns 0, so they are diag-logged as DROP here and handled by a dedicated
+ * inline encoding in their own entrypoint (NOT shipped through this generic path, which would
+ * carry a dangling guest pointer). Mirrors vkCreateDevice's proven feature-chain marshalling. */
+static const char *alr_icd_pnext_stype_name(uint32_t s) {
+    switch (s) {
+        case VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO_VAL:  return "ExternalMemoryImageCreateInfo";
+        case VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO_VAL: return "ExternalMemoryBufferCreateInfo";
+        case VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO_VAL:    return "ImageStencilUsageCreateInfo";
+        case VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO_VAL:       return "ImageViewUsageCreateInfo";
+        case VK_STRUCTURE_TYPE_BUFFER_OPAQUE_CAPTURE_ADDRESS_CREATE_INFO_VAL: return "BufferOpaqueCaptureAddressCreateInfo";
+        case VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO_VAL: return "DescriptorSetLayoutBindingFlagsCreateInfo";
+        case VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO_VAL:      return "ImageFormatListCreateInfo";
+        default: return "(other)";
+    }
+}
+/* Count the POINTERLESS allowlisted pNext structs (for buffer-size planning) AND emit the
+ * per-sType FWD/DROP diag for the WHOLE chain. Returns the count to ship verbatim; *out_bytes
+ * accumulates their total wire payload (sType u32 + len u32 + struct bytes). */
+static uint32_t alr_icd_count_create_pnext(const void *p_next, const char *who,
+                                           uint32_t *out_bytes) {
+    uint32_t count = 0, bytes = 0;
+    for (const VkBaseInStructure *p = (const VkBaseInStructure *)p_next; p; p = p->pNext) {
+        uint32_t sz = alr_icd_create_pnext_struct_size((uint32_t)p->sType);
+        ALR_ICD_DIAG("%s pNext sType=%u %s %s", who, (uint32_t)p->sType,
+                     alr_icd_pnext_stype_name((uint32_t)p->sType),
+                     sz ? "FWD" : "DROP(pointer-bearing or not in create allowlist)");
+        if (sz) { count++; bytes += 4u + 4u + sz; }
+    }
+    if (out_bytes) *out_bytes = bytes;
+    return count;
+}
+/* Emit the pNext header (count) + each POINTERLESS allowlisted struct verbatim. The host
+ * (vk_gen_relink_pnext) re-validates each sType against its OWN allowlist before chaining it
+ * to real Mali, so an unknown sType can never make the driver walk a bogus chain. */
+static void alr_icd_emit_create_pnext(AlrVkEncoder *e, const void *p_next, uint32_t count) {
+    alr_vk_gen_pnext_count(e, count);
+    if (!count) return;
+    for (const VkBaseInStructure *p = (const VkBaseInStructure *)p_next; p; p = p->pNext) {
+        uint32_t sz = alr_icd_create_pnext_struct_size((uint32_t)p->sType);
+        if (sz) alr_vk_gen_pnext(e, (uint32_t)p->sType, p, sz);
+    }
+}
+
 /* Fires when this ICD is loaded (BEFORE any vk* call). After the Part B rename our
  * SONAME is libalr_mali_icd.so, and the Khronos Vulkan-Loader dlopen()s us via the
  * alr_icd.json manifest (NOT the client directly). Under ALR_ICD_DIAG it proves
@@ -1573,6 +1623,30 @@ static void VKAPI_CALL alr_vkGetPhysicalDeviceFormatProperties2(
     if (!pFormatProperties) return;
     alr_vkGetPhysicalDeviceFormatProperties(physicalDevice, format,
                                             &pFormatProperties->formatProperties);
+    /* LEAD-3 FIX: fill any chained VkFormatProperties3 from the SAME real-Mali v1 flags
+     * (widened to the 64-bit VkFormatFeatureFlags2 — the legacy bits are value-compatible).
+     * ANGLE's RendererVk::getFormatFeatureBits() READS FormatProperties3.optimalTilingFeatures
+     * (NOT the v1 member) when the device supports VK_KHR_format_feature_flags2 (Mali does).
+     * Leaving it zero (the old behavior) made ANGLE see RGBA8 as featureless -> a degenerate
+     * vk::Format whose helper member is NULL -> the first-glTexImage2D deref at
+     * libGLESv2+0x206db4. The v1 flags came from real Mali, so widening them is truthful. */
+    const VkFormatProperties *v1 = &pFormatProperties->formatProperties;
+    for (AlrVkBaseOut *p = (AlrVkBaseOut *)pFormatProperties->pNext; p; p = p->pNext) {
+        if (p->sType == VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3_VAL) {
+            VkFormatProperties3Min *fp3 = (VkFormatProperties3Min *)p;
+            fp3->linearTilingFeatures  = (VkFormatFeatureFlags2Min)v1->linearTilingFeatures;
+            fp3->optimalTilingFeatures = (VkFormatFeatureFlags2Min)v1->optimalTilingFeatures;
+            fp3->bufferFeatures        = (VkFormatFeatureFlags2Min)v1->bufferFeatures;
+            ALR_ICD_DIAG("vkGetPhysicalDeviceFormatProperties2 fmt=%u FILLED FormatProperties3 "
+                         "lin=0x%llx opt=0x%llx buf=0x%llx (was zero -> RGBA8 degenerate-format fix)",
+                         (unsigned)format, (unsigned long long)fp3->linearTilingFeatures,
+                         (unsigned long long)fp3->optimalTilingFeatures,
+                         (unsigned long long)fp3->bufferFeatures);
+        } else if (alr_icd_diag_on()) {
+            ALR_ICD_DIAG("vkGetPhysicalDeviceFormatProperties2 fmt=%u pNext sType=%d (left as caller set)",
+                         (unsigned)format, (int)p->sType);
+        }
+    }
 }
 
 static VkResult VKAPI_CALL alr_vkGetPhysicalDeviceImageFormatProperties2(
