@@ -657,6 +657,28 @@ typedef struct VkMemoryRequirements {
     uint32_t     memoryTypeBits;
 } VkMemoryRequirements;
 
+/* The core-1.1 "2" memory-requirements family (ANGLE resolves these to allocate texture/FBO
+ * backing memory on a 1.1+ device). Layouts are ABI-identical to <vulkan/vulkan_core.h>.
+ * sType values from the Vulkan spec (VK_VERSION_1_1). */
+#define VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2 1000146000
+#define VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2  1000146001
+#define VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2             1000146003
+typedef struct VkBufferMemoryRequirementsInfo2 {
+    VkStructureType sType;
+    const void     *pNext;
+    VkBuffer        buffer;
+} VkBufferMemoryRequirementsInfo2;
+typedef struct VkImageMemoryRequirementsInfo2 {
+    VkStructureType sType;
+    const void     *pNext;
+    VkImage         image;
+} VkImageMemoryRequirementsInfo2;
+typedef struct VkMemoryRequirements2 {
+    VkStructureType      sType;
+    void                *pNext;
+    VkMemoryRequirements memoryRequirements;
+} VkMemoryRequirements2;
+
 /* VkBufferCreateInfo (the POD prefix the codegen ships; pQueueFamilyIndices is part of
  * the ABI struct but the generated forwarder uses EXCLUSIVE sharing — see the tool). */
 typedef struct VkBufferCreateInfo {

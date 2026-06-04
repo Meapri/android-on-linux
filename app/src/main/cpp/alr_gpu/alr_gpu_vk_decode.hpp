@@ -146,13 +146,25 @@ struct VkPhysProps {
     // its conservative defaults). See ALR_VK_PHYS_FEATURES_BYTES / ALR_VK_PHYS_LIMITS_BYTES.
     std::vector<uint8_t> features_blob;  // raw VkPhysicalDeviceFeatures bytes (or empty)
     std::vector<uint8_t> limits_blob;    // raw VkPhysicalDeviceLimits bytes   (or empty)
+    // ANGLE memory-type-selection rung: the REAL Mali VkPhysicalDeviceMemoryProperties as its
+    // RAW official-ABI bytes (520B on the arm64 ABI: a fixed VkPhysicalDeviceMemoryProperties
+    // is u32 heapCount + 16×VkMemoryHeap{u64 size,u32 flags,pad} + u32 typeCount + 32×
+    // VkMemoryType{u32 propertyFlags,u32 heapIndex}). Stored opaquely so this struct stays
+    // SDK-free. Empty = "not supplied" (synthetic-wire provider); the guest then keeps its
+    // conservative single-heap default. ANGLE's RendererVk memory-type selection indexes the
+    // type list returned here against the REAL Mali device it created, so a SYNTHETIC 1-heap/
+    // 2-type model made ANGLE pick a type index that doesn't match real Mali => fault right
+    // after vkGetDeviceQueue (libGLESv2.so.2+0x1f6db4). Shipping Mali's real heaps/types fixes
+    // the index mismatch. See ALR_VK_PHYS_MEMORY_BYTES.
+    std::vector<uint8_t> memprops_blob;  // raw VkPhysicalDeviceMemoryProperties bytes (or empty)
 };
 
-// Exact official-ABI sizes of the two structs we ship as raw bytes (64-bit ABI: both the
+// Exact official-ABI sizes of the structs we ship as raw bytes (64-bit ABI: both the
 // arm64 NDK host and the arm64 guest ICD). The guest validates the blob length against
 // these before memcpy()ing, so a mismatched build can never scribble past the struct.
 static constexpr uint32_t ALR_VK_PHYS_FEATURES_BYTES = 220;  // sizeof(VkPhysicalDeviceFeatures)
 static constexpr uint32_t ALR_VK_PHYS_LIMITS_BYTES   = 504;  // sizeof(VkPhysicalDeviceLimits)
+static constexpr uint32_t ALR_VK_PHYS_MEMORY_BYTES   = 520;  // sizeof(VkPhysicalDeviceMemoryProperties)
 
 // One image-format query's result, in the host's own struct (decoupled from <vulkan.h>
 // so the wire test can construct/compare it without a Vulkan SDK). Mirrors the fields of
@@ -167,6 +179,16 @@ struct VkImageFmtProps {
     uint32_t max_array_layers = 0;
     uint32_t sample_counts = 0;   // VkSampleCountFlags
     uint64_t max_resource_size = 0;
+};
+
+// One vkGetPhysicalDeviceFormatProperties query's result — the three VkFormatFeatureFlags
+// the real Mali driver reports for a VkFormat (decoupled from <vulkan.h> for the wire test).
+// Replaces the guest's old synthetic 0x7FFFFFFF all-bits answer with Mali's real per-format
+// capability bits, so ANGLE only takes render/blit/storage/sample paths Mali actually has.
+struct VkFmtProps {
+    uint32_t linear_tiling_features = 0;   // VkFormatFeatureFlags
+    uint32_t optimal_tiling_features = 0;  // VkFormatFeatureFlags
+    uint32_t buffer_features = 0;          // VkFormatFeatureFlags
 };
 
 // The clear a CMD_BEGIN_CLEAR recorded into a virtual command buffer, plus the geometry
@@ -392,6 +414,11 @@ inline void encode_phys_props_reply(VkReplyEncoder& re, uint32_t vphys, const Vk
     // zeros — the zeros made ANGLE feed a bogus count into std::vector::reserve (length_error).
     re.blob(p.features_blob.data(), static_cast<uint32_t>(p.features_blob.size()));
     re.blob(p.limits_blob.data(), static_cast<uint32_t>(p.limits_blob.size()));
+    // ANGLE memory-type-selection rung: append the REAL Mali VkPhysicalDeviceMemoryProperties
+    // as a length-prefixed raw blob (length 0 = "not supplied"). The guest reads it right after
+    // the limits blob and memcpy()s it into the caller's VkPhysicalDeviceMemoryProperties, so
+    // ANGLE selects a memory type that actually exists on the real Mali device.
+    re.blob(p.memprops_blob.data(), static_cast<uint32_t>(p.memprops_blob.size()));
 }
 
 #ifdef ALR_VK_DECODE_REAL
@@ -465,6 +492,16 @@ inline bool vk_real_props(VkDecodeState& st, uint32_t vphys, VkPhysProps& out) {
     std::memcpy(out.features_blob.data(), &feats, sizeof(feats));
     out.limits_blob.resize(sizeof(p.limits));
     std::memcpy(out.limits_blob.data(), &p.limits, sizeof(p.limits));
+    // ANGLE memory-type-selection rung: ship the REAL Mali VkPhysicalDeviceMemoryProperties
+    // (the actual heap sizes/flags + the actual memory-type propertyFlags/heapIndex list) as
+    // raw official-ABI bytes. ANGLE created the REAL Mali device, so it must select among the
+    // REAL types; a raw memcpy of the whole struct forwards every heap + type with no per-field
+    // marshalling (same model as features/limits above). The guest accepts the blob only when
+    // its length equals the guest's own sizeof(VkPhysicalDeviceMemoryProperties) (520 on arm64).
+    VkPhysicalDeviceMemoryProperties memp{};
+    vkGetPhysicalDeviceMemoryProperties(it->second, &memp);
+    out.memprops_blob.resize(sizeof(memp));
+    std::memcpy(out.memprops_blob.data(), &memp, sizeof(memp));
     return true;
 }
 
@@ -501,6 +538,23 @@ inline bool vk_real_image_format_props(VkDecodeState& st, uint32_t vphys, uint32
         out.sample_counts = static_cast<uint32_t>(props.sampleCounts);
         out.max_resource_size = static_cast<uint64_t>(props.maxResourceSize);
     }
+    return true;
+}
+
+// ANGLE-init rung: query the REAL Mali vkGetPhysicalDeviceFormatProperties for the physical
+// device behind virtual `vphys` and fill `out` with Mali's three per-format feature masks.
+// Returns true if `vphys` was a known device; false if the virtual id was unknown (the guest
+// then keeps its conservative answer). vkGetPhysicalDeviceFormatProperties returns void (a
+// format always has *some* answer, possibly all-zero "unsupported"), so there is no VkResult.
+inline bool vk_real_format_props(VkDecodeState& st, uint32_t vphys, uint32_t format,
+                                 VkFmtProps& out) {
+    auto it = st.real_phys.find(vphys);
+    if (it == st.real_phys.end()) return false;
+    VkFormatProperties props{};
+    vkGetPhysicalDeviceFormatProperties(it->second, static_cast<VkFormat>(format), &props);
+    out.linear_tiling_features = static_cast<uint32_t>(props.linearTilingFeatures);
+    out.optimal_tiling_features = static_cast<uint32_t>(props.optimalTilingFeatures);
+    out.buffer_features = static_cast<uint32_t>(props.bufferFeatures);
     return true;
 }
 
@@ -2070,6 +2124,11 @@ struct VkProvider {
     bool (*image_format_props)(void* ctx, uint32_t vphys, uint32_t format, uint32_t type,
                                uint32_t tiling, uint32_t usage, uint32_t flags,
                                VkImageFmtProps& out) = nullptr;
+    // ANGLE-init rung: per-format feature query. Fill `out` with Mali's three feature masks
+    // for `format` on vphys; return true if the id was known. Null = the host answers it
+    // directly via the real Mali path (vk_real_format_props).
+    bool (*format_props)(void* ctx, uint32_t vphys, uint32_t format,
+                         VkFmtProps& out) = nullptr;
     void (*destroy_instance)(void* ctx, uint32_t vinst) = nullptr;
     // ---- VK-M2 body seams (synthetic = wire mode; null callbacks are no-ops). ----
     // Create a logical device on vphys; return VkResult (0 == success), set gfx_family.
@@ -2277,6 +2336,33 @@ inline bool decode_vk_batch(const uint8_t* data, size_t len, VkDecodeState& st,
                 reply.u32(ifp.max_array_layers);
                 reply.u32(ifp.sample_counts);
                 reply.u64(ifp.max_resource_size);
+                st.decoded++;
+                break;
+            }
+
+            case ALR_VK_OP_GET_PHYS_FORMAT_PROPS: {
+                uint32_t vinst = 0, vphys = 0, format = 0;
+                if (!r.u32(vinst) || !r.u32(vphys) || !r.u32(format)) {
+                    st.ok = false;
+                    break;
+                }
+                (void)vinst;
+                VkFmtProps fp{};
+                // Default (unknown vphys / no host): all-zero feature masks. ANGLE treats a
+                // zero mask as "format unsupported for that use", a conformant fallback.
+                bool known = false;
+#ifdef ALR_VK_DECODE_REAL
+                if (!provider)
+                    known = vk_real_format_props(st, vphys, format, fp);
+#endif
+                if (provider && provider->format_props)
+                    known = provider->format_props(provider->ctx, vphys, format, fp);
+                (void)known;
+                reply.u8(static_cast<uint8_t>(ALR_VK_REPLY_FORMAT_PROPS));
+                reply.u32(vphys);
+                reply.u32(fp.linear_tiling_features);
+                reply.u32(fp.optimal_tiling_features);
+                reply.u32(fp.buffer_features);
                 st.decoded++;
                 break;
             }
@@ -2780,6 +2866,13 @@ struct VkReplyImageFormatProps {
     uint32_t sample_counts = 0;
     uint64_t max_resource_size = 0;
 };
+
+struct VkReplyFormatProps {
+    uint32_t vphys = 0;
+    uint32_t linear_tiling_features = 0;
+    uint32_t optimal_tiling_features = 0;
+    uint32_t buffer_features = 0;
+};
 struct VkDecodedReply {
     std::vector<VkReplyInstance> instances;
     std::vector<VkReplyPhysCount> enumerations;
@@ -2791,6 +2884,7 @@ struct VkDecodedReply {
     std::vector<VkReplyAcquire> acquires;      // VK-M4
     std::vector<VkReplyPresent> presents;      // VK-M4
     std::vector<VkReplyImageFormatProps> image_format_props;  // ANGLE-init rung
+    std::vector<VkReplyFormatProps> format_props;              // ANGLE-init rung
     bool ok = true;
 };
 
@@ -2841,17 +2935,24 @@ inline bool decode_vk_reply(const uint8_t* data, size_t len, VkDecodedReply& out
                 }
                 if (!r.u8(is_sw)) { out.ok = false; return false; }
                 p.is_software = (is_sw != 0);
-                // ANGLE caps-init rung: the features + limits raw blobs follow is_software.
+                // ANGLE caps-init rung: the features + limits + memory raw blobs follow
+                // is_software (in that order). The memory blob is read defensively: an older
+                // host that didn't ship it leaves the reader at the stream end and r.blob fails,
+                // so we only require it when bytes remain — keeping the reply backward-readable.
                 const uint8_t* feat_b = nullptr;
                 uint32_t feat_len = 0;
                 const uint8_t* lim_b = nullptr;
                 uint32_t lim_len = 0;
-                if (!r.blob(feat_b, feat_len) || !r.blob(lim_b, lim_len)) {
+                const uint8_t* mem_b = nullptr;
+                uint32_t mem_len = 0;
+                if (!r.blob(feat_b, feat_len) || !r.blob(lim_b, lim_len) ||
+                    !r.blob(mem_b, mem_len)) {
                     out.ok = false;
                     return false;
                 }
                 if (feat_len) p.features_blob.assign(feat_b, feat_b + feat_len);
                 if (lim_len) p.limits_blob.assign(lim_b, lim_b + lim_len);
+                if (mem_len) p.memprops_blob.assign(mem_b, mem_b + mem_len);
                 out.props[vphys] = p;
                 break;
             }
@@ -2921,6 +3022,16 @@ inline bool decode_vk_reply(const uint8_t* data, size_t len, VkDecodedReply& out
                     return false;
                 }
                 out.image_format_props.push_back(ip);
+                break;
+            }
+            case ALR_VK_REPLY_FORMAT_PROPS: {
+                VkReplyFormatProps fp{};
+                if (!r.u32(fp.vphys) || !r.u32(fp.linear_tiling_features) ||
+                    !r.u32(fp.optimal_tiling_features) || !r.u32(fp.buffer_features)) {
+                    out.ok = false;
+                    return false;
+                }
+                out.format_props.push_back(fp);
                 break;
             }
             default:

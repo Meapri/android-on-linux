@@ -348,10 +348,51 @@ int main() {
         check(!ok, "truncated image-format op fails cleanly");
     }
 
+    // 17) ANGLE-init rung: GET_PHYS_FORMAT_PROPS round-trips the REAL per-format feature
+    //     masks (the op that replaces the guest's synthetic all-bits answer). The synthetic
+    //     provider returns a realistic color-renderable RGBA mask; assert it survives the
+    //     wire verbatim (NOT all-bits, so the test proves real Mali bits — not 0x7FFFFFFF —
+    //     flow back), and that the buffer feature carries VERTEX_BUFFER.
+    {
+        SyntheticMaliProvider syn;
+        VkProvider prov = syn.as_provider();
+        VkDecodeState st;
+        std::vector<uint8_t> a(256);
+        AlrVkEncoder e; alr_vk_enc_init(&e, a.data(), (uint32_t)a.size());
+        alr_vk_enc_create_instance(&e, 1, kAlrVkApi13);
+        alr_vk_enc_enumerate_phys(&e, 1, 100);
+        alr_vk_enc_get_phys_format_props(&e, 1, 100, 37);  // R8G8B8A8_UNORM (37)
+        alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
+        VkReplyEncoder reply;
+        check(decode_vk_batch(a.data(), e.len, st, reply, &prov), "format-props batch decodes");
+        VkDecodedReply dr;
+        check(decode_vk_reply(reply.bytes().data(), reply.bytes().size(), dr),
+              "format-props reply decodes");
+        check(dr.format_props.size() == 1, "one format-props reply record");
+        if (dr.format_props.size() == 1) {
+            const auto& fp = dr.format_props[0];
+            check(fp.vphys == 100, "format-props vphys round-trips");
+            check(fp.optimal_tiling_features != 0x7FFFFFFFu &&
+                  fp.optimal_tiling_features != 0, "optimal feature mask is REAL (not all-bits/0)");
+            check((fp.optimal_tiling_features & 0x80u) != 0, "COLOR_ATTACHMENT bit survives");
+            check((fp.buffer_features & 0x40u) != 0, "VERTEX_BUFFER bit survives");
+        }
+    }
+
+    // 18) ANGLE-init rung: a truncated GET_PHYS_FORMAT_PROPS (opcode + partial operands)
+    //     must fail-stop, not over-read.
+    {
+        uint8_t bad[5] = {(uint8_t)ALR_VK_OP_GET_PHYS_FORMAT_PROPS, 1, 0, 0, 0};  // vinst only
+        VkDecodeState st;
+        VkReplyEncoder reply;
+        const bool ok = decode_vk_batch(bad, sizeof(bad), st, reply, nullptr);
+        check(!ok, "truncated format-props op fails cleanly");
+    }
+
     if (failures == 0) {
         printf("native_vk_marshal_test: ALL PASS (vk enumerate/props + clear-submit + "
                "DRAW(pipeline/vbuf/vkCmdDraw) + PRESENT(guest SPIR-V/swapchain) + "
-               "ANGLE-init image-format marshalling)\n");
+               "ANGLE-init image-format + format-props marshalling)\n");
         return 0;
     }
     printf("native_vk_marshal_test: %d FAILURE(S)\n", failures);

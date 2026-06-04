@@ -197,10 +197,13 @@ static uint32_t alr_alloc(uint32_t *counter, uint32_t step) {
  * both ends, so a raw memcpy of the structs is layout-correct. */
 #define ALR_ICD_FEATURES_BYTES 220u  /* sizeof(VkPhysicalDeviceFeatures) = 55 * VkBool32 */
 #define ALR_ICD_LIMITS_BYTES   504u  /* sizeof(VkPhysicalDeviceLimits) */
+#define ALR_ICD_MEMORY_BYTES   520u  /* sizeof(VkPhysicalDeviceMemoryProperties) */
 _Static_assert(sizeof(VkPhysicalDeviceFeatures) == ALR_ICD_FEATURES_BYTES,
                "VkPhysicalDeviceFeatures must be 220 bytes for the raw-bytes wire copy");
 _Static_assert(sizeof(VkPhysicalDeviceLimits) == ALR_ICD_LIMITS_BYTES,
                "VkPhysicalDeviceLimits must be 504 bytes for the raw-bytes wire copy");
+_Static_assert(sizeof(VkPhysicalDeviceMemoryProperties) == ALR_ICD_MEMORY_BYTES,
+               "VkPhysicalDeviceMemoryProperties must be 520 bytes for the raw-bytes wire copy");
 typedef struct AlrIcdPhysCache {
     uint32_t vphys;            /* 0 = empty slot */
     int      have_props;
@@ -221,6 +224,12 @@ typedef struct AlrIcdPhysCache {
     int      have_limits;
     uint8_t  features_raw[ALR_ICD_FEATURES_BYTES];
     uint8_t  limits_raw[ALR_ICD_LIMITS_BYTES];
+    /* ANGLE memory-type-selection rung: the REAL Mali VkPhysicalDeviceMemoryProperties raw
+     * bytes (host-shipped via the same extended PHYS_PROPS record). have_memprops is set only
+     * when the host sent a correctly-SIZED blob; otherwise the query keeps its conservative
+     * single-heap default. */
+    int      have_memprops;
+    uint8_t  memprops_raw[ALR_ICD_MEMORY_BYTES];
 } AlrIcdPhysCache;
 static AlrIcdPhysCache g_phys_cache[ALR_ICD_MAX_PHYS];
 
@@ -313,9 +322,14 @@ static int alr_icd_parse_reply(const uint8_t *data, uint32_t len,
                  * a mismatched build can never scribble past the fixed cache arrays; a 0-length
                  * blob (synthetic-wire / no-host) just leaves have_features/have_limits = 0. */
                 {
-                    const uint8_t *feat_b = NULL, *lim_b = NULL;
-                    uint32_t feat_len = 0, lim_len = 0;
-                    if (!rd_blob(&r, &feat_b, &feat_len) || !rd_blob(&r, &lim_b, &lim_len)) return 0;
+                    const uint8_t *feat_b = NULL, *lim_b = NULL, *mem_b = NULL;
+                    uint32_t feat_len = 0, lim_len = 0, mem_len = 0;
+                    /* features + limits + memory blobs follow is_software, in that order. The
+                     * memory blob is read defensively: rd_blob fails cleanly at stream end, so
+                     * an older host that didn't ship it leaves have_memprops = 0 (conservative
+                     * default) rather than corrupting the parse. */
+                    if (!rd_blob(&r, &feat_b, &feat_len) || !rd_blob(&r, &lim_b, &lim_len) ||
+                        !rd_blob(&r, &mem_b, &mem_len)) return 0;
                     if (slot && feat_len == ALR_ICD_FEATURES_BYTES) {
                         memcpy(slot->features_raw, feat_b, ALR_ICD_FEATURES_BYTES);
                         slot->have_features = 1;
@@ -323,6 +337,10 @@ static int alr_icd_parse_reply(const uint8_t *data, uint32_t len,
                     if (slot && lim_len == ALR_ICD_LIMITS_BYTES) {
                         memcpy(slot->limits_raw, lim_b, ALR_ICD_LIMITS_BYTES);
                         slot->have_limits = 1;
+                    }
+                    if (slot && mem_len == ALR_ICD_MEMORY_BYTES) {
+                        memcpy(slot->memprops_raw, mem_b, ALR_ICD_MEMORY_BYTES);
+                        slot->have_memprops = 1;
                     }
                 }
                 break;
@@ -1149,12 +1167,26 @@ static void VKAPI_CALL alr_vkGetPhysicalDeviceFeatures(
 
 static void VKAPI_CALL alr_vkGetPhysicalDeviceMemoryProperties(
     VkPhysicalDevice physicalDevice, VkPhysicalDeviceMemoryProperties *pMemProps) {
-    (void)physicalDevice;
+    AlrIcdPhysicalDevice *pd = (AlrIcdPhysicalDevice *)physicalDevice;
+    AlrIcdPhysCache *slot;
     if (!pMemProps) return;
+    /* ANGLE memory-type-selection rung: forward the REAL Mali VkPhysicalDeviceMemoryProperties.
+     * ANGLE created the REAL Mali device (real heaps/types); it then selects a memory type by
+     * INDEX into the list returned here. The previous SYNTHETIC 1-heap/2-type model made ANGLE
+     * pick a type index that doesn't exist on real Mali => fault right after vkGetDeviceQueue
+     * (libGLESv2.so.2+0x1f6db4, before any resource create). ensure_phys_props marshals the
+     * extended PHYS_PROPS reply (host queried real Mali vkGetPhysicalDeviceMemoryProperties). */
+    slot = pd ? ensure_phys_props(pd) : NULL;
+    if (slot && slot->have_memprops) {
+        memcpy(pMemProps, slot->memprops_raw, ALR_ICD_MEMORY_BYTES);
+        ALR_ICD_DIAG("vkGetPhysicalDeviceMemoryProperties -> REAL Mali forwarded "
+                     "(%u heaps, %u types)",
+                     pMemProps->memoryHeapCount, pMemProps->memoryTypeCount);
+        return;
+    }
+    /* No host / unknown device: keep the conservative single-heap shape a UMA mobile GPU
+     * (Mali) minimally exposes (one DEVICE_LOCAL type + one HOST_VISIBLE|COHERENT type). */
     memset(pMemProps, 0, sizeof(*pMemProps));
-    /* One device-local heap; one DEVICE_LOCAL type + one HOST_VISIBLE|COHERENT type —
-     * the minimal shape a UMA mobile GPU (Mali) exposes. Real values would marshal from
-     * the host's vkGetPhysicalDeviceMemoryProperties (next rung). */
     pMemProps->memoryHeapCount = 1;
     pMemProps->memoryHeaps[0].size = (VkDeviceSize)2 * 1024 * 1024 * 1024;  /* 2 GiB */
     pMemProps->memoryHeaps[0].flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
@@ -1165,20 +1197,69 @@ static void VKAPI_CALL alr_vkGetPhysicalDeviceMemoryProperties(
     pMemProps->memoryTypes[1].propertyFlags =
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    ALR_ICD_DIAG("vkGetPhysicalDeviceMemoryProperties -> 1 heap, 2 types");
+    ALR_ICD_DIAG("vkGetPhysicalDeviceMemoryProperties -> 1 heap, 2 types (no host)");
+}
+
+/* Scan a reply stream for the ONE ALR_VK_REPLY_FORMAT_PROPS record, filling the three
+ * VkFormatFeatureFlags out params. Returns 1 if found. (Mirrors the image-format scanner:
+ * a single-op batch, so any other record is unexpected.) */
+static int alr_icd_scan_format_props_reply(const uint8_t *data, uint32_t len,
+                                           uint32_t *out_lin, uint32_t *out_opt,
+                                           uint32_t *out_buf) {
+    AlrRd r; uint8_t op;
+    r.p = data; r.n = len; r.pos = 0;
+    for (;;) {
+        if (!rd_u8(&r, &op)) break;
+        if (op == ALR_VK_REPLY_END) break;
+        if (op == ALR_VK_REPLY_FORMAT_PROPS) {
+            uint32_t vphys, lin, opt, buf;
+            if (!rd_u32(&r, &vphys) || !rd_u32(&r, &lin) || !rd_u32(&r, &opt) ||
+                !rd_u32(&r, &buf)) return 0;
+            if (out_lin) *out_lin = lin;
+            if (out_opt) *out_opt = opt;
+            if (out_buf) *out_buf = buf;
+            return 1;
+        }
+        return 0;  /* unexpected record for this single-op batch */
+    }
+    return 0;
 }
 
 static void VKAPI_CALL alr_vkGetPhysicalDeviceFormatProperties(
     VkPhysicalDevice physicalDevice, VkFormat format, VkFormatProperties *pFormatProperties) {
-    (void)physicalDevice; (void)format;
-    /* Advertise broad support so ANGLE's format-capability probe doesn't reject the
-     * basic RGBA render path. 0x7FFFFFFF = "all feature bits" (conservative-permissive;
-     * a precise answer would marshal vkGetPhysicalDeviceFormatProperties — next rung). */
-    if (pFormatProperties) {
-        pFormatProperties->linearTilingFeatures = 0x7FFFFFFF;
-        pFormatProperties->optimalTilingFeatures = 0x7FFFFFFF;
-        pFormatProperties->bufferFeatures = 0x7FFFFFFF;
+    AlrIcdPhysicalDevice *pd = (AlrIcdPhysicalDevice *)physicalDevice;
+    if (!pFormatProperties) return;
+    /* ANGLE format-path-selection rung: forward the REAL Mali per-format feature flags.
+     * ANGLE queries these to choose render/blit/storage/sample paths for a VkFormat; the old
+     * synthetic 0x7FFFFFFF (all bits) lied about Mali (claimed storage/atomic/blit on formats
+     * Mali lacks) and could steer ANGLE down an unsupported path. Like ImageFormatProperties
+     * this is parameterized, so it round-trips per query (op GET_PHYS_FORMAT_PROPS -> host
+     * servicer -> real Mali vkGetPhysicalDeviceFormatProperties -> reply). */
+    if (pd && alr_icd_ring_ok()) {
+        uint8_t req[32]; AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH]; uint32_t rlen;
+        uint32_t lin = 0, opt = 0, buf = 0;
+        alr_vk_enc_init(&e, req, sizeof(req));
+        alr_vk_enc_get_phys_format_props(&e, pd->inst->vinst, pd->vphys, (uint32_t)format);
+        alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
+        if (!e.overflow) {
+            rlen = alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
+            if (rlen && alr_icd_scan_format_props_reply(reply, rlen, &lin, &opt, &buf)) {
+                pFormatProperties->linearTilingFeatures = lin;
+                pFormatProperties->optimalTilingFeatures = opt;
+                pFormatProperties->bufferFeatures = buf;
+                ALR_ICD_DIAG("vkGetPhysicalDeviceFormatProperties fmt=%d -> REAL Mali "
+                             "(lin=0x%x opt=0x%x buf=0x%x)", (int)format, lin, opt, buf);
+                return;
+            }
+        }
     }
+    /* Ring-less / unknown device: fall back to the conservative-permissive all-bits answer so
+     * a no-host guest still progresses (the same stance the ring-less image-format path takes). */
+    pFormatProperties->linearTilingFeatures = 0x7FFFFFFF;
+    pFormatProperties->optimalTilingFeatures = 0x7FFFFFFF;
+    pFormatProperties->bufferFeatures = 0x7FFFFFFF;
+    ALR_ICD_DIAG("vkGetPhysicalDeviceFormatProperties fmt=%d -> all-bits (no host)",
+                 (int)format);
 }
 
 /* ============================================================================
@@ -1402,6 +1483,49 @@ static VkResult VKAPI_CALL alr_vkGetPhysicalDeviceImageFormatProperties2(
 #undef ALR_ICD_CMD_DEFINE
 
 /* ============================================================================
+ * The core-1.1 "2" memory-requirements family. ANGLE's RendererVk (a Vulkan-1.1+ device)
+ * resolves vkGetImageMemoryRequirements2 / vkGetBufferMemoryRequirements2 — NOT the v1
+ * entrypoints — when it allocates the backing image/buffer for a texture/FBO. Returning NULL
+ * for these made ANGLE call through a NULL fn pointer in its image-allocation path and FAULT
+ * at libGLESv2.so.2+0x1f6db4 (DEVICE-PROVEN: the fault that used to hit right after
+ * vkGetDeviceQueue now moves HERE, on the first FBO/texture allocation, once the real Mali
+ * memory-properties fix let device-init's memory-type selection succeed).
+ *
+ * The "2" structs are { sType, pNext, <v1 value> }; the v1 value is exactly what the already-
+ * forwarding generated v1 entrypoints (alr_vkGetImageMemoryRequirements /
+ * alr_vkGetBufferMemoryRequirements, which round-trip the REAL Mali memoryTypeBits/size/align)
+ * produce. So these wrappers fill the embedded v1 member from the v1 entrypoint and leave any
+ * chained pNext (e.g. VkMemoryDedicatedRequirements) at its caller-initialized value — ANGLE
+ * zero-inits that chain and tolerates an untouched dedicated-requirements struct. This forwards
+ * Mali's true memoryTypeBits so ANGLE's memory-type selection indexes a type that EXISTS.
+ * ============================================================================ */
+static void VKAPI_CALL alr_vkGetImageMemoryRequirements2(
+    VkDevice device, const VkImageMemoryRequirementsInfo2 *pInfo,
+    VkMemoryRequirements2 *pMemoryRequirements) {
+    if (!pInfo || !pMemoryRequirements) return;
+    alr_vkGetImageMemoryRequirements(device, pInfo->image,
+                                     &pMemoryRequirements->memoryRequirements);
+    ALR_ICD_DIAG("vkGetImageMemoryRequirements2 -> REAL Mali forwarded "
+                 "(size=%llu align=%llu typeBits=0x%x)",
+                 (unsigned long long)pMemoryRequirements->memoryRequirements.size,
+                 (unsigned long long)pMemoryRequirements->memoryRequirements.alignment,
+                 pMemoryRequirements->memoryRequirements.memoryTypeBits);
+}
+
+static void VKAPI_CALL alr_vkGetBufferMemoryRequirements2(
+    VkDevice device, const VkBufferMemoryRequirementsInfo2 *pInfo,
+    VkMemoryRequirements2 *pMemoryRequirements) {
+    if (!pInfo || !pMemoryRequirements) return;
+    alr_vkGetBufferMemoryRequirements(device, pInfo->buffer,
+                                      &pMemoryRequirements->memoryRequirements);
+    ALR_ICD_DIAG("vkGetBufferMemoryRequirements2 -> REAL Mali forwarded "
+                 "(size=%llu align=%llu typeBits=0x%x)",
+                 (unsigned long long)pMemoryRequirements->memoryRequirements.size,
+                 (unsigned long long)pMemoryRequirements->memoryRequirements.alignment,
+                 pMemoryRequirements->memoryRequirements.memoryTypeBits);
+}
+
+/* ============================================================================
  * Dispatch — vkGetInstanceProcAddr / vkGetDeviceProcAddr. The app/loader resolves
  * every entry point through these. We return our ENUM-rung implementations and
  * vkGetInstanceProcAddr / vkGetDeviceProcAddr themselves (a global GIPA also resolves
@@ -1449,6 +1573,14 @@ static PFN_vkVoidFunction alr_lookup(const char *pName) {
         ALR_ENTRY("vkGetPhysicalDeviceMemoryProperties2KHR", alr_vkGetPhysicalDeviceMemoryProperties2),
         ALR_ENTRY("vkGetPhysicalDeviceFormatProperties2KHR", alr_vkGetPhysicalDeviceFormatProperties2),
         ALR_ENTRY("vkGetPhysicalDeviceImageFormatProperties2KHR", alr_vkGetPhysicalDeviceImageFormatProperties2),
+        /* The core-1.1 "2" memory-requirements family ANGLE resolves to allocate texture/FBO
+         * backing memory. Their ABSENCE (NULL) made ANGLE fault at libGLESv2.so.2+0x1f6db4 on
+         * the first FBO allocation; these forward the REAL Mali memoryTypeBits via the v1 path
+         * so ANGLE's memory-type selection indexes a type that exists. */
+        ALR_ENTRY("vkGetImageMemoryRequirements2", alr_vkGetImageMemoryRequirements2),
+        ALR_ENTRY("vkGetBufferMemoryRequirements2", alr_vkGetBufferMemoryRequirements2),
+        ALR_ENTRY("vkGetImageMemoryRequirements2KHR", alr_vkGetImageMemoryRequirements2),
+        ALR_ENTRY("vkGetBufferMemoryRequirements2KHR", alr_vkGetBufferMemoryRequirements2),
         ALR_ENTRY("vkCreateDevice", alr_vkCreateDevice),
         ALR_ENTRY("vkDestroyDevice", alr_vkDestroyDevice),
         ALR_ENTRY("vkGetDeviceQueue", alr_vkGetDeviceQueue),

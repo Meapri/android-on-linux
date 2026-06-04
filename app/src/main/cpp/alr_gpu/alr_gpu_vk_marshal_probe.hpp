@@ -87,6 +87,19 @@ struct SyntheticMaliProvider {
         out.max_resource_size = static_cast<uint64_t>(1) << 31;  // 2 GiB
         return true;
     }
+    // ANGLE-init rung: answer a per-format feature query with a REALISTIC (not all-bits) mask
+    // so the wire round trip proves Mali's actual feature bits survive marshalling. We report
+    // a typical color-renderable/sampled RGBA format's flags: SAMPLED_IMAGE (0x1) |
+    // COLOR_ATTACHMENT (0x80) | COLOR_ATTACHMENT_BLEND (0x100) | BLIT_SRC (0x400) |
+    // BLIT_DST (0x800) on optimal tiling; VERTEX_BUFFER (0x40) on buffers. The REAL Mali path
+    // (vk_real_format_props) returns the true per-format verdict.
+    static bool format_props(void* /*ctx*/, uint32_t /*vphys*/, uint32_t /*format*/,
+                             VkFmtProps& out) {
+        out.optimal_tiling_features = 0x1u | 0x80u | 0x100u | 0x400u | 0x800u;
+        out.linear_tiling_features = 0x1u;        // SAMPLED_IMAGE on linear
+        out.buffer_features = 0x40u;              // VERTEX_BUFFER
+        return true;
+    }
     // ---- VK-M2 body seams: the synthetic device behaves like a real one for the wire
     // round trip. create/queue/pool/cmd succeed; clear_submit "renders" by returning the
     // requested clear color as the center pixel (0..1 -> 0..255), so the round trip can
@@ -184,6 +197,7 @@ struct SyntheticMaliProvider {
         p.enumerate = &enumerate;
         p.props = &props;
         p.image_format_props = &image_format_props;
+        p.format_props = &format_props;
         p.destroy_instance = &destroy_instance;
         p.create_device = &create_device;
         p.get_queue = &get_queue;

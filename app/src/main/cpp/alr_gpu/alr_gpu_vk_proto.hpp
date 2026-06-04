@@ -102,6 +102,17 @@ enum AlrVkOp {
     ALR_VK_OP_GET_DEVICE_QUEUE2 = 205,
     //   u32 vdev, u32 queue_family_index, u32 queue_index, u32 vqueue
 
+    // ---- ANGLE-init rung: vkGetPhysicalDeviceFormatProperties forward. ----
+    // ANGLE's RendererVk queries per-format buffer/linear/optimal feature flags to decide
+    // which render/blit/storage/sampling path a given VkFormat supports. The guest used to
+    // answer a SYNTHETIC 0x7FFFFFFF (all bits) for every format, which lies about Mali (e.g.
+    // claims storage/atomic/blit on formats Mali lacks) and steers ANGLE down unsupported
+    // paths. Like IMAGE_FORMAT_PROPS this is parameterized, so it round-trips per query: the
+    // host calls the REAL Mali vkGetPhysicalDeviceFormatProperties for `vphys`+`format` and
+    // returns the three VkFormatFeatureFlags in ALR_VK_REPLY_FORMAT_PROPS.
+    ALR_VK_OP_GET_PHYS_FORMAT_PROPS = 206,
+    //   u32 vinst, u32 vphys, u32 format
+
     // destroy the instance `vinst` (releases the host's real VkInstance + virtual maps).
     ALR_VK_OP_DESTROY_INSTANCE = 209,  // u32 vinst
 
@@ -295,7 +306,7 @@ enum AlrVkReply {
     // VK_ERROR_FORMAT_NOT_SUPPORTED is a valid "this format/usage is unsupported" verdict)
     // + the VkImageFormatProperties fields Mali returned. The guest fills the caller's
     // VkImageFormatProperties from these (or returns the error result on a non-zero code).
-    ALR_VK_REPLY_IMAGE_FORMAT_PROPS = 229
+    ALR_VK_REPLY_IMAGE_FORMAT_PROPS = 229,
     //   u32 vphys
     //   i32 vk_result
     //   u32 max_extent_w, u32 max_extent_h, u32 max_extent_d
@@ -303,6 +314,19 @@ enum AlrVkReply {
     //   u32 max_array_layers
     //   u32 sample_counts        (VkSampleCountFlags)
     //   u64 max_resource_size
+
+    // NOTE: 230 == ALR_VK_REPLY_GEN_ESCAPE (the generated cmd/create band rides it with a
+    // u16 sub-opcode); top-level reply bytes 231+ stay free for fixed replies like this one.
+
+    // result of GET_PHYS_FORMAT_PROPS: the three VkFormatFeatureFlags the real Mali
+    // vkGetPhysicalDeviceFormatProperties returned for `vphys`+`format`. The guest fills the
+    // caller's VkFormatProperties from these (Mali's real per-format capability bits replace
+    // the old synthetic all-bits answer).
+    ALR_VK_REPLY_FORMAT_PROPS = 231
+    //   u32 vphys
+    //   u32 linear_tiling_features
+    //   u32 optimal_tiling_features
+    //   u32 buffer_features
 };
 
 // Host-side render-path outcome carried in ALR_VK_REPLY_SUBMIT::render_result. 0 means
@@ -403,6 +427,15 @@ static inline void alr_vk_enc_get_phys_image_format_props(AlrVkEncoder *e, uint3
     alr_vk_enc_u32(e, tiling);
     alr_vk_enc_u32(e, usage);
     alr_vk_enc_u32(e, flags);
+}
+/* ANGLE-init rung: query real Mali per-format feature flags for `format` on virtual device
+ * `vphys`. The three VkFormatFeatureFlags come back in ALR_VK_REPLY_FORMAT_PROPS. */
+static inline void alr_vk_enc_get_phys_format_props(AlrVkEncoder *e, uint32_t vinst,
+                                                    uint32_t vphys, uint32_t format) {
+    alr_vk_enc_u8(e, (uint8_t)ALR_VK_OP_GET_PHYS_FORMAT_PROPS);
+    alr_vk_enc_u32(e, vinst);
+    alr_vk_enc_u32(e, vphys);
+    alr_vk_enc_u32(e, format);
 }
 static inline void alr_vk_enc_destroy_instance(AlrVkEncoder *e, uint32_t vinst) {
     alr_vk_enc_u8(e, (uint8_t)ALR_VK_OP_DESTROY_INSTANCE);
