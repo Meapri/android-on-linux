@@ -562,73 +562,95 @@ typedef struct VkPhysicalDeviceSparseImageFormatInfo2 {
  * vkGetPhysicalDeviceFeatures2, a conformant client (ANGLE) enables none, so in practice the
  * only struct on the wire is an all-zero VkPhysicalDeviceFeatures2 — but we size the common
  * core-version feature structs too so a client that chains them is handled, not truncated. */
+/* ABI-EXACT size of a {VkStructureType sType; u32 _pad; void* pNext; VkBool32 x N} feature
+ * struct on arm64-LP64. The struct's natural alignment is 8 (the void* pNext), so the WHOLE
+ * struct is rounded UP to a multiple of 8 — for an ODD bool count N the trailing 4 bytes are
+ * tail-padded to reach 8. The previous table used a bare `16 + N*4`, which is 4 bytes SHORT
+ * for every odd-N struct (Multiview, ScalarBlockLayout, Synchronization2, …) — the SAME
+ * align/tail-pad ABI class as the VkPhysicalDeviceLimits offset bug. A short size truncates
+ * ANGLE's real struct by 4 B before the wire (dropping its last VkBool32) AND makes the host
+ * chain a 4-B-short buffer into real Mali vkCreateDevice (Mali then over-reads the buffer).
+ * ALR_FEAT_SZ(N) computes the correct padded size so an odd N can never truncate again. */
+#define ALR_FEAT_SZ(n) (uint32_t)(((16u + (uint32_t)(n) * 4u) + 7u) & ~7u)
+/* Compile-time lock: ALR_FEAT_SZ must equal the official NDK r27 sizeof for each struct
+ * (derived from <vulkan/vulkan_core.h>; see out/abi_oracle). If a future header edit changes
+ * a bool count, the matching assert fires. The numbers on the right are the OFFICIAL sizes. */
+_Static_assert(ALR_FEAT_SZ(12) == 64,  "Vulkan11Features = 64");
+_Static_assert(ALR_FEAT_SZ(47) == 208, "Vulkan12Features = 208");
+_Static_assert(ALR_FEAT_SZ(15) == 80,  "Vulkan13Features = 80");
+_Static_assert(ALR_FEAT_SZ(2)  == 24,  "VariablePointers/ShaderFloat16Int8/TransformFeedback/ProvokingVertex/CustomBorderColor/VertexAttributeDivisor = 24");
+_Static_assert(ALR_FEAT_SZ(3)  == 32,  "Multiview/8BitStorage/BufferDeviceAddress/ExtendedDynamicState2 = 32");
+_Static_assert(ALR_FEAT_SZ(4)  == 32,  "16BitStorage = 32");
+_Static_assert(ALR_FEAT_SZ(1)  == 24,  "single-bool core/EXT feature structs = 24");
+_Static_assert(ALR_FEAT_SZ(20) == 96,  "DescriptorIndexing = 96");
+_Static_assert(ALR_FEAT_SZ(6)  == 40,  "LineRasterization = 40");
 static inline uint32_t alr_icd_feature_struct_size(uint32_t s_type) {
     switch (s_type) {
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2_VAL:
-            return (uint32_t)sizeof(VkPhysicalDeviceFeatures2);  /* exact, guest-defined */
+            return (uint32_t)sizeof(VkPhysicalDeviceFeatures2);  /* exact, guest-defined (240) */
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES_VAL:
-            return 16 + 12 * 4;   /* 12 VkBool32 */
+            return ALR_FEAT_SZ(12);   /* 12 VkBool32 -> 64 */
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES_VAL:
-            return 16 + 47 * 4;   /* 47 VkBool32 */
+            return ALR_FEAT_SZ(47);   /* 47 VkBool32 -> 208 */
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES_VAL:
-            return 16 + 15 * 4;   /* 15 VkBool32 */
+            return ALR_FEAT_SZ(15);   /* 15 VkBool32 -> 80 */
         /* Individual core-promoted feature structs (ANGLE chains VariablePointers on Mali;
          * the rest are sized so a chain that uses the granular structs is never truncated).
-         * Byte sizes are the official 64-bit ABI: 16-byte header + N x VkBool32, all 8-aligned
-         * already (each N x 4 is 8-aligned for even N and the header pads odd-N tails). */
+         * Byte sizes are the official 64-bit ABI: 16-byte header + N x VkBool32, the WHOLE
+         * struct rounded up to its 8-byte alignment (odd N gets a 4-byte tail pad). */
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES_VAL:
-            return 16 + 2 * 4;    /* variablePointersStorageBuffer, variablePointers */
+            return ALR_FEAT_SZ(2);    /* variablePointersStorageBuffer, variablePointers -> 24 */
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES_VAL:
-            return 16 + 3 * 4;    /* multiview, *GeometryShader, *TessellationShader */
+            return ALR_FEAT_SZ(3);    /* multiview, *GeometryShader, *TessellationShader -> 32 */
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES_VAL:
-            return 16 + 4 * 4;
+            return ALR_FEAT_SZ(4);    /* -> 32 */
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_VAL:
-            return 16 + 3 * 4;
+            return ALR_FEAT_SZ(3);    /* -> 32 (was 28: 4 B short) */
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES_VAL:
-            return 16 + 1 * 4;
+            return ALR_FEAT_SZ(1);    /* -> 24 (was 20: 4 B short) */
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROTECTED_MEMORY_FEATURES_VAL:
-            return 16 + 1 * 4;
+            return ALR_FEAT_SZ(1);    /* -> 24 (was 20) */
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES_VAL:
-            return 16 + 1 * 4;
+            return ALR_FEAT_SZ(1);    /* -> 24 (was 20) */
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_VAL:
-            return 16 + 2 * 4;
+            return ALR_FEAT_SZ(2);    /* -> 24 */
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_VAL:
-            return 16 + 20 * 4;
+            return ALR_FEAT_SZ(20);   /* -> 96 */
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES_VAL:
-            return 16 + 1 * 4;
+            return ALR_FEAT_SZ(1);    /* -> 24 (was 20) */
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES_VAL:
-            return 16 + 1 * 4;
+            return ALR_FEAT_SZ(1);    /* -> 24 (was 20) */
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES_VAL:
-            return 16 + 1 * 4;
+            return ALR_FEAT_SZ(1);    /* -> 24 (was 20) */
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SEPARATE_DEPTH_STENCIL_LAYOUTS_FEATURES_VAL:
-            return 16 + 1 * 4;
+            return ALR_FEAT_SZ(1);    /* -> 24 (was 20) */
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES_VAL:
-            return 16 + 1 * 4;
+            return ALR_FEAT_SZ(1);    /* -> 24 (was 20) */
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_VAL:
-            return 16 + 1 * 4;
+            return ALR_FEAT_SZ(1);    /* -> 24 (was 20) */
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_VAL:
-            return 16 + 3 * 4;
+            return ALR_FEAT_SZ(3);    /* -> 32 (was 28: 4 B short) */
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_VAL:
-            return 16 + 1 * 4;
+            return ALR_FEAT_SZ(1);    /* -> 24 (was 20) */
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_VAL:
-            return 16 + 1 * 4;
+            return ALR_FEAT_SZ(1);    /* -> 24 (was 20) */
         /* EXT feature structs (only chained when Mali exposes the matching extension). */
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT_VAL:
-            return 16 + 2 * 4;
+            return ALR_FEAT_SZ(2);    /* -> 24 */
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT_VAL:
-            return 16 + 2 * 4;
+            return ALR_FEAT_SZ(2);    /* -> 24 */
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES_EXT_VAL:
-            return 16 + 6 * 4;
+            return ALR_FEAT_SZ(6);    /* -> 40 */
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT_VAL:
-            return 16 + 1 * 4;
+            return ALR_FEAT_SZ(1);    /* -> 24 (was 20) */
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT_VAL:
-            return 16 + 1 * 4;
+            return ALR_FEAT_SZ(1);    /* -> 24 (was 20) */
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT_VAL:
-            return 16 + 3 * 4;
+            return ALR_FEAT_SZ(3);    /* -> 32 (was 28: 4 B short) */
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT_VAL:
-            return 16 + 2 * 4;
+            return ALR_FEAT_SZ(2);    /* -> 24 */
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT_VAL:
-            return 16 + 2 * 4;
+            return ALR_FEAT_SZ(2);    /* -> 24 */
         default:
             return 0;             /* unknown: drop (feature stays off) */
     }
@@ -1322,4 +1344,92 @@ static inline void alr_set_loader_magic_value(void *pNewObject) {
     li->loaderMagic = ICD_LOADER_MAGIC;
 }
 
+/* ============================================================================
+ * EXHAUSTIVE ABI LOCK (arm64-LP64). Every struct below is one the ICD either FILLS for
+ * ANGLE (a query reply) or whose bytes it ships verbatim on the wire; ANGLE/Mali read
+ * them through the OFFICIAL <vulkan/vulkan_core.h> ABI, so a single wrong size/offset/
+ * alignment desyncs the copy and corrupts a value ANGLE later dereferences (the proven
+ * libGLESv2+0x1f6db4 vector-grow crash was exactly this: VkPhysicalDeviceLimits landing
+ * 4 B early). The right-hand numbers are the official NDK r27 (vk.xml 1.3.x) sizeof/
+ * alignof/offsetof, generated by out/abi_oracle.c which #includes the real header. If a
+ * future edit changes any layout, the matching assert fires at COMPILE time — the whole
+ * "limits bug family" is now a build error, never a device-only SIGSEGV. ---- */
+#define ALR_VK_ABI_EQ(expr, want, msg) _Static_assert((expr) == (want), msg)
+
+/* -- VkPhysicalDeviceProperties + its blobs (the vkGetPhysicalDeviceProperties reply) -- */
+ALR_VK_ABI_EQ(sizeof(VkPhysicalDeviceProperties), 824, "VkPhysicalDeviceProperties sizeof must be 824");
+ALR_VK_ABI_EQ(_Alignof(VkPhysicalDeviceProperties), 8, "VkPhysicalDeviceProperties alignof must be 8");
+ALR_VK_ABI_EQ(offsetof(VkPhysicalDeviceProperties, deviceType), 16, "deviceType@16");
+ALR_VK_ABI_EQ(offsetof(VkPhysicalDeviceProperties, deviceName), 20, "deviceName@20");
+ALR_VK_ABI_EQ(offsetof(VkPhysicalDeviceProperties, pipelineCacheUUID), 276, "pipelineCacheUUID@276");
+ALR_VK_ABI_EQ(offsetof(VkPhysicalDeviceProperties, limits), 296, "limits@296 (the proven crash offset)");
+ALR_VK_ABI_EQ(offsetof(VkPhysicalDeviceProperties, sparseProperties), 800, "sparseProperties@800");
+ALR_VK_ABI_EQ(sizeof(VkPhysicalDeviceLimits), 504, "VkPhysicalDeviceLimits sizeof must be 504");
+ALR_VK_ABI_EQ(_Alignof(VkPhysicalDeviceLimits), 8, "VkPhysicalDeviceLimits alignof must be 8");
+ALR_VK_ABI_EQ(sizeof(VkPhysicalDeviceSparseProperties), 20, "VkPhysicalDeviceSparseProperties sizeof must be 20");
+
+/* -- VkPhysicalDeviceFeatures (vkGetPhysicalDeviceFeatures reply, raw-bytes wire) -- */
+ALR_VK_ABI_EQ(sizeof(VkPhysicalDeviceFeatures), 220, "VkPhysicalDeviceFeatures sizeof must be 220");
+
+/* -- VkPhysicalDeviceMemoryProperties + embedded arrays (the memory-type selection path) -- */
+ALR_VK_ABI_EQ(sizeof(VkPhysicalDeviceMemoryProperties), 520, "VkPhysicalDeviceMemoryProperties sizeof must be 520");
+ALR_VK_ABI_EQ(_Alignof(VkPhysicalDeviceMemoryProperties), 8, "VkPhysicalDeviceMemoryProperties alignof must be 8");
+ALR_VK_ABI_EQ(offsetof(VkPhysicalDeviceMemoryProperties, memoryTypes), 4, "memoryTypes@4");
+ALR_VK_ABI_EQ(offsetof(VkPhysicalDeviceMemoryProperties, memoryHeapCount), 260, "memoryHeapCount@260");
+ALR_VK_ABI_EQ(offsetof(VkPhysicalDeviceMemoryProperties, memoryHeaps), 264, "memoryHeaps@264");
+ALR_VK_ABI_EQ(sizeof(VkMemoryType), 8, "VkMemoryType sizeof must be 8");
+ALR_VK_ABI_EQ(offsetof(VkMemoryType, heapIndex), 4, "VkMemoryType.heapIndex@4");
+ALR_VK_ABI_EQ(sizeof(VkMemoryHeap), 16, "VkMemoryHeap sizeof must be 16 (8-byte VkDeviceSize size)");
+ALR_VK_ABI_EQ(_Alignof(VkMemoryHeap), 8, "VkMemoryHeap alignof must be 8");
+ALR_VK_ABI_EQ(offsetof(VkMemoryHeap, flags), 8, "VkMemoryHeap.flags@8");
+
+/* -- VkMemoryRequirements (+ the v2 wrapper): the texture/FBO backing-alloc path -- */
+ALR_VK_ABI_EQ(sizeof(VkMemoryRequirements), 24, "VkMemoryRequirements sizeof must be 24");
+ALR_VK_ABI_EQ(_Alignof(VkMemoryRequirements), 8, "VkMemoryRequirements alignof must be 8");
+ALR_VK_ABI_EQ(offsetof(VkMemoryRequirements, size), 0, "VkMemoryRequirements.size@0");
+ALR_VK_ABI_EQ(offsetof(VkMemoryRequirements, alignment), 8, "VkMemoryRequirements.alignment@8");
+ALR_VK_ABI_EQ(offsetof(VkMemoryRequirements, memoryTypeBits), 16, "VkMemoryRequirements.memoryTypeBits@16");
+ALR_VK_ABI_EQ(sizeof(VkMemoryRequirements2), 40, "VkMemoryRequirements2 sizeof must be 40");
+ALR_VK_ABI_EQ(offsetof(VkMemoryRequirements2, memoryRequirements), 16, "VkMemoryRequirements2.memoryRequirements@16");
+
+/* -- VkFormatProperties / VkImageFormatProperties (the glTexImage2D format-capability path) -- */
+ALR_VK_ABI_EQ(sizeof(VkFormatProperties), 12, "VkFormatProperties sizeof must be 12");
+ALR_VK_ABI_EQ(sizeof(VkImageFormatProperties), 32, "VkImageFormatProperties sizeof must be 32");
+ALR_VK_ABI_EQ(_Alignof(VkImageFormatProperties), 8, "VkImageFormatProperties alignof must be 8");
+ALR_VK_ABI_EQ(offsetof(VkImageFormatProperties, maxMipLevels), 12, "maxMipLevels@12");
+ALR_VK_ABI_EQ(offsetof(VkImageFormatProperties, maxArrayLayers), 16, "maxArrayLayers@16");
+ALR_VK_ABI_EQ(offsetof(VkImageFormatProperties, sampleCounts), 20, "sampleCounts@20");
+ALR_VK_ABI_EQ(offsetof(VkImageFormatProperties, maxResourceSize), 24, "maxResourceSize@24 (8-byte VkDeviceSize)");
+ALR_VK_ABI_EQ(sizeof(VkSparseImageFormatProperties), 20, "VkSparseImageFormatProperties sizeof must be 20");
+
+/* -- VkQueueFamilyProperties (+ v2): the queue-family query ANGLE enumerates -- */
+ALR_VK_ABI_EQ(sizeof(VkQueueFamilyProperties), 24, "VkQueueFamilyProperties sizeof must be 24");
+ALR_VK_ABI_EQ(offsetof(VkQueueFamilyProperties, timestampValidBits), 8, "timestampValidBits@8");
+ALR_VK_ABI_EQ(sizeof(VkQueueFamilyProperties2), 40, "VkQueueFamilyProperties2 sizeof must be 40");
+ALR_VK_ABI_EQ(offsetof(VkQueueFamilyProperties2, queueFamilyProperties), 16, "queueFamilyProperties@16");
+
+/* -- the "2" wrapper structs the ICD fills (Properties2/Features2/MemoryProperties2/…) -- */
+ALR_VK_ABI_EQ(sizeof(VkPhysicalDeviceProperties2), 840, "VkPhysicalDeviceProperties2 sizeof must be 840");
+ALR_VK_ABI_EQ(offsetof(VkPhysicalDeviceProperties2, properties), 16, "Properties2.properties@16");
+ALR_VK_ABI_EQ(sizeof(VkPhysicalDeviceFeatures2), 240, "VkPhysicalDeviceFeatures2 sizeof must be 240");
+ALR_VK_ABI_EQ(offsetof(VkPhysicalDeviceFeatures2, features), 16, "Features2.features@16");
+ALR_VK_ABI_EQ(sizeof(VkPhysicalDeviceMemoryProperties2), 536, "VkPhysicalDeviceMemoryProperties2 sizeof must be 536");
+ALR_VK_ABI_EQ(offsetof(VkPhysicalDeviceMemoryProperties2, memoryProperties), 16, "MemoryProperties2.memoryProperties@16");
+ALR_VK_ABI_EQ(sizeof(VkFormatProperties2), 32, "VkFormatProperties2 sizeof must be 32");
+ALR_VK_ABI_EQ(offsetof(VkFormatProperties2, formatProperties), 16, "FormatProperties2.formatProperties@16");
+ALR_VK_ABI_EQ(sizeof(VkImageFormatProperties2), 48, "VkImageFormatProperties2 sizeof must be 48");
+ALR_VK_ABI_EQ(offsetof(VkImageFormatProperties2, imageFormatProperties), 16, "ImageFormatProperties2.imageFormatProperties@16");
+ALR_VK_ABI_EQ(sizeof(VkSparseImageFormatProperties2), 40, "VkSparseImageFormatProperties2 sizeof must be 40");
+
+/* -- create-info structs whose ABI the codegen wire forwarders walk (image/buffer create) -- */
+ALR_VK_ABI_EQ(sizeof(VkImageCreateInfo), 88, "VkImageCreateInfo sizeof must be 88");
+ALR_VK_ABI_EQ(offsetof(VkImageCreateInfo, extent), 28, "VkImageCreateInfo.extent@28");
+ALR_VK_ABI_EQ(offsetof(VkImageCreateInfo, initialLayout), 80, "VkImageCreateInfo.initialLayout@80");
+ALR_VK_ABI_EQ(sizeof(VkBufferCreateInfo), 56, "VkBufferCreateInfo sizeof must be 56");
+ALR_VK_ABI_EQ(offsetof(VkBufferCreateInfo, size), 24, "VkBufferCreateInfo.size@24");
+ALR_VK_ABI_EQ(sizeof(VkImageViewCreateInfo), 80, "VkImageViewCreateInfo sizeof must be 80");
+ALR_VK_ABI_EQ(sizeof(VkMemoryAllocateInfo), 32, "VkMemoryAllocateInfo sizeof must be 32");
+ALR_VK_ABI_EQ(offsetof(VkMemoryAllocateInfo, allocationSize), 16, "VkMemoryAllocateInfo.allocationSize@16");
+
+#undef ALR_VK_ABI_EQ
 #endif /* ALR_ICD_VK_MIN_H */

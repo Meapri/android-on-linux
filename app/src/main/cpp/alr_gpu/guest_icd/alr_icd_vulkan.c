@@ -409,7 +409,11 @@ static VkResult VKAPI_CALL alr_vkCreateInstance(const VkInstanceCreateInfo *pCre
     inst->vphys_base = 0;
     inst->phys_count = 0;
 
-    app_api = VK_API_VERSION_1_1;
+    /* VERSION-SKEW FIX (LEAD 2): default the app-requested instance version to 1.3 (matching
+     * the 1.3 vkEnumerateInstanceVersion + the real-Mali 1.3 device) when the client left it
+     * 0, instead of clamping to 1.1. ANGLE passes its OWN apiVersion (honored verbatim), so
+     * this only affects clients that pass appInfo.apiVersion == 0. */
+    app_api = VK_API_VERSION_1_3;
     if (pCreateInfo && pCreateInfo->pApplicationInfo &&
         pCreateInfo->pApplicationInfo->apiVersion != 0) {
         app_api = pCreateInfo->pApplicationInfo->apiVersion;
@@ -587,8 +591,9 @@ static void VKAPI_CALL alr_vkGetPhysicalDeviceProperties(VkPhysicalDevice physic
             ALR_ICD_DIAG("vkGetPhysicalDeviceProperties -> limits ABSENT (host sent none)");
         }
     } else {
-        /* No host / unknown device: report a benign placeholder so callers don't NPE. */
-        pProperties->apiVersion = VK_API_VERSION_1_1;
+        /* No host / unknown device: report a benign placeholder so callers don't NPE. Version
+         * 1.3 to stay consistent with vkEnumerateInstanceVersion (LEAD 2). */
+        pProperties->apiVersion = VK_API_VERSION_1_3;
         pProperties->deviceType = VK_PHYSICAL_DEVICE_TYPE_OTHER;
         strncpy(pProperties->deviceName, "ALR (no host)", VK_MAX_PHYSICAL_DEVICE_NAME_SIZE - 1);
     }
@@ -1116,8 +1121,17 @@ static VkResult alr_fill_ext_props(const char *const *names, const uint32_t *spe
 }
 
 VkResult VKAPI_CALL alr_vkEnumerateInstanceVersion(uint32_t *pApiVersion) {
-    if (pApiVersion) *pApiVersion = VK_API_VERSION_1_1;  /* we model a 1.1 ICD */
-    ALR_ICD_DIAG("vkEnumerateInstanceVersion -> 1.1");
+    /* VERSION-SKEW FIX (LEAD 2): report a 1.3 INSTANCE so the instance version and the
+     * physical-device apiVersion AGREE. The physical device forwards REAL Mali (1.3.247),
+     * so an instance pinned to 1.1 made ANGLE run a 1.1-instance / 1.3-device HYBRID:
+     * ANGLE computes its effective device version as min(instanceVersion, deviceApiVersion),
+     * and a 1.1 instance silently caps a 1.3 Mali to 1.1 — a mismatch against the 1.3 struct
+     * sizes/promoted-entrypoint expectations elsewhere in RendererVk. Our query structs are
+     * 1.3-ABI-exact (compile-time-locked) and the promoted Get*2 family is wired, so 1.3 is
+     * the honest, consistent answer. (The loader still clamps this to its own max; the
+     * Khronos loader on the guest path is >= 1.3.) */
+    if (pApiVersion) *pApiVersion = VK_API_VERSION_1_3;
+    ALR_ICD_DIAG("vkEnumerateInstanceVersion -> 1.3 (consistent with Mali device apiVersion)");
     return VK_SUCCESS;
 }
 
