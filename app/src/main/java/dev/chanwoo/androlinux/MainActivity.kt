@@ -2506,18 +2506,53 @@ class MainActivity : Activity() {
                                 // (libvulkan.so.1) → our ICD. switches::kUseVulkan=native +
                                 // features::kVulkan (gpu_finch_features.cc) + OOP-raster + GPU raster.
                                 "\n--use-vulkan=native" +
-                                "\n--enable-features=Vulkan,DefaultEnableOopRasterization" +
+                                // DEVICE-DIAGNOSED (ladder run #1): chromium-147 IS_ANDROID HARD-disables
+                                // Vulkan in EVERY in-process-GPU mode. GpuInit::InitializeInProcess (the
+                                // path --single-process/--in-process-gpu route to) calls
+                                // DisableInProcessGpuVulkan() UNLESS switches::kWebViewDrawFunctorUsesVulkan
+                                // is set — then it calls InitializeVulkan() directly (gpu_init.cc ~L1053,
+                                // IS_ANDROID branch). Without this flag the run walled at
+                                // "gpu_init.cc:217 Vulkan not supported with in process gpu" → demote to
+                                // GL, our ICD never touched. This is the SOLE in-process Vulkan door on
+                                // Android; it makes Viz build a Vulkan GrContext (gr_context_type=kVulkan)
+                                // → the system loader → our ICD → Mali. (webview-draw-functor-uses-vulkan)
+                                "\n--webview-draw-functor-uses-vulkan" +
+                                // SkipVulkanBlocklist: CheckVulkanCompatibilities() (vulkan_util.cc, ARM
+                                // branch) gates Mali on device_name/driver; Mali-G615 passes the slow-GPU
+                                // + "*Mali-G?? M*" filters, but this feature short-circuits the whole
+                                // blocklist to a hard allow so a build-info/dEQP edge can't demote Vulkan.
+                                "\n--enable-features=Vulkan,DefaultEnableOopRasterization,SkipVulkanBlocklist" +
                                 "\n--enable-gpu-rasterization" +
                                 // chromium blocklists/virtualizes Mali (software_rendering_list.json /
                                 // gpu_driver_bug_list.json) — on the Vulkan path the blocklist can mark
                                 // Vulkan UNSUPPORTED for Mali → silent demote. Override the whole
                                 // blocklist + the derived driver-bug workarounds so Vulkan is allowed.
                                 "\n--ignore-gpu-blocklist\n--disable-gpu-driver-bug-workarounds" +
-                                // Commit to Vulkan: never bring up a GL/ANGLE display, and FAIL VISIBLY
-                                // if Vulkan init fails (no silent GL fallback) so the experiment sees
-                                // the Vulkan wall, not a software demote. (gl_switches.cc kUseGL=
-                                // disabled + gpu_switches.cc kDisableVulkanFallbackToGLForTesting.)
-                                "\n--use-gl=disabled\n--disable-vulkan-fallback-to-gl-for-testing" +
+                                // GL SUBSTRATE for SharedImage virtualization — DEVICE-DIAGNOSED
+                                // (ladder run #2). chromium-Android in-process composites with a Vulkan
+                                // GrContext, but its SharedImage/"virtualization" substrate
+                                // (SharedImageStub -> gpu_channel_manager "shared context for
+                                // virtualization") is GL-BASED and is created UNCONDITIONALLY. With no
+                                // working GL display, SharedImageStub fails with
+                                // ContextResult::kFatalFailure and the GPU thread wedges in an infinite
+                                // retry BEFORE Viz ever creates the Vulkan device (our [alr-icd] trace
+                                // stopped at vkEnumerateDeviceExtensionProperties, never reached
+                                // vkCreateDevice). Run #2 also showed chromium's BUNDLED ANGLE failing
+                                // its DEFAULT backend ("Failed to get system egl display", EGL error
+                                // 12289). FIX: point ANGLE at our gpushim Mali GLES (the glmark2-es2
+                                // software=false path): --use-gl=angle --use-angle=gles-egl makes ANGLE
+                                // dlopen the gpushim libEGL.so.1/libGLESv2.so.2 (on LD_LIBRARY_PATH via
+                                // ALR_GPU_ACCEL=1, set above) -> the GPU ring -> Mali. So GL (the
+                                // SharedImage substrate) runs on Mali via gpushim, while the COMPOSITOR's
+                                // GrContext is native Vulkan via our ICD. ANGLE here is only the
+                                // shared-image GL substrate, NOT the compositor texture path that the
+                                // banked GL→Vulkan route walled on (chromium-vulkan-path.md "Why this is
+                                // distinct"): gr_context_type stays kVulkan from --use-vulkan=native.
+                                "\n--use-gl=angle\n--use-angle=gles-egl" +
+                                // FAIL VISIBLY if Vulkan init fails (no silent GL fallback) so the
+                                // experiment sees the Vulkan wall, not a software demote
+                                // (gpu_switches.cc kDisableVulkanFallbackToGLForTesting).
+                                "\n--disable-vulkan-fallback-to-gl-for-testing" +
                                 // Run Vulkan SURFACELESS: Viz composites into an offscreen VkImage and
                                 // presents via Ozone (our AHB present sink), NOT a VkSurfaceKHR
                                 // swapchain — sidesteps the WSI surface-query family our ICD doesn't

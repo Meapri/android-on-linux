@@ -35,6 +35,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>      /* nanosleep — block-yield while waiting for the host reply ack */
 #include <unistd.h>
 
 #include "alr_gpu_ring_c.h"  /* AlrRingHeader, AlrRingProducer, alr_ring_* */
@@ -204,19 +205,58 @@ static uint32_t alr_icd_roundtrip(const uint8_t *req_bytes, uint32_t req_len,
     /* 3) Block until the host has serviced this request. The host posts completion by
      *    bumping the REQUEST ring's reply_seq to >= want (after it has appended the
      *    reply op stream to the reply ring), exactly like the GLES per-frame handshake.
-     *    Spin fallback (correct, just busier); the doorbell makes the host prompt. */
-    spin = (1u << 24);
+     *
+     *    DEVICE-DIAGNOSED (chromium-vulkan ladder run #2): a FIXED busy-spin bound was a
+     *    correctness bug, not just a perf knob. On a cold first call (host servicer thread
+     *    not yet scheduled) the spin could EXHAUST with observed < want, the code below
+     *    would then drain whatever was in the reply ring (empty, or — worse — the PREVIOUS
+     *    request's leftover reply), and every subsequent roundtrip was skewed by one reply.
+     *    Concretely: vkCreateInstance's spin gave up (got=0, reply undrained); the next
+     *    vkEnumeratePhysicalDevices count-query then drained the stale INSTANCE reply
+     *    (count parsed as 0), and the fill drained the real PHYS_COUNT reply (count=1) into
+     *    an already-sized-0 array -> VK_INCOMPLETE -> the loader dropped our Mali device.
+     *    FIX: WAIT until the host actually acks (observed >= want) before draining, so the
+     *    reply we consume is ALWAYS this request's. Spin briefly (hot path stays ~0-latency)
+     *    then yield via nanosleep so we never burn a core while the host catches up. Bounded
+     *    by a generous wall-clock ceiling (~8s) purely as a deadlock backstop — under the
+     *    SPSC contract the host always posts, so this loop normally exits on the first spins.
+     *    `closed` still breaks out immediately for a torn-down ring. */
+    spin = (1u << 16);  /* short hot-spin before falling back to nanosleep yields */
     observed = 0;
-    for (unsigned i = 0; i < spin; ++i) {
-        observed = atomic_load_explicit(&s->req.h->reply_seq, memory_order_acquire);
-        if (observed >= want) break;
-        if (atomic_load_explicit(&s->req.h->closed, memory_order_acquire)) break;
+    {
+        unsigned slept_us = 0;
+        const unsigned max_sleep_us = 8u * 1000u * 1000u;  /* ~8s deadlock backstop */
+        for (;;) {
+            unsigned i;
+            for (i = 0; i < spin; ++i) {
+                observed = atomic_load_explicit(&s->req.h->reply_seq, memory_order_acquire);
+                if (observed >= want) break;
+                if (atomic_load_explicit(&s->req.h->closed, memory_order_acquire)) break;
+            }
+            if (observed >= want) break;
+            if (atomic_load_explicit(&s->req.h->closed, memory_order_acquire)) break;
+            if (slept_us >= max_sleep_us) break;  /* give up (host wedged) — caller sees got=0 */
+            {
+                struct timespec ts = {0, 50 * 1000};  /* 50us yield */
+                nanosleep(&ts, NULL);
+                slept_us += 50;
+            }
+        }
     }
 
-    /* 4) Drain the reply ring into reply_out (the host wrote the AlrVkReply stream
-     *    there before bumping reply_seq, so it is fully visible now). */
-    got = alr_ring_consumer_snapshot(&s->rep, reply_out, reply_cap);
-    if (got) alr_ring_consumer_advance(&s->rep, got);
+    /* 4) Drain the reply ring into reply_out — ONLY if the host actually acked this
+     *    request (observed >= want). The host writes the AlrVkReply stream before bumping
+     *    reply_seq, so once acked it is fully visible. If we GAVE UP without an ack (host
+     *    wedged past the backstop), draining would consume a reply that is NOT ours (or
+     *    nothing) and skew every later roundtrip — so we leave the ring untouched and
+     *    report got=0; the caller treats that as a failed marshal (0 devices / init-fail)
+     *    rather than silently desyncing the pipeline. */
+    if (observed >= want) {
+        got = alr_ring_consumer_snapshot(&s->rep, reply_out, reply_cap);
+        if (got) alr_ring_consumer_advance(&s->rep, got);
+    } else {
+        got = 0;
+    }
 
     /* ROUNDTRIP DIAG (gated on ALR_ICD_DIAG): the req/reply seq handshake + the reply
      * byte count + first reply op. This is the ground truth for a reply/request seq
