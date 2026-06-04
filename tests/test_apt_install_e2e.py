@@ -346,6 +346,33 @@ def test_single_leaf_closure_is_the_proven_base_case():
     assert single.cyclic is False
 
 
+def test_offline_staged_galculator_uses_the_same_single_leaf_completion():
+    """OFFLINE/staged install (AptInstaller.installStaged) installs a PRE-STAGED
+    galculator .deb with NO mirror fetch, then runs the IDENTICAL completion shape
+    the online path uses for its downloaded debs — `dpkg -i <deb>` + `dpkg
+    --configure -a` — and judges success by `dpkg --status`. galculator's whole
+    runtime closure is base-provided (GTK3), so the offline install is the SAME
+    single-leaf base case as online: one .deb, one configure, reaches installed.
+
+    This is the regression contract for the b020804-era staged failure: the old
+    MainActivity drain judged success by the loader's GUEST-EXEC `ran` flag (child
+    exit==0 && stdout non-empty) + a "Unpacking galculator" marker, so a non-zero
+    dpkg exit (a failed maintainer-script, or a dirty dpkg journal left by the
+    unconditional alr-smoke `dpkg -i` racing the same admindir) reported
+    unpacked=false even when the package installed. The model's verdict is the
+    admin-DB state (`all_installed`), exactly what installStaged trusts."""
+    staged = complete_closure_via_dpkg((ClosurePackage("galculator"),),
+                                       target="galculator")
+    online = complete_closure_via_dpkg((ClosurePackage("galculator"),),
+                                       target="galculator")
+    # offline and online reduce to the byte-identical single-leaf completion
+    assert staged.all_installed is True
+    assert staged.configure_order == ("galculator",) == online.configure_order
+    assert staged.cyclic is False
+    # the verdict is admin-DB completion, never a single dpkg exit code/marker
+    assert staged.all_installed == online.all_installed
+
+
 def test_base_provided_dep_does_not_block_configure():
     """A Depends satisfied by the BASE (not in the downloaded set) imposes no
     intra-closure edge, so it never blocks the target's configure."""

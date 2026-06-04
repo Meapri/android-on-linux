@@ -27,6 +27,20 @@
  *   - verify via `dpkg --status <pkg>` ("Status: install ok installed"), and log any dep
  *     that did not reach "installed" so a partial closure is honestly visible.
  *
+ * OFFLINE/STAGED path: [installStaged] installs a PRE-STAGED `<pkg>-stage.tar` (built by
+ * tools/build_install_stage.py — it ships the leaf `.deb` at var/cache/apt/archives/ plus the
+ * unpacked closure) with NO mirror fetch, so it works when the network/apt-key path is down.
+ * It deliberately mirrors the online path's COMPLETION+RECOVERY shape (the part that made
+ * online robust): `dpkg -i <staged .deb>` → `dpkg --configure -a` → judge ONLY by
+ * `dpkg --status` ("install ok installed"), never by a single dpkg exit code or a stdout
+ * marker. The pre-existing MainActivity.launchAptDrainProbe staged drain judged success by
+ * the loader's GUEST-EXEC `ran` flag (child exit==0 && stdout non-empty) + stdout markers,
+ * so a non-zero dpkg exit (a failed maintainer-script, or a dpkg journal left dirty by the
+ * unconditional `launchPackageManagerProbes` alr-smoke `dpkg -i` that races it on the SAME
+ * admindir) reported unpacked=false even when the package actually installed. This method
+ * removes that fragility: it clears any stale dpkg journal/lock first, then trusts the admin
+ * DB state — exactly what the online path does after its top-level dpkg.
+ *
  * Host abstraction: the two callers differ only in WHICH JNI symbol runs the guest
  * (MainActivity's mangled export vs the runtime AlrNative export) and in their Context for
  * extractOverlayTar. [Host] captures exactly that, so the body below is shared 1:1.
@@ -55,6 +69,16 @@ object AptInstaller {
 
     /** The overlays the apt path stages (same set + order as the proven probe). */
     private val APT_OVERLAYS = listOf("fakeroot", "apt-dpkg", "dpkg-db", "apt-mirror")
+
+    /**
+     * The dpkg-tooling overlays the OFFLINE/STAGED path stages — the apt-mirror overlay is
+     * dropped (no fetch), but the ORDER for the other three is the proven admindir-scaffold
+     * order: apt-dpkg FIRST (ships the empty var/lib/dpkg/{updates,triggers,…} scaffold dirs),
+     * then dpkg-db LAST so its populated status overwrites the scaffold's zero-byte one while
+     * the scaffold's updates/ dir survives. fakeroot provides the uid=0 shim. The app's own
+     * `<pkg>-stage.tar` (the .deb + closure) is staged after these, by [installStaged].
+     */
+    private val STAGED_TOOLING_OVERLAYS = listOf("fakeroot", "apt-dpkg", "dpkg-db")
 
     /**
      * GNOME-platform install-configure unlock (TASK-A1). These extra overlays are staged
@@ -382,6 +406,166 @@ object AptInstaller {
             Os.unsetenv("ALR_REEXEC_INPROC")
             Os.unsetenv("ALR_PERSIST_GUEST")
             Os.unsetenv("ALR_INTERPOSE_DIAG")
+            Os.unsetenv("ALR_TEE_GUEST_STDOUT")
+            if (gnomeConfigure) {
+                Os.unsetenv("DEBIAN_FRONTEND")
+                Os.unsetenv("DEBCONF_NONINTERACTIVE_SEEN")
+            }
+        }
+    }
+
+    /**
+     * OFFLINE/STAGED install of [pkg] from a pre-staged `<pkg>-stage.tar` (no mirror fetch).
+     *
+     * The tar (tools/build_install_stage.py) ships the leaf `.deb` at
+     * `var/cache/apt/archives/<pkg>_<ver>_<arch>.deb` plus the unpacked base-subtracted
+     * closure. We stage it (+ the fakeroot/apt-dpkg/dpkg-db tooling overlays the dpkg run
+     * needs, + interpose), then run the SAME completion shape the online path uses for its
+     * downloaded debs — `dpkg -i <staged deb>` → `dpkg --configure -a` → verify by
+     * `dpkg --status`. This is the product's offline/bundled-catalog install capability; it
+     * does NOT touch the mirror so it is unaffected by the apt-key/keyring gap that gates the
+     * online path.
+     *
+     * ROBUSTNESS over the old MainActivity drain (the b020804-era staged failure): we (a) judge
+     * success purely by the admin DB (`dpkg --status` == "install ok installed"), never by the
+     * single dpkg exit code or a stdout "Unpacking <pkg>" marker — a maintainer-script that
+     * exits non-zero no longer masks a real unpack+configure; and (b) clear any stale dpkg
+     * journal under `var/lib/dpkg/updates/` BEFORE the run, so a prior aborted `dpkg -i` (e.g.
+     * the unconditional no-fakeroot alr-smoke probe that races on the same admindir) cannot
+     * make this `dpkg -i` replay/abort with a non-zero exit.
+     *
+     * Returns the same [Result] shape as [install]; `downloaded` is reported as the .deb being
+     * present in the staged cache (nothing is fetched). Prereq-missing → installed=false with a
+     * clear "push <pkg>-stage.tar" error. Blocks; call off the UI thread.
+     */
+    fun installStaged(
+        host: Host,
+        rootfsDir: File,
+        rootfsName: String,
+        pkg: String,
+        onProgress: (Phase) -> Unit = {},
+    ): Result {
+        Log.i(TAG, "aptinstall-staged: armed pkg=$pkg — staging interpose/fakeroot/apt-dpkg/dpkg-db + $pkg-stage.tar")
+        onProgress(Phase.RESOLVING)
+
+        // --- stage interpose (path-mediation .so) FIRST, then the tooling + app overlays ---
+        stageInterpose(host, rootfsDir)
+        // The staged path needs only the dpkg tooling (fakeroot uid=0 + dpkg/tar admindir) plus
+        // the app's own <pkg>-stage.tar (its .deb + closure). apt-mirror is deliberately NOT
+        // staged — there is no fetch, so the offline install is unaffected by the mirror/apt-key
+        // gap that can block the online path. Order: tooling (scaffold order) THEN <pkg>-stage.
+        val stageNames = STAGED_TOOLING_OVERLAYS + pkg
+        for (name in stageNames) {
+            val tar = File("/data/local/tmp/$name-stage.tar")
+            val m = File(rootfsDir, ".aptdrain-$name-staged-${tar.length()}")
+            if (tar.isFile && !m.isFile) {
+                val (extracted, skipped) = host.extractOverlay(tar, rootfsDir)
+                m.writeText("staged\n")
+                Log.i(TAG, "aptinstall-staged: $name-stage done (extracted=$extracted skipped=$skipped)")
+            } else if (!tar.isFile) {
+                Log.i(TAG, "aptinstall-staged: $name-stage.tar absent (push it to /data/local/tmp)")
+            }
+        }
+
+        // --- settle-wait: fakeroot.so + dpkg + the staged .deb must all be present ----------
+        val fakerootSo = File(rootfsDir, "usr/lib/androlinux/libalr_fakeroot.so")
+        val dpkgBin = File(rootfsDir, "usr/bin/dpkg")
+        val interposeSo = File(rootfsDir, "usr/lib/androlinux/libalr_interpose.so")
+        val interposeStageTar = File("/data/local/tmp/interpose-stage.tar")
+        val interposeStaging = {
+            interposeStageTar.isFile &&
+                (rootfsDir.listFiles { f -> f.name.startsWith(".interpose-staged-") }?.isEmpty() ?: true)
+        }
+        val archives = File(rootfsDir, "var/cache/apt/archives")
+        // Discover the staged leaf .deb by glob (<pkg>_<ver>_<arch>.deb) rather than a hardcoded
+        // version — robust to a tar rebuilt at a newer pkg version (the MainActivity drain
+        // hardcodes e.g. galculator_2.1.4-1.2build2 and silently skips if the version moved).
+        fun stagedDeb(): File? = archives.listFiles { f ->
+            f.isFile && f.name.startsWith("${pkg}_") &&
+                (f.name.endsWith("_arm64.deb") || f.name.endsWith("_all.deb"))
+        }?.minByOrNull { it.name }
+        var w = 0
+        while (w < 40000 &&
+            !(fakerootSo.isFile && dpkgBin.isFile && interposeSo.isFile &&
+                !interposeStaging() && stagedDeb() != null)
+        ) { Thread.sleep(500); w += 500 }
+        val deb = stagedDeb()
+        Log.i(
+            TAG,
+            "aptinstall-staged: fakeroot.so=${fakerootSo.isFile} dpkg=${dpkgBin.isFile} " +
+                "interpose=${interposeSo.isFile && !interposeStaging()} ${pkg}.deb=${deb?.name} (waited ${w}ms)",
+        )
+        if (!(fakerootSo.isFile && dpkgBin.isFile) || deb == null) {
+            Log.w(TAG, "aptinstall-staged: prerequisites missing — push fakeroot/apt-dpkg/dpkg-db + $pkg-stage.tar")
+            return Result(installed = false, downloaded = (deb != null), binaryPresent = false,
+                error = "오프라인 설치 패키지가 준비되지 않았습니다 ($pkg-stage.tar)")
+        }
+        onProgress(Phase.DOWNLOADING) // (already-present: the staged .deb stands in for the fetch)
+
+        // --- defensive: clear any stale dpkg journal left by a prior aborted dpkg run -------
+        // A `dpkg -i` that died mid-transaction (e.g. the unconditional no-fakeroot alr-smoke
+        // probe racing on this admindir) can leave entries under var/lib/dpkg/updates/; the next
+        // dpkg REPLAYS them and may abort non-zero before it touches our deb. The scaffold dir
+        // itself must survive (dpkg needs it), so we delete only its file entries.
+        runCatching {
+            val updates = File(rootfsDir, "var/lib/dpkg/updates")
+            val stale = updates.listFiles { f -> f.isFile }?.toList().orEmpty()
+            if (stale.isNotEmpty()) {
+                stale.forEach { it.delete() }
+                Log.i(TAG, "aptinstall-staged: cleared ${stale.size} stale dpkg journal file(s) under var/lib/dpkg/updates/")
+            }
+            // A leftover lock can also wedge dpkg; it is recreated on demand.
+            File(rootfsDir, "var/lib/dpkg/lock").takeIf { it.isFile }?.delete()
+            File(rootfsDir, "var/lib/dpkg/lock-frontend").takeIf { it.isFile }?.delete()
+        }.onFailure { Log.w(TAG, "aptinstall-staged: journal cleanup skipped: $it") }
+
+        val candidateBins = listOf("usr/bin/$pkg", "bin/$pkg", "usr/games/$pkg")
+        Os.setenv("ALR_FAKEROOT", "1", true)
+        Os.setenv("ALR_REEXEC_INPROC", "1", true)
+        Os.setenv("ALR_PERSIST_GUEST", "1", true)
+        Os.setenv("ALR_TEE_GUEST_STDOUT", "1", true)
+        val gnomeConfigure = isGnomePlatformPkg(pkg)
+        if (gnomeConfigure) {
+            Os.setenv("DEBIAN_FRONTEND", "noninteractive", true)
+            Os.setenv("DEBCONF_NONINTERACTIVE_SEEN", "true", true)
+        }
+        try {
+            val debRel = "/var/cache/apt/archives/${deb.name}"
+            onProgress(Phase.UNPACKING)
+            // `dpkg -i <staged deb>` — same forces the online completion uses (fakeroot uid=0 +
+            // rootfs paths). We do NOT branch on its exit/markers; the verdict is dpkg --status.
+            val diOut = host.loaderProbe(
+                rootfsName,
+                "/usr/bin/dpkg\n--force-not-root\n--force-bad-path\n-i\n$debRel",
+            )
+            Log.i(TAG, "aptinstall-staged: dpkg -i ${deb.name} unpacking=${diOut.contains("Unpacking $pkg")} settingUp=${diOut.contains("Setting up $pkg")}")
+            Log.i(TAG, "aptinstall-staged-dpkgi-out:\n$diOut")
+            onProgress(Phase.CONFIGURING)
+            // Flush any deferred/half-done configure — the RECOVERY step the online path has and
+            // the old drain lacked. Safe no-op (exit 0) for an already-fully-configured leaf.
+            val cfgOut = host.loaderProbe(
+                rootfsName,
+                "/usr/bin/dpkg\n--force-not-root\n--force-bad-path\n--configure\n-a",
+            )
+            Log.i(TAG, "aptinstall-staged: dpkg --configure -a settingUpTarget=${cfgOut.contains("Setting up $pkg")}")
+            Log.i(TAG, "aptinstall-staged-dpkgconfig-out:\n$cfgOut")
+
+            // VERDICT: the admin DB, not the exit code. This is the whole fix.
+            val statusOut = host.loaderProbe(rootfsName, "/usr/bin/dpkg\n--status\n" + pkg)
+            val installed = statusOut.contains("Status: install ok installed")
+            val binaryPresent = candidateBins.any { File(rootfsDir, it).isFile }
+            Log.i(TAG, "aptinstall-staged: FINAL pkg=$pkg installed=$installed binary=$binaryPresent (dpkg --status)")
+            Log.i(TAG, "aptinstall-staged-status:\n$statusOut")
+            if (installed) onProgress(Phase.REGISTERING)
+            val err = if (installed) null
+                else aptErrorLine(diOut) ?: aptErrorLine(cfgOut)
+                    ?: "오프라인 설치를 완료하지 못했습니다 (dpkg)"
+            return Result(installed = installed, downloaded = true, binaryPresent = binaryPresent,
+                error = err)
+        } finally {
+            Os.unsetenv("ALR_FAKEROOT")
+            Os.unsetenv("ALR_REEXEC_INPROC")
+            Os.unsetenv("ALR_PERSIST_GUEST")
             Os.unsetenv("ALR_TEE_GUEST_STDOUT")
             if (gnomeConfigure) {
                 Os.unsetenv("DEBIAN_FRONTEND")

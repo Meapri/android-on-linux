@@ -170,13 +170,9 @@ class NativeAlrRuntime(private val appContext: Context) : AlrRuntime {
                 }
                 val (rootfsDir, rootfsName) = rootfs
                 trySend(InstallProgress.Running(appId, PCT_RESOLVING, InstallStage.RESOLVING))
-                val result = AptInstaller.install(
-                    host = aptHost(),
-                    rootfsDir = rootfsDir,
-                    rootfsName = rootfsName,
-                    pkg = aptRef,
-                ) { phase ->
-                    // apt stdout phase → monotonic percent + UI stage label.
+                // apt/dpkg stdout phase → monotonic percent + UI stage label (shared by the
+                // online and the offline/staged attempts so progress is identical either way).
+                val onPhase: (AptInstaller.Phase) -> Unit = { phase ->
                     val (pct, stage) = when (phase) {
                         AptInstaller.Phase.RESOLVING -> PCT_RESOLVING to InstallStage.RESOLVING
                         AptInstaller.Phase.DOWNLOADING -> PCT_DOWNLOADING to InstallStage.DOWNLOADING
@@ -185,6 +181,28 @@ class NativeAlrRuntime(private val appContext: Context) : AlrRuntime {
                         AptInstaller.Phase.REGISTERING -> PCT_REGISTERING to InstallStage.REGISTERING
                     }
                     trySend(InstallProgress.Running(appId, pct, stage))
+                }
+                // ONLINE first (the product path: download the closure from the mirror). If it
+                // fails (e.g. the mirror/apt-key path is down) AND a pre-staged <pkg>-stage.tar
+                // is on the device, fall back to the OFFLINE/staged install — the bundled/offline
+                // capability — which needs no fetch. The staged method judges success by
+                // `dpkg --status`, so it is robust where the old MainActivity drain was not.
+                var result = AptInstaller.install(
+                    host = aptHost(),
+                    rootfsDir = rootfsDir,
+                    rootfsName = rootfsName,
+                    pkg = aptRef,
+                    onProgress = onPhase,
+                )
+                if (!result.installed && stagedTarPresent(aptRef)) {
+                    Log.w(TAG, "install($appId): online failed (${result.error}); trying OFFLINE staged $aptRef-stage.tar")
+                    result = AptInstaller.installStaged(
+                        host = aptHost(),
+                        rootfsDir = rootfsDir,
+                        rootfsName = rootfsName,
+                        pkg = aptRef,
+                        onProgress = onPhase,
+                    )
                 }
                 if (result.installed) {
                     // The keystone: re-scan .desktop so the newly-installed app becomes a tile
@@ -351,6 +369,15 @@ class NativeAlrRuntime(private val appContext: Context) : AlrRuntime {
     /** Apply an overlay stage-tar with the lib-downgrade guard (same path as MainActivity). */
     internal fun extractOverlay(tar: File, rootfsDir: File) =
         RootfsInstaller(appContext).extractOverlayTar(tar, rootfsDir)
+
+    /**
+     * True iff a pre-staged `<pkg>-stage.tar` (built by tools/build_install_stage.py, shipping
+     * the leaf .deb + closure) has been pushed to /data/local/tmp — the gate for the OFFLINE
+     * staged-install fallback. We only attempt the offline path when its payload is actually
+     * present, so a normal device with no staged tar just sees the online failure as before.
+     */
+    internal fun stagedTarPresent(pkg: String): Boolean =
+        File("/data/local/tmp/$pkg-stage.tar").isFile
 
     /** Display metrics for the compositor output (same fields runChromiumStandalone reads). */
     internal fun displayMetrics(): DisplayMetrics = appContext.resources.displayMetrics
