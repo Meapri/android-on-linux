@@ -159,7 +159,33 @@ struct VkPhysProps {
     // after vkGetDeviceQueue (libGLESv2.so.2+0x1f6db4). Shipping Mali's real heaps/types fixes
     // the index mismatch. See ALR_VK_PHYS_MEMORY_BYTES.
     std::vector<uint8_t> memprops_blob;  // raw VkPhysicalDeviceMemoryProperties bytes (or empty)
+    // ANGLE ES-3.0-version rung: a tiny capability descriptor for the extended VkPhysicalDeviceFeatures2
+    // pNext structs ANGLE reads to DECIDE its max GLES version. ANGLE's
+    // Renderer::getMaxSupportedESVersion() (vk_renderer.cpp) caps the context to ES 2.0 unless
+    // mFeatures.provokingVertex.enabled — which is true ONLY when VK_EXT_provoking_vertex is in the
+    // device-extension list AND VkPhysicalDeviceProvokingVertexFeaturesEXT::provokingVertexLast is
+    // VK_TRUE. ANGLE only QUERIES that feature struct if the extension is advertised, and our ICD's
+    // base-features memcpy (VkPhysicalDeviceFeatures, core 1.0) does NOT carry it (it lives in an
+    // ext pNext struct). So eglCreateContext(ES 3.0) failed EGL_BAD_ATTRIBUTE despite every Vulkan
+    // resource allocating/mapping fine. We forward the REAL Mali answer for this one ext+feature so
+    // the guest ICD can truthfully advertise it (Mali-G615's ARM driver exposes provoking_vertex) →
+    // ANGLE enables ES 3.0; if a future device genuinely lacks it, both bits stay 0 → the guest does
+    // NOT advertise it → ANGLE gracefully caps to ES 2.0 (no false advertisement, no device-create
+    // VK_ERROR_FEATURE_NOT_PRESENT). Bit layout in caps_flags: bit0 = VK_EXT_provoking_vertex present
+    // on real Mali; bit1 = provokingVertexLast == VK_TRUE. Default 0 = "not supplied / unsupported".
+    uint32_t caps_flags = 0;
 };
+
+// caps_flags bit assignments (ANGLE ES-version-gating capability descriptor; see VkPhysProps).
+static constexpr uint32_t ALR_VK_CAPS_PROVOKING_VERTEX_EXT  = 1u << 0;  // VK_EXT_provoking_vertex present
+static constexpr uint32_t ALR_VK_CAPS_PROVOKING_VERTEX_LAST = 1u << 1;  // provokingVertexLast == VK_TRUE
+// ANGLE's SECOND ES-3.0 gate (transform feedback). getMaxSupportedESVersion() caps to ES 2.0 when
+// BOTH the VK_EXT_transform_feedback ext path AND the vertexPipelineStoresAndAtomics emulation path
+// are unavailable. Mali-G615 reports vertexPipelineStoresAndAtomics == VK_FALSE (device-proven), so
+// the emulation path is dead → we MUST forward the real-Mali VK_EXT_transform_feedback ext + feature
+// for ANGLE to reach ES 3.0. Same forward-real-Mali pattern as provoking-vertex.
+static constexpr uint32_t ALR_VK_CAPS_XFB_EXT              = 1u << 2;  // VK_EXT_transform_feedback present
+static constexpr uint32_t ALR_VK_CAPS_XFB_FEATURE          = 1u << 3;  // transformFeedback == VK_TRUE
 
 // Exact official-ABI sizes of the structs we ship as raw bytes (64-bit ABI: both the
 // arm64 NDK host and the arm64 guest ICD). The guest validates the blob length against
@@ -421,9 +447,21 @@ inline void encode_phys_props_reply(VkReplyEncoder& re, uint32_t vphys, const Vk
     // the limits blob and memcpy()s it into the caller's VkPhysicalDeviceMemoryProperties, so
     // ANGLE selects a memory type that actually exists on the real Mali device.
     re.blob(p.memprops_blob.data(), static_cast<uint32_t>(p.memprops_blob.size()));
+    // ANGLE ES-3.0-version rung: the provoking-vertex capability descriptor (see VkPhysProps).
+    // Shipped as a bare 4-byte u32 right after the memprops blob. PHYS_PROPS is the LAST record
+    // before ALR_VK_REPLY_END, so this trailing u32 is read defensively guest-side (a u32 read at
+    // the 1-byte REPLY_END tail fails cleanly → caps_flags stays 0). An older host that didn't ship
+    // it leaves caps_flags = 0 (guest does not advertise the ext → ANGLE caps to ES 2.0). Both guest
+    // parsers (the C++ host-decode and the C guest ICD) read this only when 4 bytes remain after the
+    // memprops blob, keeping the reply backward-readable.
+    re.u32(p.caps_flags);
 }
 
 #ifdef ALR_VK_DECODE_REAL
+// Fwd decl: vk_real_props (below) probes real-Mali device extensions for the ANGLE ES-version
+// capability descriptor; the definition lives further down (after the AHB-ext helpers).
+inline bool vk_real_dev_ext_present(VkPhysicalDevice phys, const char* want);
+
 // Bring up a real VkInstance on the vendor Mali libvulkan and resolve props for the
 // requested virtual device. Returns the VkResult of instance creation; fills `st`.
 // (Only compiled on the device path — runtime_report.cpp defines ALR_VK_DECODE_REAL.)
@@ -504,6 +542,63 @@ inline bool vk_real_props(VkDecodeState& st, uint32_t vphys, VkPhysProps& out) {
     vkGetPhysicalDeviceMemoryProperties(it->second, &memp);
     out.memprops_blob.resize(sizeof(memp));
     std::memcpy(out.memprops_blob.data(), &memp, sizeof(memp));
+    // ANGLE ES-3.0-version rung: query the REAL Mali VK_EXT_provoking_vertex support so the guest
+    // ICD can truthfully advertise the ext + the provokingVertexLast feature ANGLE gates ES 3.0 on
+    // (Renderer::getMaxSupportedESVersion). Two real-Mali facts, forwarded as caps_flags bits:
+    //  (1) is the extension in the device-extension list?  (vk_real_dev_ext_present)
+    //  (2) does VkPhysicalDeviceProvokingVertexFeaturesEXT.provokingVertexLast come back VK_TRUE?
+    // We only chain the feature struct into vkGetPhysicalDeviceFeatures2 when (1) is true — querying
+    // a feature struct for an unsupported ext is undefined; an absent ext leaves both bits 0 and the
+    // guest then does NOT advertise it (ANGLE caps to ES 2.0, the honest fallback). The ICD's own
+    // vk_real_create_device2 already allowlists this feature struct, so once advertised, ANGLE's
+    // enabled provoking-vertex feature relays through to the real Mali device at create time.
+    out.caps_flags = 0;
+    if (vk_real_dev_ext_present(it->second, "VK_EXT_provoking_vertex")) {
+        out.caps_flags |= ALR_VK_CAPS_PROVOKING_VERTEX_EXT;
+        // vkGetPhysicalDeviceFeatures2 is core-1.1 but the APK links libvulkan.so at minSdk
+        // (android-26), whose stub predates it (exported only from API 28). Resolve it dynamically
+        // via vkGetInstanceProcAddr on the real Mali instance (always present) so the loader links
+        // on android-26 yet uses the real entry at runtime. (vkGetPhysicalDeviceFeatures, used for
+        // the base features blob, IS in the 26 stub, so only the "2" form needs this.)
+        VkInstance inst = st.real_inst.empty() ? VK_NULL_HANDLE : st.real_inst.begin()->second;
+        auto pfn = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+            inst ? vkGetInstanceProcAddr(inst, "vkGetPhysicalDeviceFeatures2") : nullptr);
+        if (!pfn && inst)  // KHR alias fallback (1.0 + VK_KHR_get_physical_device_properties2)
+            pfn = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+                vkGetInstanceProcAddr(inst, "vkGetPhysicalDeviceFeatures2KHR"));
+        if (pfn) {
+            VkPhysicalDeviceProvokingVertexFeaturesEXT pv{};
+            pv.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT;
+            VkPhysicalDeviceFeatures2 f2{};
+            f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            f2.pNext = &pv;
+            pfn(it->second, &f2);
+            if (pv.provokingVertexLast == VK_TRUE)
+                out.caps_flags |= ALR_VK_CAPS_PROVOKING_VERTEX_LAST;
+        }
+    }
+    // ANGLE's SECOND ES-3.0 gate (transform feedback): forward real Mali's VK_EXT_transform_feedback
+    // ext + transformFeedback feature so ANGLE's CanSupportTransformFeedbackExtension() is true (the
+    // emulation path is dead on Mali — vertexPipelineStoresAndAtomics == VK_FALSE). Same probe shape.
+    if (vk_real_dev_ext_present(it->second, "VK_EXT_transform_feedback")) {
+        out.caps_flags |= ALR_VK_CAPS_XFB_EXT;
+        VkInstance inst = st.real_inst.empty() ? VK_NULL_HANDLE : st.real_inst.begin()->second;
+        auto pfn = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+            inst ? vkGetInstanceProcAddr(inst, "vkGetPhysicalDeviceFeatures2") : nullptr);
+        if (!pfn && inst)
+            pfn = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+                vkGetInstanceProcAddr(inst, "vkGetPhysicalDeviceFeatures2KHR"));
+        if (pfn) {
+            VkPhysicalDeviceTransformFeedbackFeaturesEXT xfb{};
+            xfb.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT;
+            VkPhysicalDeviceFeatures2 f2{};
+            f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            f2.pNext = &xfb;
+            pfn(it->second, &f2);
+            if (xfb.transformFeedback == VK_TRUE)
+                out.caps_flags |= ALR_VK_CAPS_XFB_FEATURE;
+        }
+    }
     return true;
 }
 
@@ -3061,6 +3156,11 @@ inline bool decode_vk_reply(const uint8_t* data, size_t len, VkDecodedReply& out
                 if (feat_len) p.features_blob.assign(feat_b, feat_b + feat_len);
                 if (lim_len) p.limits_blob.assign(lim_b, lim_b + lim_len);
                 if (mem_len) p.memprops_blob.assign(mem_b, mem_b + mem_len);
+                // ANGLE ES-3.0-version rung: the provoking-vertex caps_flags (bare u32) trails the
+                // memprops blob. Read defensively — at the REPLY_END tail r.u32 fails cleanly and
+                // caps_flags stays 0 (an older host that didn't ship it → no ext advertised → ES 2.0).
+                uint32_t caps_flags = 0;
+                if (r.u32(caps_flags)) p.caps_flags = caps_flags;
                 out.props[vphys] = p;
                 break;
             }
