@@ -2562,6 +2562,19 @@ class MainActivity : Activity() {
                                 android.system.Os.unsetenv("DISPLAY")
                                 android.system.Os.setenv("XDG_SESSION_TYPE", "wayland", true)
                             }
+                            // ANGLE ES-3.0 gate A/B (the WALL after WALL-E). Our ICD now forwards the
+                            // REAL Mali VK_EXT_provoking_vertex + provokingVertexLast feature, which is
+                            // the one VkPhysicalDeviceFeatures2 cap ANGLE's getMaxSupportedESVersion()
+                            // (vk_renderer.cpp) gates ES 3.0 on (mFeatures.provokingVertex.enabled) —
+                            // every other ES-3.0 gate is already met by the real-Mali base-features +
+                            // limits forward. With the forward, ANGLE's eglCreateContext(ES 3.0) should
+                            // SUCCEED. The .alr-cr-vk-no-pv sub-marker SUPPRESSES the forward
+                            // (ALR_ICD_NO_PROVOKING_VERTEX=1) so a run can prove back-to-back that
+                            // WITHOUT it ANGLE caps to ES 2.0 (EGL_BAD_ATTRIBUTE) and WITH it reaches
+                            // ES 3.0 — i.e. that provoking-vertex is the exact cap. Default: forward on.
+                            if (File("/data/local/tmp/.alr-cr-vk-no-pv").isFile) {
+                                android.system.Os.setenv("ALR_ICD_NO_PROVOKING_VERTEX", "1", true)
+                            }
                             android.util.Log.i("alr_loader", "cronly: chromium NATIVE-VULKAN path (ALR_VK_ICD=1, glsub=$crVkGlSub comp=$crVkComp)")
                         }
                         // GPU/raster argv tail. DEFAULT (marker absent) = the proven software-raster

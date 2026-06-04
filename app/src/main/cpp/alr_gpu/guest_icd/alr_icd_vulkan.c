@@ -145,6 +145,23 @@ static int alr_icd_vendor_override(uint32_t *vendorID, uint32_t *driverID) {
     return 0;
 }
 
+/* A/B gate for the ANGLE ES-3.0 provoking-vertex forward (the WALL after WALL-E). Default OFF
+ * (forward the real-Mali VK_EXT_provoking_vertex → ANGLE reaches ES 3.0). Set
+ * ALR_ICD_NO_PROVOKING_VERTEX=1 to SUPPRESS the advertise+synthesize so a device run can prove,
+ * back-to-back, that WITHOUT the forward ANGLE caps to ES 2.0 (eglCreateContext ES 3.0 fails
+ * EGL_BAD_ATTRIBUTE) and WITH it ANGLE reaches ES 3.0 — i.e. that provoking-vertex is the exact
+ * ES-3.0 gate. Cached; read once. (Same env-or-rootfs-file style as the vendor override.) */
+static int alr_icd_no_provoking_vertex(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("ALR_ICD_NO_PROVOKING_VERTEX");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+        if (cached) ALR_ICD_DIAG("A/B: ALR_ICD_NO_PROVOKING_VERTEX set -> NOT forwarding "
+                                 "VK_EXT_provoking_vertex (ANGLE will cap to ES 2.0)");
+    }
+    return cached;
+}
+
 /* ====================================================================================
  * LEAD-1 create-call pNext FORWARDING. Every alr_vkCreate* used to hardcode
  * alr_vk_gen_pnext_count(&e, 0), DROPPING ANGLE's whole pNext chain. This helper ships the
@@ -368,6 +385,18 @@ typedef struct AlrIcdPhysCache {
      * single-heap default. */
     int      have_memprops;
     uint8_t  memprops_raw[ALR_ICD_MEMORY_BYTES];
+    /* ANGLE ES-3.0-version rung: the REAL Mali provoking-vertex capability (host-shipped via the
+     * caps_flags u32 trailing the PHYS_PROPS record). ANGLE's Renderer::getMaxSupportedESVersion()
+     * caps the GL context to ES 2.0 unless mFeatures.provokingVertex.enabled — true only when
+     * VK_EXT_provoking_vertex is advertised AND provokingVertexLast == VK_TRUE. We advertise the ext
+     * (vkEnumerateDeviceExtensionProperties) and synthesize the feature (vkGetPhysicalDeviceFeatures2
+     * pNext) ONLY when real Mali backs both, so ANGLE reaches ES 3.0 truthfully. have_caps gates the
+     * default (an older host leaves it 0 → conservative: do not advertise → ES 2.0 fallback). */
+    int      have_caps;            /* host shipped the caps_flags u32 */
+    uint8_t  provoking_vertex_ext; /* real Mali has VK_EXT_provoking_vertex */
+    uint8_t  provoking_vertex_last;/* real Mali provokingVertexLast == VK_TRUE */
+    uint8_t  xfb_ext;              /* real Mali has VK_EXT_transform_feedback */
+    uint8_t  xfb_feature;         /* real Mali transformFeedback == VK_TRUE (ANGLE's 2nd ES-3.0 gate) */
 } AlrIcdPhysCache;
 static AlrIcdPhysCache g_phys_cache[ALR_ICD_MAX_PHYS];
 
@@ -479,6 +508,21 @@ static int alr_icd_parse_reply(const uint8_t *data, uint32_t len,
                     if (slot && mem_len == ALR_ICD_MEMORY_BYTES) {
                         memcpy(slot->memprops_raw, mem_b, ALR_ICD_MEMORY_BYTES);
                         slot->have_memprops = 1;
+                    }
+                }
+                /* ANGLE ES-3.0-version rung: the provoking-vertex caps_flags (bare u32) trails the
+                 * memprops blob. PHYS_PROPS is the last record before REPLY_END, so rd_u32 fails
+                 * cleanly at the 1-byte tail (an older host that didn't ship it → have_caps stays 0
+                 * → the ICD does NOT advertise the ext → ANGLE caps to ES 2.0). bit0 = ext present,
+                 * bit1 = provokingVertexLast == VK_TRUE (ALR_VK_CAPS_PROVOKING_VERTEX_{EXT,LAST}). */
+                {
+                    uint32_t caps_flags = 0;
+                    if (rd_u32(&r, &caps_flags) && slot) {
+                        slot->have_caps = 1;
+                        slot->provoking_vertex_ext  = (caps_flags & 1u) ? 1 : 0;  /* bit0 */
+                        slot->provoking_vertex_last = (caps_flags & 2u) ? 1 : 0;  /* bit1 */
+                        slot->xfb_ext     = (caps_flags & 4u) ? 1 : 0;  /* bit2 VK_EXT_transform_feedback */
+                        slot->xfb_feature = (caps_flags & 8u) ? 1 : 0;  /* bit3 transformFeedback feature */
                     }
                 }
                 break;
@@ -1319,7 +1363,9 @@ VkResult VKAPI_CALL alr_vkEnumerateInstanceLayerProperties(
 static VkResult VKAPI_CALL alr_vkEnumerateDeviceExtensionProperties(
     VkPhysicalDevice physicalDevice, const char *pLayerName,
     uint32_t *pPropertyCount, VkExtensionProperties *pProperties) {
-    (void)physicalDevice; (void)pLayerName;
+    AlrIcdPhysicalDevice *pd = (AlrIcdPhysicalDevice *)physicalDevice;
+    AlrIcdPhysCache *slot;
+    (void)pLayerName;
     /* The device-level extensions ANGLE enables for a basic render+present path, PLUS the
      * core-1.1 bind2 / dedicated-allocation family ANGLE's VMA allocator binds resources
      * through. DEVICE-CHECKED (wave-15): the first-glTexImage2D NULL-deref is invariant to
@@ -1329,17 +1375,53 @@ static VkResult VKAPI_CALL alr_vkEnumerateDeviceExtensionProperties(
      * can't service. (Adding more is safe re: the crash but pointless, and risks routing a
      * future ANGLE path to an unimplemented fn; revisit only when a path is proven to need
      * a specific extension.) */
-    static const char *const exts[] = {
+    static const char *const base_exts[] = {
         "VK_KHR_swapchain",
         "VK_KHR_maintenance1",
         "VK_KHR_dedicated_allocation",
         "VK_KHR_get_memory_requirements2",
         "VK_KHR_bind_memory2",
     };
-    ALR_ICD_DIAG("vkEnumerateDeviceExtensionProperties (props=%p)", (void *)pProperties);
-    return alr_fill_ext_props(exts, NULL,
-                              (uint32_t)(sizeof(exts) / sizeof(exts[0])),
-                              pPropertyCount, pProperties);
+    /* Build the advertised list: the base KHR set PLUS, when REAL Mali backs it (host caps_flags),
+     * VK_EXT_provoking_vertex. ANGLE's Renderer::getMaxSupportedESVersion() (vk_renderer.cpp) caps
+     * the GL context to ES 2.0 unless mFeatures.provokingVertex.enabled, which requires this ext to
+     * be advertised AND its provokingVertexLast feature reported VK_TRUE. ANGLE only queries the
+     * feature struct when the ext is present, so advertising it here (gated on real Mali) is the
+     * keystone that lets ANGLE reach ES 3.0. The host's vk_real_create_device2 already allowlists +
+     * forwards the provoking-vertex feature to the real Mali device at create time, so ANGLE's
+     * enabled feature is honoured. If real Mali lacks it (have_caps=0 or bit clear), we DON'T add it
+     * → ANGLE caps to ES 2.0 (honest fallback; no false advertisement → no FEATURE_NOT_PRESENT). */
+    const char *exts[8];
+    uint32_t navail = 0, i;
+    for (i = 0; i < (uint32_t)(sizeof(base_exts) / sizeof(base_exts[0])); ++i)
+        exts[navail++] = base_exts[i];
+    slot = pd ? ensure_phys_props(pd) : NULL;
+    if (slot && slot->have_caps && slot->provoking_vertex_ext && slot->provoking_vertex_last &&
+        !alr_icd_no_provoking_vertex()) {
+        exts[navail++] = "VK_EXT_provoking_vertex";
+        ALR_ICD_DIAG("vkEnumerateDeviceExtensionProperties: advertising VK_EXT_provoking_vertex "
+                     "(real Mali backs it) -> ANGLE ES-3.0 gate");
+    }
+    /* ANGLE's SECOND ES-3.0 gate: advertise VK_EXT_transform_feedback when real Mali backs it.
+     * ANGLE caps to ES 2.0 unless transform feedback is available, and Mali's emulation path
+     * (vertexPipelineStoresAndAtomics) is VK_FALSE, so the ext is the ONLY way to ES 3.0. The host
+     * decode allowlists + forwards the TF feature struct to real Mali at create. NOTE: the TF
+     * command recorders (vkCmdBeginTransformFeedbackEXT / vkCmdBindTransformFeedbackBuffersEXT /
+     * vkCmdEndTransformFeedbackEXT / vkCmdBeginQueryIndexedEXT / vkCmdEndQueryIndexedEXT /
+     * vkCmdDrawIndirectByteCountEXT) are NOT yet backed — GDPA returns NULL for them. ANGLE
+     * resolves them lazily and only CALLS them if a GL program actually uses glBeginTransformFeedback,
+     * which the chromium compositor substrate does not at bring-up. Advertising the ext clears the
+     * VERSION gate (eglCreateContext ES 3.0); a real TF draw would need the recorders (a follow-up,
+     * same one-recorder-each pattern as the existing vkCmd* band). Same env A/B gate as provoking. */
+    if (slot && slot->have_caps && slot->xfb_ext && slot->xfb_feature &&
+        !alr_icd_no_provoking_vertex()) {
+        exts[navail++] = "VK_EXT_transform_feedback";
+        ALR_ICD_DIAG("vkEnumerateDeviceExtensionProperties: advertising VK_EXT_transform_feedback "
+                     "(real Mali backs it) -> ANGLE ES-3.0 TF gate");
+    }
+    ALR_ICD_DIAG("vkEnumerateDeviceExtensionProperties (props=%p, navail=%u)",
+                 (void *)pProperties, navail);
+    return alr_fill_ext_props(exts, NULL, navail, pPropertyCount, pProperties);
 }
 
 /* Deprecated (device layers are gone since Vulkan 1.0.13) but the loader still queries it
@@ -1366,6 +1448,17 @@ static void VKAPI_CALL alr_vkGetPhysicalDeviceFeatures(
         memcpy(pFeatures, slot->features_raw, ALR_ICD_FEATURES_BYTES);
         ALR_ICD_DIAG("vkGetPhysicalDeviceFeatures -> REAL Mali features forwarded (%u B)",
                      (unsigned)ALR_ICD_FEATURES_BYTES);
+        /* ANGLE ES-3.0-gate dump: the exact base VkPhysicalDeviceFeatures bits ANGLE's
+         * getMaxSupportedESVersion() gates ES 3.0 on (vk_renderer.cpp): independentBlend (idx3),
+         * vertexPipelineStoresAndAtomics (idx25, the TF-emulation gate), fragmentStoresAndAtomics
+         * (idx26). A 0 in independentBlend or vertexPipelineStoresAndAtomics caps ANGLE to ES 2.0
+         * even with provoking-vertex forwarded — this names which (if any) real Mali itself lacks. */
+        if (alr_icd_diag_on()) {
+            const VkBool32 *fb = (const VkBool32 *)pFeatures;
+            ALR_ICD_DIAG("  ES3-gate feats: independentBlend=%u vertexPipelineStoresAndAtomics=%u "
+                         "fragmentStoresAndAtomics=%u (occlusionQueryPrecise=%u tessellationShader=%u)",
+                         fb[3], fb[25], fb[26], fb[23], fb[5]);
+        }
     } else {
         /* No host / unknown device: keep the conservative all-zero answer (core 1.0 only). */
         ALR_ICD_DIAG("vkGetPhysicalDeviceFeatures -> all-zero (no host features)");
@@ -1699,18 +1792,53 @@ static void VKAPI_CALL alr_vkGetPhysicalDeviceProperties2(
 
 static void VKAPI_CALL alr_vkGetPhysicalDeviceFeatures2(
     VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures2 *pFeatures) {
+    AlrIcdPhysicalDevice *pd = (AlrIcdPhysicalDevice *)physicalDevice;
+    AlrIcdPhysCache *slot;
     if (!pFeatures) return;
     alr_vkGetPhysicalDeviceFeatures(physicalDevice, &pFeatures->features);
     ALR_ICD_DIAG("vkGetPhysicalDeviceFeatures2 (pNext=%p)", (void *)pFeatures->pNext);
-    /* Like Properties2: the feature pNext chain (Multiview/16BitStorage/VariablePointers/
-     * ProtectedMemory/SamplerYcbcr) is left as the caller initialized it. DEVICE-CHECKED:
-     * reporting these features as supported did NOT move the first-texture crash. Dump-only
-     * under ALR_ICD_DIAG; the orthodox fix (forward the REAL Mali Features2 chain) is
-     * deferred until a path is proven to require a specific one. */
-    if (alr_icd_diag_on())
-        for (const VkBaseInStructure *p = (const VkBaseInStructure *)pFeatures->pNext;
-             p; p = p->pNext)
+    /* ANGLE ES-3.0-version rung: synthesize VkPhysicalDeviceProvokingVertexFeaturesEXT from the
+     * REAL Mali caps. ANGLE's Renderer::getMaxSupportedESVersion() (vk_renderer.cpp) caps the GL
+     * context to ES 2.0 unless mFeatures.provokingVertex.enabled — set ONLY when the device both
+     * advertises VK_EXT_provoking_vertex (our vkEnumerateDeviceExtensionProperties does, gated on
+     * real Mali) AND reports provokingVertexLast == VK_TRUE here. ANGLE chains this struct (sType
+     * 1000254000) into pFeatures->pNext when it sees the ext; we fill provokingVertexLast (offset 16
+     * in the official ABI: { sType@0, pNext@8, provokingVertexLast@16, ...@20 }) with the real Mali
+     * bit. This is the keystone that lets ANGLE reach ES 3.0 — every other ES-3.0 gate (independent-
+     * Blend, standardSampleLocations, vertexPipelineStoresAndAtomics, the uniform-block/vertex-output
+     * limits) is already satisfied by the real-Mali base-features + limits memcpy. The other EXT
+     * feature structs (Multiview/16BitStorage/VariablePointers/...) are left as the caller set them;
+     * synthesize a specific one only when a path is proven to need it. */
+    slot = pd ? ensure_phys_props(pd) : NULL;
+    for (AlrVkBaseOut *p = (AlrVkBaseOut *)pFeatures->pNext; p; p = p->pNext) {
+        if ((uint32_t)p->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT_VAL) {
+            /* { int32 sType@0; pad; void* pNext@8; VkBool32 provokingVertexLast@16;
+             *   VkBool32 transformFeedbackPreservesProvokingVertex@20 } — write by offset. */
+            uint8_t *base = (uint8_t *)p;
+            uint32_t pvl = (slot && slot->have_caps && slot->provoking_vertex_last) ? 1u : 0u;
+            uint32_t tf  = 0u;  /* TF-preserves-provoking: not an ES-version gate; safe default 0 */
+            memcpy(base + 16, &pvl, 4);
+            memcpy(base + 20, &tf, 4);
+            ALR_ICD_DIAG("  feat2 ProvokingVertex synthesized: provokingVertexLast=%u "
+                         "(real Mali, ANGLE ES-3.0 gate)", pvl);
+        } else if ((uint32_t)p->sType ==
+                   VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT_VAL) {
+            /* { int32 sType@0; pad; void* pNext@8; VkBool32 transformFeedback@16;
+             *   VkBool32 geometryStreams@20 } — ANGLE's getMaxSupportedESVersion reads
+             *   transformFeedback (the 2nd ES-3.0 gate). Forward real Mali's bit; geometryStreams
+             *   from caps too (ANGLE only uses it for ES3.2-class paths, harmless to forward). */
+            uint8_t *base = (uint8_t *)p;
+            uint32_t xfb = (slot && slot->have_caps && slot->xfb_feature && !alr_icd_no_provoking_vertex())
+                               ? 1u : 0u;
+            uint32_t gs  = 0u;  /* geometryStreams: conservative 0 (not an ES-3.0 gate) */
+            memcpy(base + 16, &xfb, 4);
+            memcpy(base + 20, &gs, 4);
+            ALR_ICD_DIAG("  feat2 TransformFeedback synthesized: transformFeedback=%u "
+                         "(real Mali, ANGLE ES-3.0 TF gate)", xfb);
+        } else if (alr_icd_diag_on()) {
             ALR_ICD_DIAG("  feat2 pNext sType=%u (v1-only; not synthesized)", (uint32_t)p->sType);
+        }
+    }
 }
 
 static void VKAPI_CALL alr_vkGetPhysicalDeviceQueueFamilyProperties2(
