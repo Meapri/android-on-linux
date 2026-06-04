@@ -87,6 +87,17 @@ class Toolkit:
     ok_marker: str
     keep_prefixes: tuple[str, ...] = ()
     note: str = ""
+    # Lowercase substrings: any leaf-installed file whose rootfs rel-path contains one is
+    # DROPPED from the kept set (and the DT_NEEDED BFS, since it starts at the kept leaf
+    # ELFs, then never pulls the private libs ONLY that file needed). This is how the
+    # qt6-gui overlay forces the GENERIC wl_shm QPA: dropping the wayland-egl /
+    # dmabuf / vulkan integration plugins means libEGL's Qt hwintegration clients never
+    # enter the overlay, so Qt cannot pick the EGL platform and falls back to SHM.
+    # Empty (default) keeps every leaf file (the existing netsurf/qt6/sdl2 behaviour).
+    exclude_leaf_substrings: tuple[str, ...] = ()
+    # True for a windowed GUI toolkit binary (qt6-gui): launched DISPLAY/Wayland-backed on
+    # the compositor (the probe asserts a frame rendered), not a display-free CLI smoke.
+    gui: bool = False
 
 
 # The matrix. Order = easiest→hardest (matches STAGE_TAR_SPEC §5 M2 order).
@@ -130,6 +141,49 @@ TOOLKITS: dict[str, Toolkit] = {
         launch_arg="",  # testver takes no args; prints SDL version info and exits 0
         ok_marker="SDL",  # prints "Compiled version: …" / "Linked version: …" + revision
     ),
+    # qt6-gui — the WINDOWED Qt6 toolkit class (TASK-B). The apt Qt-GUI path is closure-
+    # BLOCKED on the ALR base: every Qt-GUI package drags x11-common via
+    # libqt6gui6t64 → libsm6/libice6 → x11-common, whose postinst is the device-proven
+    # exit-127 cascade, and the install-configure neutralizer is gated to gnome-platform
+    # pkgs (tools/app_closure_audit.py --live: qt6-wayland / keepassxc / qjackctl … all
+    # HEAVY). So we deliver Qt-on-Wayland as an OVERLAY instead — apt never runs, so
+    # x11-common's postinst never fires. qmleasing (from qt6-declarative-dev-tools) is the
+    # one REAL Qt6 Quick GUI binary in noble apt: it opens a Qt Quick window with an
+    # interactive easing-curve editor (links libQt6Quick/Widgets/Gui). qt6-wayland adds the
+    # platform plugin; the qml6-module-qtquick* leaves add the QtQuick / Controls / Layouts
+    # QML modules qmleasing dlopens at runtime (kept ENTIRELY as leaf files). We EXCLUDE the
+    # wayland-egl / dmabuf / vulkan integration plugins (exclude_leaf_substrings) so Qt uses
+    # the GENERIC SHM QPA platform (libqwayland-generic.so) — wl_shm only, matching the
+    # software compositor (the WS-4 matrix's qt6-wayland software path). QT_QPA_PLATFORM=
+    # wayland is injected by the loader's env for the qt6 program family (runtime_report.cpp),
+    # so the window binds the ALR compositor (Qt → wl_shm → SurfaceView). exec_path is the
+    # real /usr/lib/qt6/bin/qmleasing (the deb ships no /usr/bin symlink). ~106MB (full Qt6
+    # Quick + QML stack), comparable to the netsurf overlay. See docs/research/
+    # qt-toolkit-app-class.md for the full closure evidence + device-verify plan.
+    "qt6-gui": Toolkit(
+        name="qt6-gui",
+        leaf_packages=(
+            "qt6-declarative-dev-tools",  # ships qmleasing (the Qt6 Quick GUI binary)
+            "qt6-wayland",                # qtwayland platform plugin + shell integration
+            "qml6-module-qtquick",        # QtQuick base QML module (dlopen'd at runtime)
+            "qml6-module-qtquick-window",
+            "qml6-module-qtquick-controls",
+            "qml6-module-qtquick-layouts",
+            "qml6-module-qtquick-templates",
+            "qml6-module-qtqml-workerscript",
+        ),
+        exec_path="/usr/lib/qt6/bin/qmleasing",
+        real_exec_path=None,
+        launch_arg="",   # qmleasing opens its window with no args
+        ok_marker="",    # GUI app: success is a rendered frame (probe), not a stdout marker
+        gui=True,
+        # Force the wl_shm-only generic QPA: drop every EGL/dmabuf/vulkan wayland integration
+        # so libEGL's Qt hwintegration clients never enter the overlay → Qt picks generic SHM.
+        exclude_leaf_substrings=(
+            "wayland-egl", "egl-server", "dmabuf", "vulkan-server",
+            "eglstream", "drm-egl",
+        ),
+    ),
 }
 
 
@@ -172,6 +226,13 @@ def build_toolkit_overlay(
     that the base lacks, base-subtracted and flattened to a §5-E tar, then validated
     with overlay_guard + stage_tar_spec.
     """
+    # Drop leaf files matching any excluded substring (wl_shm-only Qt: no EGL/dmabuf
+    # wayland integration). None when the toolkit excludes nothing (the default).
+    excl = toolkit.exclude_leaf_substrings
+    exclude_leaf = (
+        (lambda rel: any(s in rel.lower() for s in excl)) if excl else None
+    )
+
     m = build_minimal_overlay(
         list(toolkit.leaf_packages),
         base,
@@ -182,6 +243,7 @@ def build_toolkit_overlay(
         components=components,
         cache_dir=cache_dir,
         keep_prefixes=toolkit.keep_prefixes,
+        exclude_leaf=exclude_leaf,
     )
 
     # structural §5-E conformance (composes overlay_guard) for the final verdict.
@@ -304,8 +366,8 @@ def _selftest() -> int:
         print(f"  [{'PASS' if cond else 'FAIL'}] {label}")
 
     # --- matrix invariants -------------------------------------------------
-    check("3 toolkits defined (netsurf, qt6, sdl2)",
-          set(TOOLKITS) == {"netsurf", "qt6", "sdl2"})
+    check("4 toolkits defined (netsurf, qt6, sdl2, qt6-gui)",
+          set(TOOLKITS) == {"netsurf", "qt6", "sdl2", "qt6-gui"})
     check("every toolkit names at least one leaf package",
           all(tk.leaf_packages for tk in TOOLKITS.values()))
     check("every exec_path is rootfs-absolute (/...)",
@@ -324,6 +386,31 @@ def _selftest() -> int:
     check("netsurf exec is /usr/bin/netsurf-gtk",
           TOOLKITS["netsurf"].exec_path == "/usr/bin/netsurf-gtk")
 
+    # --- qt6-gui (TASK-B: windowed Qt6 Quick on Wayland) -------------------
+    qg = TOOLKITS["qt6-gui"]
+    check("qt6-gui is a GUI toolkit (windowed, not a CLI smoke)", qg.gui is True)
+    check("qt6-gui ships the qmleasing Qt6 Quick GUI binary",
+          "qt6-declarative-dev-tools" in qg.leaf_packages
+          and qg.exec_path == "/usr/lib/qt6/bin/qmleasing")
+    check("qt6-gui includes the qtwayland platform plugin (qt6-wayland)",
+          "qt6-wayland" in qg.leaf_packages)
+    check("qt6-gui includes the QtQuick QML module (dlopen'd at runtime)",
+          "qml6-module-qtquick" in qg.leaf_packages)
+    # The wl_shm-only forcing: the EGL/dmabuf wayland integration plugins must be excluded
+    # so Qt picks the generic SHM QPA (matches the software compositor).
+    check("qt6-gui excludes wayland-egl/dmabuf integration (forces generic wl_shm QPA)",
+          "wayland-egl" in qg.exclude_leaf_substrings and "dmabuf" in qg.exclude_leaf_substrings)
+    # The other three toolkits are display-free CLI smokes (gui defaults False).
+    check("non-GUI toolkits keep gui=False (display-free CLI smoke)",
+          all(not TOOLKITS[n].gui for n in ("netsurf", "qt6", "sdl2")))
+    # The exclude predicate built from exclude_leaf_substrings drops the egl plugin path.
+    _excl = qg.exclude_leaf_substrings
+    _pred = lambda rel: any(s in rel.lower() for s in _excl)
+    check("qt6-gui exclude predicate drops the wayland-egl platform plugin",
+          _pred("usr/lib/aarch64-linux-gnu/qt6/plugins/platforms/libqwayland-egl.so"))
+    check("qt6-gui exclude predicate KEEPS the generic wl_shm platform plugin",
+          not _pred("usr/lib/aarch64-linux-gnu/qt6/plugins/platforms/libqwayland-generic.so"))
+
     # --- overlay_has_exec --------------------------------------------------
     with tempfile.TemporaryDirectory() as tmp:
         tar_path = Path(tmp) / "t.tar"
@@ -331,6 +418,7 @@ def _selftest() -> int:
             for member in (
                 "./usr/bin/netsurf-gtk",
                 "./usr/lib/qt6/bin/qtpaths6",
+                "./usr/lib/qt6/bin/qmleasing",
                 "./usr/libexec/installed-tests/SDL2/testver",
             ):
                 payload = b"\x7fELF" + member.encode()
@@ -342,6 +430,8 @@ def _selftest() -> int:
               overlay_has_exec(tar_path, "/usr/bin/netsurf-gtk"))
         check("overlay_has_exec finds the real qtpaths6 target",
               overlay_has_exec(tar_path, "/usr/lib/qt6/bin/qtpaths6"))
+        check("overlay_has_exec finds the qt6-gui qmleasing binary",
+              overlay_has_exec(tar_path, "/usr/lib/qt6/bin/qmleasing"))
         check("overlay_has_exec finds the SDL2 testver binary",
               overlay_has_exec(tar_path, "/usr/libexec/installed-tests/SDL2/testver"))
         check("overlay_has_exec reports a genuinely missing binary as False",

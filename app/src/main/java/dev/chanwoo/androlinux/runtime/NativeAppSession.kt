@@ -117,6 +117,23 @@ class NativeAppSession internal constructor(
             setEnv("ALR_TEE_GUEST_STDOUT", "1")  // stream guest stderr/stdout to logcat
             for ((k, v) in request.env) setEnv(k, v)
 
+            // === X11-only routing via ROOTFUL Xwayland (TASK-A) ======================= //
+            // KEPT IN A SEPARATE REGION from the env-flag block above (so a concurrent
+            // ALR_REEXEC_INPROC edit there merges cleanly): the whole X11 launch path is
+            // delegated to XwaylandLaunch (a self-contained helper object at the bottom of
+            // this file, sibling to GnomePlatformShim). For an X11-only app (one that links
+            // libX11 but NOT libwayland-client — e.g. xzgv/xli, marked needsXwayland in the
+            // catalog, or launched with protocol=X11) it preps the X11 sockets, starts a
+            // ROOTFUL Xwayland :0 as a persistent wl client (Xwayland → wl_shm → SurfaceView,
+            // the xcalc device-proven path), waits for the X0 socket, and yields DISPLAY=:0
+            // for the guest env. For a Wayland-capable app it is a complete no-op (byte-
+            // identical to before). Gated entirely inside the helper.
+            if (XwaylandLaunch.needsX11(appId, request.protocol, request.entryPath)) {
+                val xReady = XwaylandLaunch.ensureUp(runtime, rootfsDir, rootfsName, outW, outH)
+                for ((k, v) in XwaylandLaunch.envFor()) setEnv(k, v)
+                Log.i(TAG, "[$appId] X11 routing: Xwayland :0 ready=$xReady (DISPLAY=:0)")
+            }
+
             // --- GNOME-platform session-dbus shim (TASK-A2; gated, no-op otherwise) ----
             // GTK4/GNOME apps register a unique GtkApplication name on the SESSION bus and
             // read GSettings; the base ships only the libdbus CLIENT (no dbus-daemon). For a
@@ -292,9 +309,16 @@ class NativeAppSession internal constructor(
         // and dbus-daemon ships /usr/bin/dbus-daemon + dbus-run-session — the two overlays
         // the gnome-platform launch shim (GnomePlatformShim) needs. Both staged best-effort
         // (no-op when their tars are absent), so a non-GNOME launch is unaffected.
+        // xwayland ships /usr/bin/Xwayland (the rootful X server XwaylandLaunch starts for
+        // X11-only catalog apps, TASK-A); staged best-effort like the rest (no-op when its
+        // tar is absent), so a Wayland-only launch is unaffected. qt6-gui ships the Qt6
+        // Quick + qtwayland(generic wl_shm) GUI stack (tools/build_toolkit_overlays.py
+        // `qt6-gui` recipe → qmleasing) — the lightest REACHABLE Qt-on-Wayland app-class
+        // (the apt Qt-GUI path is closure-blocked by libqt6gui6→libice6→x11-common; see
+        // docs/research). Both are presence-guarded best-effort stages.
         private val OVERLAY_NAMES =
             listOf("interpose", "nss", "xkb-gegl", "babl-gegl", "x11", "pulse", "vk-icd",
-                   "vk-loader", "gnome-schemas", "dbus-daemon")
+                   "vk-loader", "gnome-schemas", "dbus-daemon", "xwayland", "qt6-gui")
 
         // The loader report's status line, e.g. "alr native loader child exit=0 signal=0".
         private val SIGNAL_RE = Regex("""child exit=(-?\d+) signal=(\d+)""")
@@ -411,5 +435,169 @@ internal object GnomePlatformShim {
             addAll(args)
         }
         return "/$DBUS_RUN_SESSION" to wrapped
+    }
+}
+
+// --------------------------------------------------------------------------- //
+// XwaylandLaunch — ROOTFUL Xwayland routing for X11-only apps (TASK-A)
+// --------------------------------------------------------------------------- //
+
+/**
+ * The launch-routing half of the X11-app unlock (TASK-A). ALR's compositor speaks
+ * Wayland only; an X11-ONLY guest app (one whose EXEC binary links libX11/libxcb but
+ * NOT libwayland-client — e.g. xzgv, xli) therefore has no Wayland display to bind and,
+ * sent down the normal path with no DISPLAY, dies "cannot open display". The product fix
+ * is to AUTO-ROUTE such apps through a ROOTFUL Xwayland the SAME way the device-proven
+ * xcalc demo did (Xwayland :0 → wl_shm → SurfaceView), but driven by a catalog flag
+ * instead of a `/data/local/tmp` marker.
+ *
+ * This object is the runtime counterpart to that flag. [needsX11] decides whether an app
+ * must be routed (by the catalog's `needsXwayland` set — kept in lock-step with
+ * NativeAlrRuntime.BundledCatalog — OR an explicit `protocol == X11` request). When it
+ * does, [ensureUp] performs EXACTLY the proven MainActivity Xwayland sequence:
+ *
+ *   1. **X11 socket prep** — create `<rootfs>/tmp` and `<rootfs>/tmp/.X11-unix` at the
+ *      sticky `01777` mode the X server's `MkdirIfNeeded` ownership check expects, OWNED
+ *      by the app uid (== the guest euid). The base ships neither dir at a usable mode,
+ *      and Xwayland refuses `-nolock` for non-root, so without this the server aborts at
+ *      `/tmp/.X0-lock` create (EPERM) before binding its socket. `Os.chmod` (not File.set*)
+ *      because Java cannot set the sticky bit. Idempotent + best-effort (failure only logs).
+ *   2. **Start ROOTFUL Xwayland :0** on its OWN thread — it is a *persistent* wl client
+ *      (it does not exit), so it must not block the guest launch. argv (verified vs
+ *      Xwayland(1)): `:0 -shm -geometry WxH`. `-shm` pins the shared-memory backend (the
+ *      compositor is wl_shm-only) so glamor/DRI3/EGL stay inert (software X), `-geometry`
+ *      sizes the rootful screen to the panel. No `-rootless` ⇒ rootful ⇒ no X window
+ *      manager needed. `ALR_REEXEC_INPROC=1` is required so Xwayland's fork+exec(xkbcomp)
+ *      keymap compile re-enters the in-process loader (device-proven: without it the
+ *      keymap compile fails); the session already sets that flag for every launch.
+ *   3. **Wait (bounded) for the X0 socket** — `<rootfs>/tmp/.X11-unix/X0`. A bound AF_UNIX
+ *      socket is a SPECIAL file, so readiness is probed with `exists()` (NOT `isFile()`,
+ *      which is false for a socket and would spin the full timeout). The interposer's X11
+ *      `sun_path` transform rewrites `/tmp/.X11-unix/X0` → `<rootfs>/tmp/.X11-unix/X0` in
+ *      both the server bind and the client connect, so they meet on the same node.
+ *
+ * [envFor] then yields `DISPLAY=:0` for the guest env. The X app, launched right after on
+ * the session's normal blocking loader call, connects to Xwayland and renders.
+ *
+ * GATED entirely on [needsX11]: a Wayland-capable app never enters any of this (no socket
+ * prep, no Xwayland process, no DISPLAY), so its launch is byte-identical to before. The
+ * Xwayland process is process-global and started at most once across sessions (a single
+ * compositor backs all of them), guarded by [started]. PURE except the documented IO
+ * (mkdir/chmod + the persistent loader-probe thread), so [needsX11]/[envFor] are
+ * host-unit-testable and the whole shape is source-assertable.
+ */
+internal object XwaylandLaunch {
+
+    /** Rootfs bin path of the X server shipped by the xwayland overlay (xwayland-stage.tar). */
+    private const val XWAYLAND_BIN = "usr/bin/Xwayland"
+    /** The X display the rootful server owns; injected into the guest env as DISPLAY. */
+    private const val DISPLAY_VALUE = ":0"
+    /** Sticky world-writable mode (01777) the X server requires on /tmp + /tmp/.X11-unix. */
+    private const val STICKY_1777 = 0x3FF
+    /** Bounded waits (ms): overlay extraction, then the X0 socket appearing. */
+    private const val XWAYLAND_STAGE_WAIT_MS = 60_000
+    private const val X0_SOCKET_WAIT_MS = 20_000
+
+    /**
+     * appIds that are X11-only and must be routed through Xwayland. Kept in lock-step with
+     * NativeAlrRuntime.BundledCatalog's `needsXwayland = true` entries. Detection is by the
+     * catalog launch key (appId), mirroring GnomePlatformShim.GNOME_APP_IDS. Membership was
+     * established host-side from each app's EXEC-binary DT_NEEDED (libX11 present,
+     * libwayland-client absent) — see CatalogApp.needsXwayland.
+     */
+    private val X11_ONLY_APP_IDS = setOf(
+        "xzgv",   // GTK2-x11 thumbnail/image viewer: libgtk-x11-2.0 + libX11, no wayland
+        "xli",    // classic Xlib image viewer: libX11 only, no wayland
+    )
+
+    /** Process-global guard: the rootful Xwayland is started at most once (one compositor). */
+    private val started = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * True iff this launch must be routed through Xwayland: the appId is a known X11-only
+     * catalog app, OR the request explicitly asked for the X11 protocol. [entryPath] is
+     * accepted for symmetry with GnomePlatformShim (and future binary-name heuristics) but
+     * the authoritative signal is the catalog flag / explicit protocol — never a guess.
+     */
+    fun needsX11(appId: String, protocol: SurfaceProtocol, entryPath: String = ""): Boolean =
+        protocol == SurfaceProtocol.X11 || appId in X11_ONLY_APP_IDS
+
+    /** Guest env for an X11-routed app: point DISPLAY at the rootful Xwayland. */
+    fun envFor(): Map<String, String> = mapOf("DISPLAY" to DISPLAY_VALUE)
+
+    /**
+     * Ensure a ROOTFUL Xwayland :0 is up for X11 clients, replicating the proven sequence.
+     * Returns true if the X0 socket is present (server reachable) within the bounded wait.
+     * Best-effort + idempotent: safe to call on every X11 launch; the server is started at
+     * most once. Must be called BEFORE the guest's blocking loader call (Xwayland runs on
+     * its own thread; this call returns once the socket is ready or the wait elapses).
+     */
+    fun ensureUp(runtime: NativeAlrRuntime, rootfsDir: File, rootfsName: String, outW: Int, outH: Int): Boolean {
+        prepX11Sockets(rootfsDir)
+
+        val xSock = File(rootfsDir, "tmp/.X11-unix/X0")
+        // Already up (a prior session started it) → just confirm the socket.
+        if (xSock.exists()) return true
+
+        val xwBin = File(rootfsDir, XWAYLAND_BIN)
+        var waited = 0
+        while (waited < XWAYLAND_STAGE_WAIT_MS && !xwBin.isFile) {
+            try { Thread.sleep(1000) } catch (_: InterruptedException) { return false }
+            waited += 1000
+        }
+        if (!xwBin.isFile) {
+            Log.w(TAG, "xwayland: /usr/bin/Xwayland not staged (push xwayland-stage.tar) — " +
+                "X11 app will have no display")
+            return false
+        }
+
+        if (started.compareAndSet(false, true)) {
+            // Persistent wl client: own thread, never joins (Xwayland does not exit).
+            Thread({
+                try {
+                    val xwServer = AlrNative.nativeAlrNativeLoaderProbe(
+                        runtime.packageName,
+                        runtime.nativeLibraryDir,
+                        runtime.filesDirPath,
+                        runtime.cacheDirPath,
+                        rootfsName,
+                        "/$XWAYLAND_BIN\n$DISPLAY_VALUE\n-shm\n-geometry\n${outW}x$outH",
+                    )
+                    Log.i(TAG, "xwayland-server exited:\n$xwServer")
+                } catch (e: Throwable) {
+                    Log.e(TAG, "xwayland-server EXC: ${Log.getStackTraceString(e)}")
+                }
+            }, "alr-xwayland-server").start()
+        }
+
+        var sockWaited = 0
+        while (sockWaited < X0_SOCKET_WAIT_MS && !xSock.exists()) {
+            try { Thread.sleep(500) } catch (_: InterruptedException) { break }
+            sockWaited += 500
+        }
+        val ready = xSock.exists()
+        Log.i(TAG, "xwayland: X0 socket=$ready (waited ${sockWaited}ms, geometry=${outW}x$outH)")
+        return ready
+    }
+
+    /**
+     * Pre-create `<rootfs>/tmp` + `<rootfs>/tmp/.X11-unix` at sticky 01777 (the X server's
+     * required mode), via direct UNMEDIATED host-rootfs access from the app side. Idempotent
+     * + best-effort: a failure only logs (the launch still attempts). This is the ONLY
+     * Xwayland-launch-specific filesystem prep; it does not touch the shared loader env.
+     */
+    private fun prepX11Sockets(rootfsDir: File) {
+        try {
+            val xTmp = File(rootfsDir, "tmp")
+            val xUnix = File(xTmp, ".X11-unix")
+            xTmp.mkdirs()
+            xUnix.mkdirs()
+            android.system.Os.chmod(xTmp.absolutePath, STICKY_1777)
+            android.system.Os.chmod(xUnix.absolutePath, STICKY_1777)
+            Log.i(TAG, "xwayland: prepped /tmp(1777)=${xTmp.isDirectory} " +
+                "/tmp/.X11-unix(1777)=${xUnix.isDirectory}")
+        } catch (e: Throwable) {
+            Log.w(TAG, "xwayland: /tmp prep EXC: ${e.message}")
+        }
     }
 }
