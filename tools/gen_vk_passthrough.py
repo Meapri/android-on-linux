@@ -527,6 +527,16 @@ SPECS = [
         "name": "vkDestroyPipeline", "kind": "destroy_handle",
         "handle_param": ("pipeline", "VkPipeline"),
     },
+    # ---- staged-slab read-back (APPENDED LAST so the op/reply numbers stay append-only). ----
+    # vkInvalidateMappedMemoryRanges: the reverse of flush. For a STAGED slab (Mali lacks
+    # VK_EXT_external_memory_host so the zero-copy import is impossible) the host copies the
+    # real HOST_VISIBLE VkDeviceMemory back into the guest's shadow arena slab, so a guest
+    # read after a GPU write (read-back / glReadPixels-equivalent) sees fresh bytes. For a
+    # zero-copy-imported or coherent slab it is a no-op (the bytes already alias). Same wire
+    # shape as flush_ranges (vdev + range list); no reply.
+    {
+        "name": "vkInvalidateMappedMemoryRanges", "kind": "invalidate_ranges",
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -778,10 +788,10 @@ def gen_proto_encoder(op):
         a("    alr_vk_enc_u32(e, vdev);")
         a("    alr_vk_enc_u32(e, vmemory);")
         a("}")
-    elif k == "flush_ranges":
-        a(f"// Encoder for {name} (arena slabs are HOST_COHERENT; a marker for ordering).")
-        a("// Ships each range's (vmemory, offset, size) so a future non-coherent arena")
-        a("// could honor it; the count is bounded by the host decoder.")
+    elif k in ("flush_ranges", "invalidate_ranges"):
+        a(f"// Encoder for {name} (ships each range's (vmemory, offset, size); the host copies")
+        a("// staged shadow-slab <-> real VkDeviceMemory for slabs that could not be imported")
+        a("// zero-copy. The count is bounded by the host decoder.")
         a(f"static inline void {enc}_begin(AlrVkEncoder *e, uint32_t vdev, uint32_t range_count) {{")
         a(f"    alr_vk_gen_op_begin(e, {op['op_enum']});")
         a("    alr_vk_enc_u32(e, vdev);")
@@ -1150,6 +1160,7 @@ def gen_decode(reg, ops):
     a("")
     a('#include "alr_gpu/alr_gpu_vk_decode.hpp"        // VkDecodeState, VkReader, VkReplyEncoder')
     a('#include "alr_gpu/generated/alr_gpu_vk_gen_proto.hpp"  // the op enums')
+    a('#include "alr_gpu/generated/alr_gpu_vk_arena.hpp"      // the MAP_SHARED arena + AlrVkStagedSlab')
     a("")
     a("// --- Block 1: the generated handle tables (VkGenTables + gen_tables). These must be")
     a("// a COMPLETE type before the real-Mali bodies below use them, so they are emitted in")
@@ -1385,6 +1396,13 @@ def gen_decode_state_ext():
     a("    std::map<uint32_t, VkFramebuffer> framebuffers;     // vfb      -> real")
     a("    // WAVE D pipeline handle table (graphics + compute share one VkPipeline map).")
     a("    std::map<uint32_t, VkPipeline> pipelines;           // vpipe    -> real")
+    a("    // STAGED-SLAB fallback registry (Mali lacks VK_EXT_external_memory_host): for a")
+    a("    // device-memory vid the host COULD NOT import zero-copy, an AlrVkStagedSlab records")
+    a("    // its real HOST_VISIBLE VkDeviceMemory + shadow arena slab so flush/invalidate/submit")
+    a("    // can memcpy slab<->real. A vid present here is STAGED; absent == zero-copy import")
+    a("    // (or non-mappable) — the per-allocation path flag the coarse->fine model needs.")
+    a("    std::map<uint32_t, AlrVkStagedSlab> mem_staged;     // vmem -> staged record")
+    a("    std::map<uint32_t, bool> mem_staged_coherent;       // vmem -> real type is COHERENT")
     a("#endif")
     a("    // Arena offset assigned to each device-memory virtual id (HOST_VISIBLE only).")
     a("    // UINT64_MAX == not arena-backed (e.g. a DEVICE_LOCAL alloc). Tracked even in")
@@ -1537,12 +1555,33 @@ def gen_decode_case(op):
     elif k == "flush_ranges":
         a("            uint32_t vdev = 0, range_count = 0;")
         a("            if (!r.u32(vdev) || !r.u32(range_count)) { st.ok = false; return true; }")
-        a("            (void)vdev;")
         a("            if (range_count > 4096) { st.ok = false; return true; }")
         a("            for (uint32_t i = 0; i < range_count; ++i) {")
         a("                uint32_t vmem = 0; uint64_t off = 0, sz = 0;")
         a("                if (!r.u32(vmem) || !r.u64(off) || !r.u64(sz)) { st.ok = false; return true; }")
-        a("                (void)vmem; (void)off; (void)sz;  // coherent: nothing to flush")
+        a("                // ZERO-COPY (imported / coherent) slabs need NO copy — the guest write")
+        a("                // already landed in the real allocation. A STAGED slab (Mali lacks")
+        a("                // VK_EXT_external_memory_host) is copied shadow-slab -> real here.")
+        a("#ifdef ALR_VK_DECODE_REAL")
+        a("                if (!gp) vk_gen_real_flush_staged_range(st, vdev, vmem, off, sz);")
+        a("#endif")
+        a("                (void)vdev; (void)vmem; (void)off; (void)sz;")
+        a("            }")
+        a("            st.decoded++;")
+        a("            return true;")
+    elif k == "invalidate_ranges":
+        a("            uint32_t vdev = 0, range_count = 0;")
+        a("            if (!r.u32(vdev) || !r.u32(range_count)) { st.ok = false; return true; }")
+        a("            if (range_count > 4096) { st.ok = false; return true; }")
+        a("            for (uint32_t i = 0; i < range_count; ++i) {")
+        a("                uint32_t vmem = 0; uint64_t off = 0, sz = 0;")
+        a("                if (!r.u32(vmem) || !r.u64(off) || !r.u64(sz)) { st.ok = false; return true; }")
+        a("                // READ-BACK direction. A STAGED slab gets real -> shadow-slab copied")
+        a("                // so the guest reads fresh GPU-written bytes; coherent/imported need none.")
+        a("#ifdef ALR_VK_DECODE_REAL")
+        a("                if (!gp) vk_gen_real_invalidate_staged_range(st, vdev, vmem, off, sz);")
+        a("#endif")
+        a("                (void)vdev; (void)vmem; (void)off; (void)sz;")
         a("            }")
         a("            st.decoded++;")
         a("            return true;")
@@ -2256,7 +2295,7 @@ def gen_icd_fn(op):
         a("    alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);")
         a("    if (!e.overflow) (void)alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));")
         a("}")
-    elif k == "flush_ranges":
+    elif k in ("flush_ranges", "invalidate_ranges"):
         a(f"static VkResult VKAPI_CALL {fn}(VkDevice device, uint32_t memoryRangeCount,")
         a("                          const VkMappedMemoryRange *pMemoryRanges) {")
         a("    AlrIcdDevice *dev = (AlrIcdDevice *)device;")

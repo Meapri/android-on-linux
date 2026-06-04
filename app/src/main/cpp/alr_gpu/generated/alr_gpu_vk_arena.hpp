@@ -19,17 +19,24 @@
 //     write to that pointer is immediately visible to the real VkDeviceMemory (same pages),
 //     so a vkQueueSubmit that reads the buffer/image sees the guest's data with no copy.
 //
-// GRACEFUL DEGRADATION: if Mali does NOT expose VK_EXT_external_memory_host (some drivers
-// don't), the host falls back to a STAGED slab: it still hands the guest an arena pointer
-// (so vkMapMemory works + the wire is identical), but the real VkDeviceMemory is ordinary
-// HOST_VISIBLE driver memory, and the arena slab is copied INTO it lazily (on the first
-// bind's submit / on flush). The fast zero-copy path is preferred; the staged path keeps
-// correctness on drivers without the extension. Which path is live is recorded per-slab.
+// GRACEFUL DEGRADATION (IMPLEMENTED in section (C) below): if Mali does NOT expose
+// VK_EXT_external_memory_host (Mali-G615 does not), the host falls back to a STAGED slab:
+// it still hands the guest an arena pointer (so vkMapMemory works + the wire is identical),
+// but the real VkDeviceMemory is ordinary HOST_VISIBLE driver memory, and the arena slab is
+// copied INTO it lazily (on vkFlushMappedMemoryRanges, or — the backstop — right before the
+// first vkQueueSubmit that consumes the allocation). The reverse copy (real -> slab) runs on
+// vkInvalidateMappedMemoryRanges for read-back. The fast zero-copy path (B) is PREFERRED and
+// stays byte-identical when the extension is present; the staged path (C) keeps correctness
+// on drivers without it. Which path is live is recorded per-allocation (an AlrVkStagedSlab
+// exists only for a staged allocation; an imported allocation has none).
 //
 // This header is split into:
 //   (A) a pure-POSIX arena (memfd + mmap + bump allocator) usable with NO Vulkan SDK, so
-//       the host wire test exercises the offset bookkeeping host-side; and
-//   (B) the Vulkan import glue, compiled only under ALR_VK_DECODE_REAL.
+//       the host wire test exercises the offset bookkeeping host-side;
+//   (B) the Vulkan import glue (zero-copy host-pointer import), compiled only under
+//       ALR_VK_DECODE_REAL; and
+//   (C) the staged-slab copy-on-map fallback (slab<->real VkDeviceMemory memcpy), also
+//       ALR_VK_DECODE_REAL-only.
 //
 // Header-only + self-contained (POSIX + optional NDK Vulkan), matching the alr_gpu/** rule.
 
@@ -250,6 +257,125 @@ inline bool alr_vk_arena_pick_host_type(VkPhysicalDevice phys, VkDevice dev, uin
         if (importable && host_vis) { *out_type = i; return true; }
     }
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// (C) STAGED-SLAB COPY-ON-MAP fallback (the documented degradation, now IMPLEMENTED).
+//
+// When VK_EXT_external_memory_host is NOT available (Mali-G615 does NOT expose it), the
+// host cannot import an arena pointer as VkDeviceMemory, so the zero-copy alias of (B) is
+// impossible. Instead of failing vkMapMemory, we keep the wire identical: the guest still
+// gets an arena SLAB pointer (a SHADOW of the real allocation), so its writes succeed
+// locally. The real allocation is ordinary HOST_VISIBLE driver memory. We then COPY the
+// shadow slab into the real memory lazily — on vkFlushMappedMemoryRanges, or (the backstop)
+// right before the first vkQueueSubmit that consumes the allocation. The reverse copy
+// (real -> shadow) runs on vkInvalidateMappedMemoryRanges for read-back.
+//
+// This struct is the per-allocation record the HOST keeps for a staged allocation. (For an
+// import / zero-copy allocation there is NO StagedSlab — that path is byte-identical to (B),
+// the strict no-regression guarantee.) The host keeps these in its VkGenTables, keyed by the
+// device-memory virtual id; the helpers below do the actual VkDeviceMemory map+memcpy.
+struct AlrVkStagedSlab {
+    VkDeviceMemory real_mem = VK_NULL_HANDLE;  // the real HOST_VISIBLE Mali allocation
+    uint64_t arena_off = kAlrVkArenaNoOffset;  // shadow slab offset in the shared arena
+    uint64_t size = 0;                         // allocation size (bytes the slab shadows)
+    bool dirty = false;  // guest wrote the slab since the last copy-to-real (needs flush)
+};
+
+// Pick a HOST_VISIBLE memory type index (COHERENT preferred) whose bit is set in
+// `allowed_bits` (the memory type a real allocation of `mem_type_index` would satisfy, i.e.
+// the requested type's own bit, or — if that type is not host-visible — any host-visible
+// type, so the guest still gets mappable memory). Returns true + *out_type on success.
+// HOST_COHERENT is preferred so the slab->real copy needs no explicit driver flush; if only
+// a non-coherent host-visible type exists, the copy helpers issue the explicit flush/invalidate.
+inline bool alr_vk_arena_pick_staged_host_type(VkPhysicalDevice phys, uint32_t requested,
+                                               uint32_t* out_type, bool* out_coherent) {
+    VkPhysicalDeviceMemoryProperties mp{};
+    vkGetPhysicalDeviceMemoryProperties(phys, &mp);
+    // 1) If the guest's requested type is itself host-visible, honor it (it already satisfies
+    //    the bound resource's memoryTypeBits — ANGLE chose it for exactly that). This keeps
+    //    vkBind*Memory compatible with no guesswork.
+    if (requested < mp.memoryTypeCount &&
+        (mp.memoryTypes[requested].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+        *out_type = requested;
+        *out_coherent =
+            (mp.memoryTypes[requested].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+        return true;
+    }
+    // 2) Otherwise fall back to ANY host-visible type (coherent first). (The guest only ever
+    //    maps host-visible memory; a DEVICE_LOCAL-only request that nonetheless gets mapped
+    //    is re-homed to a host-visible type so the shadow slab still has a real backing.)
+    int best = -1; bool best_coh = false;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
+        const auto f = mp.memoryTypes[i].propertyFlags;
+        if (!(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) continue;
+        const bool coh = (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+        if (best < 0 || (coh && !best_coh)) { best = static_cast<int>(i); best_coh = coh; }
+        if (coh) break;
+    }
+    if (best < 0) return false;
+    *out_type = static_cast<uint32_t>(best);
+    *out_coherent = best_coh;
+    return true;
+}
+
+// Copy the shadow slab -> the real HOST_VISIBLE VkDeviceMemory (the guest-write direction:
+// run on flush / before a submit that consumes the allocation). Maps the real memory, memcpy
+// from the arena, flushes (non-coherent) and unmaps. `off`/`size` bound the copy within the
+// allocation (VK_WHOLE_SIZE-style: size==0 means to the end of the allocation). Returns
+// VK_SUCCESS or the driver error. Clears `slab.dirty` on success.
+inline VkResult alr_vk_arena_staged_copy_to_real(VkDevice dev, AlrVkStagedSlab& slab,
+                                                 bool coherent, uint64_t off, uint64_t size) {
+    if (slab.real_mem == VK_NULL_HANDLE || slab.arena_off == kAlrVkArenaNoOffset)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    const uint8_t* src = static_cast<const uint8_t*>(alr_vk_arena_ptr(slab.arena_off));
+    if (!src) return VK_ERROR_INITIALIZATION_FAILED;
+    if (off >= slab.size) return VK_SUCCESS;  // nothing in range
+    uint64_t n = (size == 0 || off + size > slab.size) ? (slab.size - off) : size;
+    if (n == 0) return VK_SUCCESS;
+    void* dst = nullptr;
+    VkResult r = vkMapMemory(dev, slab.real_mem, off, n, 0, &dst);
+    if (r != VK_SUCCESS || !dst) return (r == VK_SUCCESS) ? VK_ERROR_MEMORY_MAP_FAILED : r;
+    std::memcpy(dst, src + off, static_cast<size_t>(n));
+    if (!coherent) {
+        VkMappedMemoryRange mr{};
+        mr.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+        mr.memory = slab.real_mem;
+        mr.offset = off;
+        mr.size = VK_WHOLE_SIZE;  // off..end; the driver rounds to nonCoherentAtomSize
+        vkFlushMappedMemoryRanges(dev, 1, &mr);
+    }
+    vkUnmapMemory(dev, slab.real_mem);
+    slab.dirty = false;
+    return VK_SUCCESS;
+}
+
+// Copy the real HOST_VISIBLE VkDeviceMemory -> the shadow slab (the read-back direction: run
+// on vkInvalidateMappedMemoryRanges so the guest reads fresh GPU-written bytes). Returns
+// VK_SUCCESS or the driver error.
+inline VkResult alr_vk_arena_staged_copy_from_real(VkDevice dev, const AlrVkStagedSlab& slab,
+                                                   bool coherent, uint64_t off, uint64_t size) {
+    if (slab.real_mem == VK_NULL_HANDLE || slab.arena_off == kAlrVkArenaNoOffset)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    uint8_t* dst = static_cast<uint8_t*>(alr_vk_arena_ptr(slab.arena_off));
+    if (!dst) return VK_ERROR_INITIALIZATION_FAILED;
+    if (off >= slab.size) return VK_SUCCESS;
+    uint64_t n = (size == 0 || off + size > slab.size) ? (slab.size - off) : size;
+    if (n == 0) return VK_SUCCESS;
+    void* src = nullptr;
+    VkResult r = vkMapMemory(dev, slab.real_mem, off, n, 0, &src);
+    if (r != VK_SUCCESS || !src) return (r == VK_SUCCESS) ? VK_ERROR_MEMORY_MAP_FAILED : r;
+    if (!coherent) {
+        VkMappedMemoryRange mr{};
+        mr.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+        mr.memory = slab.real_mem;
+        mr.offset = off;
+        mr.size = VK_WHOLE_SIZE;
+        vkInvalidateMappedMemoryRanges(dev, 1, &mr);
+    }
+    std::memcpy(dst + off, src, static_cast<size_t>(n));
+    vkUnmapMemory(dev, slab.real_mem);
+    return VK_SUCCESS;
 }
 #endif  // ALR_VK_DECODE_REAL
 

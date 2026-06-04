@@ -20,6 +20,7 @@
 
 #include "alr_gpu/alr_gpu_vk_decode.hpp"        // VkDecodeState, VkReader, VkReplyEncoder
 #include "alr_gpu/generated/alr_gpu_vk_gen_proto.hpp"  // the op enums
+#include "alr_gpu/generated/alr_gpu_vk_arena.hpp"      // the MAP_SHARED arena + AlrVkStagedSlab
 
 // --- Block 1: the generated handle tables (VkGenTables + gen_tables). These must be
 // a COMPLETE type before the real-Mali bodies below use them, so they are emitted in
@@ -56,6 +57,13 @@ struct VkGenTables {
     std::map<uint32_t, VkFramebuffer> framebuffers;     // vfb      -> real
     // WAVE D pipeline handle table (graphics + compute share one VkPipeline map).
     std::map<uint32_t, VkPipeline> pipelines;           // vpipe    -> real
+    // STAGED-SLAB fallback registry (Mali lacks VK_EXT_external_memory_host): for a
+    // device-memory vid the host COULD NOT import zero-copy, an AlrVkStagedSlab records
+    // its real HOST_VISIBLE VkDeviceMemory + shadow arena slab so flush/invalidate/submit
+    // can memcpy slab<->real. A vid present here is STAGED; absent == zero-copy import
+    // (or non-mappable) — the per-allocation path flag the coarse->fine model needs.
+    std::map<uint32_t, AlrVkStagedSlab> mem_staged;     // vmem -> staged record
+    std::map<uint32_t, bool> mem_staged_coherent;       // vmem -> real type is COHERENT
 #endif
     // Arena offset assigned to each device-memory virtual id (HOST_VISIBLE only).
     // UINT64_MAX == not arena-backed (e.g. a DEVICE_LOCAL alloc). Tracked even in
@@ -356,12 +364,17 @@ inline bool decode_vk_gen_op(uint8_t op, VkReader& r, VkDecodeState& st,
         case ALR_VK_GEN_OP_FLUSH_MAPPED_MEMORY_RANGES: {  // vkFlushMappedMemoryRanges
             uint32_t vdev = 0, range_count = 0;
             if (!r.u32(vdev) || !r.u32(range_count)) { st.ok = false; return true; }
-            (void)vdev;
             if (range_count > 4096) { st.ok = false; return true; }
             for (uint32_t i = 0; i < range_count; ++i) {
                 uint32_t vmem = 0; uint64_t off = 0, sz = 0;
                 if (!r.u32(vmem) || !r.u64(off) || !r.u64(sz)) { st.ok = false; return true; }
-                (void)vmem; (void)off; (void)sz;  // coherent: nothing to flush
+                // ZERO-COPY (imported / coherent) slabs need NO copy — the guest write
+                // already landed in the real allocation. A STAGED slab (Mali lacks
+                // VK_EXT_external_memory_host) is copied shadow-slab -> real here.
+#ifdef ALR_VK_DECODE_REAL
+                if (!gp) vk_gen_real_flush_staged_range(st, vdev, vmem, off, sz);
+#endif
+                (void)vdev; (void)vmem; (void)off; (void)sz;
             }
             st.decoded++;
             return true;
@@ -1621,6 +1634,23 @@ inline bool decode_vk_gen_op(uint8_t op, VkReader& r, VkDecodeState& st,
 #endif
             if (gp && gp->destroy_handle)
                 gp->destroy_handle(gp->ctx, ALR_VK_GEN_OP_DESTROY_PIPELINE, vdev, vhandle);
+            st.decoded++;
+            return true;
+        }
+        case ALR_VK_GEN_OP_INVALIDATE_MAPPED_MEMORY_RANGES: {  // vkInvalidateMappedMemoryRanges
+            uint32_t vdev = 0, range_count = 0;
+            if (!r.u32(vdev) || !r.u32(range_count)) { st.ok = false; return true; }
+            if (range_count > 4096) { st.ok = false; return true; }
+            for (uint32_t i = 0; i < range_count; ++i) {
+                uint32_t vmem = 0; uint64_t off = 0, sz = 0;
+                if (!r.u32(vmem) || !r.u64(off) || !r.u64(sz)) { st.ok = false; return true; }
+                // READ-BACK direction. A STAGED slab gets real -> shadow-slab copied
+                // so the guest reads fresh GPU-written bytes; coherent/imported need none.
+#ifdef ALR_VK_DECODE_REAL
+                if (!gp) vk_gen_real_invalidate_staged_range(st, vdev, vmem, off, sz);
+#endif
+                (void)vdev; (void)vmem; (void)off; (void)sz;
+            }
             st.decoded++;
             return true;
         }

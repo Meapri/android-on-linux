@@ -1228,6 +1228,28 @@ static void VKAPI_CALL alr_vkDestroyPipeline(VkDevice device, VkPipeline pipelin
     if (!e.overflow) (void)alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
 }
 
+static VkResult VKAPI_CALL alr_vkInvalidateMappedMemoryRanges(VkDevice device, uint32_t memoryRangeCount,
+                          const VkMappedMemoryRange *pMemoryRanges) {
+    AlrIcdDevice *dev = (AlrIcdDevice *)device;
+    uint32_t i;
+    if (!dev) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!alr_icd_ring_ok() || memoryRangeCount == 0 || !pMemoryRanges) return VK_SUCCESS;
+    {
+        uint8_t req[16 + 64 * 20]; AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];
+        uint32_t n = memoryRangeCount > 64 ? 64 : memoryRangeCount;
+        alr_vk_enc_init(&e, req, sizeof(req));
+        alr_vk_enc_gen_invalidate_mapped_memory_ranges_begin(&e, dev->vdev, n);
+        for (i = 0; i < n; ++i) {
+            uint32_t vmem = (uint32_t)(uintptr_t)pMemoryRanges[i].memory;
+            alr_vk_enc_gen_invalidate_mapped_memory_ranges_range(&e, vmem, (uint64_t)pMemoryRanges[i].offset,
+                                (uint64_t)pMemoryRanges[i].size);
+        }
+        alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);
+        if (!e.overflow) (void)alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));
+    }
+    return VK_SUCCESS;
+}
+
 #endif  // ALR_ICD_GEN_DEFINE
 
 #ifdef ALR_ICD_GEN_TABLE
@@ -1274,4 +1296,5 @@ static void VKAPI_CALL alr_vkDestroyPipeline(VkDevice device, VkPipeline pipelin
     ALR_ENTRY("vkCreateGraphicsPipelines", alr_vkCreateGraphicsPipelines),
     ALR_ENTRY("vkCreateComputePipelines", alr_vkCreateComputePipelines),
     ALR_ENTRY("vkDestroyPipeline", alr_vkDestroyPipeline),
+    ALR_ENTRY("vkInvalidateMappedMemoryRanges", alr_vkInvalidateMappedMemoryRanges),
 #endif  // ALR_ICD_GEN_TABLE

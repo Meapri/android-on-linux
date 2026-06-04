@@ -144,12 +144,15 @@ inline void vk_gen_real_destroy_command_pool(VkDecodeState& st, uint32_t vdev,
 }
 
 // ---- device memory (same-process arena). For a HOST_VISIBLE alloc we carve an arena slab
-// and import it as the real VkDeviceMemory (zero-copy: a guest write through the arena IS a
-// write to this allocation). If the extension/import is unavailable, we fall back to plain
-// HOST_VISIBLE driver memory AND still record the arena slab so vkMapMemory returns a guest
-// pointer — the staged path then copies arena->driver-memory lazily (documented fallback;
-// the offset==NoOffset case means "no arena pointer", and map will fail, signalling staged
-// is needed). For the first batch ANGLE's host-visible staging is the target. ----
+// and (when VK_EXT_external_memory_host is present) IMPORT it as the real VkDeviceMemory —
+// zero-copy: a guest write through the arena IS a write to this allocation. When that
+// extension is ABSENT (Mali-G615 does not expose it), we take the STAGED-SLAB fallback:
+// allocate ordinary HOST_VISIBLE driver memory, hand the guest a shadow arena slab anyway
+// (so vkMapMemory still returns a real, writable pointer + the wire is identical), and record
+// an AlrVkStagedSlab so flush / pre-submit copies slab->real and invalidate copies real->slab.
+// DEVICE_LOCAL that the guest nonetheless maps is re-homed to a host-visible type (the guest
+// only needs SOME mappable backing for its slab). The per-allocation path (import vs staged)
+// is recorded so flush/invalidate/unmap route correctly — the coarse->fine memory model. ----
 inline VkResult vk_gen_real_alloc_memory(VkDecodeState& st, uint32_t vdev, uint32_t vmem,
                                          uint64_t allocation_size,
                                          uint32_t memory_type_index, uint64_t& arena_off) {
@@ -158,10 +161,11 @@ inline VkResult vk_gen_real_alloc_memory(VkDecodeState& st, uint32_t vdev, uint3
     if (dit == st.real_dev.end()) return VK_ERROR_INITIALIZATION_FAILED;
     VkDevice dev = dit->second.dev;
     VkPhysicalDevice phys = dit->second.phys;
+    auto& t = gen_tables(st);
 
-    // Is the requested memory type HOST_VISIBLE? Only host-visible allocations go through
-    // the arena (the guest only maps host-visible memory; DEVICE_LOCAL is never mapped, so
-    // it stays ordinary driver memory with no arena slab).
+    // Is the requested memory type HOST_VISIBLE? Only host-visible allocations are mappable
+    // (the guest only maps host-visible memory); a DEVICE_LOCAL-only request that is never
+    // mapped stays ordinary driver memory with no arena slab.
     VkPhysicalDeviceMemoryProperties mp{};
     vkGetPhysicalDeviceMemoryProperties(phys, &mp);
     const bool host_visible =
@@ -169,6 +173,7 @@ inline VkResult vk_gen_real_alloc_memory(VkDecodeState& st, uint32_t vdev, uint3
         (mp.memoryTypes[memory_type_index].propertyFlags &
          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
 
+    // ===== Path 1: ZERO-COPY host-pointer import (UNCHANGED — the no-regression fast path) =====
     if (host_visible && alr_vk_arena_ready() &&
         alr_vk_arena_host_import_available(dev)) {
         const uint64_t off = alr_vk_arena_alloc(allocation_size);
@@ -182,25 +187,65 @@ inline VkResult vk_gen_real_alloc_memory(VkDecodeState& st, uint32_t vdev, uint3
             VkDeviceMemory mem = VK_NULL_HANDLE;
             VkResult r = alr_vk_arena_import_slab(dev, off, allocation_size, host_type, &mem);
             if (r == VK_SUCCESS) {
-                gen_tables(st).memory[vmem] = mem;
+                t.memory[vmem] = mem;
                 arena_off = off;
-                return VK_SUCCESS;
+                return VK_SUCCESS;  // imported: NO staged record (path flag = absent)
             }
-            // Import failed: fall through to plain driver memory below (the slab is leaked
-            // back to the bump arena — acceptable; arenas are large and per-process).
+            // Import failed: fall through to the staged path below (re-uses this slab).
+            arena_off = off;
         }
     }
 
-    // Fallback (DEVICE_LOCAL, or no host-import support): ordinary driver allocation. No
-    // arena slab -> vkMapMemory on this memory returns failure (the guest must use a
-    // host-visible alloc to map; ANGLE allocates host-visible staging for uploads).
+    // ===== Path 2: STAGED-SLAB fallback (Mali lacks VK_EXT_external_memory_host) =====
+    // The guest WILL map this if it's host-visible; give it a shadow slab + real HOST_VISIBLE
+    // Mali memory, and copy between them on flush/invalidate/submit.
+    if (host_visible && alr_vk_arena_ready()) {
+        uint64_t off = (arena_off != kAlrVkArenaNoOffset) ? arena_off
+                                                          : alr_vk_arena_alloc(allocation_size);
+        if (off != kAlrVkArenaNoOffset) {
+            uint32_t real_type = memory_type_index;
+            bool coherent = false;
+            if (!alr_vk_arena_pick_staged_host_type(phys, memory_type_index, &real_type,
+                                                     &coherent)) {
+                real_type = memory_type_index;
+                coherent = (memory_type_index < mp.memoryTypeCount) &&
+                           (mp.memoryTypes[memory_type_index].propertyFlags &
+                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            }
+            VkMemoryAllocateInfo mai{};
+            mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            mai.allocationSize = allocation_size ? allocation_size : 256;
+            mai.memoryTypeIndex = real_type;
+            VkDeviceMemory mem = VK_NULL_HANDLE;
+            VkResult r = vkAllocateMemory(dev, &mai, nullptr, &mem);
+            if (r == VK_SUCCESS) {
+                t.memory[vmem] = mem;
+                AlrVkStagedSlab slab{};
+                slab.real_mem = mem;
+                slab.arena_off = off;
+                slab.size = allocation_size ? allocation_size : 256;
+                slab.dirty = false;
+                t.mem_staged[vmem] = slab;
+                t.mem_staged_coherent[vmem] = coherent;
+                arena_off = off;       // the guest maps the SHADOW slab
+                return VK_SUCCESS;
+            }
+            // Real allocation failed too: drop the slab claim (leaked back to the bump arena —
+            // acceptable; arenas are large per-process) and fall through to the bare path.
+            arena_off = kAlrVkArenaNoOffset;
+        }
+    }
+
+    // ===== Path 3: bare driver memory (DEVICE_LOCAL never mapped, or arena exhausted) =====
+    // No arena slab -> vkMapMemory on this memory returns failure (legal: the guest only maps
+    // host-visible memory; ANGLE allocates host-visible staging for uploads, handled above).
     VkMemoryAllocateInfo mai{};
     mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     mai.allocationSize = allocation_size ? allocation_size : 256;
     mai.memoryTypeIndex = memory_type_index;
     VkDeviceMemory mem = VK_NULL_HANDLE;
     VkResult r = vkAllocateMemory(dev, &mai, nullptr, &mem);
-    if (r == VK_SUCCESS) gen_tables(st).memory[vmem] = mem;
+    if (r == VK_SUCCESS) t.memory[vmem] = mem;
     return r;
 }
 
@@ -213,6 +258,54 @@ inline void vk_gen_real_free_memory(VkDecodeState& st, uint32_t vdev, uint32_t v
     t.memory.erase(vmem);
     t.mem_arena_off.erase(vmem);
     t.mem_size.erase(vmem);
+    t.mem_staged.erase(vmem);            // drop the staged record (if any)
+    t.mem_staged_coherent.erase(vmem);
+}
+
+// ---- staged-slab copy helpers (called by the generated flush/invalidate decode + the
+// pre-submit backstop). For a ZERO-COPY/imported allocation there is no mem_staged entry, so
+// these are no-ops (the guest write already aliased the real memory — strict no-regression).
+// For a STAGED allocation they memcpy the shadow slab <-> the real HOST_VISIBLE memory. ----
+inline void vk_gen_real_flush_staged_range(VkDecodeState& st, uint32_t vdev, uint32_t vmem,
+                                           uint64_t off, uint64_t size) {
+    auto& t = gen_tables(st);
+    auto sit = t.mem_staged.find(vmem);
+    if (sit == t.mem_staged.end()) return;  // imported/coherent: nothing to copy
+    auto dit = st.real_dev.find(vdev);
+    if (dit == st.real_dev.end()) return;
+    bool coherent = t.mem_staged_coherent.count(vmem) ? t.mem_staged_coherent[vmem] : true;
+    // VK_WHOLE_SIZE on the wire (UINT64_MAX) -> copy to the end of the allocation.
+    uint64_t sz = (size == VK_WHOLE_SIZE) ? 0 : size;
+    alr_vk_arena_staged_copy_to_real(dit->second.dev, sit->second, coherent, off, sz);
+}
+
+inline void vk_gen_real_invalidate_staged_range(VkDecodeState& st, uint32_t vdev, uint32_t vmem,
+                                                uint64_t off, uint64_t size) {
+    auto& t = gen_tables(st);
+    auto sit = t.mem_staged.find(vmem);
+    if (sit == t.mem_staged.end()) return;
+    auto dit = st.real_dev.find(vdev);
+    if (dit == st.real_dev.end()) return;
+    bool coherent = t.mem_staged_coherent.count(vmem) ? t.mem_staged_coherent[vmem] : true;
+    uint64_t sz = (size == VK_WHOLE_SIZE) ? 0 : size;
+    alr_vk_arena_staged_copy_from_real(dit->second.dev, sit->second, coherent, off, sz);
+}
+
+// ---- pre-submit backstop: copy EVERY staged slab on `vdev` slab->real before a submit that
+// might consume them. This is the correctness anchor — even if the guest's driver treats its
+// memory as coherent and SKIPS vkFlushMappedMemoryRanges, the bytes are pushed to real Mali
+// memory before the GPU reads them. Imported allocations have no staged record, so a pure
+// zero-copy device pays nothing here (the map is empty). Called from cmd_real_queue_submit. ----
+inline void vk_gen_real_flush_all_staged_for_device(VkDecodeState& st, uint32_t vdev) {
+    auto& t = gen_tables(st);
+    if (t.mem_staged.empty()) return;
+    auto dit = st.real_dev.find(vdev);
+    if (dit == st.real_dev.end()) return;
+    for (auto& kv : t.mem_staged) {
+        bool coherent =
+            t.mem_staged_coherent.count(kv.first) ? t.mem_staged_coherent[kv.first] : true;
+        alr_vk_arena_staged_copy_to_real(dit->second.dev, kv.second, coherent, 0, 0);
+    }
 }
 
 // ---- buffer ----

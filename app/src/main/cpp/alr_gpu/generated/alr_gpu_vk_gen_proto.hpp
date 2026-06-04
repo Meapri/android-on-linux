@@ -73,6 +73,7 @@ enum AlrVkGenOp {
     ALR_VK_GEN_OP_CREATE_GRAPHICS_PIPELINES = 45,  // vkCreateGraphicsPipelines
     ALR_VK_GEN_OP_CREATE_COMPUTE_PIPELINES = 46,  // vkCreateComputePipelines
     ALR_VK_GEN_OP_DESTROY_PIPELINE = 47,  // vkDestroyPipeline
+    ALR_VK_GEN_OP_INVALIDATE_MAPPED_MEMORY_RANGES = 48,  // vkInvalidateMappedMemoryRanges
 };
 
 // ---- Generated reply SUB-opcodes (u16; ride the reply escape). ----
@@ -180,9 +181,9 @@ static inline void alr_vk_enc_gen_unmap_memory(AlrVkEncoder *e, uint32_t vdev, u
     alr_vk_enc_u32(e, vmemory);
 }
 
-// Encoder for vkFlushMappedMemoryRanges (arena slabs are HOST_COHERENT; a marker for ordering).
-// Ships each range's (vmemory, offset, size) so a future non-coherent arena
-// could honor it; the count is bounded by the host decoder.
+// Encoder for vkFlushMappedMemoryRanges (ships each range's (vmemory, offset, size); the host copies
+// staged shadow-slab <-> real VkDeviceMemory for slabs that could not be imported
+// zero-copy. The count is bounded by the host decoder.
 static inline void alr_vk_enc_gen_flush_mapped_memory_ranges_begin(AlrVkEncoder *e, uint32_t vdev, uint32_t range_count) {
     alr_vk_gen_op_begin(e, ALR_VK_GEN_OP_FLUSH_MAPPED_MEMORY_RANGES);
     alr_vk_enc_u32(e, vdev);
@@ -886,6 +887,21 @@ static inline void alr_vk_enc_gen_destroy_pipeline(AlrVkEncoder *e, uint32_t vde
     alr_vk_gen_op_begin(e, ALR_VK_GEN_OP_DESTROY_PIPELINE);
     alr_vk_enc_u32(e, vdev);
     alr_vk_enc_u32(e, vpipe);
+}
+
+// Encoder for vkInvalidateMappedMemoryRanges (ships each range's (vmemory, offset, size); the host copies
+// staged shadow-slab <-> real VkDeviceMemory for slabs that could not be imported
+// zero-copy. The count is bounded by the host decoder.
+static inline void alr_vk_enc_gen_invalidate_mapped_memory_ranges_begin(AlrVkEncoder *e, uint32_t vdev, uint32_t range_count) {
+    alr_vk_gen_op_begin(e, ALR_VK_GEN_OP_INVALIDATE_MAPPED_MEMORY_RANGES);
+    alr_vk_enc_u32(e, vdev);
+    alr_vk_enc_u32(e, range_count);
+}
+static inline void alr_vk_enc_gen_invalidate_mapped_memory_ranges_range(AlrVkEncoder *e, uint32_t vmemory,
+                          uint64_t offset, uint64_t size) {
+    alr_vk_enc_u32(e, vmemory);
+    alr_vk_enc_u64(e, offset);
+    alr_vk_enc_u64(e, size);
 }
 
 #ifdef __cplusplus

@@ -41,6 +41,14 @@ namespace alr::gpu {
 // log pointer + len). Forward-declared in alr_gpu_vk_cmd_dispatch.hpp; we use it after.
 struct VkCmdSubmitInfo;
 
+// STAGED-SLAB pre-submit backstop (defined in the generated band's hand-written real bodies,
+// alr_gpu_vk_gen_real.hpp, included via gen_decode.hpp BEFORE this header in the on-device TU
+// alr_gpu_vk_host_service.hpp). Forward-declared so this header stays self-consistent. Copies
+// every staged shadow slab on `vdev` -> its real Mali HOST_VISIBLE memory; a no-op when there
+// are no staged allocations (pure zero-copy import) — strict no-regression.
+struct VkDecodeState;
+void vk_gen_real_flush_all_staged_for_device(VkDecodeState& st, uint32_t vdev);
+
 // ---- fence/semaphore resolvers (0 == VK_NULL_HANDLE). ----
 inline VkFence cmd_real_fence(VkDecodeState& st, uint32_t vid) {
     if (!vid) return VK_NULL_HANDLE;
@@ -73,6 +81,20 @@ inline int32_t cmd_real_queue_submit(VkDecodeState& st, const VkCmdSubmitInfo& i
     auto qit = st.real_queue.find(info.vqueue);
     if (qit == st.real_queue.end()) { *replay_out = ALR_VK_CMD_REPLAY_NO_QUEUE; return VK_ERROR_INITIALIZATION_FAILED; }
     VkQueue queue = qit->second;
+
+    // STAGED-SLAB backstop: before the GPU reads any guest-mapped memory, push every staged
+    // shadow slab (Mali lacks VK_EXT_external_memory_host) into its real Mali HOST_VISIBLE
+    // allocation. This guarantees correctness even if the guest's driver treated its memory as
+    // coherent and skipped vkFlushMappedMemoryRanges. A pure zero-copy device has no staged
+    // records, so this is a cheap empty-map check (no-regression). Flush per submit-device.
+    {
+        uint32_t fdev = 0;
+        for (const auto& c : info.cmds) {
+            auto cit = st.real_cmd.find(c.vcmd);
+            if (cit != st.real_cmd.end()) { fdev = cit->second.first; break; }
+        }
+        if (fdev) vk_gen_real_flush_all_staged_for_device(st, fdev);
+    }
 
     // Build + record each real command buffer from its arena log.
     std::vector<VkCommandBuffer> real_cmds;
