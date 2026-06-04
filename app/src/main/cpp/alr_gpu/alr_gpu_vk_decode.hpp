@@ -137,7 +137,22 @@ struct VkPhysProps {
         uint32_t count = 0;
     };
     std::vector<QF> queue_families;
+    // ANGLE caps-init rung: the REAL Mali VkPhysicalDeviceFeatures + VkPhysicalDeviceLimits,
+    // carried as their RAW official-ABI bytes (features = 55×VkBool32 = 220B; limits = 504B
+    // on the arm64 ABI). Stored as opaque byte vectors so this struct stays SDK-free (the
+    // host wire test compiles decode.hpp without <vulkan.h>); the device path memcpy()s the
+    // real structs in (host) and back out into the caller's structs (guest ICD). Empty =
+    // "not supplied" (the synthetic-wire provider leaves them empty; the guest then keeps
+    // its conservative defaults). See ALR_VK_PHYS_FEATURES_BYTES / ALR_VK_PHYS_LIMITS_BYTES.
+    std::vector<uint8_t> features_blob;  // raw VkPhysicalDeviceFeatures bytes (or empty)
+    std::vector<uint8_t> limits_blob;    // raw VkPhysicalDeviceLimits bytes   (or empty)
 };
+
+// Exact official-ABI sizes of the two structs we ship as raw bytes (64-bit ABI: both the
+// arm64 NDK host and the arm64 guest ICD). The guest validates the blob length against
+// these before memcpy()ing, so a mismatched build can never scribble past the struct.
+static constexpr uint32_t ALR_VK_PHYS_FEATURES_BYTES = 220;  // sizeof(VkPhysicalDeviceFeatures)
+static constexpr uint32_t ALR_VK_PHYS_LIMITS_BYTES   = 504;  // sizeof(VkPhysicalDeviceLimits)
 
 // One image-format query's result, in the host's own struct (decoupled from <vulkan.h>
 // so the wire test can construct/compare it without a Vulkan SDK). Mirrors the fields of
@@ -369,6 +384,14 @@ inline void encode_phys_props_reply(VkReplyEncoder& re, uint32_t vphys, const Vk
         re.u32(qf.count);
     }
     re.u8(p.is_software ? 1u : 0u);
+    // ANGLE caps-init rung: append the REAL Mali features + limits as length-prefixed raw
+    // blobs (length 0 = "not supplied"). The guest reads them right after is_software and
+    // memcpy()s them into the caller's VkPhysicalDeviceFeatures / VkPhysicalDeviceProperties
+    // ::limits, so ANGLE's RendererVk::ensureCapsInitialized sees Mali's actual limits
+    // (maxColorAttachments, maxComputeWorkGroupSize, sample-count flags, ...) instead of
+    // zeros — the zeros made ANGLE feed a bogus count into std::vector::reserve (length_error).
+    re.blob(p.features_blob.data(), static_cast<uint32_t>(p.features_blob.size()));
+    re.blob(p.limits_blob.data(), static_cast<uint32_t>(p.limits_blob.size()));
 }
 
 #ifdef ALR_VK_DECODE_REAL
@@ -423,6 +446,25 @@ inline bool vk_real_props(VkDecodeState& st, uint32_t vphys, VkPhysProps& out) {
     vkGetPhysicalDeviceQueueFamilyProperties(it->second, &nqf, qf.data());
     for (uint32_t i = 0; i < nqf; ++i)
         out.queue_families.push_back({static_cast<uint32_t>(qf[i].queueFlags), qf[i].queueCount});
+    // ANGLE caps-init rung: ship the REAL Mali features + the FULL VkPhysicalDeviceLimits
+    // sub-struct as raw official-ABI bytes. ANGLE's RendererVk::ensureCapsInitialized reads
+    // dozens of limit fields (maxImageDimension*, maxBoundDescriptorSets, maxPerStageDescriptor*,
+    // maxVertexInput*, maxFragmentOutput*, maxComputeWorkGroup*, maxFramebuffer*, the *SampleCounts
+    // flags, maxColorAttachments, ...) and the full feature set; a raw memcpy of the two structs
+    // forwards EVERY field with no per-field marshalling. p.limits is already populated by
+    // vkGetPhysicalDeviceProperties above. We ship sizeof() (the build ABI's real struct size)
+    // and the guest ACCEPTS the blob only when its length equals the guest's own struct size
+    // (ALR_VK_PHYS_*_BYTES = 220/504 on arm64). On the arm64 device both ends are 504/220, so
+    // the copy lands exactly; a mismatched-ABI host build (e.g. the 32-bit armeabi-v7a variant,
+    // whose VkPhysicalDeviceLimits is 496B because size_t shrinks) simply ships a different
+    // length the arm64 guest rejects — never a misaligned scribble. The arm64 device is the
+    // only path with a guest ICD, and it agrees byte-for-byte.
+    VkPhysicalDeviceFeatures feats{};
+    vkGetPhysicalDeviceFeatures(it->second, &feats);
+    out.features_blob.resize(sizeof(feats));
+    std::memcpy(out.features_blob.data(), &feats, sizeof(feats));
+    out.limits_blob.resize(sizeof(p.limits));
+    std::memcpy(out.limits_blob.data(), &p.limits, sizeof(p.limits));
     return true;
 }
 
@@ -2799,6 +2841,17 @@ inline bool decode_vk_reply(const uint8_t* data, size_t len, VkDecodedReply& out
                 }
                 if (!r.u8(is_sw)) { out.ok = false; return false; }
                 p.is_software = (is_sw != 0);
+                // ANGLE caps-init rung: the features + limits raw blobs follow is_software.
+                const uint8_t* feat_b = nullptr;
+                uint32_t feat_len = 0;
+                const uint8_t* lim_b = nullptr;
+                uint32_t lim_len = 0;
+                if (!r.blob(feat_b, feat_len) || !r.blob(lim_b, lim_len)) {
+                    out.ok = false;
+                    return false;
+                }
+                if (feat_len) p.features_blob.assign(feat_b, feat_b + feat_len);
+                if (lim_len) p.limits_blob.assign(lim_b, lim_b + lim_len);
                 out.props[vphys] = p;
                 break;
             }

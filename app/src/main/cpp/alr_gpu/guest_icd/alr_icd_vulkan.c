@@ -192,6 +192,15 @@ static uint32_t alr_alloc(uint32_t *counter, uint32_t step) {
  * reply; we cache the last decoded props per VkPhysicalDevice so repeated
  * vkGetPhysicalDeviceProperties / queue-family calls don't re-marshal. Keyed by vphys. */
 #define ALR_ICD_MAX_PHYS 8
+/* Exact official-ABI sizes of the two structs the host ships as raw bytes (mirrors
+ * ALR_VK_PHYS_FEATURES_BYTES / ALR_VK_PHYS_LIMITS_BYTES on the host). 64-bit arm64 on
+ * both ends, so a raw memcpy of the structs is layout-correct. */
+#define ALR_ICD_FEATURES_BYTES 220u  /* sizeof(VkPhysicalDeviceFeatures) = 55 * VkBool32 */
+#define ALR_ICD_LIMITS_BYTES   504u  /* sizeof(VkPhysicalDeviceLimits) */
+_Static_assert(sizeof(VkPhysicalDeviceFeatures) == ALR_ICD_FEATURES_BYTES,
+               "VkPhysicalDeviceFeatures must be 220 bytes for the raw-bytes wire copy");
+_Static_assert(sizeof(VkPhysicalDeviceLimits) == ALR_ICD_LIMITS_BYTES,
+               "VkPhysicalDeviceLimits must be 504 bytes for the raw-bytes wire copy");
 typedef struct AlrIcdPhysCache {
     uint32_t vphys;            /* 0 = empty slot */
     int      have_props;
@@ -205,6 +214,13 @@ typedef struct AlrIcdPhysCache {
     uint32_t qf_flags[16];
     uint32_t qf_qcount[16];
     uint8_t  is_software;
+    /* ANGLE caps-init rung: the REAL Mali features + limits raw bytes (host-shipped via the
+     * extended PHYS_PROPS record). have_features/have_limits are set only when the host sent
+     * a correctly-SIZED blob; otherwise the v1 query keeps its conservative default. */
+    int      have_features;
+    int      have_limits;
+    uint8_t  features_raw[ALR_ICD_FEATURES_BYTES];
+    uint8_t  limits_raw[ALR_ICD_LIMITS_BYTES];
 } AlrIcdPhysCache;
 static AlrIcdPhysCache g_phys_cache[ALR_ICD_MAX_PHYS];
 
@@ -292,6 +308,23 @@ static int alr_icd_parse_reply(const uint8_t *data, uint32_t len,
                 }
                 if (!rd_u8(&r, &is_sw)) return 0;
                 if (slot) slot->is_software = is_sw;
+                /* ANGLE caps-init rung: the REAL Mali features + limits raw blobs follow
+                 * is_software. Copy them into the cache only at the exact expected size, so
+                 * a mismatched build can never scribble past the fixed cache arrays; a 0-length
+                 * blob (synthetic-wire / no-host) just leaves have_features/have_limits = 0. */
+                {
+                    const uint8_t *feat_b = NULL, *lim_b = NULL;
+                    uint32_t feat_len = 0, lim_len = 0;
+                    if (!rd_blob(&r, &feat_b, &feat_len) || !rd_blob(&r, &lim_b, &lim_len)) return 0;
+                    if (slot && feat_len == ALR_ICD_FEATURES_BYTES) {
+                        memcpy(slot->features_raw, feat_b, ALR_ICD_FEATURES_BYTES);
+                        slot->have_features = 1;
+                    }
+                    if (slot && lim_len == ALR_ICD_LIMITS_BYTES) {
+                        memcpy(slot->limits_raw, lim_b, ALR_ICD_LIMITS_BYTES);
+                        slot->have_limits = 1;
+                    }
+                }
                 break;
             }
             case ALR_VK_REPLY_DEVICE: {
@@ -487,6 +520,20 @@ static void VKAPI_CALL alr_vkGetPhysicalDeviceProperties(VkPhysicalDevice physic
         /* deviceName: the proof string ("Mali-G615 MC2") flowed through the ICD. */
         strncpy(pProperties->deviceName, slot->device_name,
                 VK_MAX_PHYSICAL_DEVICE_NAME_SIZE - 1);
+        /* ANGLE caps-init rung: forward the FULL real-Mali VkPhysicalDeviceLimits. The
+         * host shipped the struct's raw official-ABI bytes; the ICD's VkPhysicalDeviceLimits
+         * is the correctly-sized opaque blob at the official offset, so a raw memcpy lands
+         * every field (maxImageDimension*, maxBoundDescriptorSets, maxColorAttachments,
+         * the *SampleCounts flags, ...) exactly where ANGLE's ensureCapsInitialized reads
+         * them. Without this the limits were all-zero -> ANGLE std::vector::reserve(0-ish
+         * bogus) -> length_error abort. */
+        if (slot->have_limits) {
+            memcpy(&pProperties->limits, slot->limits_raw, ALR_ICD_LIMITS_BYTES);
+            ALR_ICD_DIAG("vkGetPhysicalDeviceProperties -> REAL Mali limits forwarded (%u B)",
+                         (unsigned)ALR_ICD_LIMITS_BYTES);
+        } else {
+            ALR_ICD_DIAG("vkGetPhysicalDeviceProperties -> limits ABSENT (host sent none)");
+        }
     } else {
         /* No host / unknown device: report a benign placeholder so callers don't NPE. */
         pProperties->apiVersion = VK_API_VERSION_1_1;
@@ -1081,12 +1128,23 @@ static VkResult VKAPI_CALL alr_vkEnumerateDeviceLayerProperties(
 
 static void VKAPI_CALL alr_vkGetPhysicalDeviceFeatures(
     VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures *pFeatures) {
-    (void)physicalDevice;
-    /* Conservative: report NO optional features (all VkBool32 = 0). ANGLE treats a
-     * cleared features struct as "core 1.0 only" and disables the optional code paths;
-     * a richer answer would marshal the real Mali features (next rung). */
-    if (pFeatures) memset(pFeatures, 0, sizeof(*pFeatures));
-    ALR_ICD_DIAG("vkGetPhysicalDeviceFeatures -> all-zero");
+    AlrIcdPhysicalDevice *pd = (AlrIcdPhysicalDevice *)physicalDevice;
+    AlrIcdPhysCache *slot;
+    if (!pFeatures) return;
+    memset(pFeatures, 0, sizeof(*pFeatures));
+    /* ANGLE caps-init rung: forward the REAL Mali VkPhysicalDeviceFeatures. ensure_phys_props
+     * round-trips GET_PHYSICAL_DEVICE_PROPERTIES, whose extended reply carries the features'
+     * raw official-ABI bytes; copy them into the caller's struct (55 VkBool32, exact size).
+     * Reporting Mali's real optional-feature set (vs all-zero) lets ANGLE enable the code
+     * paths it needs and pass ensureCapsInitialized instead of treating us as core-1.0-only. */
+    if (pd && (slot = ensure_phys_props(pd)) != NULL && slot->have_features) {
+        memcpy(pFeatures, slot->features_raw, ALR_ICD_FEATURES_BYTES);
+        ALR_ICD_DIAG("vkGetPhysicalDeviceFeatures -> REAL Mali features forwarded (%u B)",
+                     (unsigned)ALR_ICD_FEATURES_BYTES);
+    } else {
+        /* No host / unknown device: keep the conservative all-zero answer (core 1.0 only). */
+        ALR_ICD_DIAG("vkGetPhysicalDeviceFeatures -> all-zero (no host features)");
+    }
 }
 
 static void VKAPI_CALL alr_vkGetPhysicalDeviceMemoryProperties(
