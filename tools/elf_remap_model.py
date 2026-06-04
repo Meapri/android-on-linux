@@ -687,3 +687,20 @@ def apt_status_fd_survives_remap(fd_table: dict[int, int], status_fd: int = 3) -
     return status_fd in surviving and all(
         fd in closed for fd, flags in fd_table.items() if (flags & FD_CLOEXEC)
     )
+
+
+def inheritable_status_fds_after_remap(fd_table: dict[int, int]) -> int:
+    """Mirror of alr_inproc_reexec.c:audit_status_fd's survivor count: the number
+    of OPEN, non-CLOEXEC fds with number >= 3 that REMAIN after the CLOEXEC sweep.
+
+    These are exactly the fds a re-mapped gpgv inherits as candidate write ends of
+    the apt status pipe. The load-bearing invariant for authenticated apt is that
+    this count is EXACTLY 1 (only fd 3 itself — the dup2'd, CLOEXEC-cleared status
+    write end). A count of 0 means fd 3 was wrongly closed (gpgv's `--status-fd 3`
+    write EBADFs -> no GOODSIG); > 1 means a stray inheritable fd lingered besides
+    fd 3 (the status pipe never EOFs -> apt reports "not signed"). The C audit is a
+    device-drain diagnostic; this models the same number for a host regression test.
+    """
+    surviving, _closed = close_cloexec_fds_model(fd_table)
+    return sum(1 for fd, flags in surviving.items()
+               if fd >= 3 and not (flags & FD_CLOEXEC))
