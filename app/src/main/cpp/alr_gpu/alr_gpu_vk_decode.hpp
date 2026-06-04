@@ -44,6 +44,7 @@
 #endif
 #include <vulkan/vulkan.h>
 #include <android/hardware_buffer.h>  // VK-M2 body: AHB-backed clear render target
+#include <android/log.h>              // host-side create_device2 -3 diagnostic -> logcat
 #include <utility>                    // std::pair (real_pool/real_cmd maps)
 #endif
 
@@ -717,6 +718,9 @@ inline VkResult vk_real_create_device2(
         std::fprintf(stderr, "[alr-vk-host] create_device2 FAIL: vphys=%u not in real_phys "
                              "(map size=%zu)\n", vphys, st.real_phys.size());
         std::fflush(stderr);
+        __android_log_print(ANDROID_LOG_ERROR, "alr-vk-host",
+                            "create_device2 FAIL: vphys=%u not in real_phys (map size=%zu)",
+                            vphys, st.real_phys.size());
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     VkPhysicalDevice phys = it->second;
@@ -843,6 +847,32 @@ inline VkResult vk_real_create_device2(
                      vphys, qci.size(),
                      created_counts.count(0) ? created_counts[0] : 0u,
                      dev_ext.size(), el.c_str(), feat_store.size(), (int)r);
+        // The host servicer runs on the APP-process stderr (not the teed guest pipe), so the
+        // line above is invisible in a guest-fork ANGLE run. Mirror the failure to logcat
+        // (tag alr-vk-host) and dump the exact queue-create list + each forwarded feature
+        // sType so a device run pins the -3 to a specific queue request / feature struct.
+        __android_log_print(ANDROID_LOG_ERROR, "alr-vk-host",
+                            "create_device2 vphys=%u qci=%zu ext=%zu[%s] feat=%zu -> VkResult=%d",
+                            vphys, qci.size(), dev_ext.size(), el.c_str(),
+                            feat_store.size(), (int)r);
+        for (const auto& q : qci)
+            __android_log_print(ANDROID_LOG_ERROR, "alr-vk-host",
+                                "  qci fam=%u count=%u (family nqf=%u flags=0x%x famcount=%u)",
+                                q.queueFamilyIndex, q.queueCount, nqf,
+                                (q.queueFamilyIndex < nqf) ? qfprops[q.queueFamilyIndex].queueFlags : 0u,
+                                (q.queueFamilyIndex < nqf) ? qfprops[q.queueFamilyIndex].queueCount : 0u);
+        for (size_t i = 0; i < feat_store.size(); ++i) {
+            Hdr h{}; std::memcpy(&h, feat_store[i].data(), sizeof(Hdr));
+            // Dump up to 4 trailing VkBool32 words so a feature with an illegal combo is visible.
+            uint32_t b0 = 0, b1 = 0, b2 = 0, b3 = 0; size_t sz = feat_store[i].size();
+            if (sz >= sizeof(Hdr) + 4)  std::memcpy(&b0, feat_store[i].data() + sizeof(Hdr) + 0, 4);
+            if (sz >= sizeof(Hdr) + 8)  std::memcpy(&b1, feat_store[i].data() + sizeof(Hdr) + 4, 4);
+            if (sz >= sizeof(Hdr) + 12) std::memcpy(&b2, feat_store[i].data() + sizeof(Hdr) + 8, 4);
+            if (sz >= sizeof(Hdr) + 16) std::memcpy(&b3, feat_store[i].data() + sizeof(Hdr) + 12, 4);
+            __android_log_print(ANDROID_LOG_ERROR, "alr-vk-host",
+                                "  feat[%zu] sType=%u size=%zu bools=[%u,%u,%u,%u]",
+                                i, (uint32_t)h.sType, sz, b0, b1, b2, b3);
+        }
         // WAVE-7: also report (1) every extension ANGLE ENABLED that Mali does NOT expose —
         // i.e. one we silently DROPPED, the prime suspect for a render device ANGLE needs but
         // we can't faithfully build; and (2) every feature sType ANGLE chained that our host
@@ -850,13 +880,20 @@ inline VkResult vk_real_create_device2(
         // -3 to a specific missing extension or unforwarded feature rather than a bare result.
         for (const auto& e : ext_store) {
             if (e.empty() || e == "VK_KHR_swapchain") continue;
-            if (!vk_real_dev_ext_present(phys, e.c_str()))
+            if (!vk_real_dev_ext_present(phys, e.c_str())) {
                 std::fprintf(stderr, "[alr-vk-host]   DROPPED-ext (Mali lacks): %s\n", e.c_str());
+                __android_log_print(ANDROID_LOG_ERROR, "alr-vk-host",
+                                    "  DROPPED-ext (Mali lacks): %s", e.c_str());
+            }
         }
         for (size_t i = 0; i < feat_bytes.size() && i < feat_types.size(); ++i) {
-            if (!vk_passthrough_feature_stype_allowed(feat_types[i]))
+            if (!vk_passthrough_feature_stype_allowed(feat_types[i])) {
                 std::fprintf(stderr, "[alr-vk-host]   DROPPED-feat sType=%u (not in host allowlist)\n",
                              feat_types[i]);
+                __android_log_print(ANDROID_LOG_ERROR, "alr-vk-host",
+                                    "  DROPPED-feat sType=%u (not in host allowlist)",
+                                    feat_types[i]);
+            }
         }
         std::fflush(stderr);
     }
@@ -868,6 +905,9 @@ inline VkResult vk_real_create_device2(
         rd.queue_counts = created_counts;
         st.real_dev[vdev] = rd;
         gfx_family_out = first_gfx;
+        __android_log_print(ANDROID_LOG_INFO, "alr-vk-host",
+                            "create_device2 OK vphys=%u vdev=%u gfx_family=%u qci=%zu ext=%zu feat=%zu",
+                            vphys, vdev, first_gfx, qci.size(), dev_ext.size(), feat_store.size());
     }
     return r;
 }

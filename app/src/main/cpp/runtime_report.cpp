@@ -2445,6 +2445,10 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     // the first fatal stop, from /proc/<faulting-tid>/maps (the tracee is still alive).
     std::string fault_pc_map;
     std::string fault_lr_map;
+    std::string fault_backtrace;  // FP-chain backtrace lines (resolved per-frame lr)
+    unsigned long long fault_x19 = 0, fault_x20 = 0, fault_x23 = 0, fault_x24 = 0, fault_sp = 0;
+    unsigned long long fault_obj_words[4] = {0, 0, 0, 0};
+    unsigned long long fault_sp_words[3] = {0, 0, 0};
     int emulated_syscalls = 0;
     int emulated_list[64] = {0};
     int guest_threads = 0;
@@ -4369,6 +4373,27 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                 fault_lr = regs[30];  // x30/LR = the caller's return address
                 fault_x0 = regs[0];
                 fault_x8 = regs[8];
+                // Callee-saved regs the crashing libc++ vector-grow uses (x19=the object,
+                // x20/x23/x24=count/ptr/cap) — pins the element count driving the bad alloc.
+                fault_x19 = regs[19]; fault_x20 = regs[20];
+                fault_x23 = regs[23]; fault_x24 = regs[24];
+                fault_sp = regs[31];
+                // Peek the std::vector control block at x19 (begin@0, end@8, cap@16) and at
+                // sp+0x18 (the libc++ grow reads vector.begin from [sp,#0x18]). The TRUE
+                // element count = (end-begin)/elemsize; a wild begin here => upstream OOB,
+                // a sane begin + huge count => a reported value drove the size. Pins which.
+                for (int k = 0; k < 4; ++k) {
+                    errno = 0;
+                    long v = ::ptrace(PTRACE_PEEKDATA, w,
+                                      reinterpret_cast<void*>(fault_x19 + 8 * k), nullptr);
+                    fault_obj_words[k] = (errno == 0) ? static_cast<unsigned long long>(v) : 0xBADBAD;
+                }
+                for (int k = 0; k < 3; ++k) {
+                    errno = 0;
+                    long v = ::ptrace(PTRACE_PEEKDATA, w,
+                                      reinterpret_cast<void*>(fault_sp + 0x18 + 8 * k), nullptr);
+                    fault_sp_words[k] = (errno == 0) ? static_cast<unsigned long long>(v) : 0xBADBAD;
+                }
             }
             siginfo_t si{};
             if (::ptrace(PTRACE_GETSIGINFO, w, nullptr, &si) == 0) {
@@ -4416,6 +4441,37 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                 };
                 fault_pc_map = resolve(fault_pc);
                 fault_lr_map = resolve(fault_lr);
+                // FP-CHAIN BACKTRACE: walk the AArch64 frame-pointer chain (x29 -> saved
+                // {fp, lr} pairs) via PTRACE_PEEKDATA so a guest crash gets a REAL call
+                // stack, not just the (possibly inlined/stale-lr) pc+lr. Each frame's lr is
+                // resolved to <module>+0xoff against the tracee maps. Bounded to 24 frames;
+                // stops when fp leaves a sane range or repeats. This is what pins WHICH
+                // ANGLE function drives a crash when pc/lr alone are ambiguous.
+                {
+                    uint64_t fp = regs[29];
+                    unsigned long long prev_fp = 0;
+                    fault_backtrace.clear();
+                    for (int depth = 0; depth < 24 && fp != 0 && fp != prev_fp; ++depth) {
+                        // saved pair at [fp]: next_fp = *(fp), saved_lr = *(fp+8)
+                        errno = 0;
+                        long nfp = ::ptrace(PTRACE_PEEKDATA, w,
+                                            reinterpret_cast<void*>(fp), nullptr);
+                        if (errno != 0) break;
+                        errno = 0;
+                        long slr = ::ptrace(PTRACE_PEEKDATA, w,
+                                            reinterpret_cast<void*>(fp + 8), nullptr);
+                        if (errno != 0) break;
+                        std::string frame = resolve(static_cast<unsigned long long>(slr));
+                        if (!frame.empty()) {
+                            char fl[300];
+                            std::snprintf(fl, sizeof(fl), "\nalr native loader fault bt[%d] lr@%s",
+                                          depth, frame.c_str());
+                            fault_backtrace += fl;
+                        }
+                        prev_fp = fp;
+                        fp = static_cast<uint64_t>(nfp);
+                    }
+                }
             }
         }
         // Deliver any other signal to the tracee that received it — EXCEPT the
@@ -4489,11 +4545,22 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         << " addr=0x" << fault_addr
         << " lr=0x" << fault_lr
         << " x0=0x" << fault_x0
-        << " x8=0x" << fault_x8 << std::dec
+        << " x8=0x" << fault_x8
+        << " x19=0x" << fault_x19 << " x20=0x" << fault_x20
+        << " x23=0x" << fault_x23 << " x24=0x" << fault_x24
+        << " sp=0x" << fault_sp << std::dec
         << " syscall=" << fault_syscall;
     if (!fault_pc_map.empty() || !fault_lr_map.empty()) {
         out << "\nalr native loader fault pc@" << fault_pc_map
             << " lr@" << fault_lr_map;
+    }
+    if (!fault_backtrace.empty()) out << fault_backtrace;
+    if (fault_signo != 0) {
+        out << "\nalr native loader fault vecobj[x19] begin=0x" << std::hex << fault_obj_words[0]
+            << " end=0x" << fault_obj_words[1] << " cap=0x" << fault_obj_words[2]
+            << " w3=0x" << fault_obj_words[3]
+            << " | sp+0x18=0x" << fault_sp_words[0] << " sp+0x20=0x" << fault_sp_words[1]
+            << " sp+0x28=0x" << fault_sp_words[2] << std::dec;
     }
     out << "\nalr native loader guest threads spawned=" << guest_threads;
     out << "\nalr native loader path-mediation traps=" << path_traps

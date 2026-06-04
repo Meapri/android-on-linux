@@ -3611,6 +3611,12 @@ class MainActivity : Activity() {
                 // implement rather than ANGLE crashing on a NULL fn pointer. ICD-side gated
                 // on ALR_ICD_TRAP; strictly diagnostic, default-off everywhere else.
                 android.system.Os.setenv("ALR_ICD_TRAP", "1", true)
+                // DIAGNOSTIC A/B (gated on /data/local/tmp/.alr-angle-nopcgate): force
+                // ALR_PCGATE=0 (full-syscall-trace loader, no PC-gate fast path) so a device
+                // run can rule the seccomp/PC-gate sandbox IN or OUT as the cause of an
+                // ANGLE-internal crash. Default absent → PC-gate stays on (no-regression).
+                if (java.io.File("/data/local/tmp/.alr-angle-nopcgate").isFile)
+                    android.system.Os.setenv("ALR_PCGATE", "0", true)
                 // Part B: surface the interposer's dlopen-redirect diag ("dlopen
                 // vulkan->loader …") so a device run can prove whether ANGLE's
                 // dlopen("libvulkan.so.1") was rewritten to the staged Khronos loader.

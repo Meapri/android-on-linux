@@ -206,6 +206,7 @@ static uint32_t alr_icd_roundtrip(const uint8_t *req_bytes, uint32_t req_len,
      *    reply op stream to the reply ring), exactly like the GLES per-frame handshake.
      *    Spin fallback (correct, just busier); the doorbell makes the host prompt. */
     spin = (1u << 24);
+    observed = 0;
     for (unsigned i = 0; i < spin; ++i) {
         observed = atomic_load_explicit(&s->req.h->reply_seq, memory_order_acquire);
         if (observed >= want) break;
@@ -216,6 +217,15 @@ static uint32_t alr_icd_roundtrip(const uint8_t *req_bytes, uint32_t req_len,
      *    there before bumping reply_seq, so it is fully visible now). */
     got = alr_ring_consumer_snapshot(&s->rep, reply_out, reply_cap);
     if (got) alr_ring_consumer_advance(&s->rep, got);
+
+    /* ROUNDTRIP DIAG (gated on ALR_ICD_DIAG): the req/reply seq handshake + the reply
+     * byte count + first reply op. This is the ground truth for a reply/request seq
+     * skew (a `want` pre-satisfied by a stale reply_seq drains 0 or a leftover reply). */
+    if (getenv("ALR_ICD_DIAG")) {
+        fprintf(stderr, "[alr-icd] roundtrip req_len=%u want=%u observed_reply_seq=%u "
+                        "got=%u firstop=%d\n",
+                req_len, want, observed, got, got ? (int)reply_out[0] : -1);
+    }
 
     pthread_mutex_unlock(&g_icd_lock);
     return got;

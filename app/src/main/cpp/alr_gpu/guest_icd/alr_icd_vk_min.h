@@ -171,6 +171,13 @@ typedef struct VkBaseInStructure {
     const struct VkBaseInStructure* pNext;
 } VkBaseInStructure;
 
+/* The writable twin (Properties2/Features2 pNext structs the ICD FILLS in place). Same
+ * first-two-words layout as VkBaseInStructure but a non-const pNext for walking + writing. */
+typedef struct VkBaseOutStructure {
+    VkStructureType            sType;
+    struct VkBaseOutStructure* pNext;
+} VkBaseOutStructure;
+
 /* sType values for the device-feature structs ANGLE's RendererVk may chain off
  * VkDeviceCreateInfo.pNext (official Vulkan constants). The size table below maps each to
  * its struct byte length so the guest can ship the WHOLE struct verbatim over the wire; the
@@ -381,9 +388,22 @@ typedef struct VkQueueFamilyProperties {
  * as correctly-SIZED opaque byte blobs so VkPhysicalDeviceProperties has the exact
  * official size + deviceName offset (the app may stack-allocate the full struct). The
  * ENUM rung only reads apiVersion/deviceType/deviceName/vendorID, all BEFORE limits. */
+/* CRITICAL ABI ALIGNMENT: the official VkPhysicalDeviceLimits contains VkDeviceSize (8-byte)
+ * members, so its natural alignment is 8 — and that 8-alignment is what places the `limits`
+ * member of VkPhysicalDeviceProperties at offset 296 (4 bytes of padding follow the 16-byte
+ * pipelineCacheUUID at offset 276..291 to 8-align limits). If we model the opaque blob as a
+ * bare uint8_t[504] (alignment 1), `limits` lands at offset 292 instead — a 4-byte shift, so
+ * a memcpy of the REAL Mali limits into a CALLER's (ANGLE's, real-ABI) VkPhysicalDeviceProperties
+ * writes 4 bytes too early and ANGLE reads every limit shifted (a 64-bit bufferImageGranularity/
+ * maxMemoryAllocationSize then reads a half-swapped huge value, sample-count masks become
+ * garbage). ANGLE turns that into a bogus std::vector size during caps init and crashes on the
+ * first texture (DEVICE-PROVEN: SIGSEGV libGLESv2+0x1f6db4, a vector grow, x24=0x60<<32). Force
+ * the 8-byte alignment so the member offset + struct size (800) match the official ABI exactly. */
 typedef struct VkPhysicalDeviceLimits {
-    uint8_t _opaque[504];  /* sizeof(VkPhysicalDeviceLimits) in the official header */
+    _Alignas(8) uint8_t _opaque[504];  /* sizeof + ALIGNMENT must match the official header (504, 8) */
 } VkPhysicalDeviceLimits;
+_Static_assert(_Alignof(VkPhysicalDeviceLimits) == 8,
+               "VkPhysicalDeviceLimits must be 8-byte aligned so VkPhysicalDeviceProperties.limits lands at offset 296");
 typedef struct VkPhysicalDeviceSparseProperties {
     VkBool32 residencyStandard2DBlockShape;
     VkBool32 residencyStandard2DMultisampleBlockShape;

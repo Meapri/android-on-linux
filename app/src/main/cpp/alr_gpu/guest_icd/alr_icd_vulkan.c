@@ -202,6 +202,14 @@ _Static_assert(sizeof(VkPhysicalDeviceFeatures) == ALR_ICD_FEATURES_BYTES,
                "VkPhysicalDeviceFeatures must be 220 bytes for the raw-bytes wire copy");
 _Static_assert(sizeof(VkPhysicalDeviceLimits) == ALR_ICD_LIMITS_BYTES,
                "VkPhysicalDeviceLimits must be 504 bytes for the raw-bytes wire copy");
+/* ABI offset lock: the CALLER (ANGLE, real Vulkan headers) reads .limits at offset 296. If
+ * our VkPhysicalDeviceProperties places it elsewhere, the memcpy of the real Mali limits into
+ * the caller's struct lands at the wrong offset and ANGLE reads every limit shifted (the
+ * DEVICE-PROVEN libGLESv2+0x1f6db4 caps-init crash). 296 = 4*4 (api/drv/vendor/devID) + 4
+ * (deviceType) + 256 (deviceName) + 16 (pipelineCacheUUID) padded up to the 8-aligned limits. */
+_Static_assert(offsetof(VkPhysicalDeviceProperties, limits) == 296,
+               "VkPhysicalDeviceProperties.limits MUST be at offset 296 (official ABI) so the "
+               "raw-Mali-limits memcpy lands where ANGLE reads it");
 _Static_assert(sizeof(VkPhysicalDeviceMemoryProperties) == ALR_ICD_MEMORY_BYTES,
                "VkPhysicalDeviceMemoryProperties must be 520 bytes for the raw-bytes wire copy");
 typedef struct AlrIcdPhysCache {
@@ -549,6 +557,32 @@ static void VKAPI_CALL alr_vkGetPhysicalDeviceProperties(VkPhysicalDevice physic
             memcpy(&pProperties->limits, slot->limits_raw, ALR_ICD_LIMITS_BYTES);
             ALR_ICD_DIAG("vkGetPhysicalDeviceProperties -> REAL Mali limits forwarded (%u B)",
                          (unsigned)ALR_ICD_LIMITS_BYTES);
+            /* Dump the limits ANGLE most plausibly turns into a vector count/reserve during
+             * caps init (a 0 or UINT32_MAX here can drive a length_error/bad_alloc grow).
+             * VkPhysicalDeviceLimits is an opaque 504B blob here, so read by OFFSET against
+             * the official arm64 ABI. Key uint32 fields (offset → field):
+             *   0  maxImageDimension1D     4  maxImageDimension2D    8  maxImageDimension3D
+             *   12 maxImageDimensionCube  16  maxImageArrayLayers   36  maxMemoryAllocationCount
+             *   168 maxBoundDescriptorSets 232 maxPerStageResources  280 maxVertexInputAttributes
+             *   284 maxVertexInputBindings 360 maxColorAttachments. We dump the FULL 504B as
+             * 126 u32 words so NO field is missed when correlating with ANGLE's caps reads. */
+            if (alr_icd_diag_on()) {
+                const uint8_t *lb = (const uint8_t *)&pProperties->limits;
+                uint32_t w[126]; memcpy(w, lb, 504);
+                ALR_ICD_DIAG("  lim[off0..16] imgDim1D=%u 2D=%u 3D=%u Cube=%u arrLayers=%u",
+                             w[0], w[1], w[2], w[3], w[4]);
+                ALR_ICD_DIAG("  lim maxMemoryAllocationCount(off36)=%u maxBoundDescriptorSets(off168)=%u "
+                             "maxPerStageResources(off232)=%u",
+                             w[9], w[42], w[58]);
+                ALR_ICD_DIAG("  lim maxVtxInAttr(off280)=%u maxVtxInBind(off284)=%u maxColorAtt(off360)=%u",
+                             w[70], w[71], w[90]);
+                /* full word dump in 6 chunks of 21 so a huge/zero anywhere is visible */
+                for (uint32_t c = 0; c < 6; ++c)
+                    ALR_ICD_DIAG("  limW[%u..]=%u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u",
+                                 c*21, w[c*21+0],w[c*21+1],w[c*21+2],w[c*21+3],w[c*21+4],w[c*21+5],w[c*21+6],
+                                 w[c*21+7],w[c*21+8],w[c*21+9],w[c*21+10],w[c*21+11],w[c*21+12],w[c*21+13],
+                                 w[c*21+14],w[c*21+15],w[c*21+16],w[c*21+17],w[c*21+18],w[c*21+19],w[c*21+20]);
+            }
         } else {
             ALR_ICD_DIAG("vkGetPhysicalDeviceProperties -> limits ABSENT (host sent none)");
         }
@@ -1182,6 +1216,19 @@ static void VKAPI_CALL alr_vkGetPhysicalDeviceMemoryProperties(
         ALR_ICD_DIAG("vkGetPhysicalDeviceMemoryProperties -> REAL Mali forwarded "
                      "(%u heaps, %u types)",
                      pMemProps->memoryHeapCount, pMemProps->memoryTypeCount);
+        /* Per-heap + per-type dump (gated on ALR_ICD_DIAG): the ground truth for an ANGLE
+         * caps-init vector grow driven by a bad memory-type/heap value (a 0-size heap, an
+         * out-of-range heapIndex, an unexpected DEVICE_LOCAL|HOST_VISIBLE combo). */
+        if (alr_icd_diag_on()) {
+            for (uint32_t h = 0; h < pMemProps->memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; ++h)
+                ALR_ICD_DIAG("  memHeap[%u] size=%llu flags=0x%x", h,
+                             (unsigned long long)pMemProps->memoryHeaps[h].size,
+                             (unsigned)pMemProps->memoryHeaps[h].flags);
+            for (uint32_t t = 0; t < pMemProps->memoryTypeCount && t < VK_MAX_MEMORY_TYPES; ++t)
+                ALR_ICD_DIAG("  memType[%u] heapIndex=%u propertyFlags=0x%x", t,
+                             pMemProps->memoryTypes[t].heapIndex,
+                             (unsigned)pMemProps->memoryTypes[t].propertyFlags);
+        }
         return;
     }
     /* No host / unknown device: keep the conservative single-heap shape a UMA mobile GPU
@@ -1397,6 +1444,17 @@ static void VKAPI_CALL alr_vkGetPhysicalDeviceProperties2(
     alr_vkGetPhysicalDeviceProperties(physicalDevice, &pProperties->properties);
     ALR_ICD_DIAG("vkGetPhysicalDeviceProperties2 (pNext=%p) name=%s",
                  (void *)pProperties->pNext, pProperties->properties.deviceName);
+    /* The pNext property chain (Maintenance3/4, Multiview, Subgroup, ID, Driver props) is
+     * left as the caller initialized it. DEVICE-CHECKED: synthesizing conservative values
+     * for these (maxPerSetDescriptors / maxMemoryAllocationSize / subgroupSize / ...) did
+     * NOT move the first-texture crash (it is invariant to every caps value the ICD
+     * reports), so we keep the minimal v1 fill and only DUMP the chain under ALR_ICD_DIAG.
+     * Forwarding the REAL Mali Properties2 chain is the orthodox next step if a later
+     * ANGLE path proves to need a specific one of these. */
+    if (alr_icd_diag_on())
+        for (const VkBaseInStructure *p = (const VkBaseInStructure *)pProperties->pNext;
+             p; p = p->pNext)
+            ALR_ICD_DIAG("  props2 pNext sType=%u (v1-only; not synthesized)", (uint32_t)p->sType);
 }
 
 static void VKAPI_CALL alr_vkGetPhysicalDeviceFeatures2(
@@ -1404,6 +1462,15 @@ static void VKAPI_CALL alr_vkGetPhysicalDeviceFeatures2(
     if (!pFeatures) return;
     alr_vkGetPhysicalDeviceFeatures(physicalDevice, &pFeatures->features);
     ALR_ICD_DIAG("vkGetPhysicalDeviceFeatures2 (pNext=%p)", (void *)pFeatures->pNext);
+    /* Like Properties2: the feature pNext chain (Multiview/16BitStorage/VariablePointers/
+     * ProtectedMemory/SamplerYcbcr) is left as the caller initialized it. DEVICE-CHECKED:
+     * reporting these features as supported did NOT move the first-texture crash. Dump-only
+     * under ALR_ICD_DIAG; the orthodox fix (forward the REAL Mali Features2 chain) is
+     * deferred until a path is proven to require a specific one. */
+    if (alr_icd_diag_on())
+        for (const VkBaseInStructure *p = (const VkBaseInStructure *)pFeatures->pNext;
+             p; p = p->pNext)
+            ALR_ICD_DIAG("  feat2 pNext sType=%u (v1-only; not synthesized)", (uint32_t)p->sType);
 }
 
 static void VKAPI_CALL alr_vkGetPhysicalDeviceQueueFamilyProperties2(
@@ -1632,7 +1699,12 @@ static PFN_vkVoidFunction VKAPI_CALL alr_vkGetInstanceProcAddr(VkInstance instan
  * silent crash into an ordered trace of the device functions ANGLE genuinely uses, so the
  * next entrypoints to implement are read off directly. OFF by default (returns NULL — the
  * correct GDPA answer), so it never perturbs the no-regression path. ---- */
-#define ALR_TRAP_POOL 128
+/* 640 slots: ANGLE's RendererVk queries ~500+ device entry points via vkGetDeviceProcAddr
+ * at init; with a 128-slot pool the 129th+ unimplemented fn fell back to NULL, and a CALL to
+ * that NULL fn crashed (blr x8=0) in libGLESv2 BEFORE the trap could name it. Sizing the pool
+ * above the full device-fn count lets EVERY unimplemented fn ANGLE invokes log "TRAP CALLED"
+ * instead, which pins the exact entrypoint the FBO/render path needs. */
+#define ALR_TRAP_POOL 640
 static const char *g_trap_names[ALR_TRAP_POOL];
 static int         g_trap_count = 0;
 static int         g_trap_fired[ALR_TRAP_POOL];
@@ -1662,10 +1734,21 @@ static uintptr_t alr_trap_body(int slot) {
 #define ALR_TRAP_FN(n) static uintptr_t alr_trap_##n(void) { return alr_trap_body(n); }
 #define ALR_TRAP_FN8(b) ALR_TRAP_FN(b##0) ALR_TRAP_FN(b##1) ALR_TRAP_FN(b##2) ALR_TRAP_FN(b##3) \
                         ALR_TRAP_FN(b##4) ALR_TRAP_FN(b##5) ALR_TRAP_FN(b##6) ALR_TRAP_FN(b##7)
-/* slots 0..127 */
+/* slots 0..639 (80 rows of 8) */
 ALR_TRAP_FN8(0) ALR_TRAP_FN8(1) ALR_TRAP_FN8(2) ALR_TRAP_FN8(3) ALR_TRAP_FN8(4) ALR_TRAP_FN8(5)
 ALR_TRAP_FN8(6) ALR_TRAP_FN8(7) ALR_TRAP_FN8(8) ALR_TRAP_FN8(9) ALR_TRAP_FN8(10) ALR_TRAP_FN8(11)
 ALR_TRAP_FN8(12) ALR_TRAP_FN8(13) ALR_TRAP_FN8(14) ALR_TRAP_FN8(15)
+ALR_TRAP_FN8(16) ALR_TRAP_FN8(17) ALR_TRAP_FN8(18) ALR_TRAP_FN8(19) ALR_TRAP_FN8(20) ALR_TRAP_FN8(21)
+ALR_TRAP_FN8(22) ALR_TRAP_FN8(23) ALR_TRAP_FN8(24) ALR_TRAP_FN8(25) ALR_TRAP_FN8(26) ALR_TRAP_FN8(27)
+ALR_TRAP_FN8(28) ALR_TRAP_FN8(29) ALR_TRAP_FN8(30) ALR_TRAP_FN8(31) ALR_TRAP_FN8(32) ALR_TRAP_FN8(33)
+ALR_TRAP_FN8(34) ALR_TRAP_FN8(35) ALR_TRAP_FN8(36) ALR_TRAP_FN8(37) ALR_TRAP_FN8(38) ALR_TRAP_FN8(39)
+ALR_TRAP_FN8(40) ALR_TRAP_FN8(41) ALR_TRAP_FN8(42) ALR_TRAP_FN8(43) ALR_TRAP_FN8(44) ALR_TRAP_FN8(45)
+ALR_TRAP_FN8(46) ALR_TRAP_FN8(47) ALR_TRAP_FN8(48) ALR_TRAP_FN8(49) ALR_TRAP_FN8(50) ALR_TRAP_FN8(51)
+ALR_TRAP_FN8(52) ALR_TRAP_FN8(53) ALR_TRAP_FN8(54) ALR_TRAP_FN8(55) ALR_TRAP_FN8(56) ALR_TRAP_FN8(57)
+ALR_TRAP_FN8(58) ALR_TRAP_FN8(59) ALR_TRAP_FN8(60) ALR_TRAP_FN8(61) ALR_TRAP_FN8(62) ALR_TRAP_FN8(63)
+ALR_TRAP_FN8(64) ALR_TRAP_FN8(65) ALR_TRAP_FN8(66) ALR_TRAP_FN8(67) ALR_TRAP_FN8(68) ALR_TRAP_FN8(69)
+ALR_TRAP_FN8(70) ALR_TRAP_FN8(71) ALR_TRAP_FN8(72) ALR_TRAP_FN8(73) ALR_TRAP_FN8(74) ALR_TRAP_FN8(75)
+ALR_TRAP_FN8(76) ALR_TRAP_FN8(77) ALR_TRAP_FN8(78) ALR_TRAP_FN8(79)
 #undef ALR_TRAP_FN8
 #undef ALR_TRAP_FN
 #define ALR_TRAP_PTR(n) (PFN_vkVoidFunction)alr_trap_##n
@@ -1675,7 +1758,19 @@ static const PFN_vkVoidFunction g_trap_fns[ALR_TRAP_POOL] = {
     ALR_TRAP_ROW8(0) ALR_TRAP_ROW8(1) ALR_TRAP_ROW8(2) ALR_TRAP_ROW8(3) ALR_TRAP_ROW8(4)
     ALR_TRAP_ROW8(5) ALR_TRAP_ROW8(6) ALR_TRAP_ROW8(7) ALR_TRAP_ROW8(8) ALR_TRAP_ROW8(9)
     ALR_TRAP_ROW8(10) ALR_TRAP_ROW8(11) ALR_TRAP_ROW8(12) ALR_TRAP_ROW8(13) ALR_TRAP_ROW8(14)
-    ALR_TRAP_ROW8(15)
+    ALR_TRAP_ROW8(15) ALR_TRAP_ROW8(16) ALR_TRAP_ROW8(17) ALR_TRAP_ROW8(18) ALR_TRAP_ROW8(19)
+    ALR_TRAP_ROW8(20) ALR_TRAP_ROW8(21) ALR_TRAP_ROW8(22) ALR_TRAP_ROW8(23) ALR_TRAP_ROW8(24)
+    ALR_TRAP_ROW8(25) ALR_TRAP_ROW8(26) ALR_TRAP_ROW8(27) ALR_TRAP_ROW8(28) ALR_TRAP_ROW8(29)
+    ALR_TRAP_ROW8(30) ALR_TRAP_ROW8(31) ALR_TRAP_ROW8(32) ALR_TRAP_ROW8(33) ALR_TRAP_ROW8(34)
+    ALR_TRAP_ROW8(35) ALR_TRAP_ROW8(36) ALR_TRAP_ROW8(37) ALR_TRAP_ROW8(38) ALR_TRAP_ROW8(39)
+    ALR_TRAP_ROW8(40) ALR_TRAP_ROW8(41) ALR_TRAP_ROW8(42) ALR_TRAP_ROW8(43) ALR_TRAP_ROW8(44)
+    ALR_TRAP_ROW8(45) ALR_TRAP_ROW8(46) ALR_TRAP_ROW8(47) ALR_TRAP_ROW8(48) ALR_TRAP_ROW8(49)
+    ALR_TRAP_ROW8(50) ALR_TRAP_ROW8(51) ALR_TRAP_ROW8(52) ALR_TRAP_ROW8(53) ALR_TRAP_ROW8(54)
+    ALR_TRAP_ROW8(55) ALR_TRAP_ROW8(56) ALR_TRAP_ROW8(57) ALR_TRAP_ROW8(58) ALR_TRAP_ROW8(59)
+    ALR_TRAP_ROW8(60) ALR_TRAP_ROW8(61) ALR_TRAP_ROW8(62) ALR_TRAP_ROW8(63) ALR_TRAP_ROW8(64)
+    ALR_TRAP_ROW8(65) ALR_TRAP_ROW8(66) ALR_TRAP_ROW8(67) ALR_TRAP_ROW8(68) ALR_TRAP_ROW8(69)
+    ALR_TRAP_ROW8(70) ALR_TRAP_ROW8(71) ALR_TRAP_ROW8(72) ALR_TRAP_ROW8(73) ALR_TRAP_ROW8(74)
+    ALR_TRAP_ROW8(75) ALR_TRAP_ROW8(76) ALR_TRAP_ROW8(77) ALR_TRAP_ROW8(78) ALR_TRAP_ROW8(79)
 #undef ALR_TRAP_ROW8
 #undef ALR_TRAP_PTR
 };
