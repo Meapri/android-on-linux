@@ -115,6 +115,13 @@ class NativeAppSession internal constructor(
             setEnv("ALR_REEXEC_INPROC", "1")
             setEnv("ALR_PERSIST_GUEST", "1")     // standalone: no SIGALRM lifetime cap
             setEnv("ALR_TEE_GUEST_STDOUT", "1")  // stream guest stderr/stdout to logcat
+            // Touch-calibrated guest DPI (product UX BUG-1): match the GTK/Qt/X11 toolkits to
+            // Android's already-finger-sized densityDpi so the Linux app's default buttons/
+            // menus/fonts are tappable. Derived (not hardcoded) and double-scale-safe w.r.t.
+            // the compositor's wl_output buffer scale — see TouchDpiEnv. Set BEFORE request.env
+            // so a per-app launch can still override any single knob.
+            for ((k, v) in TouchDpiEnv.envFor(dm.densityDpi)) setEnv(k, v)
+            Log.i(TAG, "[$appId] touch-dpi: density=${dm.densityDpi} env=${TouchDpiEnv.envFor(dm.densityDpi)}")
             for ((k, v) in request.env) setEnv(k, v)
 
             // === X11-only routing via ROOTFUL Xwayland (TASK-A) ======================= //
@@ -129,7 +136,11 @@ class NativeAppSession internal constructor(
             // for the guest env. For a Wayland-capable app it is a complete no-op (byte-
             // identical to before). Gated entirely inside the helper.
             if (XwaylandLaunch.needsX11(appId, request.protocol, request.entryPath)) {
-                val xReady = XwaylandLaunch.ensureUp(runtime, rootfsDir, rootfsName, outW, outH)
+                // Pass densityDpi so the helper seeds the X resource DB with the touch DPI
+                // (Xft.dpi) for pure-Xlib clients that read xrdb rather than the env (BUG-1).
+                val xReady = XwaylandLaunch.ensureUp(
+                    runtime, rootfsDir, rootfsName, outW, outH, dm.densityDpi,
+                )
                 for ((k, v) in XwaylandLaunch.envFor()) setEnv(k, v)
                 Log.i(TAG, "[$appId] X11 routing: Xwayland :0 ready=$xReady (DISPLAY=:0)")
             }
@@ -532,8 +543,16 @@ internal object XwaylandLaunch {
      * most once. Must be called BEFORE the guest's blocking loader call (Xwayland runs on
      * its own thread; this call returns once the socket is ready or the wait elapses).
      */
-    fun ensureUp(runtime: NativeAlrRuntime, rootfsDir: File, rootfsName: String, outW: Int, outH: Int): Boolean {
+    fun ensureUp(
+        runtime: NativeAlrRuntime,
+        rootfsDir: File,
+        rootfsName: String,
+        outW: Int,
+        outH: Int,
+        densityDpi: Int = 0,
+    ): Boolean {
         prepX11Sockets(rootfsDir)
+        seedXftDpi(rootfsDir, densityDpi)
 
         val xSock = File(rootfsDir, "tmp/.X11-unix/X0")
         // Already up (a prior session started it) → just confirm the socket.
@@ -598,6 +617,26 @@ internal object XwaylandLaunch {
                 "/tmp/.X11-unix(1777)=${xUnix.isDirectory}")
         } catch (e: Throwable) {
             Log.w(TAG, "xwayland: /tmp prep EXC: ${e.message}")
+        }
+    }
+
+    /**
+     * Seed the touch DPI into the X resource DB (BUG-1): write `Xft.dpi: <densityDpi>` to the
+     * rootfs `/root/.Xresources` so a pure-Xlib client that consults xrdb (rather than the
+     * `Xft.dpi` env TouchDpiEnv also sets) still renders fonts at the device density. X11 has
+     * no per-output scale and Xwayland presents at 1× to the (buffer-scaled) compositor, so the
+     * X client needs the FULL density as its font DPI. Best-effort + idempotent; a missing
+     * density (0) or any IO failure just logs (the launch still proceeds with the env value).
+     */
+    private fun seedXftDpi(rootfsDir: File, densityDpi: Int) {
+        if (densityDpi <= 0) return
+        try {
+            val xres = File(rootfsDir, "root/.Xresources")
+            xres.parentFile?.mkdirs()
+            xres.writeText("Xft.dpi: $densityDpi\n")
+            Log.i(TAG, "xwayland: seeded Xft.dpi=$densityDpi -> ${xres.absolutePath}")
+        } catch (e: Throwable) {
+            Log.w(TAG, "xwayland: Xft.dpi seed EXC: ${e.message}")
         }
     }
 }

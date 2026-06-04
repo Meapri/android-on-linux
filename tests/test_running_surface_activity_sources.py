@@ -177,3 +177,65 @@ def test_does_not_touch_main_activity_source():
         assert "RunningSurfaceActivity" not in ma, (
             "MainActivity 가 RunningSurfaceActivity 를 참조 — 결선은 통합 세션 소유"
         )
+
+
+# --------------------------------------------------------------------------- #
+# BUG-2: 리눅스 타이틀바 ↔ Android 상태바 겹침 — 세이프에어리어 인셋 결선
+# --------------------------------------------------------------------------- #
+def test_applies_safe_area_insets_after_set_content_view():
+    """BUG-2: setContentView 직후 인셋을 적용해 컴포지터 콘텐츠를 세이프에어리어로 가둔다."""
+    src = _src()
+    assert "applySafeAreaInsets()" in src
+    # 반드시 setContentView 뒤(데코뷰/insetsController 존재 후)에 호출.
+    set_cv = src.index("setContentView(buildContentView())")
+    apply = src.index("applySafeAreaInsets()")
+    assert set_cv < apply, "applySafeAreaInsets() 는 setContentView 뒤에 와야 함"
+
+
+def test_inset_listener_pads_root_by_system_bars_and_cutout():
+    """루트에 OnApplyWindowInsetsListener 로 상태바+내비바+컷아웃 만큼 패딩."""
+    src = _src()
+    assert "setOnApplyWindowInsetsListener" in src
+    # systemBars() | displayCutout() = 상태바+내비바+카메라 노치.
+    assert "WindowInsets.Type.systemBars()" in src
+    assert "WindowInsets.Type.displayCutout()" in src
+    # 패딩으로 세이프에어리어 적용(SurfaceView 가 그만큼 줄어 → wl_output 재구성).
+    assert "setPadding(" in src
+
+
+def test_inset_reapplies_on_rotation_via_listener():
+    """리스너(일회성 패딩 아님)라서 회전/멀티윈도우에서 인셋이 재적용된다."""
+    src = _src()
+    # requestApplyInsets 로 최초 1회 강제 + 리스너로 이후 변경 자동 반영.
+    assert "requestApplyInsets()" in src
+    # 루트 참조를 보관해 리스너를 건다(재적용 대상).
+    assert "rootLayout" in src
+    assert "private lateinit var rootLayout: FrameLayout" in src
+
+
+def test_keeps_status_bar_visible_consistent_with_chromium_path():
+    """기본 UX 는 바 표시 + 콘텐츠 인셋(크로미움 경로와 일관) — 몰입형 아님(기본값)."""
+    src = _src()
+    # 바를 SHOW(BEHAVIOR_DEFAULT) — 크로미움 showSystemBars 와 동일한 "바 보임, 겹침 없음".
+    assert "WindowInsetsController.BEHAVIOR_DEFAULT" in src
+    assert "c.show(" in src
+    # 기본 플래그는 비몰입(false): 바 표시 + 인셋.
+    assert "IMMERSIVE_FULLSCREEN = false" in src
+
+
+def test_immersive_alternative_documented_behind_flag():
+    """몰입형(바 숨김, 진짜 풀스크린) 대안을 플래그로 제공 — device 튜닝용."""
+    src = _src()
+    assert "applyImmersiveFullscreen()" in src
+    # 몰입형 경로: 바 숨김 + 스와이프 트랜지언트.
+    assert "BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE" in src
+    # 플래그로 분기(둘 중 하나만 적용).
+    assert "if (IMMERSIVE_FULLSCREEN)" in src
+
+
+def test_inset_size_flows_to_compositor_via_surface_changed():
+    """인셋된 SurfaceView 크기가 surfaceChanged→onSurfaceChanged 로 컴포지터에 흐른다."""
+    src = _src()
+    # 이미 결선된 경로(BUG-2 가 의존): surfaceChanged 에서 onSurfaceChanged(width,height).
+    assert "override fun surfaceChanged" in src
+    assert "onSurfaceChanged(holder, width, height)" in src

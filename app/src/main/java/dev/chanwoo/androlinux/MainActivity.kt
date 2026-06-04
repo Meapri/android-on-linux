@@ -1619,6 +1619,15 @@ class MainActivity : Activity() {
                     val wlStart = nativeWaylandCompositorStart(
                         cacheDir.absolutePath, holder.surface, dm.densityDpi, dm.xdpi, dm.ydpi,
                         outW, outH, refreshMhz)
+                    // Touch-calibrated guest DPI (product UX BUG-1): match the GTK/Qt/X11
+                    // toolkits to Android's finger-sized densityDpi for the probe GUI battery
+                    // (GTK3 / GIMP / foot below) too, via the SINGLE derivation in TouchDpiEnv
+                    // (no hardcoded scale; double-scale-safe vs the compositor's wl_output
+                    // buffer scale advertised at nativeWaylandCompositorStart just above).
+                    for ((k, v) in dev.chanwoo.androlinux.runtime.TouchDpiEnv.envFor(dm.densityDpi)) {
+                        android.system.Os.setenv(k, v, true)
+                    }
+                    android.util.Log.i("alr_loader", "touch-dpi: density=${dm.densityDpi} env=${dev.chanwoo.androlinux.runtime.TouchDpiEnv.envFor(dm.densityDpi)}")
                     // Wire the guest-IME-state upcall so a guest text field raises the
                     // Android soft keyboard. The editor SurfaceView is stashed in
                     // imeSurfaceView right after construction (below); onGuestImeState reads
@@ -2472,6 +2481,15 @@ class MainActivity : Activity() {
                         // (was 180s) and no stall-watchdog ceiling/no-progress kill (was
                         // 200s/40s), which is what turned the window black "after a while".
                         android.system.Os.setenv("ALR_PERSIST_GUEST", "1", true)
+                        // Touch-calibrated guest DPI (product UX BUG-1): same density-derived
+                        // GTK/Qt/X11 scale env as the product launch path (NativeAppSession),
+                        // from the SINGLE derivation in TouchDpiEnv (no hardcoded scale, no
+                        // double-scale vs the compositor's wl_output buffer scale). chromium
+                        // sizes itself via --window-size so it ignores these, but any GTK/Qt
+                        // child and the probe GUI apps stay finger-sized + consistent.
+                        for ((k, v) in dev.chanwoo.androlinux.runtime.TouchDpiEnv.envFor(dm.densityDpi)) {
+                            android.system.Os.setenv(k, v, true)
+                        }
                         if (chromiumVulkan) {
                             // VK-ICD host triggers the loader reads (runtime_report.cpp): ALR_VK_ICD
                             // attaches the VK request/reply rings + puts /usr/lib/androlinux first on

@@ -39,12 +39,15 @@
  */
 package dev.chanwoo.androlinux.ui
 
+import android.os.Build
 import android.os.Bundle
 import android.view.Gravity
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowInsets
+import android.view.WindowInsetsController
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.ProgressBar
@@ -79,6 +82,7 @@ import kotlinx.coroutines.launch
  */
 class RunningSurfaceActivity : ComponentActivity() {
 
+    private lateinit var rootLayout: FrameLayout
     private lateinit var surfaceView: SurfaceView
     private lateinit var loadingOverlay: View
     private lateinit var loadingLabel: TextView
@@ -111,6 +115,11 @@ class RunningSurfaceActivity : ComponentActivity() {
         runtime = provideRuntime()
 
         setContentView(buildContentView())
+        // BUG-2: keep the in-app Wayland compositor's content (the Linux window + its CSD
+        // title bar) inside the Android SAFE AREA so the Linux title bar never draws UNDER
+        // the Android status bar (and the nav bar / camera cutout never cover the content).
+        // MUST run after setContentView (the DecorView/insetsController exist only then).
+        applySafeAreaInsets()
         surfaceView.holder.addCallback(surfaceCallback)
 
         // 세션 시작 — 즉시 핸들 반환, 상태는 StateFlow 로(§5-F).
@@ -286,6 +295,96 @@ class RunningSurfaceActivity : ComponentActivity() {
     private fun provideRuntime(): AlrRuntime = AlrRuntimeHolder.get(applicationContext)
 
     // ----------------------------------------------------------------------- //
+    // 시스템 바 인셋 (BUG-2: 리눅스 타이틀바가 Android 상태바와 겹치지 않게)
+    // ----------------------------------------------------------------------- //
+
+    /**
+     * BUG-2 fix — inset the compositor content to the Android SAFE AREA.
+     *
+     * The in-app Wayland compositor draws the Linux window (with its client-side-decoration
+     * title bar) filling the [surfaceView]; a MATCH_PARENT SurfaceView from y=0 puts that
+     * title bar UNDER the Android status bar (overlap). We pad the ROOT by the top status-bar
+     * inset + bottom nav-bar inset + the display CUTOUT (camera notch) so the SurfaceView — and
+     * therefore the wl_output the compositor advertises — is exactly the safe content area. The
+     * inset SurfaceView size flows `surfaceChanged → NativeAppSession.onSurfaceChanged →
+     * nativeWaylandCompositorResize`, so the guest re-lays-out its toplevel BELOW the status bar
+     * (no overlap) and clear of the nav bar. The Android status bar stays VISIBLE — the clean
+     * "bars visible, no overlap" UX, consistent with the chromium MainActivity path
+     * (fitsSystemWindows + showSystemBars).
+     *
+     * A `setOnApplyWindowInsetsListener` (not a one-shot pad) re-applies on every inset change,
+     * so ROTATION / multi-window / split-screen (where the bar geometry changes) re-inset the
+     * SurfaceView automatically. The loading/crash overlays are MATCH_PARENT children of the
+     * (now padded) root, so they inset with it — their content stays inside the bars too.
+     *
+     * IMMERSIVE ALTERNATIVE (device-tune): flip [IMMERSIVE_FULLSCREEN] to true for a true
+     * edge-to-edge fullscreen Linux app (status + nav bars HIDDEN, swipe to reveal), the way
+     * MainActivity.applyImmersive drives GIMP. Then the compositor gets the WHOLE panel and the
+     * Linux title bar owns y=0 (no Android bar to overlap). Kept as a single flag so the better
+     * UX can be chosen on-device without touching the layout wiring.
+     */
+    private fun applySafeAreaInsets() {
+        if (IMMERSIVE_FULLSCREEN) {
+            applyImmersiveFullscreen()
+            return
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // We position content ourselves via padding, so opt OUT of the framework's
+            // automatic fitting and keep the bars SHOWN (default behavior, not immersive).
+            window.setDecorFitsSystemWindows(false)
+            window.decorView.windowInsetsController?.let { c ->
+                c.show(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
+                c.systemBarsBehavior = WindowInsetsController.BEHAVIOR_DEFAULT
+            }
+            rootLayout.setOnApplyWindowInsetsListener { v, insets ->
+                // systemBars() = status + navigation + caption bars; displayCutout() = notch.
+                val safe = insets.getInsets(
+                    WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout(),
+                )
+                v.setPadding(safe.left, safe.top, safe.right, safe.bottom)
+                // Consume nothing destructively, but return CONSUMED so children (the overlays)
+                // don't double-apply the same insets as their own padding.
+                WindowInsets.CONSUMED
+            }
+            rootLayout.requestApplyInsets()
+        } else {
+            // Pre-R: fitsSystemWindows pads the root by the stable system-window insets, which
+            // is the same "content inside the bars" result the listener gives on R+.
+            @Suppress("DEPRECATION")
+            run {
+                rootLayout.fitsSystemWindows = true
+                window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
+            }
+        }
+    }
+
+    /**
+     * IMMERSIVE alternative for [applySafeAreaInsets] (gated by [IMMERSIVE_FULLSCREEN]) — hide
+     * the Android status + nav bars (swipe-transient) so the Linux app is true fullscreen, the
+     * way MainActivity.applyImmersive does for GIMP. No padding: the compositor gets the whole
+     * panel. Provided for on-device UX tuning.
+     */
+    private fun applyImmersiveFullscreen() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.setDecorFitsSystemWindows(false)
+            window.decorView.windowInsetsController?.let { c ->
+                c.hide(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
+                c.systemBarsBehavior =
+                    WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            window.decorView.systemUiVisibility = (
+                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
+                    View.SYSTEM_UI_FLAG_FULLSCREEN or
+                    View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                    View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
+                    View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                    View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION)
+        }
+    }
+
+    // ----------------------------------------------------------------------- //
     // 뷰 구성 (순수 View — Compose 아님)
     // ----------------------------------------------------------------------- //
 
@@ -293,6 +392,7 @@ class RunningSurfaceActivity : ComponentActivity() {
         val root = FrameLayout(this).apply {
             layoutParams = ViewGroup.LayoutParams(MATCH, MATCH)
         }
+        rootLayout = root
 
         surfaceView = SurfaceView(this).apply {
             layoutParams = FrameLayout.LayoutParams(MATCH, MATCH)
@@ -364,6 +464,15 @@ class RunningSurfaceActivity : ComponentActivity() {
         // Lets a launch opt into runtime features the loader gates on host env — e.g.
         // ALR_VK_ICD=1 to bind the guest Vulkan ICD (the alr-vk-enum end-to-end test).
         const val EXTRA_ENV = "dev.chanwoo.androlinux.extra.ENV"
+
+        /**
+         * BUG-2 UX choice (device-tune flag). false = the SHIPPED behavior: keep the Android
+         * status + nav bars VISIBLE and inset the Linux content to the safe area (the Linux
+         * title bar sits BELOW the status bar, no overlap). true = IMMERSIVE: hide the bars for
+         * a true edge-to-edge fullscreen Linux app (compositor gets the whole panel). Flip on
+         * device to pick the better UX; the layout wiring is identical either way.
+         */
+        private const val IMMERSIVE_FULLSCREEN = false
 
         private const val LABEL_STARTING = "앱을 시작하는 중…"
         private const val LABEL_STOPPING = "종료하는 중…"
