@@ -421,6 +421,26 @@ class MainActivity : Activity() {
                         }
                     }
                 }
+                // REAL GLES app via ANGLE: stage the es2gears overlay (es2gears-stage.tar →
+                // /usr/bin/es2gears_wayland + libdecor-0.so.0) so a REAL upstream GLES2 demo
+                // — not a bespoke test client — can prove ANGLE→Vulkan→our ICD→Mali. es2gears
+                // DT_NEEDED libEGL.so.1/libGLESv2.so.2; under ALR_ANGLE those resolve to the
+                // SYSTEM ANGLE in /usr/lib/androlinux-angle (first on LD_LIBRARY_PATH). The
+                // overlay STRIPS Mesa's libEGL/libGLESv2/libGL/libvulkan host-side so ANGLE +
+                // the Khronos vk-loader win (no software-GL fallback). Best-effort, idempotent;
+                // launchAngleGlesProbe runs it when /data/local/tmp/.alr-angle-app names it.
+                val es2gearsTar = java.io.File("/data/local/tmp/es2gears-stage.tar")
+                val es2gearsMarker = java.io.File(rootfsStatus.rootfsDir, ".es2gears-staged-${es2gearsTar.length()}")
+                if (es2gearsTar.isFile && !es2gearsMarker.isFile) {
+                    synchronized(gpuOverlayStageLock) {
+                        if (!es2gearsMarker.isFile) {
+                            val ovr = RootfsInstaller(this@MainActivity).extractOverlayTar(es2gearsTar, rootfsStatus.rootfsDir)
+                            es2gearsMarker.writeText("staged\n")
+                            android.util.Log.i("alr_loader", "es2gears-stage: overlay done (extracted=${ovr.extracted} skipped=${ovr.skipped.size})")
+                            if (ovr.skipped.isNotEmpty()) android.util.Log.w("alr_loader", "es2gears-stage: guard skipped:\n${ovr.skipped.joinToString("\n")}")
+                        }
+                    }
+                }
             } catch (e: Throwable) {
                 android.util.Log.e("alr_loader", "angle-stage EXC: ${android.util.Log.getStackTraceString(e)}")
             }
@@ -3374,6 +3394,19 @@ class MainActivity : Activity() {
     // "angle-gles:") carries the exec verdict, the fault pc@<so>+off (root-cause aid for
     // the ELF-entry SIGSEGV), and the guest stdout (GL_RENDERER). ALR_TEE_GUEST_STDOUT
     // streams ANGLE's own stderr (init trace) to logcat as it arrives.
+    //
+    // REAL-APP GENERALIZATION (the es2gears rung): the SAME ANGLE env that drives the
+    // bespoke clients drives an ARBITRARY rootfs GLES app named by a second marker,
+    // /data/local/tmp/.alr-angle-app (its contents = the in-rootfs binary path, e.g.
+    // "/usr/bin/es2gears_wayland"). After the bespoke clients run, this reads that marker
+    // and runs THAT app through the identical runAngle() helper — so a canonical upstream
+    // GLES2 demo (es2gears, staged by the es2gears overlay) goes es2gears → ANGLE
+    // libGLESv2 (androlinux-angle) → our VK ICD → Mali, GL_RENDERER reporting the ANGLE
+    // Vulkan/Mali backend (software=false). This is the proof that a REAL app — not only
+    // our test client — is HW-accelerated end-to-end. es2gears creates its own window
+    // (wl_egl_window under es2gears_wayland → ANGLE's DisplayVkWayland on the in-app
+    // compositor), so frames advance ON SCREEN; the X11 flavour (es2gears_x11) is the
+    // Xwayland alternate. Same opt-in gate, same no-regression.
     private fun launchAngleGlesProbe(rootfsDir: File, rootfsName: String) {
         if (!java.io.File("/data/local/tmp/.alr-angle").isFile) return
         Thread {
@@ -3427,6 +3460,10 @@ class MainActivity : Activity() {
                 }
                 stageOverlay("vk-icd")
                 stageOverlay("vk-loader")
+                // Stage the REAL-GLES-app overlay too (es2gears + libdecor), so the
+                // .alr-angle-app marker can name /usr/bin/es2gears_wayland. Idempotent;
+                // shares the gpuOverlayStageLock so it never races the cold-start stager.
+                stageOverlay("es2gears")
                 // GPU Part B — ICD DISCOVERY without depending on interposer mediation.
                 // Root cause (device-proven): ANGLE's libGLESv2 dlopen()s the BARE soname
                 // "libvulkan.so.1", and ld.so resolves it from /usr/lib/androlinux-angle
@@ -3509,6 +3546,18 @@ class MainActivity : Activity() {
                 // the cube is the eglGetDisplay fallback (ANGLE picks X11 → no-X-display).
                 val vkBin = java.io.File(rootfsDir, "usr/bin/alr-angle-vk")
                 val cubeBin = java.io.File(rootfsDir, "usr/bin/alr-gles-cube")
+                // The REAL GLES app (es2gears overlay) is ALSO a valid run target: if the
+                // .alr-angle-app marker names it AND it is staged, the probe should proceed
+                // even when neither bespoke client shipped. Resolve the marker's path now so
+                // the readiness gate can accept es2gears (or any staged app) as "runnable".
+                val appBin: java.io.File? = run {
+                    val m = java.io.File("/data/local/tmp/.alr-angle-app")
+                    if (!m.isFile) return@run null
+                    val want = try {
+                        m.readText().lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() }
+                    } catch (e: Throwable) { null } ?: "/usr/bin/es2gears_wayland"
+                    java.io.File(rootfsDir, (if (want.startsWith("/")) want else "/$want").removePrefix("/"))
+                }
                 val angleGles = java.io.File(rootfsDir, "usr/lib/androlinux-angle/libGLESv2.so.2")
                 // CRUCIAL: wait for BOTH the Khronos loader (libvulkan.so.1, vk-loader overlay)
                 // and our renamed Mali ICD (libalr_mali_icd.so, vk-icd overlay) — ANGLE's
@@ -3519,14 +3568,16 @@ class MainActivity : Activity() {
                 // the 0-byte-loader race left a zero-length libvulkan.so.1 that "exists" but
                 // can never dlopen, so isFile alone would falsely green-light ANGLE.
                 fun ready(f: java.io.File) = f.isFile && f.length() > 0L
+                // Something to run = any bespoke client OR the marker's real app (es2gears).
+                fun haveRunTarget() = vkBin.isFile || cubeBin.isFile || (appBin?.exists() == true)
                 var waited = 0
-                while (waited < 40000 && !(angleMarker.isFile && ready(angleGles) && ready(loaderLib) && ready(icdLib) && (vkBin.isFile || cubeBin.isFile))) {
+                while (waited < 40000 && !(angleMarker.isFile && ready(angleGles) && ready(loaderLib) && ready(icdLib) && haveRunTarget())) {
                     Thread.sleep(500); waited += 500
                 }
-                if (!(ready(angleGles) && ready(loaderLib) && ready(icdLib) && (vkBin.isFile || cubeBin.isFile))) {
+                if (!(ready(angleGles) && ready(loaderLib) && ready(icdLib) && haveRunTarget())) {
                     android.util.Log.w(
                         "alr_loader",
-                        "angle-gles: skipped (vk=${vkBin.isFile} cube=${cubeBin.isFile} angleGLES=${angleGles.isFile} loader=${loaderLib.isFile}/${loaderLib.length()}B icd=${icdLib.isFile}/${icdLib.length()}B waited=${waited}ms)",
+                        "angle-gles: skipped (vk=${vkBin.isFile} cube=${cubeBin.isFile} app=${appBin?.let { it.name + ":" + it.exists() }} angleGLES=${angleGles.isFile} loader=${loaderLib.isFile}/${loaderLib.length()}B icd=${icdLib.isFile}/${icdLib.length()}B waited=${waited}ms)",
                     )
                     return@Thread
                 }
@@ -3586,6 +3637,32 @@ class MainActivity : Activity() {
                 if (vkBin.isFile) runAngle("alr-angle-vk", "/usr/bin/alr-angle-vk")
                 // Also run the eglGetDisplay cube (documents the X11-default fallback path).
                 if (cubeBin.isFile) runAngle("alr-gles-cube", "/usr/bin/alr-gles-cube\n8")
+                // REAL GLES APP via ANGLE (the generalization). A second marker,
+                // /data/local/tmp/.alr-angle-app, names an ARBITRARY in-rootfs GLES binary
+                // (its first non-empty line = the path; default /usr/bin/es2gears_wayland).
+                // We run THAT app through the IDENTICAL ANGLE env set above (ALR_ANGLE +
+                // ALR_VK_ICD, DISPLAY unset, XDG_SESSION_TYPE=wayland), so a canonical
+                // upstream demo (es2gears, staged by the es2gears overlay) proves the path:
+                // es2gears → ANGLE libGLESv2 (androlinux-angle) → our VK ICD → Mali. es2gears
+                // opens its OWN window (es2gears_wayland → wl_egl_window → ANGLE
+                // DisplayVkWayland on the in-app compositor) so frames advance ON SCREEN;
+                // GL_RENDERER then reports "ANGLE (... Mali-G615 ... Vulkan ...)" (software
+                // =false). Guarded: only runs when the marker's named binary actually exists
+                // in the rootfs (so a stale/typo'd path is a logged skip, never an exec of
+                // something unintended). Gated by the same .alr-angle opt-in as everything
+                // above (no-regression on a normal cold start).
+                if (appBin != null) {
+                    // appBin was resolved from the .alr-angle-app marker above (rootfs-relative
+                    // File under rootfsDir). Reconstruct the guest-absolute path the loader
+                    // expects (leading '/', no rootfsDir prefix) and run it iff it really exists.
+                    val appPath = "/" + appBin.relativeTo(rootfsDir).path
+                    if (appBin.exists()) {
+                        android.util.Log.i("alr_loader", "angle-gles: real-app marker → $appPath")
+                        runAngle("angle-app:${appBin.name}", appPath)
+                    } else {
+                        android.util.Log.w("alr_loader", "angle-gles: real-app marker names $appPath but it is absent in the rootfs (skipped)")
+                    }
+                }
                 android.system.Os.unsetenv("ALR_ANGLE")
                 android.system.Os.unsetenv("ALR_VK_ICD")
                 android.system.Os.unsetenv("ALR_GPU_ACCEL")
