@@ -2122,7 +2122,12 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         }
         ::write(dg, "SIGRESET;", 9);
 
-        const std::size_t stack_size = 512 * 1024;
+        // 8 MiB guest stack = the Linux default RLIMIT_STACK. 512 KiB was too small:
+        // glibc GUI apps reserve large on-stack frames (e.g. qalculate-gtk's
+        // load_preferences() ~978 KiB) and walk straight off a 512 KiB stack into the
+        // guard page → SIGSEGV. The stack is mmap'd lazily (only touched pages commit),
+        // so 8 MiB of VIRTUAL space is cheap. General fix for any large-frame app.
+        const std::size_t stack_size = 8 * 1024 * 1024;
         void* stk = ::mmap(nullptr, stack_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (stk == MAP_FAILED) {
             ::write(dg, "STACK_FAIL", 10);

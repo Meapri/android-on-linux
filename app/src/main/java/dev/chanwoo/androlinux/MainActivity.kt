@@ -1811,6 +1811,17 @@ class MainActivity : Activity() {
                             )
                             val footVersionOk = footVersion.contains("foot version")
                             val framesBeforeFoot = nativeWaylandCompositorStatus().intFieldAfter("alr wl frames=")
+                            // TERMINAL CLASS out-of-box: `foot -e /bin/dash` forks a child that
+                            // execve(/bin/dash). On the app data partition that exec hits W^X →
+                            // EACCES ("Permission denied") → foot exits 230 and NO frame renders.
+                            // ALR_REEXEC_INPROC=1 makes the supervisor PC-redirect the child exec
+                            // in-process (no real execve), so the shell runs and foot draws. Scope
+                            // it to the terminal launch (save/restore the prior value) so the rest
+                            // of the GUI battery is byte-identical; the PRODUCT path already sets it
+                            // unconditionally in NativeAppSession.runGuest (so the sakura tile works
+                            // out-of-box).
+                            val priorReexec = android.system.Os.getenv("ALR_REEXEC_INPROC")
+                            android.system.Os.setenv("ALR_REEXEC_INPROC", "1", true)
                             val footGuiClient = nativeAlrNativeLoaderProbe(
                                 packageName,
                                 applicationInfo.nativeLibraryDir,
@@ -1819,6 +1830,8 @@ class MainActivity : Activity() {
                                 rootfsManifest.name,
                                 "/usr/bin/foot\n-e\n/bin/dash",
                             )
+                            if (priorReexec == null) android.system.Os.unsetenv("ALR_REEXEC_INPROC")
+                            else android.system.Os.setenv("ALR_REEXEC_INPROC", priorReexec, true)
                             val footStatus = nativeWaylandCompositorStatus()
                             val framesAfterFoot = footStatus.intFieldAfter("alr wl frames=")
                             val footRendered = framesAfterFoot > framesBeforeFoot

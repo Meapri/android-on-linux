@@ -935,7 +935,11 @@ void alr_inproc_reexec_worker(const char* target, char** argv,
     // The guest's intended argv comes straight from x20 (we did NOT execve, so the
     // vector is still valid). argv[0] stays as-is (the guest's intended argv[0]).
     // envp comes straight from x21. AT_EXECFN points at host_target_path.
-    const size_t stack_size = 512u * 1024u;
+    // 8 MiB guest stack = the Linux default RLIMIT_STACK (was 512 KiB). glibc GUI apps
+    // reserve large on-stack frames (e.g. qalculate-gtk load_preferences() ~978 KiB) that
+    // overrun a 512 KiB stack into the guard page → SIGSEGV. mmap is lazily committed, so
+    // the extra VIRTUAL size is cheap. General fix for any large-frame guest.
+    const size_t stack_size = 8u * 1024u * 1024u;
     void* stk = (void*)sys6_(SYS_mmap, 0, stack_size, PROT_READ | PROT_WRITE,
                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (stk == MAP_FAILED) { diag("ALR-INPROC: stack fail\n"); sys_exit(EX_STACK); }

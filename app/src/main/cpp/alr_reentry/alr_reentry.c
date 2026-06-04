@@ -523,8 +523,11 @@ __attribute__((used, noreturn)) void alr_reentry_main(unsigned long* sp_in) {
     const unsigned long g_argc = argc - 1;
     char** g_argv = &argv[1];
 
-    // Fresh stack (512 KiB), like the loader.
-    const size_t stack_size = 512u * 1024u;
+    // Fresh stack, like the loader: 8 MiB = the Linux default RLIMIT_STACK (was 512 KiB).
+    // glibc GUI apps reserve large on-stack frames (e.g. qalculate-gtk load_preferences()
+    // ~978 KiB) that overrun a 512 KiB stack into the guard page → SIGSEGV. mmap commits
+    // lazily, so the larger VIRTUAL size is cheap. General fix for any large-frame guest.
+    const size_t stack_size = 8u * 1024u * 1024u;
     void* stk = (void*)sys6_(SYS_mmap, 0, stack_size, PROT_READ | PROT_WRITE,
                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (stk == MAP_FAILED) { diag("ALR-REENTRY: stack fail\n"); sys_exit(74); }
