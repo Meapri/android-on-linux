@@ -2417,6 +2417,23 @@ class MainActivity : Activity() {
                             else demoDst.writeText("<!doctype html><meta charset=utf-8><body style='margin:0;background:#10101e;color:#fff;font-family:sans-serif;text-align:center'><h1 style='padding-top:30vh'>ALR - Chromium on Android</h1><p>ALR-CR4-OK</p></body>")
                         } catch (_: Throwable) {}
                         android.util.Log.i("alr_loader", "cronly: chromium bin=${chromiumBin.isFile} (waited ${waited}ms); launching ozone-wayland window")
+                        // CHROMIUM NATIVE-VULKAN path (docs/research/chromium-vulkan-path.md),
+                        // MARKER-GATED + DEFAULT-OFF. With /data/local/tmp/.alr-chromium-vulkan
+                        // present, launch chromium with its NATIVE Vulkan backend (Viz +
+                        // SkiaRenderer on Vulkan, GrVkBackendContext) talking Vulkan DIRECTLY to
+                        // the system Vulkan loader → our guest VK ICD (libalr_mali_icd.so) → Mali,
+                        // BYPASSING ANGLE (distinct from the banked chromium-via-ANGLE GL→Vulkan
+                        // path that walls in ANGLE's RendererVk first-texture NULL-deref). The
+                        // loader (runtime_report.cpp) already wires ALR_VK_ICD=1 end-to-end (VK
+                        // rings + androlinux on LD_LIBRARY_PATH + VK_DRIVER_FILES/VK_ICD_FILENAMES
+                        // → alr_icd.json → our ICD + the AHB present sink); we only flip the host
+                        // env + swap the GPU/raster argv tail. NOTE: ALR_ANGLE is deliberately NOT
+                        // set — chromium talks Vulkan directly, and --ozone-platform=wayland binds
+                        // it to the in-app compositor via WAYLAND_DISPLAY regardless of DISPLAY.
+                        // Absent the marker, every env var + argv token below is byte-for-byte the
+                        // proven software-raster launch (strict no-regression).
+                        val chromiumVulkan =
+                            File("/data/local/tmp/.alr-chromium-vulkan").isFile
                         android.system.Os.setenv("ALR_REEXEC_INPROC", "1", true)
                         // CR-3 Mali GPU accel opt-in (chromium-gpu-child-plan §3.A-1).
                         // This is the SOLE non-glmark2 trigger the loader checks
@@ -2442,6 +2459,74 @@ class MainActivity : Activity() {
                         // (was 180s) and no stall-watchdog ceiling/no-progress kill (was
                         // 200s/40s), which is what turned the window black "after a while".
                         android.system.Os.setenv("ALR_PERSIST_GUEST", "1", true)
+                        if (chromiumVulkan) {
+                            // VK-ICD host triggers the loader reads (runtime_report.cpp): ALR_VK_ICD
+                            // attaches the VK request/reply rings + puts /usr/lib/androlinux first on
+                            // LD_LIBRARY_PATH (Khronos libvulkan.so.1 + our libalr_mali_icd.so +
+                            // alr_icd.json) + pushes VK_DRIVER_FILES/VK_ICD_FILENAMES → our ICD;
+                            // ALR_GPU_ACCEL attaches the GPU ring (chromium's Vulkan needs it). We do
+                            // NOT set ALR_ANGLE (no ANGLE on the path). ALR_ICD_DIAG=1 makes our ICD
+                            // emit a [alr-icd] per-entrypoint trace (the loader defaults it on only
+                            // under ALR_ANGLE, so force it here) and VK_LOADER_DEBUG=all lights up the
+                            // Khronos loader's ICD discovery — together they place where chromium's
+                            // Viz/Skia Vulkan context walls (our ICD = tractable gap vs chromium-
+                            // internal). See docs/research/chromium-vulkan-path.md §2.
+                            android.system.Os.setenv("ALR_VK_ICD", "1", true)
+                            android.system.Os.setenv("ALR_GPU_ACCEL", "1", true)
+                            android.system.Os.setenv("ALR_ICD_DIAG", "1", true)
+                            android.system.Os.setenv("VK_LOADER_DEBUG", "all", true)
+                            android.util.Log.i("alr_loader", "cronly: chromium NATIVE-VULKAN path (ALR_VK_ICD=1, no ANGLE)")
+                        }
+                        // GPU/raster argv tail. DEFAULT (marker absent) = the proven software-raster
+                        // tail (--single-process … --disable-gpu --in-process-gpu
+                        // --disable-gpu-compositing) — byte-for-byte unchanged. VULKAN (marker present)
+                        // = chromium's native Vulkan backend via the external loader+ICD: keep
+                        // --single-process/--no-zygote (loader needs it — collapses the per-child
+                        // ~258MiB re-map storm; with single-process the Viz/GPU thread runs in THIS
+                        // process so our ALR_VK_ICD env covers it, no GPU-child fork to inject into),
+                        // keep --in-process-gpu, but DROP --disable-gpu/--disable-gpu-compositing and
+                        // ADD the Vulkan-select + blocklist-override flags. Cited in
+                        // docs/research/chromium-vulkan-path.md §1.1.
+                        val chromiumGpuTail = if (chromiumVulkan) {
+                            "\n--single-process\n--no-zygote\n--in-process-gpu" +
+                                // Select chromium's NATIVE Vulkan backend → the system Vulkan loader
+                                // (libvulkan.so.1) → our ICD. switches::kUseVulkan=native +
+                                // features::kVulkan (gpu_finch_features.cc) + OOP-raster + GPU raster.
+                                "\n--use-vulkan=native" +
+                                "\n--enable-features=Vulkan,DefaultEnableOopRasterization" +
+                                "\n--enable-gpu-rasterization" +
+                                // chromium blocklists/virtualizes Mali (software_rendering_list.json /
+                                // gpu_driver_bug_list.json) — on the Vulkan path the blocklist can mark
+                                // Vulkan UNSUPPORTED for Mali → silent demote. Override the whole
+                                // blocklist + the derived driver-bug workarounds so Vulkan is allowed.
+                                "\n--ignore-gpu-blocklist\n--disable-gpu-driver-bug-workarounds" +
+                                // Commit to Vulkan: never bring up a GL/ANGLE display, and FAIL VISIBLY
+                                // if Vulkan init fails (no silent GL fallback) so the experiment sees
+                                // the Vulkan wall, not a software demote. (gl_switches.cc kUseGL=
+                                // disabled + gpu_switches.cc kDisableVulkanFallbackToGLForTesting.)
+                                "\n--use-gl=disabled\n--disable-vulkan-fallback-to-gl-for-testing" +
+                                // Run Vulkan SURFACELESS: Viz composites into an offscreen VkImage and
+                                // presents via Ozone (our AHB present sink), NOT a VkSurfaceKHR
+                                // swapchain — sidesteps the WSI surface-query family our ICD doesn't
+                                // implement (chromium-vulkan-path.md §3 GAP-1). Load-bearing.
+                                "\n--disable-vulkan-surface" +
+                                // GPU-decision diagnostics: raise just the Vulkan/GpuInit/Viz/Skia TUs
+                                // + the blocklist decision, so the logcat ladder (R2..R6) is readable.
+                                "\n--vmodule=*vulkan*=2,*gpu_init*=2,*viz*=1,*skia*=1,gpu_data_manager*=2"
+                        } else {
+                            // GPU HARDWARE accel (Mali via the alr_gpu shim: --use-gl=angle
+                            // → libEGL/libGLESv2 shim → ring → Mali executor) was wired +
+                            // attempted, but chromium's GPU process FAILS to create its
+                            // shared/virtualized GL context ("Failed to create shared
+                            // context for virtualization" / "SharedImageStub: unable to
+                            // create context") — the glmark2-era shim does not yet implement
+                            // chromium's EGL context-sharing model, and the failure BLACKS
+                            // the page. Reverted to stable software raster so the standalone
+                            // browser keeps rendering; Mali accel is a dedicated shim effort
+                            // (the ANGLE EGL-device exts + ring-attach scaffolding stay in).
+                            "\n--single-process\n--no-zygote\n--disable-gpu" +
+                                "\n--in-process-gpu\n--disable-gpu-compositing"
+                        }
                         val out = nativeAlrNativeLoaderProbe(
                             packageName,
                             applicationInfo.nativeLibraryDir,
@@ -2501,18 +2586,11 @@ class MainActivity : Activity() {
                                 "\n--no-sandbox\n--disable-seccomp-filter-sandbox" +
                                 "\n--disable-setuid-sandbox\n--disable-namespace-sandbox" +
                                 "\n--disable-gpu-sandbox" +
-                                // GPU HARDWARE accel (Mali via the alr_gpu shim: --use-gl=angle
-                                // → libEGL/libGLESv2 shim → ring → Mali executor) was wired +
-                                // attempted, but chromium's GPU process FAILS to create its
-                                // shared/virtualized GL context ("Failed to create shared
-                                // context for virtualization" / "SharedImageStub: unable to
-                                // create context") — the glmark2-era shim does not yet implement
-                                // chromium's EGL context-sharing model, and the failure BLACKS
-                                // the page. Reverted to stable software raster so the standalone
-                                // browser keeps rendering; Mali accel is a dedicated shim effort
-                                // (the ANGLE EGL-device exts + ring-attach scaffolding stay in).
-                                "\n--single-process\n--no-zygote\n--disable-gpu" +
-                                "\n--in-process-gpu\n--disable-gpu-compositing" +
+                                // GPU/raster tail: software-raster by default, chromium native
+                                // Vulkan (--use-vulkan=native → external loader+ICD → Mali) when
+                                // the .alr-chromium-vulkan marker is present. Computed above as
+                                // chromiumGpuTail (docs/research/chromium-vulkan-path.md §1.1).
+                                chromiumGpuTail +
                                 "\n--disable-dev-shm-usage\n--user-data-dir=/tmp/cr4-profile" +
                                 "\n--no-first-run\n--no-default-browser-check" +
                                 "\n--disable-crash-reporter\n--disable-breakpad" +
