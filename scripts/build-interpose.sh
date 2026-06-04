@@ -40,7 +40,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# The interposer is two TUs: the wrappers/trampoline (libalr_interpose.c) and
+# the syscall-free PTY-emulation core (alr_pts.c, also host-unit-tested). Both
+# compile into the single libalr_interpose.so.
 SRC="app/src/main/cpp/alr_interpose/libalr_interpose.c"
+SRC_PTS="app/src/main/cpp/alr_interpose/alr_pts.c"
 OUT_DIR="${1:-build/interpose}"
 OUT_SO="${OUT_DIR}/libalr_interpose.so"
 
@@ -64,10 +68,14 @@ if [ ! -f "$SRC" ]; then
   echo "build-interpose: source not found: $SRC" >&2
   exit 1
 fi
+if [ ! -f "$SRC_PTS" ]; then
+  echo "build-interpose: source not found: $SRC_PTS" >&2
+  exit 1
+fi
 
 echo "build-interpose: zig    = $("$ZIG" version) ($ZIG)" >&2
 echo "build-interpose: target = $TARGET" >&2
-echo "build-interpose: source = $SRC" >&2
+echo "build-interpose: source = $SRC $SRC_PTS" >&2
 echo "build-interpose: out    = $OUT_SO" >&2
 
 mkdir -p "$OUT_DIR"
@@ -85,7 +93,7 @@ mkdir -p "$OUT_DIR"
   -fPIC \
   -O2 \
   -o "$OUT_SO" \
-  "$SRC"
+  "$SRC" "$SRC_PTS"
 
 if [ ! -f "$OUT_SO" ]; then
   echo "build-interpose: compile produced no output" >&2

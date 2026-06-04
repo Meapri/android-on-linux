@@ -143,6 +143,28 @@
 #include <linux/seccomp.h>   /* SECCOMP_SET_MODE_FILTER, SECCOMP_RET_* */
 #include <sys/prctl.h>       /* PR_SET_NO_NEW_PRIVS, PR_SET_SECCOMP (fallback) */
 #include <sys/syscall.h>     /* __NR_* */
+#include <termios.h>         /* TIOC / TC request macros, struct termios, winsize */
+#include <unistd.h>          /* getpgrp (tcgetpgrp default) */
+#include "alr_pts.h"         /* in-process PTY emulation (TERMINAL app class) */
+
+/* Syscall numbers the PTY emulation emits through the trampoline. All are
+ * stable in asm-generic/unistd.h; the fallbacks just keep the file portable if
+ * an older sysroot lacks a macro. */
+#ifndef __NR_socketpair
+#define __NR_socketpair 199
+#endif
+#ifndef __NR_dup3
+#define __NR_dup3 24
+#endif
+#ifndef __NR_fcntl
+#define __NR_fcntl 25
+#endif
+#ifndef __NR_ioctl
+#define __NR_ioctl 29
+#endif
+#ifndef __NR_getsockopt
+#define __NR_getsockopt 209
+#endif
 
 /* linux/openat2.h (struct open_how, RESOLVE_IN_ROOT) is present on the
  * aarch64-linux-gnu.2.36 zig sysroot, but guard it so the file still builds if
@@ -697,6 +719,14 @@ static void alr_emit_fd2(const char *s, size_t n) {
  * and zero output when unset/"0". Strictly diagnostic — never changes behavior.
  * errno is saved/restored by callers around the emit. */
 static int g_diag = 0;   /* read once in ctor from ALR_INTERPOSE_DIAG */
+/* PTY-session flags (see PTY block). g_pty_active = "I was launched UNDER a live
+ * terminal" (ALR_PTY_ACTIVE inherited via env, read in ctor) → the exec'd shell.
+ * g_pty_minted = "I myself minted a /dev/ptmx" → the terminal emulator. The
+ * shell lazily adopts its inherited socket stdio as a tty; the terminal must NOT
+ * (its real masters/slaves are already in the table, and adopting e.g. its
+ * Wayland socket would be wrong). So lazy-adopt iff g_pty_active && !g_pty_minted. */
+static int g_pty_active = 0;
+static int g_pty_minted = 0;
 
 /* Emit "ALR-IDIAG <tag> <a>[ <b>][ =<r>]\n" through the trampoline write.
  * All args are bytewise-copied (no libc string calls in the trusted path). */
@@ -850,6 +880,16 @@ static void alr_ctor(void) {
      * any wrapper can fire so the chdir/relative-open trace is complete. */
     const char *dg = getenv("ALR_INTERPOSE_DIAG");
     g_diag = (dg != NULL && dg[0] != '0' && dg[0] != '\0') ? 1 : 0;
+
+    /* ALR_PTY_ACTIVE: set by alr_pts_mint() in the TERMINAL process and inherited
+     * by the forked+exec'd shell (which gets a fresh, empty pty table because
+     * execve replaces the process image). When set, the TTY shims (isatty/
+     * tcgetattr/ioctl/…) recognize an inherited AF_UNIX SOCK_STREAM stdio fd as a
+     * PTY slave and lazily register it — so `bash` on the slave sees a real tty
+     * even though the original table entry was lost across exec. Scoped tightly
+     * to terminal sessions, so ordinary IPC socketpairs elsewhere are unaffected. */
+    const char *pa = getenv("ALR_PTY_ACTIVE");
+    g_pty_active = (pa != NULL && pa[0] != '0' && pa[0] != '\0') ? 1 : 0;
     /* Liveness marker: proves THIS process actually loaded the interposer (vs a
      * static/raw-syscall guest where the wrappers never fire => rewrites=0). */
     alr_diag("ctor-live rootfs", (g_rootfs_len > 0) ? g_rootfs : "(none)", 0,
@@ -906,6 +946,11 @@ static mode_t alr_va_mode(int flags, va_list ap) {
     return 0;
 }
 
+/* Forward decl: the PTY-emulation open hook (defined with the rest of the PTY
+ * block after the open family). Used by alr_open_emit + the open wrappers below
+ * to serve /dev/ptmx, /dev/pts/N and /dev/tty from the virtual-PTY table. */
+static int alr_pts_try_open(const char *path, int flags, int *out_fd);
+
 /*
  * alr_open_emit — PCGATE=1 open emission for the whole open/creat family.
  *
@@ -925,6 +970,16 @@ static mode_t alr_va_mode(int flags, va_list ap) {
  * trusted PC is the trampoline.
  */
 static int alr_open_emit(int dirfd, const char *path, int flags, mode_t mode) {
+    /* PTY emulation: /dev/ptmx, /dev/pts/N, /dev/tty are served from the
+     * in-process virtual-PTY table (the TERMINAL app class). This MUST run
+     * before the string-rewrite fallback below, which would otherwise rewrite
+     * /dev/ptmx → <rootfs>/dev/ptmx (a non-existent regular path). The fast
+     * openat2 path already excludes /dev, so the rewrite path is where these
+     * would land. Only absolute paths reach here meaningfully. */
+    {
+        int pfd = -1;
+        if (alr_pts_try_open(path, flags, &pfd)) return pfd;  /* errno set on <0 */
+    }
     if (g_openat2_ok && g_rootfs_fd >= 0 &&
         path && path[0] == '/' &&
         !a_under(path, "/proc") && !a_under(path, "/sys") && !a_under(path, "/dev") &&
@@ -970,7 +1025,9 @@ int open(const char *path, int flags, ...) {
     mode_t m = alr_va_mode(flags, ap);
     va_end(ap);
     if (g_pcgate) return alr_open_emit(AT_FDCWD, path, flags, m);
-    /* PCGATE=0 baseline: original RTLD_NEXT behavior, unchanged. */
+    /* PCGATE=0 baseline: original RTLD_NEXT behavior, unchanged — except the
+     * PTY paths are still served from the emulation (no real /dev/pts exists). */
+    { int pfd = -1; if (alr_pts_try_open(path, flags, &pfd)) return pfd; }
     static int (*real)(const char *, int, ...);
     ALR_REAL(real, int (*)(const char *, int, ...), "open");
     char b[ALR_PBUF];
@@ -982,6 +1039,7 @@ int open64(const char *path, int flags, ...) {
     mode_t m = alr_va_mode(flags, ap);
     va_end(ap);
     if (g_pcgate) return alr_open_emit(AT_FDCWD, path, flags, m);
+    { int pfd = -1; if (alr_pts_try_open(path, flags, &pfd)) return pfd; }
     static int (*real)(const char *, int, ...);
     ALR_REAL(real, int (*)(const char *, int, ...), "open64");
     char b[ALR_PBUF];
@@ -1021,6 +1079,7 @@ int openat(int dirfd, const char *path, int flags, ...) {
     mode_t m = alr_va_mode(flags, ap);
     va_end(ap);
     if (g_pcgate) return alr_open_emit(dirfd, path, flags, m);
+    { int pfd = -1; if (alr_pts_try_open(path, flags, &pfd)) return pfd; }
     static int (*real)(int, const char *, int, ...);
     ALR_REAL(real, int (*)(int, const char *, int, ...), "openat");
     return alr_openat(real, dirfd, path, flags, m);
@@ -1031,6 +1090,7 @@ int openat64(int dirfd, const char *path, int flags, ...) {
     mode_t m = alr_va_mode(flags, ap);
     va_end(ap);
     if (g_pcgate) return alr_open_emit(dirfd, path, flags, m);
+    { int pfd = -1; if (alr_pts_try_open(path, flags, &pfd)) return pfd; }
     static int (*real)(int, const char *, int, ...);
     ALR_REAL(real, int (*)(int, const char *, int, ...), "openat64");
     return alr_openat(real, dirfd, path, flags, m);
@@ -1068,6 +1128,713 @@ int creat64(const char *path, mode_t mode) {
     ALR_REAL(real, int (*)(const char *, mode_t), "creat64");
     char b[ALR_PBUF];
     return real(rw(path, b, sizeof b), mode);
+}
+
+/* =================================================================== */
+/* PTY emulation — the TERMINAL app class (sakura/xterm + htop/vim/…)   */
+/*                                                                     */
+/* A non-root Android app has no usable /dev/pts (no devpts to mount).  */
+/* We synthesize a virtual PTY pair on a socketpair(AF_UNIX,STREAM):    */
+/* open("/dev/ptmx") mints a pair and returns the master; the slave is  */
+/* /dev/pts/N. The data path is a real kernel socket, so read/write/    */
+/* poll/close work UNWRAPPED; we only intercept open + the TTY ioctls.  */
+/* The pure dispatch + termios/winsize logic lives in alr_pts.c (unit-  */
+/* tested host-side); this block owns the fd table and the libc shims.  */
+/* =================================================================== */
+
+/* The PTY table. Zero-initialized BSS (used=0 ⇒ free). Guarded by a tiny
+ * atomic spinlock — open/ioctl/close on a pty are low-frequency, and the lock
+ * is held only across table slot bookkeeping (never across a blocking call). */
+static struct alr_pty g_pts[ALR_PTS_MAX];
+static volatile int   g_pts_lock = 0;
+
+static void alr_pts_acquire(void) {
+    while (__atomic_exchange_n(&g_pts_lock, 1, __ATOMIC_ACQUIRE)) {
+        /* brief spin; contention is effectively nil for a terminal */
+    }
+}
+static void alr_pts_release(void) {
+    __atomic_store_n(&g_pts_lock, 0, __ATOMIC_RELEASE);
+}
+
+/* forward decls (definitions further down in this block) */
+static struct alr_pty *alr_pts_by_fd(int fd, int *is_master);
+static struct alr_pty *alr_pts_by_ptn(int ptn);
+
+/* Mint a fresh virtual PTY: socketpair(AF_UNIX, SOCK_STREAM) → [master,slave].
+ * Returns the master fd (>=0) and fills *out_ptn, or -1 with errno on failure
+ * (no free slot ⇒ ENOSPC; socketpair failure ⇒ its errno). cloexec mirrors the
+ * O_CLOEXEC the caller requested on /dev/ptmx (the master should not leak into
+ * the forked shell; the slave is dup'd separately for the child). */
+static int alr_pts_mint(int cloexec, int *out_ptn) {
+    /* socketpair via the trampoline so the PC gate ALLOWs it un-traced. arm64
+     * has no separate __NR_socketpair gotcha — it is in asm-generic. */
+    int sv[2] = { -1, -1 };
+    int type = SOCK_STREAM;
+#ifdef SOCK_CLOEXEC
+    if (cloexec) type |= SOCK_CLOEXEC;
+#endif
+    long r = alr_tramp_syscall(__NR_socketpair, AF_UNIX, type, 0, (long)sv, 0, 0);
+    if (r < 0) { errno = (int)(-r); return -1; }
+
+    alr_pts_acquire();
+    int idx = -1;
+    for (int i = 0; i < ALR_PTS_MAX; ++i) {
+        if (!g_pts[i].used) { idx = i; break; }
+    }
+    if (idx < 0) {
+        alr_pts_release();
+        alr_tramp_syscall(__NR_close, sv[0], 0, 0, 0, 0, 0);
+        alr_tramp_syscall(__NR_close, sv[1], 0, 0, 0, 0, 0);
+        errno = ENOSPC;
+        return -1;
+    }
+    struct alr_pty *p = &g_pts[idx];
+    memset(p, 0, sizeof *p);
+    p->used       = 1;
+    p->ptn        = idx;
+    p->master_fd  = sv[0];
+    p->slave_fd   = sv[1];
+    p->locked     = 1;             /* fresh ptmx is locked until unlockpt() */
+    p->pgrp       = 0;
+    p->sid        = 0;
+    alr_pty_init_termios(&p->tio);
+    alr_pty_init_winsize(&p->win);
+    alr_pts_release();
+
+    /* Mark this process (and so the env it hands its forked+exec'd shell) as
+     * having a live PTY session. The shell's interposer reads ALR_PTY_ACTIVE in
+     * its constructor and then recognizes its inherited socket stdio as a tty
+     * (the original table entry is gone after execve). setenv updates `environ`,
+     * which the terminal passes to the child by default. Best-effort. We mark
+     * THIS process as a minter (so it never lazily adopts its own sockets), but
+     * do NOT set g_pty_active here — that flag means "launched under a terminal"
+     * and is set only from the inherited env in the ctor (i.e. in the shell). */
+    g_pty_minted = 1;
+    setenv("ALR_PTY_ACTIVE", "1", 1);
+
+    if (out_ptn) *out_ptn = idx;
+    return sv[0];
+}
+
+/* Is `fd` an AF_UNIX SOCK_STREAM socket? Used (only when ALR_PTY_ACTIVE) to
+ * recognize an inherited PTY-slave stdio fd in the exec'd shell. Queries
+ * SO_DOMAIN + SO_TYPE through the trampoline; returns 1 iff both match. A real
+ * tty/pipe/file returns 0 (getsockopt → ENOTSOCK), so this never misfires on a
+ * genuine device fd. */
+static int alr_fd_is_unix_stream(int fd) {
+    if (fd < 0) return 0;
+#if defined(SO_DOMAIN) && defined(SO_TYPE)
+    int dom = -1, typ = -1;
+    unsigned int sl = sizeof dom;
+    long r = alr_tramp_syscall(__NR_getsockopt, fd, SOL_SOCKET, SO_DOMAIN,
+                               (long)&dom, (long)&sl, 0);
+    if (r < 0 || dom != AF_UNIX) return 0;
+    sl = sizeof typ;
+    r = alr_tramp_syscall(__NR_getsockopt, fd, SOL_SOCKET, SO_TYPE,
+                          (long)&typ, (long)&sl, 0);
+    if (r < 0 || typ != SOCK_STREAM) return 0;
+    return 1;
+#else
+    (void)fd; return 0;
+#endif
+}
+
+/* Resolve `fd` to a PTY entry. Table hit → return it (sets *is_master). Else,
+ * if ALR_PTY_ACTIVE and `fd` is an AF_UNIX stream socket, LAZILY register it as
+ * a slave (this is the exec'd shell recognizing its inherited stdio) and return
+ * the new entry with *is_master=0. Otherwise NULL (a non-PTY fd). This is the
+ * single resolver every TTY shim uses so the lazy-adopt happens uniformly. */
+static struct alr_pty *alr_pts_resolve(int fd, int *is_master) {
+    struct alr_pty *p = alr_pts_by_fd(fd, is_master);
+    if (p) return p;
+    /* Lazy-adopt ONLY in the exec'd shell: launched under a terminal
+     * (g_pty_active) and not itself a minter (so the terminal emulator never
+     * adopts its own Wayland/IPC sockets). Restrict to the standard stdio fds
+     * (0/1/2) — that is exactly where a terminal child wires its slave, and it
+     * means an unrelated higher-numbered socket the shell may hold is never
+     * mistaken for a tty. */
+    if (!g_pty_active || g_pty_minted) return NULL;
+    if (fd > 2) return NULL;
+    if (!alr_fd_is_unix_stream(fd)) return NULL;
+    /* lazily adopt this inherited slave fd into a free slot */
+    alr_pts_acquire();
+    struct alr_pty *np = NULL;
+    for (int i = 0; i < ALR_PTS_MAX; ++i) {
+        if (!g_pts[i].used) { np = &g_pts[i]; break; }
+    }
+    if (np) {
+        memset(np, 0, sizeof *np);
+        np->used = 1;
+        np->ptn = (int)(np - g_pts);
+        np->master_fd = -1;          /* master lives in the parent terminal */
+        np->slave_fd = fd;           /* the inherited stdio socket */
+        np->locked = 0;
+        np->slave_opened = 1;
+        alr_pty_init_termios(&np->tio);
+        alr_pty_init_winsize(&np->win);
+        /* Inherit the terminal's window size if it published one before spawn
+         * (ALR_PTY_WINSZ="COLSxROWS"), so a TUI draws at the real size rather
+         * than the 80x24 default. The original master's size did not survive
+         * across exec (separate process/table); this env carries it. */
+        const char *ws = getenv("ALR_PTY_WINSZ");
+        if (ws && ws[0]) {
+            unsigned cols = 0, rows = 0; const char *q = ws;
+            while (*q >= '0' && *q <= '9') { cols = cols * 10 + (unsigned)(*q++ - '0'); }
+            if (*q == 'x' || *q == 'X') {
+                ++q;
+                while (*q >= '0' && *q <= '9') { rows = rows * 10 + (unsigned)(*q++ - '0'); }
+            }
+            if (cols > 0 && cols < 10000 && rows > 0 && rows < 10000) {
+                np->win.ws_col = (unsigned short)cols;
+                np->win.ws_row = (unsigned short)rows;
+            }
+        }
+    }
+    alr_pts_release();
+    if (np && is_master) *is_master = 0;
+    return np;
+}
+
+/* Find the pty whose master OR slave is `fd`. Returns the entry (and sets
+ * *is_master) or NULL. Caller need not hold the lock for a read of immutable
+ * fields, but we take it to avoid racing a concurrent mint/close. */
+static struct alr_pty *alr_pts_by_fd(int fd, int *is_master) {
+    if (fd < 0) return NULL;
+    struct alr_pty *found = NULL;
+    int m = 0;
+    alr_pts_acquire();
+    for (int i = 0; i < ALR_PTS_MAX; ++i) {
+        if (!g_pts[i].used) continue;
+        if (g_pts[i].master_fd == fd) { found = &g_pts[i]; m = 1; break; }
+        if (g_pts[i].slave_fd  == fd) { found = &g_pts[i]; m = 0; break; }
+    }
+    alr_pts_release();
+    if (found && is_master) *is_master = m;
+    return found;
+}
+
+/* Find the pty with virtual index N (for open("/dev/pts/N")). */
+static struct alr_pty *alr_pts_by_ptn(int ptn) {
+    if (ptn < 0) return NULL;
+    struct alr_pty *found = NULL;
+    alr_pts_acquire();
+    for (int i = 0; i < ALR_PTS_MAX; ++i) {
+        if (g_pts[i].used && g_pts[i].ptn == ptn) { found = &g_pts[i]; break; }
+    }
+    alr_pts_release();
+    return found;
+}
+
+/* dup the slave fd of `p` (for open("/dev/pts/N") and TIOCGPTPEER). Uses
+ * fcntl(F_DUPFD[_CLOEXEC], 0), which returns the lowest free fd ≥ 0 — exactly
+ * dup() semantics, with optional close-on-exec. Returns the new fd or -1/errno.
+ * We do NOT dup3 onto a fixed target: the caller (open) expects the kernel's
+ * lowest-fd allocation, identical to a real device open. */
+static int alr_pts_dup_slave(struct alr_pty *p, int cloexec) {
+    if (!p) { errno = EINVAL; return -1; }
+#ifdef F_DUPFD_CLOEXEC
+    int cmd = cloexec ? F_DUPFD_CLOEXEC : F_DUPFD;
+#else
+    int cmd = F_DUPFD;
+    (void)cloexec;
+#endif
+    long r = alr_tramp_syscall(__NR_fcntl, p->slave_fd, cmd, 0 /*lowest fd ≥ 0*/,
+                               0, 0, 0);
+    if (r < 0) { errno = (int)(-r); return -1; }
+    alr_pts_acquire();
+    p->slave_opened = 1;
+    alr_pts_release();
+    return (int)r;
+}
+
+/* Open interception for the open()/openat() family. Given the GUEST-visible
+ * absolute path and the flags, if it names a PTY device, serve it from the
+ * emulation and store the result fd in *out_fd (returning 1). Otherwise return
+ * 0 (the caller proceeds with normal path mediation). On an emulation error
+ * *out_fd is set to -1 with errno, and we still return 1 (handled).
+ *
+ *   /dev/ptmx, /dev/pts/ptmx  → mint a pair, return master
+ *   /dev/pts/N                → dup the slave of pty N
+ *   /dev/tty                  → controlling tty: the slave of the first pty
+ *                               whose slave has been opened (best-effort); if
+ *                               none, fall through (0) so a real /dev/tty (if
+ *                               any) or an ENXIO is produced normally.
+ *   /dev/pts (dir)            → fall through (0): harmless real dir open.
+ */
+static int alr_pts_try_open(const char *path, int flags, int *out_fd) {
+    if (!path || path[0] != '/') return 0;
+    int cloexec = 0;
+#ifdef O_CLOEXEC
+    cloexec = (flags & O_CLOEXEC) ? 1 : 0;
+#endif
+    if (alr_pts_is_ptmx_path(path)) {
+        int ptn = -1;
+        *out_fd = alr_pts_mint(cloexec, &ptn);
+        /* LAUNCH MARKER — emitted UNCONDITIONALLY (not gated on ALR_INTERPOSE_DIAG)
+         * the first few times a virtual /dev/ptmx is served. Opening ptmx is a
+         * rare, significant event that ONLY a terminal does, so a one-line marker
+         * is low-noise and is the clearest device-verify signal that the TERMINAL
+         * app class engaged. With ALR_TEE_GUEST_STDOUT=1 (set by the launch path)
+         * it lands in logcat. Format: "ALR-PTY ptmx-served ptn=<N> master=<fd>"
+         * (or "master=-1 errno=<e>" on failure). */
+        {
+            int saved = errno;
+            char m[96]; size_t o = 0;
+            const char *pre = "ALR-PTY ptmx-served ptn=";
+            for (size_t i = 0; pre[i] && o < sizeof m - 1; ++i) m[o++] = pre[i];
+            long v = (long)ptn; if (*out_fd < 0) v = -1;
+            char num[24]; int ni = 0; int neg = (v < 0);
+            unsigned long u = neg ? (unsigned long)(-(v + 1)) + 1UL : (unsigned long)v;
+            if (u == 0) num[ni++] = '0';
+            while (u && ni < (int)sizeof num) { num[ni++] = (char)('0' + u % 10); u /= 10; }
+            if (neg && o < sizeof m - 1) m[o++] = '-';
+            while (ni > 0 && o < sizeof m - 1) m[o++] = num[--ni];
+            const char *mid = (*out_fd >= 0) ? " master=" : " master=-1 errno=";
+            for (size_t i = 0; mid[i] && o < sizeof m - 1; ++i) m[o++] = mid[i];
+            long fv = (*out_fd >= 0) ? (long)*out_fd : (long)errno;
+            ni = 0; u = (unsigned long)(fv < 0 ? -fv : fv);
+            if (u == 0) num[ni++] = '0';
+            while (u && ni < (int)sizeof num) { num[ni++] = (char)('0' + u % 10); u /= 10; }
+            while (ni > 0 && o < sizeof m - 1) m[o++] = num[--ni];
+            if (o < sizeof m) m[o++] = '\n';
+            alr_emit_fd2(m, o);
+            errno = saved;
+        }
+        /* Verbose per-open trace stays gated on ALR_INTERPOSE_DIAG. */
+        alr_diag("pty-ptmx", path, (*out_fd >= 0) ? "master" : "FAIL",
+                 (*out_fd >= 0) ? (long)ptn : (long)*out_fd);
+        return 1;
+    }
+    int n = alr_pts_parse_slave_path(path);
+    if (n >= 0) {
+        struct alr_pty *p = alr_pts_by_ptn(n);
+        if (!p) {
+            errno = ENXIO; *out_fd = -1;
+            alr_diag("pty-slave", path, "ENXIO", (long)n);
+            return 1;
+        }
+        *out_fd = alr_pts_dup_slave(p, cloexec);
+        alr_diag("pty-slave", path, (*out_fd >= 0) ? "slave" : "FAIL",
+                 (*out_fd >= 0) ? (long)*out_fd : (long)*out_fd);
+        return 1;
+    }
+    if (alr_pts_is_tty_path(path)) {
+        /* /dev/tty → the process's controlling terminal. We don't track ctty
+         * across the fork precisely, but a terminal's child opens its slave by
+         * name (/dev/pts/N) for stdio, so /dev/tty is mainly used by the SHELL
+         * to reach "the terminal". Return the slave of the most-recently-minted
+         * pty whose slave has been opened. If there is none, fall through. */
+        struct alr_pty *cand = NULL;
+        alr_pts_acquire();
+        for (int i = ALR_PTS_MAX - 1; i >= 0; --i) {
+            if (g_pts[i].used && g_pts[i].slave_opened) { cand = &g_pts[i]; break; }
+        }
+        alr_pts_release();
+        if (!cand) return 0;
+        *out_fd = alr_pts_dup_slave(cand, cloexec);
+        alr_diag("pty-tty", path, (*out_fd >= 0) ? "ctty" : "FAIL", (long)*out_fd);
+        return 1;
+    }
+    return 0;   /* not a pty path (incl. /dev/pts directory) */
+}
+
+/* ioctl — the FIRST ioctl wrapper in this interposer. For a fd that belongs to
+ * a virtual PTY, emulate the TTY ioctls (TIOCGPTN/TCGETS/TIOCSWINSZ/…) via the
+ * pure dispatch in alr_pts.c; for everything else, forward to the real ioctl on
+ * the underlying object. ioctl is variadic in glibc (request, then an optional
+ * arg); the kernel always takes a single unsigned-long/pointer arg, so we read
+ * exactly one. */
+int ioctl(int fd, unsigned long request, ...) {
+    void *arg;
+    va_list ap; va_start(ap, request);
+    arg = va_arg(ap, void *);
+    va_end(ap);
+
+    /* The real libc ioctl (RTLD_NEXT). For NON-PTY fds we forward to it verbatim
+     * so this wrapper is byte-for-byte transparent to every other ioctl in the
+     * guest (DRM, evdev, real-tty TCGETS, socket FIONBIO, …) — the interposer
+     * adds a PTY branch and is otherwise a pure pass-through. ioctl is variadic
+     * in glibc but the kernel ABI takes exactly one arg; we forward the single
+     * arg we read, matching glibc's own behavior (no-arg ioctls ignore it). */
+    static int (*real)(int, unsigned long, ...);
+    ALR_REAL(real, int (*)(int, unsigned long, ...), "ioctl");
+
+    int is_master = 0;
+    struct alr_pty *p = alr_pts_by_fd(fd, &is_master);
+    /* If not already a known pty fd but this is a TTY-class ioctl on an inherited
+     * stdio socket inside a terminal session (ALR_PTY_ACTIVE), lazily adopt it —
+     * scoped to the TTY requests so an unrelated socket ioctl never adopts. */
+    if (!p && g_pty_active) {
+        switch (request) {
+        case TCGETS: case TCSETS: case TCSETSW: case TCSETSF:
+        case ALR_TCGETS2: case ALR_TCSETS2: case ALR_TCSETSW2: case ALR_TCSETSF2:
+        case TIOCGWINSZ: case TIOCSWINSZ:
+        case TIOCSCTTY: case TIOCNOTTY:
+        case TIOCGPGRP: case TIOCSPGRP: case TIOCGSID:
+            p = alr_pts_resolve(fd, &is_master);
+            break;
+        default: break;
+        }
+    }
+    if (p) {
+        long r = alr_pts_emulate_ioctl(p, is_master, request, arg);
+        if (r == ALR_PTS_IOCTL_GPTPEER) {
+            /* TIOCGPTPEER: open (dup) the slave end of this master. The flags
+             * are in `arg` (O_RDWR|O_NOCTTY|O_CLOEXEC…); honor O_CLOEXEC. */
+            long af = (long)(intptr_t)arg;
+            int cloexec = 0;
+#ifdef O_CLOEXEC
+            cloexec = (af & O_CLOEXEC) ? 1 : 0;
+#endif
+            return alr_pts_dup_slave(p, cloexec);     /* sets errno on failure */
+        }
+        if (r == ALR_PTS_IOCTL_PASS) {
+            /* Not an emulated TTY ioctl (e.g. FIONREAD): run it on the
+             * underlying socket (real bytes-available, non-blocking flags, …). */
+            if (real) return real(fd, request, arg);
+            long rr = alr_tramp_syscall(__NR_ioctl, fd, (long)request, (long)arg, 0, 0, 0);
+            return (int)alr_ret(rr);
+        }
+        if (r < 0) { errno = (int)(-r); return -1; }
+        /* When the terminal resizes the MASTER, publish the new size into the
+         * env so a (later-spawned) shell's lazy-adopt inherits it. Best-effort,
+         * gated to the master side; ws_col/ws_row are already stored in pty->win
+         * by the emulate dispatch. Format "COLSxROWS". */
+        if (request == TIOCSWINSZ && is_master) {
+            char wb[24]; size_t o = 0;
+            unsigned vals[2] = { p->win.ws_col, p->win.ws_row };
+            for (int vi = 0; vi < 2; ++vi) {
+                if (vi) { if (o < sizeof wb - 1) wb[o++] = 'x'; }
+                char num[8]; int ni = 0; unsigned u = vals[vi];
+                if (u == 0) num[ni++] = '0';
+                while (u && ni < (int)sizeof num) { num[ni++] = (char)('0' + u % 10); u /= 10; }
+                while (ni > 0 && o < sizeof wb - 1) wb[o++] = num[--ni];
+            }
+            wb[o < sizeof wb ? o : sizeof wb - 1] = '\0';
+            int saved = errno; setenv("ALR_PTY_WINSZ", wb, 1); errno = saved;
+        }
+        return (int)r;
+    }
+    /* Non-PTY fd: transparent forward to the real libc ioctl. */
+    if (real) return real(fd, request, arg);
+    long rr = alr_tramp_syscall(__NR_ioctl, fd, (long)request, (long)arg, 0, 0, 0);
+    return (int)alr_ret(rr);
+}
+
+/* isatty — a socket answers ioctl(TCGETS) with ENOTTY, so the stock isatty()
+ * would return 0 for our pty ends and the terminal would refuse to run. Report
+ * TRUE for a pty fd (table or lazily-adopted inherited slave); else defer. */
+int isatty(int fd) {
+    if (alr_pts_resolve(fd, NULL)) return 1;
+    static int (*real)(int);
+    ALR_REAL(real, int (*)(int), "isatty");
+    if (real) return real(fd);
+    /* Fallback: TCGETS through the trampoline (TCGETS from <sys/ioctl.h>). */
+    struct alr_ktermios k;
+    long r = alr_tramp_syscall(__NR_ioctl, fd, (long)TCGETS, (long)&k, 0, 0, 0);
+    if (r == 0) return 1;
+    errno = ENOTTY;
+    return 0;
+}
+
+/* tcgetattr/tcsetattr — glibc implements these as TCGETS2/TCSETS2 (or TCGETS/
+ * TCSETS) ioctls plus a struct translation. Since our ioctl() already emulates
+ * those for pty fds, the stock glibc tcgetattr/tcsetattr would Just Work IF they
+ * called our interposed ioctl — but glibc calls the ioctl SYSCALL directly
+ * (its own inlined wrapper), bypassing our symbol. So we provide tcgetattr/
+ * tcsetattr that, for a pty fd, fill/read glibc's struct termios from the pty's
+ * kernel termios2 state directly; for a non-pty fd we defer to the real ones. */
+int tcgetattr(int fd, struct termios *t) {
+    int is_master = 0;
+    struct alr_pty *p = alr_pts_resolve(fd, &is_master);
+    if (p) {
+        if (!t) { errno = EINVAL; return -1; }
+        /* Translate kernel termios2 → glibc struct termios. glibc's struct has
+         * the same first four flag words + c_line + c_cc[0..18] in the same
+         * order; the extra c_cc slots (19..31) and c_ispeed/c_ospeed are glibc-
+         * private. Zero the target, then copy the common fields. */
+        memset(t, 0, sizeof *t);
+        t->c_iflag = p->tio.c_iflag;
+        t->c_oflag = p->tio.c_oflag;
+        t->c_cflag = p->tio.c_cflag;
+        t->c_lflag = p->tio.c_lflag;
+        t->c_line  = p->tio.c_line;
+        for (int i = 0; i < ALR_KNCCS && i < NCCS; ++i) t->c_cc[i] = p->tio.c_cc[i];
+        /* glibc stashes the baud in c_ispeed/c_ospeed; mirror it so
+         * cfgetospeed() returns 38400 rather than 0. */
+        cfsetispeed(t, B38400);
+        cfsetospeed(t, B38400);
+        return 0;
+    }
+    static int (*real)(int, struct termios *);
+    ALR_REAL(real, int (*)(int, struct termios *), "tcgetattr");
+    return real(fd, t);
+}
+
+int tcsetattr(int fd, int optional_actions, const struct termios *t) {
+    int is_master = 0;
+    struct alr_pty *p = alr_pts_resolve(fd, &is_master);
+    if (p) {
+        if (!t) { errno = EINVAL; return -1; }
+        (void)optional_actions;     /* TCSANOW/DRAIN/FLUSH identical for a pty */
+        alr_pts_acquire();
+        p->tio.c_iflag = t->c_iflag;
+        p->tio.c_oflag = t->c_oflag;
+        p->tio.c_cflag = t->c_cflag;
+        p->tio.c_lflag = t->c_lflag;
+        p->tio.c_line  = t->c_line;
+        for (int i = 0; i < ALR_KNCCS && i < NCCS; ++i) p->tio.c_cc[i] = t->c_cc[i];
+        /* keep the termios2 baud fields plausible */
+        p->tio.c_ispeed = 38400;
+        p->tio.c_ospeed = 38400;
+        alr_pts_release();
+        return 0;
+    }
+    static int (*real)(int, int, const struct termios *);
+    ALR_REAL(real, int (*)(int, int, const struct termios *), "tcsetattr");
+    return real(fd, optional_actions, t);
+}
+
+/* tcgetpgrp/tcsetpgrp — bash job control. For a pty fd, read/write the stored
+ * foreground pgrp; else defer. (glibc implements these as TIOC[GS]PGRP ioctls
+ * directly, again bypassing our ioctl symbol.) */
+pid_t tcgetpgrp(int fd) {
+    struct alr_pty *p = alr_pts_resolve(fd, NULL);
+    if (p) return p->pgrp > 0 ? p->pgrp : getpgrp();
+    static pid_t (*real)(int);
+    ALR_REAL(real, pid_t (*)(int), "tcgetpgrp");
+    return real(fd);
+}
+int tcsetpgrp(int fd, pid_t pgrp) {
+    struct alr_pty *p = alr_pts_resolve(fd, NULL);
+    if (p) { alr_pts_acquire(); p->pgrp = pgrp; alr_pts_release(); return 0; }
+    static int (*real)(int, pid_t);
+    ALR_REAL(real, int (*)(int, pid_t), "tcsetpgrp");
+    return real(fd, pgrp);
+}
+
+/* tcflush/tcflow/tcdrain/tcsendbreak — no-ops (success) for a pty fd: a socket
+ * has nothing to flush/drain and no break to send. Defer for non-pty fds. */
+int tcflush(int fd, int queue_selector) {
+    if (alr_pts_resolve(fd, NULL)) return 0;
+    static int (*real)(int, int);
+    ALR_REAL(real, int (*)(int, int), "tcflush");
+    return real(fd, queue_selector);
+}
+int tcflow(int fd, int action) {
+    if (alr_pts_resolve(fd, NULL)) return 0;
+    static int (*real)(int, int);
+    ALR_REAL(real, int (*)(int, int), "tcflow");
+    return real(fd, action);
+}
+int tcdrain(int fd) {
+    if (alr_pts_resolve(fd, NULL)) return 0;
+    static int (*real)(int);
+    ALR_REAL(real, int (*)(int), "tcdrain");
+    return real(fd);
+}
+int tcsendbreak(int fd, int duration) {
+    if (alr_pts_resolve(fd, NULL)) return 0;
+    static int (*real)(int, int);
+    ALR_REAL(real, int (*)(int, int), "tcsendbreak");
+    return real(fd, duration);
+}
+
+/* ptsname_r/ptsname — return "/dev/pts/N" for a master fd. glibc's ptsname_r
+ * does TIOCGPTN then stat("/dev/pts/N"); the stat would fail (no such file), so
+ * we must provide our own. */
+int ptsname_r(int fd, char *buf, size_t buflen) {
+    int is_master = 0;
+    struct alr_pty *p = alr_pts_by_fd(fd, &is_master);
+    if (p) {
+        if (!is_master) { errno = ENOTTY; return ENOTTY; }
+        if (!buf) { errno = EINVAL; return EINVAL; }
+        /* format "/dev/pts/<ptn>" without snprintf (keep it allocation-free) */
+        char tmp[32];
+        int n = p->ptn, len = 0;
+        char rev[12]; int rl = 0;
+        if (n == 0) rev[rl++] = '0';
+        while (n > 0 && rl < (int)sizeof rev) { rev[rl++] = (char)('0' + n % 10); n /= 10; }
+        static const char pfx[] = "/dev/pts/";
+        for (const char *s = pfx; *s; ++s) if (len < (int)sizeof tmp) tmp[len++] = *s;
+        for (int i = rl - 1; i >= 0; --i) if (len < (int)sizeof tmp) tmp[len++] = rev[i];
+        if ((size_t)(len + 1) > buflen) { errno = ERANGE; return ERANGE; }
+        for (int i = 0; i < len; ++i) buf[i] = tmp[i];
+        buf[len] = '\0';
+        return 0;
+    }
+    static int (*real)(int, char *, size_t);
+    ALR_REAL(real, int (*)(int, char *, size_t), "ptsname_r");
+    return real(fd, buf, buflen);
+}
+char *ptsname(int fd) {
+    static __thread char tls[32];
+    if (ptsname_r(fd, tls, sizeof tls) == 0) return tls;
+    return NULL;   /* errno already set */
+}
+
+/* ttyname_r/ttyname — name of the tty on `fd`. For a pty SLAVE fd we know the
+ * name ("/dev/pts/N"); for a master, ttyname is conventionally not defined
+ * (return ENOTTY). */
+int ttyname_r(int fd, char *buf, size_t buflen) {
+    int is_master = 0;
+    struct alr_pty *p = alr_pts_resolve(fd, &is_master);
+    if (p) {
+        if (is_master) { errno = ENOTTY; return ENOTTY; }
+        /* slave name == ptsname of the peer master == "/dev/pts/N" */
+        if (!buf) { errno = EINVAL; return EINVAL; }
+        char tmp[32]; int len = 0;
+        int n = p->ptn; char rev[12]; int rl = 0;
+        if (n == 0) rev[rl++] = '0';
+        while (n > 0 && rl < (int)sizeof rev) { rev[rl++] = (char)('0' + n % 10); n /= 10; }
+        static const char pfx[] = "/dev/pts/";
+        for (const char *s = pfx; *s; ++s) if (len < (int)sizeof tmp) tmp[len++] = *s;
+        for (int i = rl - 1; i >= 0; --i) if (len < (int)sizeof tmp) tmp[len++] = rev[i];
+        if ((size_t)(len + 1) > buflen) { errno = ERANGE; return ERANGE; }
+        for (int i = 0; i < len; ++i) buf[i] = tmp[i];
+        buf[len] = '\0';
+        return 0;
+    }
+    static int (*real)(int, char *, size_t);
+    ALR_REAL(real, int (*)(int, char *, size_t), "ttyname_r");
+    return real(fd, buf, buflen);
+}
+char *ttyname(int fd) {
+    static __thread char tls[32];
+    if (ttyname_r(fd, tls, sizeof tls) == 0) return tls;
+    return NULL;
+}
+
+/* grantpt/unlockpt — the POSIX pty unlock dance. grantpt historically chowns
+ * the slave (needs root / a setuid helper); for our emulation it is a no-op
+ * success. unlockpt clears the lock (TIOCSPTLCK 0). Both take a master fd. */
+int grantpt(int fd) {
+    if (alr_pts_by_fd(fd, NULL)) return 0;        /* emulated: nothing to chown */
+    static int (*real)(int);
+    ALR_REAL(real, int (*)(int), "grantpt");
+    return real(fd);
+}
+int unlockpt(int fd) {
+    int is_master = 0;
+    struct alr_pty *p = alr_pts_by_fd(fd, &is_master);
+    if (p) {
+        if (!is_master) { errno = EINVAL; return -1; }
+        alr_pts_acquire(); p->locked = 0; alr_pts_release();
+        return 0;
+    }
+    static int (*real)(int);
+    ALR_REAL(real, int (*)(int), "unlockpt");
+    return real(fd);
+}
+
+/* posix_openpt — the modern entry point a terminal may use instead of
+ * open("/dev/ptmx"). Mint a pair and return the master. `oflags` carries
+ * O_RDWR|O_NOCTTY (and maybe O_CLOEXEC). */
+int posix_openpt(int oflags) {
+    int cloexec = 0;
+#ifdef O_CLOEXEC
+    cloexec = (oflags & O_CLOEXEC) ? 1 : 0;
+#endif
+    int ptn = -1;
+    return alr_pts_mint(cloexec, &ptn);
+}
+
+/* openpty — the libutil one-call "give me a pty pair" (used by xterm, screen,
+ * util-linux script, etc.). glibc's own openpty would do the ptmx/grantpt/
+ * unlockpt/ptsname/open(slave) dance with its INTERNAL (un-interposed) symbols,
+ * so the slave open would hit the real (absent) /dev/pts → fail. We provide our
+ * own: mint the pair, dup a fresh slave fd, apply the optional termios/winsize,
+ * and return both ends + the slave name. Signature matches <pty.h>. */
+int openpty(int *amaster, int *aslave, char *name,
+            const struct termios *termp, const struct winsize *winp) {
+    if (!amaster || !aslave) { errno = EINVAL; return -1; }
+    int ptn = -1;
+    int m = alr_pts_mint(0, &ptn);
+    if (m < 0) return -1;                       /* errno set by mint */
+    struct alr_pty *p = alr_pts_by_fd(m, NULL);
+    if (!p) { int e = errno; alr_tramp_syscall(__NR_close, m, 0,0,0,0,0); errno = e ? e : EIO; return -1; }
+    p->locked = 0;                              /* openpty hands back an unlocked pair */
+    int s = alr_pts_dup_slave(p, 0);
+    if (s < 0) { int e = errno; alr_tramp_syscall(__NR_close, m, 0,0,0,0,0); errno = e; return -1; }
+    if (termp) tcsetattr(s, TCSANOW, termp);    /* routes to our pty tcsetattr */
+    if (winp)  ioctl(s, TIOCSWINSZ, (void *)winp);
+    if (name) {                                 /* caller-owned buf, ≥ ptsname size */
+        if (ptsname_r(m, name, 64) != 0) { /* best-effort; non-fatal */ }
+    }
+    *amaster = m;
+    *aslave  = s;
+    return 0;
+}
+
+/* forkpty — openpty + fork + login_tty(slave) in the child. We implement it on
+ * our openpty so the pair is the virtual one. login_tty = setsid + TIOCSCTTY +
+ * dup2(slave→0/1/2) + close(slave); those are real syscalls (setsid/dup2 are
+ * not interposed; TIOCSCTTY runs through our ioctl). The child returns 0; the
+ * parent returns the child pid and *amaster. */
+pid_t forkpty(int *amaster, char *name,
+              const struct termios *termp, const struct winsize *winp) {
+    int master = -1, slave = -1;
+    if (openpty(&master, &slave, name, termp, winp) != 0) return -1;
+
+    static pid_t (*real_fork)(void);
+    ALR_REAL(real_fork, pid_t (*)(void), "fork");
+    if (!real_fork) {   /* never happens on glibc; fail cleanly rather than guess */
+        alr_tramp_syscall(__NR_close, master, 0,0,0,0,0);
+        alr_tramp_syscall(__NR_close, slave, 0,0,0,0,0);
+        errno = ENOSYS;
+        return -1;
+    }
+    pid_t pid = real_fork();
+    if (pid < 0) {
+        int e = errno;
+        alr_tramp_syscall(__NR_close, master, 0,0,0,0,0);
+        alr_tramp_syscall(__NR_close, slave, 0,0,0,0,0);
+        errno = e;
+        return -1;
+    }
+    if (pid == 0) {
+        /* child: become session leader on the slave tty, wire stdio. */
+        static int (*real_setsid)(void);
+        ALR_REAL(real_setsid, int (*)(void), "setsid");
+        if (real_setsid) real_setsid();
+        ioctl(slave, TIOCSCTTY, (void *)(long)0);    /* our emulated success */
+        static int (*real_dup2)(int, int);
+        ALR_REAL(real_dup2, int (*)(int, int), "dup2");
+        if (real_dup2) { real_dup2(slave, 0); real_dup2(slave, 1); real_dup2(slave, 2); }
+        if (slave > 2) {
+            static int (*real_close)(int);
+            ALR_REAL(real_close, int (*)(int), "close");
+            if (real_close) real_close(slave); else alr_tramp_syscall(__NR_close, slave, 0,0,0,0,0);
+        }
+        if (amaster) *amaster = master;          /* per glibc: child sees master too */
+        return 0;
+    }
+    /* parent */
+    if (amaster) *amaster = master;
+    return pid;
+}
+
+/* close — transparent for every fd, EXCEPT that closing a PTY master frees its
+ * table slot (so the virtual pts index can be reused and a later fd with the
+ * same number is not mis-identified as that pty). The data-flow close itself is
+ * the real libc close (RTLD_NEXT): this wrapper is otherwise byte-identical to
+ * not wrapping close at all. Conservatively, we reclaim only on MASTER close
+ * (the terminal owns the master for the session's lifetime); slave dups are
+ * ordinary kernel fds the guest still owns and the kernel reaps. */
+int close(int fd) {
+    struct alr_pty *p = alr_pts_by_fd(fd, NULL);
+    if (p && p->master_fd == fd) {
+        alr_pts_acquire();
+        /* re-check under the lock in case of a concurrent close/mint race */
+        if (p->used && p->master_fd == fd) p->used = 0;
+        alr_pts_release();
+    }
+    static int (*real)(int);
+    ALR_REAL(real, int (*)(int), "close");
+    if (real) return real(fd);
+    long r = alr_tramp_syscall(__NR_close, fd, 0, 0, 0, 0, 0);
+    return (int)alr_ret(r);
 }
 
 /* =================================================================== */
