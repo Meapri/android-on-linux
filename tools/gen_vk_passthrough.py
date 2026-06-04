@@ -2021,9 +2021,121 @@ def gen_icd(reg, ops):
     return "\n".join(L) + "\n"
 
 
+# ----------------------------------------------------------------------------------------
+# PER-ENTRYPOINT ICD HAND-EDITS (the wave-16 first-glTexImage2D create-pNext + diag spec,
+# moved here so a fresh `gen_vk_passthrough.py` reproduces alr_gpu_vk_gen_icd.inc VERBATIM
+# — keeping `--check` green and future regens safe instead of stomping the hand-edits).
+#
+# Rationale: LEAD-1 forwards ANGLE's allowlisted create-pNext chains verbatim (Buffer /
+# Image / ImageView via alr_icd_count_create_pnext+alr_icd_emit_create_pnext; DSL ships the
+# pointer-bearing VkDescriptorSetLayoutBindingFlagsCreateInfo as an INLINE blob). The enter/
+# memreqs ALR_ICD_DIAG lines pin the exact create-chain a device run reaches before the wall.
+# These reference helpers/macros defined in alr_icd_vulkan.c (the .inc is #included into it):
+# alr_icd_count_create_pnext, alr_icd_emit_create_pnext, alr_icd_pnext_stype_name,
+# alr_vk_enc_u32, VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO_VAL.
+#
+# Keyed by ICD fn name. Per entry (all optional):
+#   enter_diag         : list[str] literal lines emitted at function-body scope (4-space indent)
+#   enter_before_alloc : if True, enter_diag goes BEFORE `vid = alr_alloc(...)`, else AFTER
+#   req_bytes          : override the default stack req[] size (simple create_handle only)
+#   pnext_block        : list[str] literal lines REPLACING the default `alr_vk_gen_pnext_count`
+#                        line (8-space indent; inside the `if (alr_icd_ring_ok())` body)
+#   after_block        : list[str] literal lines appended at the end of a get_reqs body
+ICD_HANDEDIT = {
+    "alr_vkCreateBuffer": {
+        "enter_before_alloc": False,
+        "enter_diag": [
+            '    ALR_ICD_DIAG("vkCreateBuffer enter vbuf=%u size=%llu usage=0x%x pNext=%p",',
+            '                 vid, (unsigned long long)pCreateInfo->size, (unsigned)pCreateInfo->usage, (void *)pCreateInfo->pNext);',
+        ],
+        "req_bytes": 384,
+        "pnext_block": [
+            "        // LEAD-1: forward ANGLE's allowlisted pNext (e.g. ExternalMemoryBufferCreateInfo) verbatim.",
+            '        { uint32_t pnb = 0; uint32_t pnc = alr_icd_count_create_pnext(pCreateInfo->pNext, "vkCreateBuffer", &pnb);',
+            "          alr_icd_emit_create_pnext(&e, pCreateInfo->pNext, pnc); }",
+        ],
+    },
+    "alr_vkCreateImage": {
+        "enter_before_alloc": True,
+        "enter_diag": [
+            '    ALR_ICD_DIAG("vkCreateImage enter fmt=%u type=%u %ux%u usage=0x%x tiling=%u pNext=%p",',
+            "                 (unsigned)pCreateInfo->format, (unsigned)pCreateInfo->imageType,",
+            "                 (unsigned)pCreateInfo->extent.width, (unsigned)pCreateInfo->extent.height,",
+            "                 (unsigned)pCreateInfo->usage, (unsigned)pCreateInfo->tiling, (void *)pCreateInfo->pNext);",
+        ],
+        "req_bytes": 384,
+        "pnext_block": [
+            "        // LEAD-1: forward ANGLE's allowlisted image pNext (ExternalMemoryImage / StencilUsage) verbatim.",
+            '        { uint32_t pnb = 0; uint32_t pnc = alr_icd_count_create_pnext(pCreateInfo->pNext, "vkCreateImage", &pnb);',
+            "          alr_icd_emit_create_pnext(&e, pCreateInfo->pNext, pnc); }",
+        ],
+    },
+    "alr_vkCreateImageView": {
+        "req_bytes": 384,
+        "pnext_block": [
+            "        // LEAD-1: forward ANGLE's allowlisted image-view pNext (ImageViewUsageCreateInfo) verbatim.",
+            '        { uint32_t pnb = 0; uint32_t pnc = alr_icd_count_create_pnext(pCreateInfo->pNext, "vkCreateImageView", &pnb);',
+            "          alr_icd_emit_create_pnext(&e, pCreateInfo->pNext, pnc); }",
+        ],
+    },
+    "alr_vkCreateDescriptorSetLayout": {
+        "enter_before_alloc": True,
+        "enter_diag": [
+            '    ALR_ICD_DIAG("vkCreateDescriptorSetLayout enter bindingCount=%u flags=0x%x pNext=%p",',
+            "                 pCreateInfo->bindingCount, (unsigned)pCreateInfo->flags, (void *)pCreateInfo->pNext);",
+        ],
+        "pnext_block": [
+            "        // LEAD-1 (TOP): the LAST create before the first-texture NULL-deref. ANGLE chains",
+            "        // VkDescriptorSetLayoutBindingFlagsCreateInfo here (update-after-bind / partially-bound /",
+            "        // variable-count binding flags) — DROPPED until now (hardcoded pnext_count=0). It is",
+            "        // pointer-bearing (pBindingFlags), so it canNOT ride the verbatim path; ship the FLAGS",
+            "        // ARRAY INLINE as the pNext blob for sType=BINDING_FLAGS, and let the DSL host-forward",
+            "        // (vk_gen_real_create_descriptor_set_layout) rebuild the struct with a host-side array.",
+            "        { const VkBaseInStructure *bf = NULL; uint32_t bf_count = 0; const uint32_t *bf_flags = NULL;",
+            "          for (const VkBaseInStructure *p = (const VkBaseInStructure *)pCreateInfo->pNext; p; p = p->pNext) {",
+            "              uint32_t st = (uint32_t)p->sType;",
+            "              if (st == VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO_VAL) {",
+            "                  bf = p; /* { sType; pad; pNext; u32 bindingCount; pad; const VkDescriptorBindingFlags* pBindingFlags } */",
+            "                  bf_count = *(const uint32_t *)((const uint8_t *)p + 16);",
+            "                  bf_flags = *(const uint32_t *const *)((const uint8_t *)p + 24);",
+            '                  ALR_ICD_DIAG("vkCreateDescriptorSetLayout pNext sType=%u DescriptorSetLayoutBindingFlagsCreateInfo FWD-INLINE bindingCount=%u", st, bf_count);',
+            "              } else {",
+            '                  ALR_ICD_DIAG("vkCreateDescriptorSetLayout pNext sType=%u %s DROP", st, alr_icd_pnext_stype_name(st));',
+            "              }",
+            "          }",
+            "          if (bf && bf_count && bf_flags && bf_count <= 4096) {",
+            "              if (bf_count > pCreateInfo->bindingCount) bf_count = pCreateInfo->bindingCount;",
+            "              alr_vk_gen_pnext_count(&e, 1);",
+            "              /* blob = { u32 bindingCount, u32 flags[bindingCount] } — the host DSL-forward",
+            "               * recognizes this sType and rebuilds the real struct with a host array. */",
+            "              alr_vk_enc_u32(&e, (uint32_t)VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO_VAL);",
+            "              alr_vk_enc_u32(&e, 4u + bf_count * 4u);   /* blob length */",
+            "              alr_vk_enc_u32(&e, bf_count);",
+            "              for (ai = 0; ai < bf_count; ++ai) alr_vk_enc_u32(&e, bf_flags[ai]);",
+            "          } else {",
+            "              alr_vk_gen_pnext_count(&e, 0);",
+            "          }",
+            "        }",
+        ],
+    },
+    "alr_vkGetBufferMemoryRequirements": {
+        "after_block": [
+            "    // LEAD-2: dump the per-buffer memreqs (the 7-probe memory-type map ANGLE builds). vh ties",
+            "    // back to the vkCreateBuffer enter line (same virtual id order) so usage->memoryTypeBits is",
+            "    // recoverable; a wrong/identical bits across distinct usages would corrupt ANGLE's map.",
+            '    ALR_ICD_DIAG("vkGetBufferMemoryRequirements vbuf=%u -> size=%llu align=%llu memoryTypeBits=0x%x",',
+            "                 vh, (unsigned long long)pMemoryRequirements->size,",
+            "                 (unsigned long long)pMemoryRequirements->alignment,",
+            "                 (unsigned)pMemoryRequirements->memoryTypeBits);",
+        ],
+    },
+}
+
+
 def gen_icd_fn(op):
     k = op["kind"]
     name = op["name"]
+    he = ICD_HANDEDIT.get(op["icd_fn"], {})
     fn = op["icd_fn"]
     L = []
     a = L.append
@@ -2036,7 +2148,11 @@ def gen_icd_fn(op):
         a("    AlrIcdDevice *dev = (AlrIcdDevice *)device;")
         a("    uint32_t vid; int32_t res = 0;")
         a("    if (!dev || !pCreateInfo || !pHandle) return VK_ERROR_INITIALIZATION_FAILED;")
+        if he.get("enter_diag") and he.get("enter_before_alloc"):
+            L.extend(he["enter_diag"])
         a(f"    vid = alr_alloc(&{op['counter']}, 1);")
+        if he.get("enter_diag") and not he.get("enter_before_alloc"):
+            L.extend(he["enter_diag"])
         a("    if (alr_icd_ring_ok()) {")
         if blob:
             blen, bdata = blob  # the C members: byte-length and data pointer
@@ -2060,10 +2176,13 @@ def gen_icd_fn(op):
             a("        } else res = (int32_t)VK_ERROR_INITIALIZATION_FAILED;")
             a("        free(req);")
         else:
-            a("        uint8_t req[256]; AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];")
+            a(f"        uint8_t req[{he.get('req_bytes', 256)}]; AlrVkEncoder e; uint8_t reply[ALR_ICD_REPLY_SCRATCH];")
             a("        alr_vk_enc_init(&e, req, sizeof(req));")
             a(f"        {op['enc_name']}_begin(&e, dev->vdev, vid{op['icd_ci_args']});")
-            a("        alr_vk_gen_pnext_count(&e, 0);  // first batch: no pNext forwarded yet")
+            if he.get("pnext_block"):
+                L.extend(he["pnext_block"])
+            else:
+                a("        alr_vk_gen_pnext_count(&e, 0);  // first batch: no pNext forwarded yet")
             a("        alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);")
             a("        if (!e.overflow) {")
             a("            uint32_t rlen = alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));")
@@ -2185,6 +2304,8 @@ def gen_icd_fn(op):
         a("            }")
         a("        }")
         a("    }")
+        if he.get("after_block"):
+            L.extend(he["after_block"])
         a("}")
     elif k == "bind_memory":
         hp_name, hp_ty = op["handle_param"]
@@ -2229,7 +2350,11 @@ def gen_icd_fn(op):
         a("    AlrIcdDevice *dev = (AlrIcdDevice *)device;")
         a("    uint32_t vid; int32_t res = 0; uint32_t ai;")
         a("    if (!dev || !pCreateInfo || !pHandle) return VK_ERROR_INITIALIZATION_FAILED;")
+        if he.get("enter_diag") and he.get("enter_before_alloc"):
+            L.extend(he["enter_diag"])
         a(f"    vid = alr_alloc(&{op['counter']}, 1);")
+        if he.get("enter_diag") and not he.get("enter_before_alloc"):
+            L.extend(he["enter_diag"])
         a("    if (alr_icd_ring_ok()) {")
         # Heap request buffer sized generously for the arrays (each element <= 16 bytes; the
         # counts are bounded by the host decode at 4096, but we cap our own loop too).
@@ -2258,7 +2383,10 @@ def gen_icd_fn(op):
                 else:
                     elem_args.append(f"(uint32_t)pCreateInfo->{pf}[ai].{fname}")
             a(f"              {op['enc_name']}_{an}_elem(&e, {', '.join(elem_args)}); }} }}")
-        a("        alr_vk_gen_pnext_count(&e, 0);")
+        if he.get("pnext_block"):
+            L.extend(he["pnext_block"])
+        else:
+            a("        alr_vk_gen_pnext_count(&e, 0);")
         a("        alr_vk_enc_u8(&e, (uint8_t)ALR_VK_OP_END);")
         a("        if (!e.overflow) {")
         a("            uint32_t rlen = alr_icd_roundtrip(req, (uint32_t)e.len, reply, sizeof(reply));")

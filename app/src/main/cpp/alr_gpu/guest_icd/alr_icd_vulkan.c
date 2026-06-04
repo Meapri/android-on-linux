@@ -52,6 +52,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>  /* strcasecmp (POSIX) — vendor-override token compare */
 
 /* ICD call-trace diagnostic (gated on ALR_ICD_DIAG): emits one "[alr-icd]" line per
  * traced entrypoint to stderr → the loader's guest-stdout capture / logcat. Lets a
@@ -64,6 +65,85 @@ static int alr_icd_diag_on(void) {
 }
 #define ALR_ICD_DIAG(...) do { if (alr_icd_diag_on()) { \
     fprintf(stderr, "[alr-icd] " __VA_ARGS__); fputc('\n', stderr); fflush(stderr); } } while (0)
+
+/* ====================================================================================
+ * VENDOR-ID FLIP decisive experiment (wave-17, gated on ALR_ICD_VENDOR_OVERRIDE; the ring
+ * to the REAL Mali GPU is UNCHANGED — only the IDENTITY we advertise to ANGLE is faked).
+ *
+ * WHY: 16 waves proved every Vulkan DATA value our ICD reports is byte-correct real-Mali,
+ * yet ANGLE SIGSEGVs on the first glTexImage2D in PURE CPU-side ANGLE code (zero Vulkan ops
+ * issued) at a NULL member — while SwiftShader (same ANGLE+loader) renders PAST it. The
+ * remaining divergence is therefore a Mali/ARM-VENDOR-CONDITIONAL ANGLE code path: ANGLE
+ * keys FeaturesVk on mPhysicalDeviceProperties.vendorID + mDriverProperties.driverID, and
+ * an ARM-specific workaround / lazily-built helper our deferred-ring ICD leaves NULL faults.
+ * This override makes the ICD report a NON-ARM driverID+vendorID so ANGLE takes a known-good
+ * (e.g. SwiftShader-class) path while our real Mali backend still executes the ops.
+ *
+ * TRANSPORT (note: runtime_report.cpp's guest-env forward allowlist is OUT OF SCOPE this
+ * wave): the value is read FIRST from getenv("ALR_ICD_VENDOR_OVERRIDE") (works if the loader
+ * forwards it), ELSE from the rootfs file "$ALR_ROOTFS/.alr-icd-vendor-override" which the
+ * launcher (MainActivity) writes from the /data/local/tmp/.alr-angle-vendor-override marker.
+ * ALR_ROOTFS is always forwarded to the guest, so this file channel needs no loader change.
+ *
+ * TOKENS (first non-empty line / env value, case-insensitive): swiftshader | google |
+ * nvidia | amd | intel | arm | off. Returns 1 and fills the out vendorID+driverID iff an
+ * override is active; 0 (= real Mali) otherwise. Default-off everywhere = no-regression. */
+static int alr_icd_vendor_token_to_ids(const char *tok, uint32_t *vendorID, uint32_t *driverID) {
+    /* canonical PCI vendorIDs + VkDriverId enum values (vulkan_core.h). */
+    if (!strcasecmp(tok, "swiftshader") || !strcasecmp(tok, "google")) {
+        *vendorID = 0x1AE0u; *driverID = 10u; /* Google / VK_DRIVER_ID_GOOGLE_SWIFTSHADER */ return 1; }
+    if (!strcasecmp(tok, "nvidia")) {
+        *vendorID = 0x10DEu; *driverID = 4u;  /* NVIDIA / VK_DRIVER_ID_NVIDIA_PROPRIETARY */ return 1; }
+    if (!strcasecmp(tok, "amd")) {
+        *vendorID = 0x1002u; *driverID = 1u;  /* AMD / VK_DRIVER_ID_AMD_PROPRIETARY */ return 1; }
+    if (!strcasecmp(tok, "intel")) {
+        *vendorID = 0x8086u; *driverID = 6u;  /* Intel / VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA */ return 1; }
+    if (!strcasecmp(tok, "arm")) {
+        *vendorID = 0x13B5u; *driverID = 9u;  /* ARM / VK_DRIVER_ID_ARM_PROPRIETARY (= real) */ return 1; }
+    /* "off"/"0"/unknown → no override. */
+    return 0;
+}
+static int alr_icd_vendor_override(uint32_t *vendorID, uint32_t *driverID) {
+    static int cached = -1;            /* -1 unknown, 0 none, 1 active */
+    static uint32_t cv = 0, cd = 0;
+    if (cached < 0) {
+        char buf[64]; buf[0] = '\0';
+        const char *e = getenv("ALR_ICD_VENDOR_OVERRIDE");
+        if (e && e[0]) { strncpy(buf, e, sizeof(buf) - 1); buf[sizeof(buf) - 1] = '\0'; }
+        else {
+            /* rootfs-file fallback: $ALR_ROOTFS/.alr-icd-vendor-override (host-absolute, so it
+             * works regardless of the interposer's path-mediation state at ICD ctor time). */
+            const char *rf = getenv("ALR_ROOTFS");
+            if (rf && rf[0]) {
+                char path[1024];
+                int n = snprintf(path, sizeof(path), "%s/.alr-icd-vendor-override", rf);
+                if (n > 0 && (size_t)n < sizeof(path)) {
+                    FILE *f = fopen(path, "re");
+                    if (f) {
+                        if (fgets(buf, sizeof(buf), f)) { /* first line only */ }
+                        else buf[0] = '\0';
+                        fclose(f);
+                    }
+                }
+            }
+        }
+        /* trim trailing whitespace/newline */
+        for (size_t i = strlen(buf); i > 0; --i) {
+            char c = buf[i - 1];
+            if (c == '\n' || c == '\r' || c == ' ' || c == '\t') buf[i - 1] = '\0'; else break;
+        }
+        if (buf[0] && alr_icd_vendor_token_to_ids(buf, &cv, &cd)) {
+            cached = 1;
+            ALR_ICD_DIAG("VENDOR OVERRIDE ACTIVE token=\"%s\" -> vendorID=0x%x driverID=%u "
+                         "(real Mali backend unchanged)", buf, cv, cd);
+        } else {
+            cached = 0;
+            if (buf[0]) ALR_ICD_DIAG("VENDOR OVERRIDE token=\"%s\" unrecognized -> real Mali", buf);
+        }
+    }
+    if (cached == 1) { if (vendorID) *vendorID = cv; if (driverID) *driverID = cd; return 1; }
+    return 0;
+}
 
 /* ====================================================================================
  * LEAD-1 create-call pNext FORWARDING. Every alr_vkCreate* used to hardcode
@@ -608,6 +688,14 @@ static void VKAPI_CALL alr_vkGetPhysicalDeviceProperties(VkPhysicalDevice physic
         }
         pProperties->driverVersion = slot->driver_version;
         pProperties->vendorID = slot->vendor_id;
+        /* VENDOR-ID FLIP (wave-17): if the override marker is set, advertise a NON-ARM
+         * vendorID so ANGLE's RendererVk::initFeatures takes a non-Mali (e.g. SwiftShader-
+         * class) FeaturesVk path. deviceName/limits/everything else stay the REAL Mali values;
+         * only this 32-bit identity is faked, and the ring still drives the real Mali GPU. */
+        {
+            uint32_t ov_vid = 0, ov_did = 0;
+            if (alr_icd_vendor_override(&ov_vid, &ov_did)) pProperties->vendorID = ov_vid;
+        }
         pProperties->deviceID = slot->device_id;
         pProperties->deviceType = (VkPhysicalDeviceType)slot->device_type;
         /* deviceName: the proof string ("Mali-G615 MC2") flowed through the ICD. */
@@ -1558,7 +1646,17 @@ static void VKAPI_CALL alr_vkGetPhysicalDeviceProperties2(
                 /* { sType,pNext, VkDriverId driverID, char driverName[256],
                  *   char driverInfo[256], VkConformanceVersion } — driverID at offset 16. */
                 uint8_t *base = (uint8_t *)p + 16;
-                *(uint32_t *)base = 6u;  /* VK_DRIVER_ID_ARM_PROPRIETARY */
+                /* DEFAULT = VK_DRIVER_ID_ARM_PROPRIETARY = 9 (vulkan_core.h). NOTE: this was
+                 * previously hardcoded 6, which is actually VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA
+                 * — a latent mislabel that made ANGLE see vendorID=ARM(0x13B5) but driverID=Intel.
+                 * VENDOR-ID FLIP (wave-17): if the override is set, report its matching driverID
+                 * so vendorID and driverID stay consistent for ANGLE's workaround switch. */
+                uint32_t did = 9u;  /* VK_DRIVER_ID_ARM_PROPRIETARY (real Mali) */
+                {
+                    uint32_t ov_vid = 0, ov_did = 0;
+                    if (alr_icd_vendor_override(&ov_vid, &ov_did)) did = ov_did;
+                }
+                *(uint32_t *)base = did;
                 /* driverName / driverInfo: leave caller-zeroed (ANGLE reads driverID, not the
                  * strings, for its workaround switch); conformanceVersion left zeroed. */
                 break;
