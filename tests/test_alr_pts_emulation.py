@@ -78,6 +78,7 @@ def test_header_declares_core_api():
         "alr_pts_is_ptsdir_path",
         "alr_pts_is_tty_path",
         "alr_pts_parse_slave_path",
+        "alr_pts_slave_env_name",   # cross-fork inherited-slave env handoff
         "alr_pts_emulate_ioctl",
         "ALR_PTS_IOCTL_PASS",
         "ALR_PTS_IOCTL_GPTPEER",
@@ -141,6 +142,53 @@ def test_interposer_carries_pty_identity_across_exec():
     assert "fd > 2" in c
     # the window size is carried across exec so a TUI draws at the real size
     assert "ALR_PTY_WINSZ" in c
+
+
+def test_interposer_resolves_slave_across_fork():
+    """foot/xterm posix_openpt+fork+open(ptsname): the slave is opened BY NAME in
+    a forked child whose COW pty table is empty, so alr_pts_by_ptn() misses. The
+    minter publishes the inherited slave socketpair fd as ALR_PTY_SLAVE_<ptn>
+    (survives fork, not cloexec); the child reads it, dup()s the inherited fd, and
+    re-registers a minimal slave entry. This is the precise fix for foot exiting
+    230 with 'failed to open pseudo terminal slave device'."""
+    c = ITP_C.read_text()
+    # the per-pty inherited-slave env var, set on mint and read on the by-name miss
+    assert "ALR_PTY_SLAVE_" in c
+    assert "alr_pts_slave_env_name" in c           # pure name formatter (shared)
+    assert "alr_pts_publish_slave_env" in c        # minter side: setenv the slave fd
+    assert "alr_pts_adopt_inherited_slave" in c     # child side: getenv + dup + register
+    # the adopt path is invoked exactly from the by-name slave-open MISS branch
+    assert "alr_pts_adopt_inherited_slave(n, cloexec)" in c
+    # publish happens at the single mint chokepoint (so ALL four entry points —
+    # open(ptmx)/posix_openpt/openpty/forkpty — inherit it)
+    pub = c.index("alr_pts_publish_slave_env(idx, sv[1])")
+    mint = c.index("static int alr_pts_mint(")
+    nxt = c.index("\nstatic ", mint + 1)
+    assert mint < pub < nxt, "slave env must be published inside alr_pts_mint"
+    # the cross-fork resolution emits a device-verify marker in the child
+    assert "ALR-PTY slave-dup-from-env ptn=" in c
+    # the inherited fd is dup'd via the trampoline fcntl (honoring cloexec), and a
+    # minimal slave-only entry (master_fd = -1) is registered for ioctl resolution
+    assert "F_DUPFD" in c
+    assert "np->master_fd = -1" in c
+
+
+def test_mint_marker_fires_from_every_mint_path():
+    """The unconditional 'ALR-PTY ptmx-served' launch marker must be emitted from
+    the single mint chokepoint (alr_pts_mint), so posix_openpt / openpty / forkpty
+    — not just open('/dev/ptmx') — all produce it. The previous inline marker in
+    alr_pts_try_open (ptmx-only) must be gone (no double-emit)."""
+    c = ITP_C.read_text()
+    assert "alr_pts_emit_mint_marker" in c
+    # emitted from inside alr_pts_mint
+    mint = c.index("static int alr_pts_mint(")
+    nxt = c.index("\nstatic int alr_fd_is_unix_stream", mint + 1)
+    body = c[mint:nxt]
+    assert "alr_pts_emit_mint_marker(idx, sv[0], 0)" in body, \
+        "success marker must fire inside alr_pts_mint"
+    # exactly one literal of the marker prefix string (the helper); the old inline
+    # copy in alr_pts_try_open is removed
+    assert c.count('"ALR-PTY ptmx-served ptn="') == 1
 
 
 def test_interposer_provides_tty_libc_shims():

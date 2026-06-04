@@ -166,6 +166,25 @@ int alr_pts_parse_slave_path(const char *path)
     return (int)n;
 }
 
+size_t alr_pts_slave_env_name(int ptn, char *buf, size_t buflen)
+{
+    if (!buf || ptn < 0) return 0;
+    static const char pfx[] = "ALR_PTY_SLAVE_";
+    size_t plen = sizeof pfx - 1;                 /* strlen, compile-time */
+    /* decimal digits of ptn (ptn >= 0 here) */
+    char dig[16]; int di = 0;
+    unsigned int u = (unsigned int)ptn;
+    if (u == 0) dig[di++] = '0';
+    while (u && di < (int)sizeof dig) { dig[di++] = (char)('0' + u % 10); u /= 10; }
+    /* need prefix + digits + NUL */
+    if (buflen < plen + (size_t)di + 1) return 0;
+    size_t o = 0;
+    for (size_t i = 0; i < plen; ++i) buf[o++] = pfx[i];
+    while (di > 0) buf[o++] = dig[--di];
+    buf[o] = '\0';
+    return o;
+}
+
 /* ---- ioctl dispatch ----
  *
  * Operates on the kernel wire layout. `arg` is the third ioctl() argument (a

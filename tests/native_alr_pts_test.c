@@ -17,8 +17,10 @@
 #include "alr_pts.h"
 
 #include <stdio.h>
+#include <stdlib.h>       /* setenv/getenv/unsetenv — cross-fork env handoff test */
 #include <string.h>
 #include <errno.h>
+#include <fcntl.h>        /* fcntl(F_DUPFD) — mirrors the interposer's slave dup */
 #include <unistd.h>       /* read/write/close — for the socketpair data-flow test */
 #include <sys/socket.h>   /* socketpair — proves the master/slave channel works */
 
@@ -291,6 +293,115 @@ static void test_socketpair_dataflow(void) {
     close(sv[1]);
 }
 
+/* The pure env-name formatter the cross-fork handoff is built on. The minter
+ * sets ALR_PTY_SLAVE_<ptn>=<slave_fd>; the forked child (empty COW pty table)
+ * reads the same name to resolve open("/dev/pts/N"). Both sides format the name
+ * with alr_pts_slave_env_name, so it must be stable, exact, and bounds-safe. */
+static void test_slave_env_name(void) {
+    char b[32];
+    size_t n = alr_pts_slave_env_name(0, b, sizeof b);
+    CHECK(n == 15 && strcmp(b, "ALR_PTY_SLAVE_0") == 0, "env name ptn=0");
+    n = alr_pts_slave_env_name(7, b, sizeof b);
+    CHECK(n == 15 && strcmp(b, "ALR_PTY_SLAVE_7") == 0, "env name ptn=7");
+    n = alr_pts_slave_env_name(42, b, sizeof b);
+    CHECK(n == 16 && strcmp(b, "ALR_PTY_SLAVE_42") == 0, "env name ptn=42");
+    n = alr_pts_slave_env_name(123, b, sizeof b);
+    CHECK(n == 17 && strcmp(b, "ALR_PTY_SLAVE_123") == 0, "env name ptn=123");
+
+    /* bad args / overflow → 0, buffer not relied upon */
+    CHECK(alr_pts_slave_env_name(-1, b, sizeof b) == 0, "negative ptn → 0");
+    CHECK(alr_pts_slave_env_name(0, NULL, sizeof b) == 0, "NULL buf → 0");
+    /* "ALR_PTY_SLAVE_0" needs 15 + NUL = 16; a 15-byte buffer must refuse */
+    char small[15];
+    CHECK(alr_pts_slave_env_name(0, small, sizeof small) == 0, "too-small buf → 0");
+    /* exact-fit 16-byte buffer for ptn=0 succeeds and NUL-terminates */
+    char exact[16];
+    memset(exact, 0x55, sizeof exact);
+    CHECK(alr_pts_slave_env_name(0, exact, sizeof exact) == 15 &&
+          exact[15] == '\0' && strcmp(exact, "ALR_PTY_SLAVE_0") == 0,
+          "exact-fit buf ok");
+}
+
+/* Cross-fork inherited-slave resolution, host-simulated end to end.
+ *
+ * This reproduces, with no Android and no interposer .so, the exact sequence the
+ * device path runs in foot's forked child: the table lookup MISSES (empty COW
+ * copy), so the child rebuilds the env-var name, reads the inherited slave fd
+ * number the parent published, dup()s it, and that dup is a live slave channel
+ * back to the master. We model the "empty table" as a plain struct alr_pty with
+ * used=0 (so alr_pts_by_fd-style logic would miss) and prove the env round-trip
+ * + dup yields a working byte path — the precise behavior of
+ * alr_pts_adopt_inherited_slave() minus the (untestable here) g_pts[] write. */
+static void test_cross_fork_inherited_slave(void) {
+    int sv[2] = { -1, -1 };
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+        printf("FAIL: socketpair: %s\n", strerror(errno));
+        g_fail = 1;
+        return;
+    }
+    const int ptn = 3;
+    int master = sv[0], slave = sv[1];
+
+    /* PARENT (minter): publish the slave fd under ALR_PTY_SLAVE_<ptn>, exactly as
+     * alr_pts_publish_slave_env() does. */
+    char name[32];
+    size_t nn = alr_pts_slave_env_name(ptn, name, sizeof name);
+    CHECK(nn > 0, "xfork: env name formatted");
+    char val[24];
+    snprintf(val, sizeof val, "%d", slave);
+    CHECK(setenv(name, val, 1) == 0, "xfork: publish slave env");
+
+    /* CHILD (forked): the table lookup misses (modeled: a fresh/empty entry).
+     * Rebuild the SAME name, read the inherited fd number, dup it. */
+    struct alr_pty empty;
+    memset(&empty, 0, sizeof empty);            /* used==0 → would-miss table */
+    CHECK(empty.used == 0, "xfork: child table is empty");
+
+    char name2[32];
+    CHECK(alr_pts_slave_env_name(ptn, name2, sizeof name2) == nn &&
+          strcmp(name, name2) == 0, "xfork: child rebuilds identical env name");
+    const char *got = getenv(name2);
+    CHECK(got != NULL && got[0], "xfork: child reads published env");
+    int inh = -1;
+    if (got) {
+        inh = 0; int ok = 1;
+        for (const char *q = got; *q; ++q) {
+            if (*q < '0' || *q > '9') { ok = 0; break; }
+            inh = inh * 10 + (*q - '0');
+        }
+        CHECK(ok && inh == slave, "xfork: parsed inherited fd matches slave");
+    }
+    int dfd = fcntl(inh, F_DUPFD, 0);            /* the interposer's dup of the slave */
+    CHECK(dfd >= 0 && dfd != slave, "xfork: dup of inherited slave");
+
+    /* The dup is a working slave: master→dup and dup→master both carry bytes —
+     * i.e. open("/dev/pts/3") in the child resolved to a live terminal channel. */
+    const char *prompt = "$ ";
+    ssize_t w = write(master, prompt, 2);
+    CHECK(w == 2, "xfork: master writes to child slave");
+    char buf[8]; memset(buf, 0, sizeof buf);
+    ssize_t rd = read(dfd, buf, sizeof buf);
+    CHECK(rd == 2 && memcmp(buf, prompt, 2) == 0, "xfork: dup slave reads master bytes");
+
+    const char *cmd = "ls\n";
+    w = write(dfd, cmd, 3);
+    CHECK(w == 3, "xfork: child slave writes to master");
+    memset(buf, 0, sizeof buf);
+    rd = read(master, buf, sizeof buf);
+    CHECK(rd == 3 && memcmp(buf, cmd, 3) == 0, "xfork: master reads child slave bytes");
+
+    /* A bad/never-published index yields no env → the resolver would fall back to
+     * ENXIO (here: getenv miss). Proves we don't mis-resolve unrelated slaves. */
+    char miss[32];
+    alr_pts_slave_env_name(58, miss, sizeof miss);
+    CHECK(getenv(miss) == NULL, "xfork: unpublished ptn has no env (→ ENXIO)");
+
+    unsetenv(name);
+    if (dfd >= 0) close(dfd);
+    close(master);
+    close(slave);
+}
+
 int main(void) {
     test_path_classification();
     test_slave_parse();
@@ -302,6 +413,8 @@ int main(void) {
     test_ioctl_jobcontrol();
     test_ioctl_passthrough_and_guards();
     test_socketpair_dataflow();
+    test_slave_env_name();
+    test_cross_fork_inherited_slave();
 
     if (g_fail) { printf("SOME TESTS FAILED\n"); return 1; }
     printf("all tests passed\n");

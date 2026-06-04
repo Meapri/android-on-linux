@@ -1160,6 +1160,58 @@ static void alr_pts_release(void) {
 /* forward decls (definitions further down in this block) */
 static struct alr_pty *alr_pts_by_fd(int fd, int *is_master);
 static struct alr_pty *alr_pts_by_ptn(int ptn);
+static void            alr_pts_apply_env_winsize(struct winsize *w);
+
+/* Append the unsigned decimal value of `v` (or, if v<0, a leading '-' then the
+ * magnitude) into m[*o], bounded by `cap`. Tiny shared formatter for the PTY
+ * markers (no libc; runs in the trusted-PC path). *o is advanced. */
+static void alr_pts_append_long(char *m, size_t *o, size_t cap, long v) {
+    char num[24]; int ni = 0; int neg = (v < 0);
+    unsigned long u = neg ? (unsigned long)(-(v + 1)) + 1UL : (unsigned long)v;
+    if (u == 0) num[ni++] = '0';
+    while (u && ni < (int)sizeof num) { num[ni++] = (char)('0' + u % 10); u /= 10; }
+    if (neg && *o < cap - 1) m[(*o)++] = '-';
+    while (ni > 0 && *o < cap - 1) m[(*o)++] = num[--ni];
+}
+
+/* LAUNCH MARKER — emitted UNCONDITIONALLY (not gated on ALR_INTERPOSE_DIAG)
+ * from EVERY mint path (open("/dev/ptmx"), posix_openpt, openpty, forkpty).
+ * Minting a PTY is a rare, significant event that ONLY a terminal does, so a
+ * one-line marker is low-noise and is the clearest device-verify signal that
+ * the TERMINAL app class engaged. With ALR_TEE_GUEST_STDOUT=1 (set by the launch
+ * path) it lands in logcat. Format on success: "ALR-PTY ptmx-served ptn=<N>
+ * master=<fd>"; on failure: "ALR-PTY ptmx-served ptn=-1 master=-1 errno=<e>".
+ * `ptn`/`master` are <0 to signal failure (then `err` is the errno). Callers
+ * save/restore errno around this. */
+static void alr_pts_emit_mint_marker(int ptn, int master, int err) {
+    char m[96]; size_t o = 0;
+    const char *pre = "ALR-PTY ptmx-served ptn=";
+    for (size_t i = 0; pre[i] && o < sizeof m - 1; ++i) m[o++] = pre[i];
+    alr_pts_append_long(m, &o, sizeof m, (master >= 0) ? (long)ptn : -1L);
+    const char *mid = (master >= 0) ? " master=" : " master=-1 errno=";
+    for (size_t i = 0; mid[i] && o < sizeof m - 1; ++i) m[o++] = mid[i];
+    alr_pts_append_long(m, &o, sizeof m, (master >= 0) ? (long)master : (long)err);
+    if (o < sizeof m) m[o++] = '\n';
+    alr_emit_fd2(m, o);
+}
+
+/* Publish the inherited slave fd of a freshly-minted pty into the environment as
+ * ALR_PTY_SLAVE_<ptn>=<slave_fd>. The slave fd is one end of the socketpair; it
+ * is NOT close-on-exec and is inherited across fork() (foot/xterm mint in the
+ * parent, then fork — the child's COW copy of g_pts[] is empty, so a by-name
+ * open("/dev/pts/N") cannot find the table entry). The child reads this env in
+ * alr_pts_try_open's slave branch and dup()s the inherited fd. setenv updates
+ * `environ`, which the terminal passes to the child by default. Best-effort;
+ * errno is saved/restored by the caller. */
+static void alr_pts_publish_slave_env(int ptn, int slave_fd) {
+    if (ptn < 0 || slave_fd < 0) return;
+    char name[32];
+    if (alr_pts_slave_env_name(ptn, name, sizeof name) == 0) return;
+    char val[24]; size_t vo = 0;
+    alr_pts_append_long(val, &vo, sizeof val, (long)slave_fd);
+    if (vo < sizeof val) val[vo] = '\0'; else return;
+    setenv(name, val, 1);
+}
 
 /* Mint a fresh virtual PTY: socketpair(AF_UNIX, SOCK_STREAM) → [master,slave].
  * Returns the master fd (>=0) and fills *out_ptn, or -1 with errno on failure
@@ -1168,14 +1220,24 @@ static struct alr_pty *alr_pts_by_ptn(int ptn);
  * the forked shell; the slave is dup'd separately for the child). */
 static int alr_pts_mint(int cloexec, int *out_ptn) {
     /* socketpair via the trampoline so the PC gate ALLOWs it un-traced. arm64
-     * has no separate __NR_socketpair gotcha — it is in asm-generic. */
+     * has no separate __NR_socketpair gotcha — it is in asm-generic.
+     *
+     * We deliberately do NOT pass SOCK_CLOEXEC here even when the caller asked
+     * for O_CLOEXEC on /dev/ptmx: SOCK_CLOEXEC would set close-on-exec on BOTH
+     * ends, but the SLAVE end must survive the terminal's fork+exec so a forked
+     * child (empty COW pty table) can resolve open("/dev/pts/N") to the inherited
+     * fd (published as ALR_PTY_SLAVE_<ptn>). The requested cloexec is applied to
+     * the MASTER fd alone, below — preserving "the master must not leak into the
+     * shell" while keeping the slave inheritable. */
     int sv[2] = { -1, -1 };
-    int type = SOCK_STREAM;
-#ifdef SOCK_CLOEXEC
-    if (cloexec) type |= SOCK_CLOEXEC;
+    long r = alr_tramp_syscall(__NR_socketpair, AF_UNIX, SOCK_STREAM, 0, (long)sv, 0, 0);
+    if (r < 0) { errno = (int)(-r); alr_pts_emit_mint_marker(-1, -1, errno); return -1; }
+#ifdef FD_CLOEXEC
+    if (cloexec) {
+        /* master-only close-on-exec; ignore failure (best-effort, non-fatal) */
+        alr_tramp_syscall(__NR_fcntl, sv[0], F_SETFD, FD_CLOEXEC, 0, 0, 0);
+    }
 #endif
-    long r = alr_tramp_syscall(__NR_socketpair, AF_UNIX, type, 0, (long)sv, 0, 0);
-    if (r < 0) { errno = (int)(-r); return -1; }
 
     alr_pts_acquire();
     int idx = -1;
@@ -1187,6 +1249,7 @@ static int alr_pts_mint(int cloexec, int *out_ptn) {
         alr_tramp_syscall(__NR_close, sv[0], 0, 0, 0, 0, 0);
         alr_tramp_syscall(__NR_close, sv[1], 0, 0, 0, 0, 0);
         errno = ENOSPC;
+        alr_pts_emit_mint_marker(-1, -1, errno);
         return -1;
     }
     struct alr_pty *p = &g_pts[idx];
@@ -1212,6 +1275,18 @@ static int alr_pts_mint(int cloexec, int *out_ptn) {
      * and is set only from the inherited env in the ctor (i.e. in the shell). */
     g_pty_minted = 1;
     setenv("ALR_PTY_ACTIVE", "1", 1);
+
+    /* Publish the inherited slave fd so a forked child (empty COW pty table) can
+     * resolve open("/dev/pts/<idx>") by name — the foot/xterm posix_openpt+fork+
+     * open(ptsname) path. The slave socketpair end survives fork (not cloexec).
+     * Then emit the launch marker for EVERY mint path (this single chokepoint is
+     * reached by open(ptmx), posix_openpt, openpty and forkpty). errno preserved. */
+    {
+        int saved = errno;
+        alr_pts_publish_slave_env(idx, sv[1]);
+        alr_pts_emit_mint_marker(idx, sv[0], 0);
+        errno = saved;
+    }
 
     if (out_ptn) *out_ptn = idx;
     return sv[0];
@@ -1277,19 +1352,7 @@ static struct alr_pty *alr_pts_resolve(int fd, int *is_master) {
          * (ALR_PTY_WINSZ="COLSxROWS"), so a TUI draws at the real size rather
          * than the 80x24 default. The original master's size did not survive
          * across exec (separate process/table); this env carries it. */
-        const char *ws = getenv("ALR_PTY_WINSZ");
-        if (ws && ws[0]) {
-            unsigned cols = 0, rows = 0; const char *q = ws;
-            while (*q >= '0' && *q <= '9') { cols = cols * 10 + (unsigned)(*q++ - '0'); }
-            if (*q == 'x' || *q == 'X') {
-                ++q;
-                while (*q >= '0' && *q <= '9') { rows = rows * 10 + (unsigned)(*q++ - '0'); }
-            }
-            if (cols > 0 && cols < 10000 && rows > 0 && rows < 10000) {
-                np->win.ws_col = (unsigned short)cols;
-                np->win.ws_row = (unsigned short)rows;
-            }
-        }
+        alr_pts_apply_env_winsize(&np->win);
     }
     alr_pts_release();
     if (np && is_master) *is_master = 0;
@@ -1348,6 +1411,102 @@ static int alr_pts_dup_slave(struct alr_pty *p, int cloexec) {
     return (int)r;
 }
 
+/* Apply the terminal's published window size (ALR_PTY_WINSZ="COLSxROWS") to *w,
+ * if present and sane; otherwise leave *w unchanged. The original master's size
+ * does not survive across the fork/exec boundary (separate process/table), so
+ * the minter publishes it via this env and the child adopts it — a TUI then
+ * draws at the real size rather than the 80x24 default. */
+static void alr_pts_apply_env_winsize(struct winsize *w) {
+    const char *ws = getenv("ALR_PTY_WINSZ");
+    if (!ws || !ws[0]) return;
+    unsigned cols = 0, rows = 0; const char *q = ws;
+    while (*q >= '0' && *q <= '9') { cols = cols * 10 + (unsigned)(*q++ - '0'); }
+    if (*q == 'x' || *q == 'X') {
+        ++q;
+        while (*q >= '0' && *q <= '9') { rows = rows * 10 + (unsigned)(*q++ - '0'); }
+    }
+    if (cols > 0 && cols < 10000 && rows > 0 && rows < 10000) {
+        w->ws_col = (unsigned short)cols;
+        w->ws_row = (unsigned short)rows;
+    }
+}
+
+/* CROSS-FORK slave resolution. Called from alr_pts_try_open's by-name slave
+ * branch when alr_pts_by_ptn(ptn) MISSED — the foot/xterm case: the pty was
+ * minted in the PARENT (posix_openpt/open(ptmx)), then the process fork()ed, and
+ * THIS child's COW copy of g_pts[] is empty so the table lookup fails. The slave
+ * socketpair fd survived the fork (inherited, not close-on-exec) and the parent
+ * published its number as ALR_PTY_SLAVE_<ptn>. Here we read that env, dup() the
+ * inherited fd (honoring cloexec, matching real open() lowest-fd semantics), and
+ * re-register a minimal table entry (master_fd=-1 — the master lives in the
+ * parent terminal) so subsequent isatty/tcgetattr/ioctl on the returned slave
+ * resolve through the normal path. Returns the new slave fd (>=0) or -1 (env
+ * unset / parse fail / out of slots / dup fail) so the caller falls back to
+ * ENXIO. Does NOT set errno on the "env unset" miss (caller sets ENXIO). */
+static int alr_pts_adopt_inherited_slave(int ptn, int cloexec) {
+    if (ptn < 0) return -1;
+    char name[32];
+    if (alr_pts_slave_env_name(ptn, name, sizeof name) == 0) return -1;
+    const char *v = getenv(name);
+    if (!v || !v[0]) return -1;                 /* not a forked-child slave open */
+    /* parse the inherited fd number (non-negative decimal) */
+    int inh = 0; const char *q = v;
+    if (*q < '0' || *q > '9') return -1;
+    for (; *q; ++q) {
+        if (*q < '0' || *q > '9') return -1;
+        inh = inh * 10 + (*q - '0');
+        if (inh > 1000000) return -1;           /* absurd fd → reject */
+    }
+    /* dup the inherited slave fd (lowest free fd ≥ 0, like a real device open) */
+#ifdef F_DUPFD_CLOEXEC
+    int cmd = cloexec ? F_DUPFD_CLOEXEC : F_DUPFD;
+#else
+    int cmd = F_DUPFD; (void)cloexec;
+#endif
+    long r = alr_tramp_syscall(__NR_fcntl, inh, cmd, 0, 0, 0, 0);
+    if (r < 0) { errno = (int)(-r); return -1; } /* e.g. EBADF if not inherited */
+    int dfd = (int)r;
+    /* register a minimal slave-only entry so ioctls on dfd resolve. Keyed on the
+     * dup we hand back (that is the fd the child will use and dup2 from). */
+    alr_pts_acquire();
+    struct alr_pty *np = NULL;
+    for (int i = 0; i < ALR_PTS_MAX; ++i) {
+        if (!g_pts[i].used) { np = &g_pts[i]; break; }
+    }
+    if (np) {
+        memset(np, 0, sizeof *np);
+        np->used = 1;
+        np->ptn = ptn;                          /* keep the parent's virtual index */
+        np->master_fd = -1;                     /* master is in the parent terminal */
+        np->slave_fd = dfd;
+        np->locked = 0;
+        np->slave_opened = 1;
+        alr_pty_init_termios(&np->tio);
+        alr_pty_init_winsize(&np->win);
+        alr_pts_apply_env_winsize(&np->win);
+    }
+    alr_pts_release();
+    if (!np) {                                  /* table full: still return the fd */
+        /* The dup is a valid slave byte channel; only the emulated ioctls on it
+         * would miss. Extremely unlikely (64 slots); don't leak the fd's utility. */
+    }
+    /* Cross-fork resolution marker (device-verify signal in logcat). */
+    {
+        int saved = errno;
+        char m[80]; size_t o = 0;
+        const char *pre = "ALR-PTY slave-dup-from-env ptn=";
+        for (size_t i = 0; pre[i] && o < sizeof m - 1; ++i) m[o++] = pre[i];
+        alr_pts_append_long(m, &o, sizeof m, (long)ptn);
+        const char *mid = " slave=";
+        for (size_t i = 0; mid[i] && o < sizeof m - 1; ++i) m[o++] = mid[i];
+        alr_pts_append_long(m, &o, sizeof m, (long)dfd);
+        if (o < sizeof m) m[o++] = '\n';
+        alr_emit_fd2(m, o);
+        errno = saved;
+    }
+    return dfd;
+}
+
 /* Open interception for the open()/openat() family. Given the GUEST-visible
  * absolute path and the flags, if it names a PTY device, serve it from the
  * emulation and store the result fd in *out_fd (returning 1). Otherwise return
@@ -1371,37 +1530,9 @@ static int alr_pts_try_open(const char *path, int flags, int *out_fd) {
     if (alr_pts_is_ptmx_path(path)) {
         int ptn = -1;
         *out_fd = alr_pts_mint(cloexec, &ptn);
-        /* LAUNCH MARKER — emitted UNCONDITIONALLY (not gated on ALR_INTERPOSE_DIAG)
-         * the first few times a virtual /dev/ptmx is served. Opening ptmx is a
-         * rare, significant event that ONLY a terminal does, so a one-line marker
-         * is low-noise and is the clearest device-verify signal that the TERMINAL
-         * app class engaged. With ALR_TEE_GUEST_STDOUT=1 (set by the launch path)
-         * it lands in logcat. Format: "ALR-PTY ptmx-served ptn=<N> master=<fd>"
-         * (or "master=-1 errno=<e>" on failure). */
-        {
-            int saved = errno;
-            char m[96]; size_t o = 0;
-            const char *pre = "ALR-PTY ptmx-served ptn=";
-            for (size_t i = 0; pre[i] && o < sizeof m - 1; ++i) m[o++] = pre[i];
-            long v = (long)ptn; if (*out_fd < 0) v = -1;
-            char num[24]; int ni = 0; int neg = (v < 0);
-            unsigned long u = neg ? (unsigned long)(-(v + 1)) + 1UL : (unsigned long)v;
-            if (u == 0) num[ni++] = '0';
-            while (u && ni < (int)sizeof num) { num[ni++] = (char)('0' + u % 10); u /= 10; }
-            if (neg && o < sizeof m - 1) m[o++] = '-';
-            while (ni > 0 && o < sizeof m - 1) m[o++] = num[--ni];
-            const char *mid = (*out_fd >= 0) ? " master=" : " master=-1 errno=";
-            for (size_t i = 0; mid[i] && o < sizeof m - 1; ++i) m[o++] = mid[i];
-            long fv = (*out_fd >= 0) ? (long)*out_fd : (long)errno;
-            ni = 0; u = (unsigned long)(fv < 0 ? -fv : fv);
-            if (u == 0) num[ni++] = '0';
-            while (u && ni < (int)sizeof num) { num[ni++] = (char)('0' + u % 10); u /= 10; }
-            while (ni > 0 && o < sizeof m - 1) m[o++] = num[--ni];
-            if (o < sizeof m) m[o++] = '\n';
-            alr_emit_fd2(m, o);
-            errno = saved;
-        }
-        /* Verbose per-open trace stays gated on ALR_INTERPOSE_DIAG. */
+        /* The unconditional "ALR-PTY ptmx-served" launch marker now fires from
+         * alr_pts_mint itself (so every mint path — ptmx, posix_openpt, openpty,
+         * forkpty — emits it exactly once). Keep only the gated verbose trace. */
         alr_diag("pty-ptmx", path, (*out_fd >= 0) ? "master" : "FAIL",
                  (*out_fd >= 0) ? (long)ptn : (long)*out_fd);
         return 1;
@@ -1410,6 +1541,20 @@ static int alr_pts_try_open(const char *path, int flags, int *out_fd) {
     if (n >= 0) {
         struct alr_pty *p = alr_pts_by_ptn(n);
         if (!p) {
+            /* Table miss. The common cause is a FORKED CHILD: the terminal minted
+             * the pty in the parent (posix_openpt/open(ptmx)), then fork()ed, and
+             * this child's COW copy of g_pts[] is empty — so the by-name slave
+             * open("/dev/pts/N") finds no entry. The slave socketpair fd, however,
+             * was inherited across the fork (not cloexec) and its number was
+             * published by the parent's mint as ALR_PTY_SLAVE_<N>. Resolve it:
+             * dup() that inherited fd and re-register a minimal table entry so
+             * subsequent isatty/termios/ioctls on the slave resolve normally. */
+            int dfd = alr_pts_adopt_inherited_slave(n, cloexec);
+            if (dfd >= 0) {
+                *out_fd = dfd;
+                alr_diag("pty-slave", path, "slave-dup-from-env", (long)n);
+                return 1;
+            }
             errno = ENXIO; *out_fd = -1;
             alr_diag("pty-slave", path, "ENXIO", (long)n);
             return 1;

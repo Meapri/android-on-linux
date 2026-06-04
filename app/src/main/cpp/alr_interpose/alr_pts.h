@@ -151,6 +151,15 @@ int  alr_pts_is_tty_path(const char *path);    /* "/dev/tty"                    
  * overflow). NULL-safe. */
 int  alr_pts_parse_slave_path(const char *path);
 
+/* Format the per-PTY inherited-slave-fd handoff env var NAME for virtual index
+ * N into `buf` (size `buflen`): "ALR_PTY_SLAVE_<N>". This env var is set by the
+ * minter (posix_openpt/open(ptmx)/openpty/forkpty) to the slave socketpair fd,
+ * which survives fork; the forked child — whose in-process PTY table is an empty
+ * COW copy — reads it to resolve open("/dev/pts/N") to the inherited fd. Returns
+ * the number of bytes written (excluding the NUL), or 0 on bad args / overflow
+ * (NULL buf, buflen too small, negative N). Pure: no syscalls, unit-tested. */
+size_t alr_pts_slave_env_name(int ptn, char *buf, size_t buflen);
+
 /* The ioctl dispatch core. Emulates the PTY/termios ioctls against *pty using
  * only the caller's `arg` buffer — NO syscalls. `is_master` distinguishes the
  * two ends (TIOCGPTN/TIOCSPTLCK/TIOCGPTPEER are master-only in Linux).
