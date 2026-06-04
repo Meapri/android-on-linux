@@ -179,6 +179,44 @@ typedef struct VkBaseInStructure {
 #define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES_VAL 49
 #define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES_VAL 51
 #define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES_VAL 53
+/* Core-promoted (1.1/1.2/1.3) INDIVIDUAL feature structs ANGLE may chain INSTEAD of (or
+ * alongside) the aggregate VulkanXX_FEATURES — e.g. ANGLE on Mali enables VariablePointers
+ * (1000120000), which the old 4-entry size table sized 0 -> DROPPED before the wire, so the
+ * host never relinked it into the real Mali vkCreateDevice. The created device then lacked a
+ * feature ANGLE had recorded its command buffer against -> ANGLE faulted at libGLESv2+0x1f6db4
+ * on the first GL command. These sTypes mirror the host's vk_passthrough_feature_stype_allowed()
+ * one-for-one so the ICD ships every struct the host is willing to relink (Mali only ever
+ * receives features it itself reported via vkGetPhysicalDeviceFeatures, which now forwards the
+ * REAL Mali set). The byte size below is the official 64-bit ABI: 16-byte header
+ * { u32 sType; u32 pad; void* pNext } + N x VkBool32. */
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES_VAL 1000053001
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES_VAL 1000083000
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES_VAL 1000063000
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES_VAL 1000120000
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROTECTED_MEMORY_FEATURES_VAL 1000145001
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES_VAL 1000156004
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_VAL 1000177000
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_VAL 1000082000
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_VAL 1000161001
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES_VAL 1000221000
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES_VAL 1000108000
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES_VAL 1000253000
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SEPARATE_DEPTH_STENCIL_LAYOUTS_FEATURES_VAL 1000241000
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES_VAL 1000261000
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_VAL 1000207000
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_VAL 1000257000
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_VAL 1000314007
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_VAL 1000044003
+/* EXT feature structs ANGLE enables when Mali exposes the extension (the host intersects the
+ * enabled-extension list against Mali's real set, so an unsupported one is never chained). */
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT_VAL 1000028000
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT_VAL 1000254000
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES_EXT_VAL 1000259000
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT_VAL 1000265000
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT_VAL 1000267000
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT_VAL 1000287002
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT_VAL 1000377000
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT_VAL 1000190002
 
 /* Selected VK-M4 enum values the guest app may set (passed opaquely to the ICD). */
 #define VK_SHADER_STAGE_VERTEX_BIT 0x00000001u
@@ -514,6 +552,63 @@ static inline uint32_t alr_icd_feature_struct_size(uint32_t s_type) {
             return 16 + 47 * 4;   /* 47 VkBool32 */
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES_VAL:
             return 16 + 15 * 4;   /* 15 VkBool32 */
+        /* Individual core-promoted feature structs (ANGLE chains VariablePointers on Mali;
+         * the rest are sized so a chain that uses the granular structs is never truncated).
+         * Byte sizes are the official 64-bit ABI: 16-byte header + N x VkBool32, all 8-aligned
+         * already (each N x 4 is 8-aligned for even N and the header pads odd-N tails). */
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES_VAL:
+            return 16 + 2 * 4;    /* variablePointersStorageBuffer, variablePointers */
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES_VAL:
+            return 16 + 3 * 4;    /* multiview, *GeometryShader, *TessellationShader */
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES_VAL:
+            return 16 + 4 * 4;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_VAL:
+            return 16 + 3 * 4;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES_VAL:
+            return 16 + 1 * 4;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROTECTED_MEMORY_FEATURES_VAL:
+            return 16 + 1 * 4;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES_VAL:
+            return 16 + 1 * 4;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_VAL:
+            return 16 + 2 * 4;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_VAL:
+            return 16 + 20 * 4;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES_VAL:
+            return 16 + 1 * 4;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES_VAL:
+            return 16 + 1 * 4;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES_VAL:
+            return 16 + 1 * 4;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SEPARATE_DEPTH_STENCIL_LAYOUTS_FEATURES_VAL:
+            return 16 + 1 * 4;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES_VAL:
+            return 16 + 1 * 4;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_VAL:
+            return 16 + 1 * 4;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_VAL:
+            return 16 + 3 * 4;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_VAL:
+            return 16 + 1 * 4;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_VAL:
+            return 16 + 1 * 4;
+        /* EXT feature structs (only chained when Mali exposes the matching extension). */
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT_VAL:
+            return 16 + 2 * 4;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT_VAL:
+            return 16 + 2 * 4;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES_EXT_VAL:
+            return 16 + 6 * 4;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT_VAL:
+            return 16 + 1 * 4;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT_VAL:
+            return 16 + 1 * 4;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT_VAL:
+            return 16 + 3 * 4;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT_VAL:
+            return 16 + 2 * 4;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT_VAL:
+            return 16 + 2 * 4;
         default:
             return 0;             /* unknown: drop (feature stays off) */
     }
