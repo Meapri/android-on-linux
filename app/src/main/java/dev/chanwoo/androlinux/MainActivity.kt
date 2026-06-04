@@ -2456,6 +2456,47 @@ class MainActivity : Activity() {
                         // proven software-raster launch (strict no-regression).
                         val chromiumVulkan =
                             File("/data/local/tmp/.alr-chromium-vulkan").isFile
+                        // GL-SUBSTRATE + COMPOSITOR backend selection (ladder run #4, the
+                        // WALL-C escape). chromium-Android's in-process compositor calls
+                        // GetSharedContextState -> gl::init::CreateGLContext() UNCONDITIONALLY
+                        // even for a Vulkan GrContext (the Vulkan device is created only AFTER
+                        // that GL context succeeds). Runs #2/#3 walled because chromium's bundled
+                        // ANGLE (--use-angle=gles-egl) "Failed to get system egl display" (EGL
+                        // 12289) — ANGLE's Linux DisplayEGL wants a real Wayland/GBM/device
+                        // display, which gpushim's sentinel libEGL does not truly back. So the GL
+                        // substrate never inits → our ICD never reaches vkCreateDevice (R4). The
+                        // GL substrate only needs to INIT (create a context + answer caps), NOT
+                        // render the page (the page composites via the native Vulkan GrContext on
+                        // our ICD). This sub-marker lets the device run pick which GL-substrate
+                        // backend inits the context; default = the run-#3 baseline (gles-egl):
+                        //   .alr-cr-vk-glsub contents (trimmed, lowercased):
+                        //     "angle-vulkan"  -> --use-angle=vulkan : chromium's BUNDLED ANGLE
+                        //        builds a DisplayVk DIRECTLY on libvulkan.so.1 (= our staged
+                        //        Khronos loader -> our Mali ICD) — needs NO system EGL display at
+                        //        all, sidestepping the 12289 wall. ANGLE-on-our-ICD-Vulkan is the
+                        //        GL substrate; the COMPOSITOR is still native Vulkan on our ICD.
+                        //     "swiftshader"   -> --use-angle=swiftshader : ANGLE-on-SwiftShader
+                        //        (chromium's bundled libvk_swiftshader.so), a SOFTWARE GL substrate
+                        //        that ALWAYS inits. The A/B isolation control: if the GL substrate
+                        //        comes up here and chromium then reaches vkCreateDevice on OUR ICD
+                        //        (R4) for the compositor, the architecture is PROVEN and the only
+                        //        remaining gap is ANGLE-on-Mali-GLES specifically.
+                        //     "gles-egl" / absent -> --use-angle=gles-egl (the run-#3 baseline:
+                        //        ANGLE dlopens gpushim's libEGL.so.1 from /usr/lib/androlinux).
+                        //   .alr-cr-vk-comp contents: "swiftshader" -> --use-vulkan=swiftshader
+                        //     (chromium's bundled software Vulkan compositor — isolates whether a
+                        //     wall past R4 is our ICD/Mali vs chromium's Vulkan-compositor wiring);
+                        //     absent/anything-else -> --use-vulkan=native (our ICD → Mali).
+                        val crVkGlSub = if (chromiumVulkan) (try {
+                            File("/data/local/tmp/.alr-cr-vk-glsub")
+                                .takeIf { it.isFile }?.readText()?.trim()?.lowercase()
+                                ?.takeIf { it.isNotEmpty() }
+                        } catch (_: Throwable) { null } ?: "gles-egl") else "gles-egl"
+                        val crVkComp = if (chromiumVulkan) (try {
+                            File("/data/local/tmp/.alr-cr-vk-comp")
+                                .takeIf { it.isFile }?.readText()?.trim()?.lowercase()
+                                ?.takeIf { it.isNotEmpty() }
+                        } catch (_: Throwable) { null } ?: "native") else "native"
                         android.system.Os.setenv("ALR_REEXEC_INPROC", "1", true)
                         // CR-3 Mali GPU accel opt-in (chromium-gpu-child-plan §3.A-1).
                         // This is the SOLE non-glmark2 trigger the loader checks
@@ -2506,7 +2547,22 @@ class MainActivity : Activity() {
                             android.system.Os.setenv("ALR_GPU_ACCEL", "1", true)
                             android.system.Os.setenv("ALR_ICD_DIAG", "1", true)
                             android.system.Os.setenv("VK_LOADER_DEBUG", "all", true)
-                            android.util.Log.i("alr_loader", "cronly: chromium NATIVE-VULKAN path (ALR_VK_ICD=1, no ANGLE)")
+                            // GL-substrate = ANGLE-on-Vulkan (run #4): chromium's bundled ANGLE
+                            // builds a DisplayVk on libvulkan.so.1 (our staged Khronos loader →
+                            // our Mali ICD). On Linux, ANGLE's Vulkan display picks DisplayVkXcb
+                            // when DISPLAY is set (xcb_connect then fails — the standalone alr-
+                            // angle-vk evidence), and DisplayVkWayland when DISPLAY is UNSET +
+                            // the session is wayland. chromium runs --ozone-platform=wayland with
+                            // WAYLAND_DISPLAY bound to the in-app compositor, so unset DISPLAY +
+                            // hint wayland → ANGLE's DisplayVkWayland on our compositor → our ICD.
+                            // (Same display-selection fix the loader applies under ALR_ANGLE; here
+                            // chromium's ANGLE is bundled in /usr/lib/chromium so we set it via env
+                            // rather than ALR_ANGLE, keeping gpushim's androlinux dir unshadowed.)
+                            if (crVkGlSub == "angle-vulkan") {
+                                android.system.Os.unsetenv("DISPLAY")
+                                android.system.Os.setenv("XDG_SESSION_TYPE", "wayland", true)
+                            }
+                            android.util.Log.i("alr_loader", "cronly: chromium NATIVE-VULKAN path (ALR_VK_ICD=1, glsub=$crVkGlSub comp=$crVkComp)")
                         }
                         // GPU/raster argv tail. DEFAULT (marker absent) = the proven software-raster
                         // tail (--single-process … --disable-gpu --in-process-gpu
@@ -2518,12 +2574,37 @@ class MainActivity : Activity() {
                         // keep --in-process-gpu, but DROP --disable-gpu/--disable-gpu-compositing and
                         // ADD the Vulkan-select + blocklist-override flags. Cited in
                         // docs/research/chromium-vulkan-path.md §1.1.
+                        // COMPOSITOR Vulkan backend (run #4 A/B): native (our ICD → Mali) by
+                        // default; swiftshader (chromium's bundled libvk_swiftshader.so) when the
+                        // .alr-cr-vk-comp marker says so — isolates whether a wall PAST R4 is our
+                        // ICD/Mali path vs chromium's Vulkan-compositor wiring (a SwiftShader R6
+                        // frame proves the compositor wiring; an our-ICD wall then localizes to us).
+                        val crCompFlag =
+                            if (crVkComp == "swiftshader") "\n--use-vulkan=swiftshader"
+                            else "\n--use-vulkan=native"
+                        // GL-SUBSTRATE ANGLE backend (run #4) + the feature/flag deltas each needs:
+                        //   angle-vulkan : ANGLE DisplayVk on libvulkan.so.1 (our ICD) — no system
+                        //                  EGL; the WALL-C escape. ANGLE picks DisplayVkWayland
+                        //                  (DISPLAY unset + wayland session, set in the env block).
+                        //   swiftshader  : ANGLE-on-SwiftShader software GL — needs
+                        //                  --enable-unsafe-swiftshader (SwiftShader is gated off by
+                        //                  default in release chromium). The A/B control: a GL
+                        //                  substrate that always inits, to confirm WALL-C is purely
+                        //                  "GL must init" and let the native-Vulkan compositor reach
+                        //                  R4 (vkCreateDevice) on our ICD.
+                        //   gles-egl     : ANGLE → gpushim's system libEGL (the run-#3 baseline).
+                        val crGlSubFlag = when (crVkGlSub) {
+                            "angle-vulkan" -> "\n--use-gl=angle\n--use-angle=vulkan"
+                            "swiftshader"  -> "\n--use-gl=angle\n--use-angle=swiftshader\n--enable-unsafe-swiftshader"
+                            else           -> "\n--use-gl=angle\n--use-angle=gles-egl"
+                        }
                         val chromiumGpuTail = if (chromiumVulkan) {
                             "\n--single-process\n--no-zygote\n--in-process-gpu" +
-                                // Select chromium's NATIVE Vulkan backend → the system Vulkan loader
-                                // (libvulkan.so.1) → our ICD. switches::kUseVulkan=native +
-                                // features::kVulkan (gpu_finch_features.cc) + OOP-raster + GPU raster.
-                                "\n--use-vulkan=native" +
+                                // Select chromium's Vulkan compositor backend → (native) the system
+                                // Vulkan loader (libvulkan.so.1) → our ICD, or (swiftshader) the
+                                // bundled software Vulkan. switches::kUseVulkan + features::kVulkan
+                                // (gpu_finch_features.cc) + OOP-raster + GPU raster.
+                                crCompFlag +
                                 // DEVICE-DIAGNOSED (ladder run #1): chromium-147 IS_ANDROID HARD-disables
                                 // Vulkan in EVERY in-process-GPU mode. GpuInit::InitializeInProcess (the
                                 // path --single-process/--in-process-gpu route to) calls
@@ -2566,7 +2647,10 @@ class MainActivity : Activity() {
                                 // shared-image GL substrate, NOT the compositor texture path that the
                                 // banked GL→Vulkan route walled on (chromium-vulkan-path.md "Why this is
                                 // distinct"): gr_context_type stays kVulkan from --use-vulkan=native.
-                                "\n--use-gl=angle\n--use-angle=gles-egl" +
+                                // The exact ANGLE backend is crGlSubFlag (computed above): run #4's
+                                // angle-vulkan (DisplayVk on our ICD, no system EGL) / swiftshader
+                                // (software GL A/B) / gles-egl (run-#3 baseline via gpushim libEGL).
+                                crGlSubFlag +
                                 // FAIL VISIBLY if Vulkan init fails (no silent GL fallback) so the
                                 // experiment sees the Vulkan wall, not a software demote
                                 // (gpu_switches.cc kDisableVulkanFallbackToGLForTesting).

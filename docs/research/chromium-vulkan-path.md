@@ -541,3 +541,111 @@ set should reach `vkCreateDevice` on our ICD (R4) and the tractable ICD-side reg
 (GAP-5 vkCmd* recorders, etc.). Alternative: a software-GL display for the SharedContext
 (chromium ships only software *Vulkan* `libvk_swiftshader.so`, no software GLES, so this
 needs a SwiftShader-GLES overlay or ANGLE's null/vulkan display backend on our ICD).
+
+---
+
+## 7. DEVICE RUN #4 — the WALL-C escape: ANGLE-on-Vulkan GL substrate (R4 REACHED)
+
+Run #4 took §6.4's "ANGLE's null/vulkan display backend on our ICD" alternative and it
+**broke WALL-C**: chromium's bundled ANGLE, pointed at its **Vulkan** display backend
+(`--use-angle=vulkan`) instead of `gles-egl`, builds a `DisplayVk` **directly on
+`libvulkan.so.1` (our staged Khronos loader → our Mali ICD)** — needing **NO system EGL
+display at all**, so the `12289 Failed to get system egl display` wall is structurally
+gone. The GL substrate then created a Vulkan **device on Mali-G615** and began allocating
+Vulkan resources — i.e. **R4 (`vkCreateDevice` on our ICD) is REACHED**, the first time
+any run got past WALL-C.
+
+Marker wiring (MainActivity, additive, default-OFF): with `.alr-chromium-vulkan` present,
+the new `/data/local/tmp/.alr-cr-vk-glsub` sub-marker selects the GL-substrate ANGLE
+backend — `angle-vulkan` / `swiftshader` / `gles-egl` (default = the run-#3 baseline) —
+and `.alr-cr-vk-comp` selects the compositor Vulkan backend (`native` default /
+`swiftshader`). For `angle-vulkan` the env block unsets `DISPLAY` + sets
+`XDG_SESSION_TYPE=wayland` so ANGLE's Vulkan display picks `DisplayVkWayland` (not
+`DisplayVkXcb`, which `xcb_connect`-fails) on the in-app compositor.
+
+### 7.1 The walls found up the new ladder (each in OUR ICD/host, each tractable)
+
+- **WALL-D — `VkPhysicalDeviceMaintenance3Properties::maxMemoryAllocationSize = 0`
+  (OUR ICD, FIXED + device-proven).** After `vkCreateDevice` succeeded, ANGLE's first
+  allocation failed: `vk_helpers.cpp init:4673 Internal Vulkan error (-2)`
+  (`VK_ERROR_OUT_OF_DEVICE_MEMORY`) with `MemoryTracking.cpp:448: Attempted allocation
+  size (16) > maximum allocation size allowed (0)`. Root cause: the ICD's
+  `alr_vkGetPhysicalDeviceProperties2` synthesized the SUBGROUP + DRIVER pNext structs
+  but hit `default: break` for `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES`
+  (sType `1000168000`, **confirmed present** in ANGLE's pNext chain), leaving
+  `maxMemoryAllocationSize = 0` → ANGLE's MemoryAllocationTracking treats it as "0 bytes
+  allowed" → every `vkAllocateMemory` pre-rejected. **FIX (`alr_icd_vulkan.c`):** add the
+  maintenance3 case filling `maxPerSetDescriptors=1024` + `maxMemoryAllocationSize=4 GiB`
+  (≤ the 5.0 GiB device-local heap the ICD already forwards), same pattern as the existing
+  SUBGROUP/DRIVER synthesis. **Device re-run: the size-0 rejection is GONE**, ANGLE
+  allocated the buffer (`Currently allocated size for memory allocation type (Buffer): 16
+  | Count: 1`) — the wall moved one rung deeper.
+
+- **WALL-E — `vkMapMemory` → `VK_ERROR_MEMORY_MAP_FAILED` (host executor / Mali-driver
+  gap, the genuine deep wall).** With WALL-D fixed, ANGLE's next step
+  (`vk_helpers.cpp map:5056 Internal Vulkan error (-5)`, `VK_ERROR_MEMORY_MAP_FAILED`)
+  failed: ANGLE allocated host-visible staging and `vkMapMemory` returned failure →
+  ANGLE could not build its upload buffers → `eglCreateContext ES 3.0 ... Requested
+  version is not supported / EGL_BAD_ATTRIBUTE` → `gl::init::CreateGLContext failed` →
+  (cascade) `gpu_init.cc:217 Vulkan not supported with in process gpu`. **Root cause
+  (host side, `alr_gpu/generated/alr_gpu_vk_gen_real.hpp::vk_gen_real_alloc_memory` +
+  `alr_gpu_vk_arena.hpp`):** the ICD's zero-copy `vkMapMemory` only works for allocations
+  the host placed in the shared arena, and the host arena-backs a host-visible allocation
+  **only if `alr_vk_arena_host_import_available(dev)` is true** — i.e. the **real Mali
+  Vulkan driver exposes `VK_EXT_external_memory_host`** (`vkGetMemoryHostPointerPropertiesEXT`)
+  to import the arena memfd pointer as `VkDeviceMemory`. On **Mali-G615 that extension is
+  (almost certainly) absent**, so the host falls back to plain driver memory with
+  `arena_off = UINT64_MAX` → the guest-side `vkMapMemory` then returns
+  `VK_ERROR_MEMORY_MAP_FAILED` (the documented "GRACEFUL DEGRADATION" path in
+  `alr_gpu_vk_arena.hpp`). This is the **same class as GAP-2 / the banked "our ICD is
+  coarse; ANGLE needs fine-grained VK" wall**: a real external-memory/host-pointer-import
+  capability our host executor cannot get from the vendor Mali driver, NOT a guest-side
+  field. It is the honest deep wall — not closeable by a flag or a one-line stub.
+
+### 7.2 A/B controls (run #4)
+
+- **`gles-egl` (default sub-marker) — REPRODUCES the documented WALL-C** exactly:
+  `Display::initialize error 12289: Failed to get system egl display` →
+  `eglInitialize OpenGLESEGL failed EGL_NOT_INITIALIZED` → `SharedImageStub: unable to
+  create context`. Confirms (a) the run-#3 baseline is preserved byte-for-byte by the new
+  wiring, and (b) `angle-vulkan` is a *qualitatively different* escape — it never enters
+  the system-EGL path.
+- **`swiftshader` GL substrate — `vkCreateDevice OK` on our ICD for the COMPOSITOR**, but
+  the SwiftShader GL substrate itself failed `eglCreateContext ES 3.0 ... Requested
+  version is not supported` (SwiftShader-via-ANGLE did not offer ES 3.0 even with
+  `--enable-unsafe-swiftshader`). Same final `gpu_init.cc:217` cascade. So the
+  **GL substrate coming up is the gate that enables Vulkan** — both `angle-vulkan` and
+  `swiftshader` confirm chromium-Android's `GetSharedContextState → CreateGLContext`
+  must succeed before `--webview-draw-functor-uses-vulkan` lets `InitializeVulkan()` run.
+
+### 7.3 Updated ladder scorecard (run #4, `angle-vulkan` GL substrate)
+
+| rung | result |
+|---|---|
+| R0 staging | YES |
+| R1 loader VK env | YES — `glsub=angle-vulkan comp=native`, `gpu accel=on vk_icd=on angle=off` |
+| R2 chromium selects Vulkan | YES |
+| R3 ICD loaded + Mali | YES — Khronos loader → `alr_icd.json` → `libalr_mali_icd.so`, ctor, Mali-G615 enumerated, real props2 (incl. synthesized maintenance3) |
+| **R4 vkCreateDevice** | **YES — `[alr-icd] vkCreateDevice OK vdev=1000`** (the WALL-C escape; ANGLE-on-Vulkan GL substrate + native-Vulkan compositor both create devices on our Mali ICD) |
+| R5 Skia/Viz GrVk | PARTIAL — post-device resource creation reached (`vkCreateBuffer` / `vkGetBufferMemoryRequirements` / `vkGetPhysicalDeviceMemoryProperties` OK; after the WALL-D fix, a host-visible buffer allocates), then walls at **WALL-E `vkMapMemory`** (Mali lacks `VK_EXT_external_memory_host` for the zero-copy arena import) |
+| R6 composited frame | NO — blocked by WALL-E |
+
+### 7.4 Verdict (run #4)
+
+The **`angle-vulkan` GL-substrate is THE WALL-C escape** the north-star needed: it makes
+chromium's GL substrate init on our Mali Vulkan ICD with **no system EGL display**, and
+the native-Vulkan path reaches **`vkCreateDevice` on Mali-G615 (R4)** — past where all
+four prior runs walled. The remaining walls are a chain of **ICD/host-executor
+completeness** gaps, not chromium-internal architecture: WALL-D (`maxMemoryAllocationSize`,
+one ICD field) is **fixed + device-proven**; the live wall **WALL-E** is the host
+executor's zero-copy `vkMapMemory` depending on **`VK_EXT_external_memory_host`** which
+**Mali-G615's driver does not expose** — the genuine deep "fine-grained VK" wall (same
+class as GAP-2). Closing it needs a host-side fallback memory path that does NOT require
+host-pointer import (e.g. allocate host-visible driver memory + an explicit
+guest↔host **copy** through the ring on map/unmap/flush, instead of the zero-copy arena
+import) — a real host-executor effort, owned by the GPU/host-VK track, not a flag.
+
+NO-REGRESSION (device-verified): default chromium (no `.alr-chromium-vulkan` marker) takes
+the unchanged software-raster path with **0** GL/Vulkan errors; `ALR VK ENUM MARSHAL:
+PASS` (the VK ICD enum/marshal path, exercising the same ICD as the WALL-D fix, unchanged);
+`alr gpu throughput ... renderer=Mali-G615 MC2 software=false` (Mali GLES accel intact).

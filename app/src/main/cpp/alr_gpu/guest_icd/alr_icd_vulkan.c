@@ -1642,6 +1642,32 @@ static void VKAPI_CALL alr_vkGetPhysicalDeviceProperties2(
                 f[3] = 1u;           /* quadOperationsInAllStages */
                 break;
             }
+            case 1000168000u: {  /* VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES */
+                /* { sType,pNext, u32 maxPerSetDescriptors, VkDeviceSize maxMemoryAllocationSize }.
+                 * 8-byte struct alignment: maxPerSetDescriptors at offset 16, the 8-byte
+                 * maxMemoryAllocationSize at offset 24 (4 bytes of pad follow the u32).
+                 * DEVICE-DIAGNOSED (chromium-vulkan ladder run #4, the angle-vulkan GL substrate):
+                 * the prior v1-only fill left this struct caller-zeroed → maxMemoryAllocationSize=0.
+                 * chromium's bundled ANGLE (DisplayVk on our ICD, the WALL-C escape) reads it into
+                 * its RendererVk MemoryAllocationTracking; a 0 cap means "0 bytes allowed", so
+                 * EVERY vkAllocateMemory is pre-rejected ("Attempted allocation size (16) > maximum
+                 * allocation size allowed (0)", vk_helpers.cpp init:4673 VK_ERROR_OUT_OF_DEVICE_MEMORY)
+                 * → eglCreateContext EGL_BAD_ATTRIBUTE → gl::init::CreateGLContext failed → the
+                 * GL substrate never inits → Vulkan disabled. After vkCreateDevice succeeded on
+                 * Mali-G615, this single zeroed limit was the ONLY thing between R4 and R5+. Fill
+                 * the real Mali-G615 maintenance3 caps: maxPerSetDescriptors and a large
+                 * maxMemoryAllocationSize (capped to the device-local heap we already forward,
+                 * ~5.0 GiB) so the allocator's pre-check passes. (Same pattern as the SUBGROUP /
+                 * DRIVER cases above — synthesize the field the caller zero-inits + the v1 fill
+                 * cannot reach, since maintenance3 lives only in the Properties2 pNext chain.) */
+                uint8_t *base = (uint8_t *)p + 16;
+                *(uint32_t *)base = 1024u;                  /* maxPerSetDescriptors (Mali-G615) */
+                /* maxMemoryAllocationSize: a single allocation can be up to (just under) the
+                 * device-local heap. Report 4 GiB — comfortably above any chromium/ANGLE/Skia
+                 * allocation, at/below the 5.0 GiB heap[0] our memory-props already forward. */
+                *(uint64_t *)(base + 8) = 0x100000000ull;   /* 4 GiB */
+                break;
+            }
             case 1000196000u: {  /* VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES */
                 /* { sType,pNext, VkDriverId driverID, char driverName[256],
                  *   char driverInfo[256], VkConformanceVersion } — driverID at offset 16. */
