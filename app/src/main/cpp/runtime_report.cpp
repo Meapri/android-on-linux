@@ -1975,6 +1975,23 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         // no-regression runs never see it).
         if (const char* icd_trap = ::getenv("ALR_ICD_TRAP"))
             guest_env.push_back(std::string("ALR_ICD_TRAP=") + icd_trap);
+        // ANGLE FEATURE-OVERRIDE BISECTION (root-cause aid for the first-glTexImage2D
+        // NULL-deref at libGLESv2+0x1f6db4 = `ldr x12,[x8,#0x390]` with x8==NULL). ANGLE
+        // auto-enables Vulkan features from the caps/extensions OUR ICD reports; a feature
+        // whose helper object is left NULL then faults on the first texture upload. ANGLE
+        // honours ANGLE_FEATURE_OVERRIDES_DISABLED / _ENABLED (semicolon-separated feature
+        // names) at RendererVk init. Forward the host values verbatim under ALR_ANGLE so a
+        // device run can disable a suspect feature (e.g. supportsHostImageCopy) and observe
+        // whether the crash moves/clears — pinning WHICH ICD-reported cap drives it WITHOUT
+        // an APK rebuild per hypothesis. Default-absent → no-regression (never set otherwise).
+        if (const char* fo_dis = ::getenv("ANGLE_FEATURE_OVERRIDES_DISABLED"))
+            guest_env.push_back(std::string("ANGLE_FEATURE_OVERRIDES_DISABLED=") + fo_dis);
+        if (const char* fo_en = ::getenv("ANGLE_FEATURE_OVERRIDES_ENABLED"))
+            guest_env.push_back(std::string("ANGLE_FEATURE_OVERRIDES_ENABLED=") + fo_en);
+        // ALR_ICD_APIVER_CAP: caps the device apiVersion our guest ICD reports (root-cause
+        // bisection of the ANGLE 1.3-core-path NULL-deref). Forwarded verbatim under ALR_ANGLE.
+        if (const char* av = ::getenv("ALR_ICD_APIVER_CAP"))
+            guest_env.push_back(std::string("ALR_ICD_APIVER_CAP=") + av);
         // ICD DISCOVERY REDIRECT (Part B, the LOADER route): when the real Khronos
         // Vulkan-Loader is staged (vk-loader overlay → /usr/lib/androlinux/libvulkan.so.1)
         // and ANGLE/volk dlopens "libvulkan.so.1", the loader discovers our (renamed) Mali
@@ -1985,10 +2002,19 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         // also enumerated); VK_ICD_FILENAMES is the legacy alias kept for older loaders.
         // Both point at the same manifest. Harmless on the direct-SONAME route (alr-vk-enum/
         // tri DT_NEEDED libalr_mali_icd.so and bind it directly — no loader reads these).
-        guest_env.push_back("VK_DRIVER_FILES=" + config.rootfs_dir +
-                            "/usr/lib/androlinux/alr_icd.json");
-        guest_env.push_back("VK_ICD_FILENAMES=" + config.rootfs_dir +
-                            "/usr/lib/androlinux/alr_icd.json");
+        // TEST-3 ICD BISECTION: a host-set ALR_VK_ICD_OVERRIDE (an in-guest absolute path
+        // to an alternative ICD manifest, e.g. SwiftShader's vk_swiftshader_icd.json) routes
+        // ANGLE to a DIFFERENT Vulkan driver — NO Mali, NO our ICD. If the +0x1f6db4 crash
+        // PERSISTS under SwiftShader it is the ANGLE/guest-loader ENVIRONMENT (not our ICD/
+        // Mali); if it CLEARS the crash is tied to the Mali/ICD path. Default-absent → the
+        // proven Mali ICD manifest below (strict no-regression).
+        std::string icd_manifest =
+            config.rootfs_dir + "/usr/lib/androlinux/alr_icd.json";
+        if (const char* icd_override = ::getenv("ALR_VK_ICD_OVERRIDE");
+            icd_override && *icd_override)
+            icd_manifest = icd_override;
+        guest_env.push_back("VK_DRIVER_FILES=" + icd_manifest);
+        guest_env.push_back("VK_ICD_FILENAMES=" + icd_manifest);
     }
     const auto t_exec_start = std::chrono::steady_clock::now();  // WS-1 M2: native-exec wall-clock (fork→reap)
     const pid_t pid = ::fork();
@@ -2449,6 +2475,16 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
     unsigned long long fault_x19 = 0, fault_x20 = 0, fault_x23 = 0, fault_x24 = 0, fault_sp = 0;
     unsigned long long fault_obj_words[4] = {0, 0, 0, 0};
     unsigned long long fault_sp_words[3] = {0, 0, 0};
+    // ANGLE first-glTexImage2D NULL-deref pin: the real fault is `ldr x12,[x8,#0x390]`
+    // with x8 = *(*(x21+0x10)+0x138). Capture the pointer-walk regs + the dereferenced
+    // members so a device run shows EXACTLY which link in the object graph is NULL.
+    unsigned long long fault_x9 = 0, fault_x12 = 0, fault_x21 = 0, fault_x29 = 0;
+    unsigned long long fault_walk[4] = {0, 0, 0, 0};  // x21, *(x21+0x10), *(+0x138), *(+0x390)
+    // vtable pointers of `this` (x21) and the sub-object (*(x21+0x10)) — resolved to
+    // <module>+off below; the offset matches against the binary's vtable RELATIVE relocs to
+    // NAME the C++ class whose +0x138 member is NULL (stripped binary, so off-line match).
+    unsigned long long fault_vt_this = 0, fault_vt_sub = 0;
+    std::string fault_vt_this_map, fault_vt_sub_map;
     int emulated_syscalls = 0;
     int emulated_list[64] = {0};
     int guest_threads = 0;
@@ -4394,6 +4430,25 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                                       reinterpret_cast<void*>(fault_sp + 0x18 + 8 * k), nullptr);
                     fault_sp_words[k] = (errno == 0) ? static_cast<unsigned long long>(v) : 0xBADBAD;
                 }
+                // ANGLE NULL-deref object-graph walk (see fault_walk decl). The faulting
+                // `ldr x12,[x8,#0x390]` has x8 = *(*(x21+0x10)+0x138); chase that chain from
+                // the live tracee so the report names the exact NULL link.
+                fault_x9 = regs[9]; fault_x12 = regs[12];
+                fault_x21 = regs[21]; fault_x29 = regs[29];
+                {
+                    auto peek = [&](unsigned long long a) -> unsigned long long {
+                        errno = 0;
+                        long v = ::ptrace(PTRACE_PEEKDATA, w, reinterpret_cast<void*>(a), nullptr);
+                        return (errno == 0) ? static_cast<unsigned long long>(v) : 0xBADBADull;
+                    };
+                    fault_walk[0] = fault_x21;
+                    fault_walk[1] = (fault_x21 && fault_x21 != 0xBADBADull) ? peek(fault_x21 + 0x10) : 0xBADBADull;
+                    fault_walk[2] = (fault_walk[1] && fault_walk[1] != 0xBADBADull) ? peek(fault_walk[1] + 0x138) : 0xBADBADull;
+                    fault_walk[3] = (fault_walk[2] && fault_walk[2] != 0xBADBADull) ? peek(fault_walk[2] + 0x390) : 0xBADBADull;
+                    // vtable ptr = first word of each object (C++ polymorphic layout).
+                    fault_vt_this = (fault_x21 && fault_x21 != 0xBADBADull) ? peek(fault_x21) : 0xBADBADull;
+                    fault_vt_sub = (fault_walk[1] && fault_walk[1] != 0xBADBADull) ? peek(fault_walk[1]) : 0xBADBADull;
+                }
             }
             siginfo_t si{};
             if (::ptrace(PTRACE_GETSIGINFO, w, nullptr, &si) == 0) {
@@ -4441,6 +4496,12 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
                 };
                 fault_pc_map = resolve(fault_pc);
                 fault_lr_map = resolve(fault_lr);
+                // Resolve the two captured vtable pointers to <module>+off so the off-line
+                // RELATIVE-reloc match can name the ANGLE C++ class (and its NULL-member type).
+                if (fault_vt_this && fault_vt_this != 0xBADBADull)
+                    fault_vt_this_map = resolve(fault_vt_this);
+                if (fault_vt_sub && fault_vt_sub != 0xBADBADull)
+                    fault_vt_sub_map = resolve(fault_vt_sub);
                 // FP-CHAIN BACKTRACE: walk the AArch64 frame-pointer chain (x29 -> saved
                 // {fp, lr} pairs) via PTRACE_PEEKDATA so a guest crash gets a REAL call
                 // stack, not just the (possibly inlined/stale-lr) pc+lr. Each frame's lr is
@@ -4561,6 +4622,16 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
             << " w3=0x" << fault_obj_words[3]
             << " | sp+0x18=0x" << fault_sp_words[0] << " sp+0x20=0x" << fault_sp_words[1]
             << " sp+0x28=0x" << fault_sp_words[2] << std::dec;
+        // ANGLE NULL-deref pin: the faulting `ldr x12,[x8,#0x390]` chases x21->[+0x10]->
+        // [+0x138]->[+0x390]; print the regs + the walked members so the NULL link is named.
+        out << "\nalr native loader fault x9=0x" << std::hex << fault_x9
+            << " x12=0x" << fault_x12 << " x21=0x" << fault_x21 << " x29=0x" << fault_x29
+            << " | walk x21=0x" << fault_walk[0] << " *(x21+0x10)=0x" << fault_walk[1]
+            << " *(+0x138)=0x" << fault_walk[2] << " *(+0x390)=0x" << fault_walk[3] << std::dec;
+        out << "\nalr native loader fault vt_this=0x" << std::hex << fault_vt_this
+            << "@" << (fault_vt_this_map.empty() ? "?" : fault_vt_this_map)
+            << " vt_sub=0x" << fault_vt_sub << "@"
+            << (fault_vt_sub_map.empty() ? "?" : fault_vt_sub_map) << std::dec;
     }
     out << "\nalr native loader guest threads spawned=" << guest_threads;
     out << "\nalr native loader path-mediation traps=" << path_traps

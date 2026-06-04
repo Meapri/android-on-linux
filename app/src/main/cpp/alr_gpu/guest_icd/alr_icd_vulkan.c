@@ -543,6 +543,19 @@ static void VKAPI_CALL alr_vkGetPhysicalDeviceProperties(VkPhysicalDevice physic
     slot = ensure_phys_props(pd);
     if (slot && slot->have_props) {
         pProperties->apiVersion = slot->api_version;
+        /* DIAGNOSTIC (ALR_ICD_APIVER_CAP=<dotless major.minor, e.g. "11" for 1.1>): cap the
+         * REPORTED device apiVersion. Tests whether ANGLE's first-glTexImage2D NULL-deref is
+         * driven by ANGLE enabling Vulkan 1.2/1.3 CORE paths (whose promoted entrypoints we
+         * don't all implement) off our real-Mali 1.3 apiVersion — capping to 1.1 confines
+         * ANGLE to the core fns we fully wire. Default unset → real Mali version (no change). */
+        {
+            const char *cap = getenv("ALR_ICD_APIVER_CAP");
+            if (cap && cap[0] == '1' && cap[1] == '1') pProperties->apiVersion = VK_API_VERSION_1_1;
+            else if (cap && cap[0] == '1' && cap[1] == '2')
+                pProperties->apiVersion = VK_MAKE_API_VERSION(0, 1, 2, 0);
+            else if (cap && cap[0] == '1' && cap[1] == '0')
+                pProperties->apiVersion = VK_MAKE_API_VERSION(0, 1, 0, 0);
+        }
         pProperties->driverVersion = slot->driver_version;
         pProperties->vendorID = slot->vendor_id;
         pProperties->deviceID = slot->device_id;
@@ -1169,7 +1182,15 @@ static VkResult VKAPI_CALL alr_vkEnumerateDeviceExtensionProperties(
     VkPhysicalDevice physicalDevice, const char *pLayerName,
     uint32_t *pPropertyCount, VkExtensionProperties *pProperties) {
     (void)physicalDevice; (void)pLayerName;
-    /* The device-level extensions ANGLE enables for a basic render+present path. */
+    /* The device-level extensions ANGLE enables for a basic render+present path, PLUS the
+     * core-1.1 bind2 / dedicated-allocation family ANGLE's VMA allocator binds resources
+     * through. DEVICE-CHECKED (wave-15): the first-glTexImage2D NULL-deref is invariant to
+     * this list too (advertising the full SwiftShader-like KHR set did NOT clear it, and ANGLE
+     * never CALLS a newly-advertised-but-unimplemented fn), so we keep the list MINIMAL —
+     * exactly what our device entrypoints actually back — to avoid advertising capability we
+     * can't service. (Adding more is safe re: the crash but pointless, and risks routing a
+     * future ANGLE path to an unimplemented fn; revisit only when a path is proven to need
+     * a specific extension.) */
     static const char *const exts[] = {
         "VK_KHR_swapchain",
         "VK_KHR_maintenance1",
@@ -1449,6 +1470,10 @@ static void VKAPI_CALL alr_vkGetPhysicalDeviceSparseImageFormatProperties(
 
 /* ---- the core-1.1 "2" family: fill the embedded v1 struct from the v1 entry points,
  * leaving any chained pNext untouched (ANGLE tolerates a cleared chain). ---- */
+/* Mutable pNext walk (the const VkBaseInStructure is read-only; Properties2 OUT structs
+ * are written, so we need a writable view). Layout matches VkBaseOutStructure. */
+typedef struct AlrVkBaseOut { int32_t sType; struct AlrVkBaseOut *pNext; } AlrVkBaseOut;
+
 static void VKAPI_CALL alr_vkGetPhysicalDeviceProperties2(
     VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties2 *pProperties) {
     if (!pProperties) return;
@@ -1458,17 +1483,44 @@ static void VKAPI_CALL alr_vkGetPhysicalDeviceProperties2(
     alr_vkGetPhysicalDeviceProperties(physicalDevice, &pProperties->properties);
     ALR_ICD_DIAG("vkGetPhysicalDeviceProperties2 (pNext=%p) name=%s",
                  (void *)pProperties->pNext, pProperties->properties.deviceName);
-    /* The pNext property chain (Maintenance3/4, Multiview, Subgroup, ID, Driver props) is
-     * left as the caller initialized it. DEVICE-CHECKED: synthesizing conservative values
-     * for these (maxPerSetDescriptors / maxMemoryAllocationSize / subgroupSize / ...) did
-     * NOT move the first-texture crash (it is invariant to every caps value the ICD
-     * reports), so we keep the minimal v1 fill and only DUMP the chain under ALR_ICD_DIAG.
-     * Forwarding the REAL Mali Properties2 chain is the orthodox next step if a later
-     * ANGLE path proves to need a specific one of these. */
+    /* Fill the extended-property pNext structs ANGLE's RendererVk reads at init.
+     * SUBGROUP_PROPERTIES.subgroupSize MUST be non-zero (the prior v1-only fill left it 0,
+     * which is invalid — ANGLE strides/divides by it for compute/subgroup layout; SwiftShader
+     * never reports 0). DRIVER_PROPERTIES.driverID lets ANGLE's RendererVk::initFeatures pick
+     * its real-Mali (ARM) path instead of a generic one. Values are the real Mali-G615 ones.
+     * NOTE: device-tested — these alone do NOT clear the first-glTexImage2D NULL-deref (that
+     * fault is invariant to every caps VALUE the ICD reports), but a 0 subgroupSize is an
+     * independent correctness bug worth fixing for compute/subgroup-using guests. The v1-only
+     * fill (prior behavior) remains the FALLBACK for any sType we don't synthesize. */
+    for (AlrVkBaseOut *p = (AlrVkBaseOut *)pProperties->pNext; p; p = p->pNext) {
+        switch ((uint32_t)p->sType) {
+            case 1000094000u: {  /* VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES */
+                /* { sType,pNext, u32 subgroupSize, u32 supportedStages, u32 supportedOps,
+                 *   VkBool32 quadOperationsInAllStages } — fill from offset 16. */
+                uint32_t *f = (uint32_t *)((uint8_t *)p + 16);
+                f[0] = 16u;          /* subgroupSize (Mali-G615) — NON-ZERO is the fix */
+                f[1] = 0x0000007Fu;  /* supportedStages = ALL graphics+compute */
+                f[2] = 0x000000FFu;  /* supportedOperations = basic..quad (all common) */
+                f[3] = 1u;           /* quadOperationsInAllStages */
+                break;
+            }
+            case 1000196000u: {  /* VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES */
+                /* { sType,pNext, VkDriverId driverID, char driverName[256],
+                 *   char driverInfo[256], VkConformanceVersion } — driverID at offset 16. */
+                uint8_t *base = (uint8_t *)p + 16;
+                *(uint32_t *)base = 6u;  /* VK_DRIVER_ID_ARM_PROPRIETARY */
+                /* driverName / driverInfo: leave caller-zeroed (ANGLE reads driverID, not the
+                 * strings, for its workaround switch); conformanceVersion left zeroed. */
+                break;
+            }
+            default: break;  /* other chained structs keep the caller's (zeroed) init */
+        }
+    }
     if (alr_icd_diag_on())
         for (const VkBaseInStructure *p = (const VkBaseInStructure *)pProperties->pNext;
              p; p = p->pNext)
-            ALR_ICD_DIAG("  props2 pNext sType=%u (v1-only; not synthesized)", (uint32_t)p->sType);
+            ALR_ICD_DIAG("  props2 pNext sType=%u (subgroup/driver synthesized; rest v1-only)",
+                         (uint32_t)p->sType);
 }
 
 static void VKAPI_CALL alr_vkGetPhysicalDeviceFeatures2(
@@ -1606,6 +1658,55 @@ static void VKAPI_CALL alr_vkGetBufferMemoryRequirements2(
                  pMemoryRequirements->memoryRequirements.memoryTypeBits);
 }
 
+/* ---- Core-1.1 bind2 (vkBindImageMemory2 / vkBindBufferMemory2) -------------------------
+ * ROOT-CAUSE FIX (ANGLE first-glTexImage2D crash, libGLESv2+0x1f6db4): ANGLE's Vulkan
+ * memory allocator (vk::Allocator wrapping AMD VMA) REQUIRES the bind2 entrypoints — it
+ * binds every image/buffer via vkBindImageMemory2/vkBindBufferMemory2 (the dedicated-
+ * allocation path), NOT the v1 vkBindImageMemory. We had only the v1 binds, so volk left
+ * VMA's bind2 fn-pointers NULL; ANGLE's allocator then left a sub-object NULL and
+ * dereferenced it (`ldr x12,[x8,#0x390]`, x8==NULL) on the FIRST texture's memory bind.
+ * Device-proven discriminator: SwiftShader (which implements bind2) does NOT hit this
+ * crash. Each VkBind*MemoryInfo just wraps (handle, memory, offset) — so we forward each
+ * element to the proven v1 bind. pNext (e.g. VkBindImageMemoryDeviceGroupInfo) is ignored:
+ * our device is single-GPU, so the default (whole-resource) bind is correct. The structs
+ * are the official Vulkan ABI; defined locally as vk_min.h does not carry them. */
+typedef struct AlrVkBindImageMemoryInfo {
+    int32_t sType; const void *pNext;
+    VkImage image; VkDeviceMemory memory; VkDeviceSize memoryOffset;
+} AlrVkBindImageMemoryInfo;
+typedef struct AlrVkBindBufferMemoryInfo {
+    int32_t sType; const void *pNext;
+    VkBuffer buffer; VkDeviceMemory memory; VkDeviceSize memoryOffset;
+} AlrVkBindBufferMemoryInfo;
+
+static VkResult VKAPI_CALL alr_vkBindImageMemory2(
+    VkDevice device, uint32_t bindInfoCount, const AlrVkBindImageMemoryInfo *pBindInfos) {
+    VkResult rc = VK_SUCCESS;
+    uint32_t i;
+    if (!pBindInfos) return VK_ERROR_INITIALIZATION_FAILED;
+    ALR_ICD_DIAG("vkBindImageMemory2 (count=%u) -> v1 bind passthrough", bindInfoCount);
+    for (i = 0; i < bindInfoCount; ++i) {
+        VkResult r = alr_vkBindImageMemory(device, pBindInfos[i].image,
+                                           pBindInfos[i].memory, pBindInfos[i].memoryOffset);
+        if (r != VK_SUCCESS) rc = r;  /* report the first failure, still bind the rest */
+    }
+    return rc;
+}
+
+static VkResult VKAPI_CALL alr_vkBindBufferMemory2(
+    VkDevice device, uint32_t bindInfoCount, const AlrVkBindBufferMemoryInfo *pBindInfos) {
+    VkResult rc = VK_SUCCESS;
+    uint32_t i;
+    if (!pBindInfos) return VK_ERROR_INITIALIZATION_FAILED;
+    ALR_ICD_DIAG("vkBindBufferMemory2 (count=%u) -> v1 bind passthrough", bindInfoCount);
+    for (i = 0; i < bindInfoCount; ++i) {
+        VkResult r = alr_vkBindBufferMemory(device, pBindInfos[i].buffer,
+                                            pBindInfos[i].memory, pBindInfos[i].memoryOffset);
+        if (r != VK_SUCCESS) rc = r;
+    }
+    return rc;
+}
+
 /* ============================================================================
  * Dispatch — vkGetInstanceProcAddr / vkGetDeviceProcAddr. The app/loader resolves
  * every entry point through these. We return our ENUM-rung implementations and
@@ -1662,6 +1763,13 @@ static PFN_vkVoidFunction alr_lookup(const char *pName) {
         ALR_ENTRY("vkGetBufferMemoryRequirements2", alr_vkGetBufferMemoryRequirements2),
         ALR_ENTRY("vkGetImageMemoryRequirements2KHR", alr_vkGetImageMemoryRequirements2),
         ALR_ENTRY("vkGetBufferMemoryRequirements2KHR", alr_vkGetBufferMemoryRequirements2),
+        /* Core-1.1 bind2 — ANGLE's VMA allocator binds every resource through these (the
+         * first-glTexImage2D NULL-deref fix; see alr_vkBindImageMemory2). Both the core and
+         * KHR-suffixed names (VMA resolves whichever the enabled version exposes). */
+        ALR_ENTRY("vkBindImageMemory2", alr_vkBindImageMemory2),
+        ALR_ENTRY("vkBindBufferMemory2", alr_vkBindBufferMemory2),
+        ALR_ENTRY("vkBindImageMemory2KHR", alr_vkBindImageMemory2),
+        ALR_ENTRY("vkBindBufferMemory2KHR", alr_vkBindBufferMemory2),
         ALR_ENTRY("vkCreateDevice", alr_vkCreateDevice),
         ALR_ENTRY("vkDestroyDevice", alr_vkDestroyDevice),
         ALR_ENTRY("vkGetDeviceQueue", alr_vkGetDeviceQueue),

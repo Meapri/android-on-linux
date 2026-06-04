@@ -3533,6 +3533,25 @@ class MainActivity : Activity() {
                         } else {
                             android.util.Log.w("alr_loader", "angle-gles: VK stack normalize SKIP (loader=${srcLoader.length()}B icd=${srcIcd.length()}B)")
                         }
+                        // TEST-3 (SwiftShader) staging: if /data/local/tmp/libvk_swiftshader.so was
+                        // pushed, mirror it + a bare-soname ICD manifest into androlinux (on
+                        // LD_LIBRARY_PATH) so .alr-angle-icd-override can route ANGLE to SwiftShader
+                        // (NO Mali, NO our ICD). Idempotent; default-absent → never staged.
+                        run {
+                            val ssSrc = java.io.File("/data/local/tmp/libvk_swiftshader.so")
+                            if (ssSrc.isFile && ssSrc.length() > 0L) {
+                                mirror(ssSrc, java.io.File(shared, "libvk_swiftshader.so"))
+                                val ssManifest =
+                                    "{\"file_format_version\":\"1.0.0\"," +
+                                        "\"ICD\":{\"library_path\":\"libvk_swiftshader.so\"," +
+                                        "\"api_version\":\"1.3.0\"}}\n"
+                                val ssJson = java.io.File(shared, "vk_swiftshader_icd.json")
+                                if (!ssJson.isFile || ssJson.readText() != ssManifest) {
+                                    ssJson.writeText(ssManifest); ssJson.setReadable(true, false)
+                                }
+                                android.util.Log.i("alr_loader", "angle-gles: SwiftShader staged into androlinux (TEST-3)")
+                            }
+                        }
                     } catch (e: Throwable) {
                         android.util.Log.e("alr_loader", "angle-gles: VK stack normalize EXC: ${android.util.Log.getStackTraceString(e)}")
                     }
@@ -3611,12 +3630,45 @@ class MainActivity : Activity() {
                 // implement rather than ANGLE crashing on a NULL fn pointer. ICD-side gated
                 // on ALR_ICD_TRAP; strictly diagnostic, default-off everywhere else.
                 android.system.Os.setenv("ALR_ICD_TRAP", "1", true)
+                // BISECTION: .alr-angle-notrap forces ALR_ICD_TRAP=0 so an unimplemented
+                // device fn ANGLE CALLS comes back NULL (crash at blr NULL → its lr names
+                // the fn) instead of a no-op trampoline that masks the failure into a later
+                // NULL-data deref. Distinguishes "ANGLE invokes a missing fn" from "ANGLE
+                // builds an object whose member is NULL". Default absent → trap stays on.
+                if (java.io.File("/data/local/tmp/.alr-angle-notrap").isFile)
+                    android.system.Os.setenv("ALR_ICD_TRAP", "0", true)
                 // DIAGNOSTIC A/B (gated on /data/local/tmp/.alr-angle-nopcgate): force
                 // ALR_PCGATE=0 (full-syscall-trace loader, no PC-gate fast path) so a device
                 // run can rule the seccomp/PC-gate sandbox IN or OUT as the cause of an
                 // ANGLE-internal crash. Default absent → PC-gate stays on (no-regression).
                 if (java.io.File("/data/local/tmp/.alr-angle-nopcgate").isFile)
                     android.system.Os.setenv("ALR_PCGATE", "0", true)
+                // ROOT-CAUSE BISECTION drivers (marker file contents → guest env), so the
+                // first-glTexImage2D NULL-deref can be pinned from the device shell WITHOUT
+                // an APK rebuild per hypothesis. The loader forwards each of these host env
+                // vars into the guest only under ALR_ANGLE (see runtime_report.cpp). All are
+                // default-absent → a normal run sets none of them (strict no-regression).
+                //   .alr-angle-feat-disabled : ANGLE_FEATURE_OVERRIDES_DISABLED (semicolon
+                //       list, e.g. "supportsHostImageCopy;allowHostImageCopyAfterInitialUpload")
+                //   .alr-angle-feat-enabled  : ANGLE_FEATURE_OVERRIDES_ENABLED
+                //   .alr-angle-icd-override  : ALR_VK_ICD_OVERRIDE (in-guest path to an
+                //       alternative ICD manifest, e.g. SwiftShader — TEST 3, no Mali)
+                fun markerEnv(marker: String, envName: String) {
+                    val f = java.io.File(marker)
+                    if (f.isFile) {
+                        val v = try {
+                            f.readText().lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() }
+                        } catch (e: Throwable) { null }
+                        if (!v.isNullOrEmpty()) {
+                            android.system.Os.setenv(envName, v, true)
+                            android.util.Log.i("alr_loader", "angle-gles: bisect $envName=$v")
+                        }
+                    }
+                }
+                markerEnv("/data/local/tmp/.alr-angle-feat-disabled", "ANGLE_FEATURE_OVERRIDES_DISABLED")
+                markerEnv("/data/local/tmp/.alr-angle-feat-enabled", "ANGLE_FEATURE_OVERRIDES_ENABLED")
+                markerEnv("/data/local/tmp/.alr-angle-icd-override", "ALR_VK_ICD_OVERRIDE")
+                markerEnv("/data/local/tmp/.alr-angle-apiver-cap", "ALR_ICD_APIVER_CAP")
                 // Part B: surface the interposer's dlopen-redirect diag ("dlopen
                 // vulkan->loader …") so a device run can prove whether ANGLE's
                 // dlopen("libvulkan.so.1") was rewritten to the staged Khronos loader.
