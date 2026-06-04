@@ -22,6 +22,7 @@ import androidx.activity.compose.setContent
 import androidx.lifecycle.lifecycleScope
 import dev.chanwoo.androlinux.runtime.AlrRuntime
 import dev.chanwoo.androlinux.runtime.AlrRuntimeHolder
+import dev.chanwoo.androlinux.runtime.BundledCatalog
 import dev.chanwoo.androlinux.runtime.InstallProgress
 import dev.chanwoo.androlinux.runtime.LaunchRequest
 import java.io.File
@@ -72,8 +73,31 @@ class LauncherActivity : ComponentActivity() {
         }
     }
 
-    /** AlrApp.onLaunchApp 위임 — LaunchRequest → RunningSurfaceActivity Intent extra. */
+    /**
+     * AlrApp.onLaunchApp 위임 — LaunchRequest → 실행화면 Intent.
+     *
+     * 보통 앱은 generic RunningSurfaceActivity 로 라우팅한다(종전 동작). 단, 카탈로그가 이 appId
+     * 에 *전용 launchActivity* 를 지정한 경우(chromium → ".ui.ChromiumStandalone")는 그 Activity
+     * 로 명시 Intent 를 보낸다 — chromium 은 LEAN runChromiumStandalone 경로(GPU/probe/GIMP/
+     * toolkit 스킵)로 띄워야 browser+renderer in-proc re-map 메모리 헤드룸을 확보하기 때문이다
+     * (generic 경로면 OOM). alias 는 같은 앱(exported=false)이라 패키지명+클래스명으로 시작
+     * 가능. launchActivity 가 없으면(=대다수 앱) 종전대로 RunningSurfaceActivity 로 보낸다.
+     */
     private fun startRunningSurface(req: LaunchRequest) {
+        val launchActivity = BundledCatalog.launchActivityFor(req.appId)
+        if (launchActivity != null) {
+            Log.i("alr_launch", "routing ${req.appId} via dedicated activity $launchActivity (LEAN path)")
+            val cls = if (launchActivity.startsWith(".")) packageName + launchActivity else launchActivity
+            val i = Intent().apply {
+                setClassName(this@LauncherActivity, cls)
+                // The dedicated alias (ChromiumStandalone) drives its own lean entrypoint; the
+                // LaunchRequest payload is not needed there, but pass the appId for parity/logs.
+                putExtra(RunningSurfaceActivity.EXTRA_APP_ID, req.appId)
+            }
+            runCatching { startActivity(i) }
+                .onFailure { Log.e("alr_launch", "dedicated-activity launch failed for ${req.appId}: ${Log.getStackTraceString(it)}") }
+            return
+        }
         val i = Intent(this, RunningSurfaceActivity::class.java).apply {
             putExtra(RunningSurfaceActivity.EXTRA_APP_ID, req.appId)
             putExtra(RunningSurfaceActivity.EXTRA_ENTRY_PATH, req.entryPath)

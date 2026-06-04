@@ -81,6 +81,30 @@ enum class RootfsDepKind(val id: String) {
 }
 
 /**
+ * 카탈로그 앱이 *어떻게 프로비저닝되는지* — 설치 동작의 부류.
+ *
+ * APT(기본): noble 미러에서 `apt-get install <ref>` 로 받는 보통 앱 — 설치 상태는 dpkg
+ *   상태이고, install() 이 AptInstaller 파이프라인을 탄다(카탈로그 대다수).
+ * OVERLAY: apt 로 받을 수 없고(예: noble 의 chromium 은 121KiB snap 스텁), 미리 빌드된
+ *   overlay stage-tar(예 chromium-gui-stage.tar)를 rootfs 에 펼쳐 제공하는 특수 앱.
+ *   "설치됨" = 그 바이너리가 rootfs 에 존재(overlay 추출됨)이고, install() 은 AptInstaller 를
+ *   타지 않고 (stage-tar 가 device 에 있으면) extractOverlay 로 펼친다. 없으면 정직하게
+ *   "구성요소를 제공해야 함"을 알린다(가짜 apt 설치를 주장하지 않음). CatalogApp.provision
+ *   참고 — chromium 이 이 부류의 첫 대상.
+ */
+enum class ProvisionKind(val id: String) {
+    APT("apt"),
+    OVERLAY("overlay"),
+
+    ;
+
+    companion object {
+        fun fromId(id: String): ProvisionKind =
+            entries.firstOrNull { it.id == id } ?: APT
+    }
+}
+
+/**
  * 하나의 rootfs 요구 — overlay stage-tar 또는 apt 패키지.
  * tools/alr_manifest.py RootfsDep 와 1:1(kind/ref/install_size_bytes).
  *
@@ -176,6 +200,29 @@ data class CatalogApp(
      * (xzgv/xli device-host-audited). 카탈로그 엔트리에 명시하여 런치 라우팅을 결정한다.
      */
     val needsXwayland: Boolean = false,
+    /**
+     * 프로비저닝 부류 — 기본 APT(보통 앱). chromium 처럼 apt 로 받을 수 없고 미리 빌드된
+     * overlay stage-tar 로 제공하는 특수 앱은 OVERLAY 로 표시한다. OVERLAY 앱은 install() 이
+     * AptInstaller 를 타지 않고, "설치됨" 판정도 dpkg 상태가 아니라 [overlayBinaryPath] 의
+     * rootfs 존재 여부로 한다(ProvisionKind 참고). 기존 apt 앱은 기본값이라 바이트 동일.
+     */
+    val provision: ProvisionKind = ProvisionKind.APT,
+    /**
+     * OVERLAY 프로비저닝 앱의 *설치-여부 프로브* = rootfs 루트 기준 상대 바이너리 경로
+     * (예 "usr/lib/chromium/chromium"). 이 파일이 rootfs 에 있으면(=overlay 추출 완료)
+     * "설치됨"으로 친다. provision==OVERLAY 일 때만 의미가 있다(APT 앱은 null). NativeAlrRuntime
+     * 가 이 경로로 설치 상태를 합성하고, install() 의 멱등 Done 판정에도 쓴다.
+     */
+    val overlayBinaryPath: String? = null,
+    /**
+     * 이 앱을 띄울 *특정 Activity 의 FQCN*(예 ".ui.ChromiumStandalone"). 비-null 이면 런처는
+     * 이 앱을 일반 RunningSurfaceActivity 가 아니라 이 Activity 로 보낸다(같은 앱 내 alias 라
+     * exported=false 라도 명시 Intent 로 시작 가능). chromium 은 LEAN runChromiumStandalone 경로
+     * (.ui.ChromiumStandalone alias → MainActivity)로 띄워야 browser+renderer in-proc re-map 에
+     * 필요한 메모리 헤드룸을 확보한다(일반 경로면 OOM). null(기본)인 보통 앱은 종전대로
+     * RunningSurfaceActivity 로 라우팅된다.
+     */
+    val launchActivity: String? = null,
 ) {
     /**
      * 카탈로그 UI 의 "다운로드 X MB" 단일 숫자 — alr_manifest.total_install_size_bytes 미러:

@@ -38,6 +38,7 @@ import android.util.DisplayMetrics
 import android.util.Log
 import android.view.SurfaceHolder
 import dev.chanwoo.androlinux.RootfsInstaller
+import kotlinx.coroutines.channels.ProducerScope
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -99,10 +100,22 @@ class NativeAlrRuntime(private val appContext: Context) : AlrRuntime {
 
     private fun refreshInstalledApps() {
         val dir = rootfsDirCached ?: return
-        val apps = runCatching { DesktopEntryScanner.scan(dir) }
+        val scanned = runCatching { DesktopEntryScanner.scan(dir) }
             .onFailure { Log.e(TAG, "desktop scan failed: ${Log.getStackTraceString(it)}") }
             .getOrDefault(emptyList())
-        Log.i(TAG, "discovered ${apps.size} installed app(s): ${apps.joinToString { it.appId }}")
+        // OVERLAY-provisioned apps (chromium) ship NO .desktop the scanner reads (the browser
+        // lives under /usr/lib/chromium, not /usr/share/applications). So if such an app's
+        // overlay binary is present in the rootfs (= overlay extracted = "installed"), synthesize
+        // its InstalledApp here so the catalog tile reads installed AND the launcher grid can tap
+        // it. The scanned set wins on appId collision (it carries the resolved icon/binary).
+        val scannedIds = scanned.map { it.appId }.toSet()
+        val overlayInstalled = BundledCatalog.overlayApps.values.mapNotNull { c ->
+            if (c.appId in scannedIds) null
+            else if (overlayBinaryPresent(dir, c)) c.toInstalledOverlayApp() else null
+        }
+        val apps = scanned + overlayInstalled
+        Log.i(TAG, "discovered ${apps.size} installed app(s): ${apps.joinToString { it.appId }}" +
+            if (overlayInstalled.isNotEmpty()) " (overlay: ${overlayInstalled.joinToString { it.appId }})" else "")
         _installedApps.value = apps
     }
 
@@ -138,7 +151,14 @@ class NativeAlrRuntime(private val appContext: Context) : AlrRuntime {
     override fun catalog(): Flow<List<CatalogApp>> = _installedApps.map { installed ->
         val byId = LinkedHashMap<String, CatalogApp>()
         for (c in BundledCatalog.apps) byId[c.appId] = c
-        for (a in installed) byId[a.appId] = a.toCatalogApp()   // installed view wins
+        for (a in installed) {
+            // Installed view wins on appId collision (it carries the resolved binary/icon) —
+            // EXCEPT OVERLAY apps (chromium), whose richer BundledCatalog entry (provision/
+            // launchActivity/overlayBinaryPath) must survive; its installed-ness is already in
+            // `installed` (so the tile reads installed), so we keep the catalog entry as-is.
+            if (BundledCatalog.isOverlayProvisioned(a.appId)) continue
+            byId[a.appId] = a.toCatalogApp()
+        }
         byId.values.toList()
     }
 
@@ -156,6 +176,16 @@ class NativeAlrRuntime(private val appContext: Context) : AlrRuntime {
         // Already installed → Done idempotently (the SSOT is installedApps).
         if (_installedApps.value.any { it.appId == appId }) {
             trySend(InstallProgress.Done(appId)); close(); return@callbackFlow
+        }
+        // OVERLAY-provisioned apps (chromium) do NOT go through AptInstaller: their "install" is
+        // extracting a pre-built overlay stage-tar, and "installed" = the binary is present. The
+        // worker closes the channel on completion; awaitClose keeps the callbackFlow open until
+        // then (the worker runs to completion — nothing to cancel mid-extract safely).
+        val overlayApp = BundledCatalog.overlayAppFor(appId)
+        if (overlayApp != null) {
+            installOverlayApp(appId, overlayApp, this)
+            awaitClose { }
+            return@callbackFlow
         }
         val aptRef = BundledCatalog.aptRefFor(appId)
         if (aptRef == null) {
@@ -253,6 +283,111 @@ class NativeAlrRuntime(private val appContext: Context) : AlrRuntime {
         }, "alr-uninstall-$appId")
         worker.start()
         awaitClose { }
+    }
+
+    // ----------------------------------------------------------------------- //
+    // OVERLAY-provisioned install (chromium) — extractOverlay, NOT AptInstaller
+    // ----------------------------------------------------------------------- //
+
+    /**
+     * Install an OVERLAY-provisioned app (chromium): NOT an apt download. Order:
+     *   1. binary already present in the rootfs → already provisioned, Done (rescan to surface
+     *      the tile);
+     *   2. else a matching overlay stage-tar is on the device (/data/local/tmp/<...>-stage.tar) →
+     *      extractOverlay() it (same guarded path MainActivity uses), rescan; Done iff the binary
+     *      is now present;
+     *   3. else NO tar present → report HONESTLY that the (large, pre-built) component must be
+     *      provided. We do NOT claim a fake apt install and do NOT touch AptInstaller.
+     * Runs on a worker thread like the apt path; emits RESOLVING → UNPACKING progress.
+     */
+    private fun installOverlayApp(
+        appId: String,
+        app: CatalogApp,
+        scope: ProducerScope<InstallProgress>,
+    ) {
+        val worker = Thread({
+            try {
+                val rootfs = awaitRootfs()
+                if (rootfs == null) {
+                    scope.trySend(InstallProgress.Failed(appId, "rootfs 준비 실패")); scope.close(); return@Thread
+                }
+                val (rootfsDir, _) = rootfs
+                scope.trySend(InstallProgress.Running(appId, PCT_RESOLVING, InstallStage.RESOLVING))
+                // (1) already extracted?
+                if (overlayBinaryPresent(rootfsDir, app)) {
+                    refreshInstalledApps()
+                    Log.i(TAG, "install($appId): overlay already present; Done")
+                    scope.trySend(InstallProgress.Done(appId)); return@Thread
+                }
+                // (2) a staged overlay tar present → extract it.
+                val tar = overlayStageTarFor(app)
+                if (tar == null) {
+                    // (3) honest: the component is a large pre-built browser, not an apt download.
+                    Log.w(TAG, "install($appId): no overlay tar staged; component must be provided")
+                    scope.trySend(
+                        InstallProgress.Failed(
+                            appId,
+                            "Chromium 구성요소(미리 빌드된 브라우저 오버레이)가 기기에 없습니다. " +
+                                "apt 로 받는 앱이 아니며, chromium-gui-stage.tar 를 " +
+                                "/data/local/tmp 에 제공해야 설치됩니다.",
+                        ),
+                    )
+                    return@Thread
+                }
+                scope.trySend(InstallProgress.Running(appId, PCT_UNPACKING, InstallStage.UNPACKING))
+                Log.i(TAG, "install($appId): extracting overlay ${tar.name} (${tar.length()} bytes)")
+                val ovr = extractOverlay(tar, rootfsDir)
+                Log.i(TAG, "install($appId): overlay done (extracted=${ovr.extracted} skipped=${ovr.skipped.size})")
+                refreshInstalledApps()
+                if (overlayBinaryPresent(rootfsDir, app)) {
+                    scope.trySend(InstallProgress.Done(appId))
+                } else {
+                    scope.trySend(
+                        InstallProgress.Failed(appId, "오버레이 추출 후에도 chromium 바이너리를 찾지 못했습니다"),
+                    )
+                }
+            } catch (e: Throwable) {
+                Log.e(TAG, "install($appId) overlay EXC: ${Log.getStackTraceString(e)}")
+                scope.trySend(InstallProgress.Failed(appId, e.message ?: "설치 중 오류"))
+            } finally {
+                scope.close()
+            }
+        }, "alr-install-overlay-$appId")
+        worker.start()
+    }
+
+    /**
+     * True iff [app]'s overlay binary is present in the rootfs (= overlay extracted = installed).
+     * Accepts the declared overlayBinaryPath AND, for chromium, the alternate binaries either
+     * overlay tar can ship (the full browser `chromium` from chromium-gui-stage.tar, or the older
+     * `chromium-headless-shell` from chromium-stage.tar) — a device that staged either reads as
+     * installed. The launch path (runChromiumStandalone) gates on the full browser, but the
+     * catalog's *installed* signal is honest for either staged component.
+     */
+    internal fun overlayBinaryPresent(rootfsDir: File, app: CatalogApp): Boolean {
+        val candidates = buildList {
+            app.overlayBinaryPath?.let { add(it) }
+            // chromium-specific alternates (full browser vs headless shell).
+            add("usr/lib/chromium/chromium")
+            add("usr/lib/chromium/chromium-headless-shell")
+        }.distinct()
+        return candidates.any { File(rootfsDir, it).isFile }
+    }
+
+    /**
+     * Locate a pre-built overlay stage-tar on the device for [app]. For chromium we prefer the
+     * FULL-browser overlay (chromium-gui-stage.tar — what runChromiumStandalone launches), then
+     * fall back to the older headless chromium-stage.tar. Returns the first present tar, or null
+     * if none is staged (→ the honest "component must be provided" path).
+     */
+    internal fun overlayStageTarFor(app: CatalogApp): File? {
+        val names = if (app.appId == "org.chromium.Chromium") {
+            listOf("chromium-gui-stage.tar", "chromium-stage.tar")
+        } else {
+            // generic fallback: <last entry-binary segment>-stage.tar
+            listOf("${app.appId}-stage.tar")
+        }
+        return names.map { File("/data/local/tmp/$it") }.firstOrNull { it.isFile }
     }
 
     /** AptInstaller.Host backed by the runtime's AlrNative JNI facade + app dirs. */
@@ -398,6 +533,24 @@ class NativeAlrRuntime(private val appContext: Context) : AlrRuntime {
 // --------------------------------------------------------------------------- //
 // Mapping helpers
 // --------------------------------------------------------------------------- //
+
+/**
+ * OVERLAY-provisioned CatalogApp (chromium) → synthesized InstalledApp, used when the overlay
+ * binary is present in the rootfs but no `.desktop` exists for the scanner to find. Carries the
+ * catalog entry's launch entry/category/display so the launcher tile + AppDetail render and tap
+ * works; the launchActivity routing is keyed by appId in LauncherActivity (not on InstalledApp).
+ */
+internal fun CatalogApp.toInstalledOverlayApp(): InstalledApp = InstalledApp(
+    appId = appId,
+    name = name,
+    summary = summary,
+    entry = entry,
+    category = category,
+    iconPath = iconPath,
+    requiredPermissions = requiredPermissions,
+    display = display,
+    installedSizeBytes = installSizeBytes,
+)
 
 /** Discovered InstalledApp → CatalogApp (Phase-1 catalog = what is installed). */
 internal fun InstalledApp.toCatalogApp(): CatalogApp = CatalogApp(
@@ -959,6 +1112,64 @@ object BundledCatalog {
             installSizeBytes = 4_300_000L,
             source = AppSource.APT,
         ),
+        // ----------------------------------------------------------------------------- //
+        // Chromium — the SPECIAL case (NOT a normal apt app). Two differences from every
+        // entry above, both carried as catalog fields so the launcher routes it correctly:
+        //
+        //   (1) PROVISION = OVERLAY (not apt). noble's `chromium`/`chromium-browser` apt
+        //       package is a 121KiB SNAP STUB — apt cannot fetch a real ELF browser. The full
+        //       chromium is provisioned by a pre-built OVERLAY (chromium-gui-stage.tar, built
+        //       by tools/build_chromium_gui_stage.py: Debian bookworm chromium under
+        //       /usr/lib/chromium/, base-subtracted closure, NSS dlopen plugins, flat
+        //       libpulsecommon). "Installed" therefore = the chromium binary is PRESENT in the
+        //       rootfs (overlay extracted), NOT a dpkg status → overlayBinaryPath =
+        //       usr/lib/chromium/chromium. install() for an OVERLAY app does NOT touch
+        //       AptInstaller: if the binary is already present it is Done; else if the overlay
+        //       tar is on the device it extractOverlay()s it; else it reports honestly that the
+        //       (large, pre-built) component must be provided (no fake apt install). The older
+        //       chromium-stage.tar shipped chromium-headless-shell (no window backend); the
+        //       installed-probe also accepts that binary so a device that staged either tar
+        //       reads as installed (NativeAlrRuntime.chromiumInstalledBinary).
+        //
+        //   (2) LAUNCH via launchActivity = ".ui.ChromiumStandalone" (not RunningSurfaceActivity).
+        //       The ChromiumStandalone activity-alias (AndroidManifest, targetActivity=
+        //       .MainActivity, exported=false) runs the LEAN MainActivity.runChromiumStandalone
+        //       path, which SKIPS the heavy onCreate (GPU/probe/GIMP/toolkit) to give chromium
+        //       the memory headroom it needs — browser + renderer are each ~800MB in-process
+        //       re-maps, and the full GUI baseline OOMs it. Routing it through the generic
+        //       RunningSurfaceActivity would OOM, so the launcher special-cases this appId and
+        //       starts the alias by explicit Intent (same-app → exported=false is fine).
+        //       runChromiumStandalone itself is UNCHANGED — the catalog only ROUTES to its alias.
+        //
+        // ⚠ HONEST device-pending: the owning chromium-Vulkan agent holds the device, so this
+        //   change is host-implemented + compile-green + host-pytest; the on-compositor render
+        //   is a DEVICE-VERIFY checklist item (push the overlay tar → tile shows installed →
+        //   tap → ChromiumStandalone → chromium window). appId="org.chromium.Chromium" is the
+        //   stable launch key; it is NOT a .desktop the scanner sees (chromium is an overlay
+        //   browser, no /usr/share/applications entry in the scan path), so NativeAlrRuntime
+        //   SYNTHESIZES its InstalledApp when overlayBinaryPath is present (refreshInstalledApps).
+        CatalogApp(
+            appId = "org.chromium.Chromium",
+            name = "Chromium",
+            summary = "오픈소스 웹 브라우저(Ozone-Wayland)",
+            entry = LaunchEntry(LaunchEntry.EntryKind.EXEC, "/usr/lib/chromium/chromium"),
+            category = AppCategory.INTERNET,
+            description = "Chromium 웹 브라우저 — ALR Wayland 컴포지터 위 창으로 실행됩니다 " +
+                "(--ozone-platform=wayland). noble 의 chromium apt 패키지는 121KiB snap 스텁이라 " +
+                "apt 로 받을 수 없어, 미리 빌드된 overlay(chromium-gui-stage.tar, Debian bookworm " +
+                "chromium → /usr/lib/chromium/)로 제공된다. 설치됨 = 그 바이너리가 rootfs 에 존재 " +
+                "(overlay 추출됨)이며, 다른 앱보다 메모리를 많이 써(browser+renderer 각 ~800MB " +
+                "in-proc re-map) LEAN runChromiumStandalone 경로(.ui.ChromiumStandalone alias)로 " +
+                "띄운다 — 일반 RunningSurfaceActivity 로 띄우면 OOM. 빌더 " +
+                "tools/build_chromium_gui_stage.py.",
+            rootfsDeps = emptyList(), // OVERLAY-provisioned: NOT an apt closure.
+            display = DisplaySpec(DisplaySpec.DisplayMode.WINDOWED),
+            installSizeBytes = 337_000_000L, // ~337MB full-browser overlay (download-size hint).
+            source = AppSource.BUNDLED,
+            provision = ProvisionKind.OVERLAY,
+            overlayBinaryPath = "usr/lib/chromium/chromium",
+            launchActivity = ".ui.ChromiumStandalone",
+        ),
     )
 
     private val aptRefByAppId: Map<String, String> =
@@ -981,4 +1192,33 @@ object BundledCatalog {
 
     /** True iff [appId] is an X11-only catalog app that must be routed through Xwayland. */
     fun needsXwayland(appId: String): Boolean = appId in xwaylandAppIds
+
+    /**
+     * SSOT for the per-app launch-Activity override, DERIVED from the entries' `launchActivity`
+     * (so the set can never drift from the catalog). An app with a non-null launchActivity
+     * (chromium → ".ui.ChromiumStandalone") must NOT be launched through the generic
+     * RunningSurfaceActivity — LauncherActivity.startRunningSurface reads this by appId and
+     * starts the named Activity by explicit Intent instead. Kept here so adding a launchActivity
+     * entry above is the ONLY edit needed to route it.
+     */
+    private val launchActivityByAppId: Map<String, String> =
+        apps.mapNotNull { c -> c.launchActivity?.let { c.appId to it } }.toMap()
+
+    /** Per-app launch-Activity FQCN override, or null if [appId] uses RunningSurfaceActivity. */
+    fun launchActivityFor(appId: String): String? = launchActivityByAppId[appId]
+
+    /**
+     * SSOT for the OVERLAY-provisioned apps (chromium): appId → its `CatalogApp` (carrying
+     * overlayBinaryPath). NativeAlrRuntime uses this to (a) synthesize the InstalledApp when the
+     * overlay binary is present and (b) drive install() down the extractOverlay path instead of
+     * AptInstaller. Derived from the entries (provision==OVERLAY) so it can never drift.
+     */
+    val overlayApps: Map<String, CatalogApp> =
+        apps.filter { it.provision == ProvisionKind.OVERLAY }.associateBy { it.appId }
+
+    /** The OVERLAY-provisioned catalog entry for [appId], or null if it is a normal apt app. */
+    fun overlayAppFor(appId: String): CatalogApp? = overlayApps[appId]
+
+    /** True iff [appId] is an OVERLAY-provisioned app (chromium) — NOT an apt install. */
+    fun isOverlayProvisioned(appId: String): Boolean = appId in overlayApps
 }

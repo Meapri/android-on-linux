@@ -26,6 +26,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 KT = ROOT / "app/src/main/java/dev/chanwoo/androlinux/runtime/NativeAlrRuntime.kt"
+MODELS = ROOT / "app/src/main/java/dev/chanwoo/androlinux/runtime/AppModels.kt"
 
 
 @pytest.fixture(scope="module")
@@ -83,8 +84,28 @@ def _entries(block: str) -> list[dict[str, str]]:
         cm = re.search(r"category\s*=\s*AppCategory\.(\w+)", body)
         if cm:
             entry["category"] = cm.group(1)
+        pm = re.search(r"provision\s*=\s*ProvisionKind\.(\w+)", body)
+        # default provision is APT (the field is omitted on normal apt entries).
+        entry["provision"] = pm.group(1) if pm else "APT"
+        lm = re.search(r'launchActivity\s*=\s*"([^"]+)"', body)
+        if lm:
+            entry["launchActivity"] = lm.group(1)
+        om = re.search(r'overlayBinaryPath\s*=\s*"([^"]+)"', body)
+        if om:
+            entry["overlayBinaryPath"] = om.group(1)
         out.append(entry)
     return out
+
+
+def _apt_entries(block: str) -> list[dict[str, str]]:
+    """Only the normal apt-provisioned entries (provision==APT).
+
+    The apt-specific invariants (a /usr/bin EXEC target, an APT RootfsDep, appId==apt-name==
+    binary basename) apply ONLY to apt apps. OVERLAY-provisioned apps (chromium) are a
+    distinct class with their own contract (see the chromium tests below), so they are
+    excluded here.
+    """
+    return [e for e in _entries(block) if e.get("provision") == "APT"]
 
 
 def test_catalog_has_entries(catalog_block: str):
@@ -93,14 +114,17 @@ def test_catalog_has_entries(catalog_block: str):
 
 
 def test_every_entry_well_formed(catalog_block: str):
+    # All entries declare an EXEC entrypoint; the apt-specific shape (a /usr/bin target + an APT
+    # RootfsDep) is required only of the apt-provisioned class (chromium is OVERLAY — exempt).
     for e in _entries(catalog_block):
         assert "appId" in e, f"entry missing appId: {e}"
         assert e.get("entryKind") == "EXEC", f"{e['appId']}: expected EXEC entry"
+    for e in _apt_entries(catalog_block):
         assert e.get("entryTarget", "").startswith("/usr/bin/"), (
             f"{e['appId']}: EXEC target must be an absolute /usr/bin path, got "
             f"{e.get('entryTarget')!r}"
         )
-        assert e.get("depKind") == "APT", f"{e['appId']}: bundled entries are apt-installable"
+        assert e.get("depKind") == "APT", f"{e['appId']}: bundled apt entries are apt-installable"
         assert e.get("depRef"), f"{e['appId']}: missing apt package ref"
 
 
@@ -111,7 +135,9 @@ def test_appid_equals_apt_name_equals_binary_basename(catalog_block: str):
     # their .desktop basename is the reverse-DNS app-id (org.gnome.Calculator) while the apt
     # package + binary are the short name (gnome-calculator) — so for those we require
     # apt-ref == binary basename, and the appId to be the reverse-DNS form of the binary.
-    for e in _entries(catalog_block):
+    # OVERLAY apps (chromium) have NO apt ref and a reverse-DNS id that is NOT a GNOME pair, so
+    # they are excluded here (their contract is checked by the chromium tests below).
+    for e in _apt_entries(catalog_block):
         app_id = e["appId"]
         binary = e["entryTarget"].rsplit("/", 1)[-1]
         if "." in app_id:  # reverse-DNS GNOME-platform app-id
@@ -231,3 +257,103 @@ def test_gnome_calculator_documents_the_two_part_fix(catalog_block: str):
     assert "dbus-daemon" in catalog_block or "dbus-run-session" in catalog_block
     # honest device-pending note (do not overclaim a device run)
     assert "device" in catalog_block.lower()
+
+
+# --------------------------------------------------------------------------- #
+# Chromium — the OVERLAY-provisioned, ChromiumStandalone-launched special case
+# --------------------------------------------------------------------------- #
+def _chromium_entry(block: str) -> dict[str, str]:
+    hits = [e for e in _entries(block) if e["appId"] == "org.chromium.Chromium"]
+    assert hits, "Chromium catalog entry (appId=org.chromium.Chromium) must be present"
+    return hits[0]
+
+
+def test_chromium_entry_present_in_internet_category(catalog_block: str):
+    e = _chromium_entry(catalog_block)
+    assert e.get("entryKind") == "EXEC"
+    # chromium's binary lives under /usr/lib/chromium (NOT /usr/bin) — the overlay layout.
+    assert e.get("entryTarget") == "/usr/lib/chromium/chromium"
+    assert e.get("category") == "INTERNET", "Chromium belongs in the INTERNET category"
+
+
+def test_chromium_is_overlay_provisioned_not_apt(catalog_block: str):
+    e = _chromium_entry(catalog_block)
+    # The defining special-case: provision=OVERLAY, NO apt RootfsDep (it is NOT apt-installable;
+    # noble's chromium apt package is a snap stub).
+    assert e.get("provision") == "OVERLAY", "Chromium must be provision=ProvisionKind.OVERLAY"
+    assert "depRef" not in e, "Chromium must NOT carry an apt RootfsDep (it is overlay-provisioned)"
+    # the installed-probe binary path (rootfs-relative) must be declared.
+    assert e.get("overlayBinaryPath") == "usr/lib/chromium/chromium", (
+        "Chromium must declare overlayBinaryPath = usr/lib/chromium/chromium (the installed-probe)"
+    )
+
+
+def test_chromium_launches_via_chromium_standalone_alias(catalog_block: str):
+    e = _chromium_entry(catalog_block)
+    # It must launch via the LEAN runChromiumStandalone path — the .ui.ChromiumStandalone alias —
+    # NOT the generic RunningSurfaceActivity (which would OOM the browser+renderer re-maps).
+    assert e.get("launchActivity") == ".ui.ChromiumStandalone", (
+        "Chromium must set launchActivity = .ui.ChromiumStandalone (the lean memory-headroom path)"
+    )
+
+
+def test_chromium_entry_documents_the_two_special_cases(catalog_block: str):
+    # The entry must be self-documenting about WHY it is special: (1) overlay-provisioned (snap
+    # stub / pre-built overlay tar), (2) launched via the lean ChromiumStandalone path (OOM
+    # otherwise). And it must stay honest about device-pending.
+    i = catalog_block.index('appId = "org.chromium.Chromium"')
+    body = catalog_block[max(0, i - 4000):i + 1500]  # the entry + its leading doc-comment
+    assert "snap" in body.lower(), "must note noble's chromium apt pkg is a snap stub"
+    assert "chromium-gui-stage.tar" in body, "must name the pre-built overlay tar"
+    assert "runChromiumStandalone" in body, "must name the lean launch path"
+    assert "OOM" in body or "memory" in body.lower(), "must explain the OOM/memory rationale"
+    assert "device" in body.lower(), "must keep the honest device-pending note"
+
+
+def test_runtime_exposes_overlay_provision_and_launch_activity_ssot(kt_text: str):
+    # BundledCatalog must expose the launch-activity + overlay-provision SSOTs (derived from the
+    # entries) so the launcher routes chromium without duplicating the app-id anywhere.
+    assert "fun launchActivityFor(appId: String)" in kt_text
+    assert "fun overlayAppFor(appId: String)" in kt_text
+    assert "fun isOverlayProvisioned(appId: String)" in kt_text
+    # the SSOTs are derived from the entries (cannot drift).
+    assert "c.launchActivity?.let" in kt_text
+    assert "it.provision == ProvisionKind.OVERLAY" in kt_text
+
+
+def test_runtime_install_routes_overlay_apps_away_from_apt(kt_text: str):
+    # install() must short-circuit OVERLAY apps to the extractOverlay path BEFORE the aptRefFor
+    # lookup (so chromium never goes through AptInstaller), and the overlay installer must extract
+    # the staged tar / report honestly when absent.
+    assert "BundledCatalog.overlayAppFor(appId)" in kt_text
+    assert "installOverlayApp(appId, overlayApp" in kt_text
+    assert "fun installOverlayApp(" in kt_text
+    # honest no-tar path (no fake apt install).
+    assert "구성요소" in kt_text or "must be provided" in kt_text.lower()
+    # the synthesized-installed path for the no-.desktop overlay browser.
+    assert "toInstalledOverlayApp" in kt_text
+    assert "overlayBinaryPresent" in kt_text
+
+
+def test_models_declare_overlay_provision_fields():
+    # AppModels.kt must declare the OVERLAY-provision model surface: a ProvisionKind enum and the
+    # three CatalogApp fields (provision / overlayBinaryPath / launchActivity), all defaulting so
+    # existing apt entries stay byte-identical.
+    m = MODELS.read_text(encoding="utf-8")
+    assert "enum class ProvisionKind" in m
+    assert "APT(" in m and "OVERLAY(" in m
+    assert "val provision: ProvisionKind = ProvisionKind.APT" in m
+    assert "val overlayBinaryPath: String? = null" in m
+    assert "val launchActivity: String? = null" in m
+
+
+def test_launcher_routes_dedicated_launch_activity(catalog_block: str):
+    # LauncherActivity.startRunningSurface must consult the launchActivity SSOT and start the
+    # named Activity by explicit Intent instead of RunningSurfaceActivity for chromium.
+    launcher = (
+        ROOT / "app/src/main/java/dev/chanwoo/androlinux/ui/LauncherActivity.kt"
+    ).read_text(encoding="utf-8")
+    assert "BundledCatalog.launchActivityFor(req.appId)" in launcher
+    assert "setClassName(" in launcher
+    # falls back to RunningSurfaceActivity for normal apps (launchActivity == null).
+    assert "RunningSurfaceActivity::class.java" in launcher
