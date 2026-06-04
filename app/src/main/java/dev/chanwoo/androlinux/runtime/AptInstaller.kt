@@ -56,6 +56,30 @@ object AptInstaller {
     /** The overlays the apt path stages (same set + order as the proven probe). */
     private val APT_OVERLAYS = listOf("fakeroot", "apt-dpkg", "dpkg-db", "apt-mirror")
 
+    /**
+     * GNOME-platform install-configure unlock (TASK-A1). These extra overlays are staged
+     * ONLY when the package being installed is a gnome-platform app: `maintscript-shim`
+     * (no-op confmodule + policy-rc.d + ucf/update-rc.d/… stubs so the libpaper1/x11-common/
+     * session-migration postinsts exit 0 instead of the exit-73 cascade) and `gnome-schemas`
+     * (the host-precompiled gschemas.compiled so the app's GSettings schemas resolve at
+     * runtime). Built by tools/build_maintscript_shim_overlay.py + tools/build_common_data_
+     * overlay.py --schemas. No-op when their tars are absent (graceful degradation).
+     */
+    private val GNOME_CONFIGURE_OVERLAYS = listOf("maintscript-shim", "gnome-schemas")
+
+    /**
+     * apt package names that are gnome-platform apps needing the install-configure unlock.
+     * Kept in lock-step with NativeAlrRuntime.BundledCatalog's gnome entries. Detection is by
+     * the apt package name (what install() receives), not the appId.
+     */
+    private val GNOME_PLATFORM_PKGS = setOf(
+        "gnome-calculator", "gnome-text-editor", "eog", "file-roller", "gedit",
+    )
+
+    /** True iff [pkg]'s configure needs the gnome-platform postinst neutralizer + schemas. */
+    private fun isGnomePlatformPkg(pkg: String): Boolean =
+        pkg in GNOME_PLATFORM_PKGS
+
     /** Coarse install phases parsed from apt stdout → the UI's monotonic percent. */
     enum class Phase { RESOLVING, DOWNLOADING, UNPACKING, CONFIGURING, REGISTERING }
 
@@ -113,7 +137,14 @@ object AptInstaller {
         stageInterpose(host, rootfsDir)
 
         // --- stage the apt overlays (size-keyed, idempotent) ------------------------------
-        for (name in APT_OVERLAYS) {
+        val overlaysToStage = APT_OVERLAYS + (
+            if (isGnomePlatformPkg(pkg)) GNOME_CONFIGURE_OVERLAYS else emptyList()
+        )
+        if (isGnomePlatformPkg(pkg)) {
+            Log.i(TAG, "aptinstall: pkg=$pkg is gnome-platform — also staging " +
+                "$GNOME_CONFIGURE_OVERLAYS (postinst neutralizer + precompiled gschemas)")
+        }
+        for (name in overlaysToStage) {
             val tar = File("/data/local/tmp/$name-stage.tar")
             val m = File(rootfsDir, ".aptdrain-$name-staged-${tar.length()}")
             if (tar.isFile && !m.isFile) {
@@ -198,6 +229,15 @@ object AptInstaller {
         Os.setenv("ALR_PERSIST_GUEST", "1", true)
         Os.setenv("ALR_INTERPOSE_DIAG", "1", true)
         Os.setenv("ALR_TEE_GUEST_STDOUT", "1", true)
+        // GNOME-platform configure: run debconf in noninteractive mode so the (stubbed)
+        // confmodule + dpkg-reconfigure never block on a prompt and the postinsts proceed.
+        // Inert for non-GNOME installs but harmless, so set unconditionally — apt/dpkg
+        // already prefer noninteractive in a headless install.
+        val gnomeConfigure = isGnomePlatformPkg(pkg)
+        if (gnomeConfigure) {
+            Os.setenv("DEBIAN_FRONTEND", "noninteractive", true)
+            Os.setenv("DEBCONF_NONINTERACTIVE_SEEN", "true", true)
+        }
         try {
             // STEP 1 — apt-get update: fetch the index from the pinned mirror.
             val upOut = host.loaderProbe(
@@ -343,6 +383,10 @@ object AptInstaller {
             Os.unsetenv("ALR_PERSIST_GUEST")
             Os.unsetenv("ALR_INTERPOSE_DIAG")
             Os.unsetenv("ALR_TEE_GUEST_STDOUT")
+            if (gnomeConfigure) {
+                Os.unsetenv("DEBIAN_FRONTEND")
+                Os.unsetenv("DEBCONF_NONINTERACTIVE_SEEN")
+            }
         }
     }
 

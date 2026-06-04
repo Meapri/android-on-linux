@@ -118,12 +118,19 @@ GROUP_PACKAGES: dict[str, str] = {
     "mime": "shared-mime-info",
     "icons": "adwaita-icon-theme",      # hicolor pulled too (see ICON_PACKAGES)
     "locale": "libc-bin",
+    "schemas": "gsettings-desktop-schemas",  # gnome-platform gsettings schemas
     # "machine-id" is synthesized, no .deb.
 }
 # icons needs BOTH the Adwaita theme and the hicolor base theme index.
 ICON_PACKAGES = ("hicolor-icon-theme", "adwaita-icon-theme")
 
-ALL_GROUPS = ("ca", "mime", "icons", "machine-id", "locale")
+# schemas needs gsettings-desktop-schemas; extra per-app schema packages (e.g.
+# gnome-calculator, which ships org.gnome.calculator.gschema.xml) are appended at
+# build time via the ``schema_packages`` argument so the compiled gschemas.compiled
+# also covers the app's own keys.
+SCHEMA_PACKAGES = ("gsettings-desktop-schemas",)
+
+ALL_GROUPS = ("ca", "mime", "icons", "machine-id", "locale", "schemas")
 
 # --- ca group -------------------------------------------------------------- #
 CA_SRC_PREFIX = "usr/share/ca-certificates/"
@@ -167,6 +174,19 @@ DBUS_SESSION_CONF_BODY = (
 # --- locale group ---------------------------------------------------------- #
 LOCALE_PREFIX = "usr/lib/locale/C.utf8/"
 
+# --- schemas group --------------------------------------------------------- #
+# GSettings schemas live here; the runtime glib reads the COMPILED gschemas.compiled
+# (a GVDB binary). The base rootfs ships ~4 GTK schemas already compiled but has NO
+# glib-compile-schemas binary, so an apt-installed gnome-platform schema package
+# (gsettings-desktop-schemas + the app's own) drops .gschema.xml SOURCE files that the
+# device can never compile → GTK4/GNOME apps abort at runtime ("Settings schema
+# 'org.gnome.desktop.interface' is not installed"). We compile host-side over the base's
+# existing schemas ∪ the new ones, so the shipped gschemas.compiled is a SUPERSET (never
+# regresses the base GTK schemas) and the runtime requirement is satisfied with no
+# on-device compile. gschemas.compiled format is glib-version-stable (GVDB).
+SCHEMAS_DIR = "usr/share/glib-2.0/schemas"
+SCHEMAS_COMPILED = "usr/share/glib-2.0/schemas/gschemas.compiled"
+
 
 # --------------------------------------------------------------------------- #
 # Result
@@ -185,6 +205,8 @@ class CommonDataResult:
     icon_file_count: int = 0
     icon_cache_shipped: bool = False      # binary icon-theme.cache (postinst tool)
     locale_file_count: int = 0
+    schema_xml_count: int = 0             # NEW .gschema.xml shipped (delta vs base)
+    schemas_compiled: bool = False        # did glib-compile-schemas run?
     debs: tuple[str, ...] = ()
     notes: tuple[str, ...] = ()
 
@@ -202,6 +224,8 @@ class CommonDataResult:
             "icon_file_count": self.icon_file_count,
             "icon_cache_shipped": self.icon_cache_shipped,
             "locale_file_count": self.locale_file_count,
+            "schema_xml_count": self.schema_xml_count,
+            "schemas_compiled": self.schemas_compiled,
             "debs": list(self.debs),
             "notes": list(self.notes),
         }
@@ -272,18 +296,29 @@ def resolve_filenames(
     return out
 
 
-def packages_for_groups(groups) -> list[str]:
-    """The set of noble packages a group selection needs (deduped, ordered)."""
+def packages_for_groups(groups, *, schema_packages=()) -> list[str]:
+    """The set of noble packages a group selection needs (deduped, ordered).
+
+    ``schema_packages`` lists EXTRA per-app schema packages to fetch for the
+    ``schemas`` group (in addition to gsettings-desktop-schemas), e.g.
+    ``("gnome-calculator",)`` so the app's own .gschema.xml is compiled in."""
     pkgs: list[str] = []
+
+    def add(p: str) -> None:
+        if p not in pkgs:
+            pkgs.append(p)
+
     for g in groups:
         if g == "icons":
             for p in ICON_PACKAGES:
-                if p not in pkgs:
-                    pkgs.append(p)
+                add(p)
+        elif g == "schemas":
+            for p in SCHEMA_PACKAGES:
+                add(p)
+            for p in schema_packages:
+                add(p)
         elif g in GROUP_PACKAGES:
-            p = GROUP_PACKAGES[g]
-            if p not in pkgs:
-                pkgs.append(p)
+            add(GROUP_PACKAGES[g])
         # machine-id needs no package
     return pkgs
 
@@ -388,6 +423,113 @@ def build_mime_tree(deb: Path, work: Path) -> tuple[Path, bool, list[str]]:
 
 
 # --------------------------------------------------------------------------- #
+# schemas group — host-precompiled gschemas.compiled (gnome-platform unlock)
+# --------------------------------------------------------------------------- #
+
+def _extract_base_schema_xml(base: str | Path, dest_root: Path) -> list[str]:
+    """Extract every ``usr/share/glib-2.0/schemas/*.gschema.xml`` (and *.enums.xml)
+    the BASE rootfs already ships into ``dest_root``. The base's schemas must be
+    present at compile time so the recompiled gschemas.compiled is a SUPERSET (the 4
+    base GTK schemas are not lost). ``base`` may be a tar file or an extracted dir.
+    Returns the sorted rootfs-relative paths written (may be empty)."""
+    written: list[str] = []
+    base = Path(base)
+
+    def want(rel: str) -> bool:
+        return rel.startswith(SCHEMAS_DIR + "/") and (
+            rel.endswith(".gschema.xml") or rel.endswith(".enums.xml")
+            or rel.endswith(".gschema.override")
+        )
+
+    if base.is_dir():
+        src = base / SCHEMAS_DIR
+        if src.is_dir():
+            for p in sorted(src.glob("*")):
+                rel = p.relative_to(base).as_posix()
+                if p.is_file() and want(rel):
+                    dst = dest_root / rel
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    dst.write_bytes(p.read_bytes())
+                    written.append(rel)
+    else:
+        with tarfile.open(base, "r:*") as t:
+            for m in t.getmembers():
+                rel = _norm(m.name)
+                if not m.isfile() or not want(rel):
+                    continue
+                fh = t.extractfile(m)
+                if fh is None:
+                    continue
+                dst = dest_root / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_bytes(fh.read())
+                written.append(rel)
+    written.sort()
+    return written
+
+
+def build_schemas_tree(
+    debs: list[Path], work: Path, *, base: str | Path | None = None,
+) -> tuple[Path, bool, list[str], list[str]]:
+    """Stage the GSettings schema XMLs (from the schema .debs + the base) and compile
+    ``gschemas.compiled`` host-side.
+
+    Returns ``(schemas_root, compiled, new_xml_rels, notes)``:
+      * ``schemas_root`` — dir whose ``usr/share/glib-2.0/schemas`` subtree to pack;
+      * ``compiled``     — True iff ``glib-compile-schemas`` ran and produced the binary;
+      * ``new_xml_rels`` — the schema XML rel-paths that came from the .debs (NOT the base);
+        only these + the compiled binary are shipped (base XMLs are merged for the compile
+        but already present on device, so we don't re-ship them);
+      * ``notes``        — degradation notes when the compiler is absent.
+
+    The compile runs over (base schemas ∪ new schemas) so gschemas.compiled is a superset
+    and never drops the base GTK schemas."""
+    notes: list[str] = []
+    # 1. base schemas first (so the compiled file remains a superset).
+    base_rels: set[str] = set()
+    if base is not None:
+        base_rels = set(_extract_base_schema_xml(base, work))
+        if not base_rels:
+            notes.append(
+                "schemas: base rootfs shipped no .gschema.xml to merge — compiled file "
+                "will cover only the new schema packages (base GTK schemas may be dropped "
+                "if the device's gschemas.compiled is overwritten)"
+            )
+    # 2. the new schema packages' XMLs.
+    new_rels: list[str] = []
+    for deb in debs:
+        new_rels += _extract_prefix(deb, SCHEMAS_DIR + "/", work)
+    # only the genuinely-new XMLs (not already in the base) need shipping as source.
+    new_xml_rels = sorted(
+        r for r in set(new_rels) - base_rels
+        if r.endswith((".gschema.xml", ".enums.xml", ".gschema.override"))
+    )
+
+    schemas_share = work / SCHEMAS_DIR
+    tool = shutil.which("glib-compile-schemas")
+    compiled = False
+    if tool is not None and schemas_share.is_dir():
+        try:
+            subprocess.run([tool, str(schemas_share)], check=True, capture_output=True)
+            compiled = (schemas_share / "gschemas.compiled").is_file()
+        except subprocess.CalledProcessError as exc:  # pragma: no cover - host tool
+            notes.append(
+                f"glib-compile-schemas failed (rc={exc.returncode}): "
+                f"{exc.stderr.decode(errors='replace')[:200]}; shipping source XML only — "
+                "GNOME apps will abort ('schema not installed') until compiled on device"
+            )
+        if not compiled and not notes:
+            notes.append("glib-compile-schemas ran but produced no gschemas.compiled")
+    else:
+        notes.append(
+            "glib-compile-schemas not on PATH; schemas group ships source XML only (no "
+            "gschemas.compiled) — run on a host with libglib2.0-bin (or `brew install "
+            "glib`), or compile on device"
+        )
+    return work, compiled, new_xml_rels, notes
+
+
+# --------------------------------------------------------------------------- #
 # icons group — index.theme (+ Adwaita payload) from the theme .debs
 # --------------------------------------------------------------------------- #
 
@@ -436,6 +578,10 @@ def build_common_data_overlay(
     # offline/selftest injection: skip the network for the ca group.
     ca_bundle: bytes | None = None,
     ca_cert_count: int | None = None,
+    # schemas group: extra per-app schema packages + the base rootfs (tar|dir) whose
+    # existing .gschema.xml are merged so the recompiled gschemas.compiled is a superset.
+    schema_packages=(),
+    base: str | Path | None = None,
 ) -> CommonDataResult:
     """Pack the selected groups into one §5-E ``common-data-stage.tar``.
 
@@ -458,7 +604,7 @@ def build_common_data_overlay(
     filenames: dict[str, str] = {}
     if need_net or (("ca" in groups) and ca_bundle is None):
         filenames = resolve_filenames(
-            packages_for_groups(groups),
+            packages_for_groups(groups, schema_packages=schema_packages),
             mirror=mirror, suite=suite, arch=arch, components=components, index=index,
         )
 
@@ -559,6 +705,38 @@ def build_common_data_overlay(
                 members += ["./" + p for p in packed]
                 res.locale_file_count = len(packed)
 
+            # --- schemas (gnome-platform unlock) -------------------------- #
+            if "schemas" in groups:
+                schema_pkgs = list(SCHEMA_PACKAGES) + [
+                    p for p in schema_packages if p not in SCHEMA_PACKAGES
+                ]
+                schema_debs: list[Path] = []
+                for p in schema_pkgs:
+                    fn = filenames[p]
+                    schema_debs.append(_download_deb(mirror, fn, cache))
+                    debs.append(Path(fn).name)
+                schemas_root, compiled, new_xml_rels, snotes = build_schemas_tree(
+                    schema_debs, work, base=base,
+                )
+                notes.extend(snotes)
+                res.schemas_compiled = compiled
+                # Ship: the NEW source .gschema.xml (so the device dir is self-describing
+                # and re-compilable) + the recompiled gschemas.compiled (the load-bearing
+                # binary the runtime glib actually reads). Base XMLs are merged for the
+                # compile but already on device, so they are NOT re-shipped.
+                shipped = 0
+                for rel in new_xml_rels:
+                    p = schemas_root / rel
+                    if p.is_file():
+                        _add_file(tar, rel, p.read_bytes())
+                        members.append("./" + rel)
+                        shipped += 1
+                res.schema_xml_count = shipped
+                if compiled:
+                    cp = schemas_root / SCHEMAS_COMPILED
+                    _add_file(tar, SCHEMAS_COMPILED, cp.read_bytes())
+                    members.append("./" + SCHEMAS_COMPILED)
+
         with tarfile.open(out_tar, "r") as t:
             res.file_count = sum(1 for m in t.getmembers() if m.isfile())
     finally:
@@ -581,9 +759,9 @@ def _selected_groups(args) -> tuple[str, ...]:
     return tuple(sel)
 
 
-def _plan(groups, *, mirror, suite, components, index=None) -> dict:
+def _plan(groups, *, mirror, suite, components, index=None, schema_packages=()) -> dict:
     """Resolve filenames + the planned member paths for ``groups`` (the --list view)."""
-    pkgs = packages_for_groups(groups)
+    pkgs = packages_for_groups(groups, schema_packages=schema_packages)
     filenames = resolve_filenames(
         pkgs, mirror=mirror, suite=suite, arch=ARCH, components=components, index=index
     ) if pkgs else {}
@@ -599,6 +777,9 @@ def _plan(groups, *, mirror, suite, components, index=None) -> dict:
         planned += ["./" + p for p in MACHINE_ID_PATHS] + ["./" + DBUS_SESSION_CONF_PATH]
     if "locale" in groups:
         planned.append("./" + LOCALE_PREFIX + "**")
+    if "schemas" in groups:
+        planned += ["./" + SCHEMAS_DIR + "/*.gschema.xml (new only)",
+                    "./" + SCHEMAS_COMPILED + " (host glib-compile-schemas)"]
     return {
         "groups": list(groups),
         "packages": pkgs,
@@ -606,6 +787,7 @@ def _plan(groups, *, mirror, suite, components, index=None) -> dict:
         "planned_members": planned,
         "update_mime_database": shutil.which("update-mime-database") or "(absent)",
         "gtk_update_icon_cache": shutil.which("gtk-update-icon-cache") or "(absent)",
+        "glib_compile_schemas": shutil.which("glib-compile-schemas") or "(absent)",
     }
 
 
@@ -628,6 +810,14 @@ def main(argv: list[str] | None = None) -> int:
                         help="ship /etc/machine-id + dbus machine-id + session.conf stub")
     parser.add_argument("--locale", action="store_true",
                         help="ship /usr/lib/locale/C.utf8/** (compiled C.UTF-8 locale)")
+    parser.add_argument("--schemas", action="store_true",
+                        help="ship host-compiled gschemas.compiled (gnome-platform unlock)")
+    parser.add_argument("--schema-package", action="append", dest="schema_packages",
+                        default=[], metavar="PKG",
+                        help="extra per-app schema package for the schemas group "
+                        "(repeatable; e.g. gnome-calculator). Needs --component universe.")
+    parser.add_argument("--base", help="base rootfs (tar|dir): its existing .gschema.xml "
+                        "are merged so the recompiled gschemas.compiled stays a superset")
     parser.add_argument("--all", action="store_true", help="select every group")
     parser.add_argument("--suite", default=SUITE)
     parser.add_argument("--mirror", default=MIRROR)
@@ -652,7 +842,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.dry_run:
         info = _plan(groups, mirror=args.mirror, suite=args.suite,
-                     components=components)
+                     components=components, schema_packages=tuple(args.schema_packages))
         if args.json:
             print(json.dumps(info, indent=2))
         else:
@@ -662,6 +852,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  deb {pkg}: {info['filenames'].get(pkg)}")
             print(f"  update-mime-database: {info['update_mime_database']}")
             print(f"  gtk-update-icon-cache: {info['gtk_update_icon_cache']}")
+            print(f"  glib-compile-schemas: {info['glib_compile_schemas']}")
             print("  planned members:")
             for m in info["planned_members"]:
                 print(f"    {m}")
@@ -673,6 +864,7 @@ def main(argv: list[str] | None = None) -> int:
     res = build_common_data_overlay(
         args.out, groups, mirror=args.mirror, suite=args.suite, arch=ARCH,
         components=components, cache_dir=args.cache,
+        schema_packages=tuple(args.schema_packages), base=args.base,
     )
     if args.json:
         print(json.dumps(res.as_dict(), indent=2))
@@ -691,6 +883,9 @@ def main(argv: list[str] | None = None) -> int:
                   f"(binary cache shipped={res.icon_cache_shipped})")
         if "locale" in res.groups:
             print(f"  locale C.utf8: {res.locale_file_count} files")
+        if "schemas" in res.groups:
+            print(f"  schemas: {res.schema_xml_count} new .gschema.xml "
+                  f"(gschemas.compiled shipped={res.schemas_compiled})")
         if res.debs:
             print(f"  source debs: {', '.join(res.debs)}")
         if res.notes:
@@ -743,8 +938,13 @@ def _selftest() -> int:
           packages_for_groups(["machine-id"]) == [])
     check("packages_for_groups dedupes across groups",
           packages_for_groups(["ca", "ca"]) == ["ca-certificates"])
-    check("ALL_GROUPS has the 5 documented groups",
-          set(ALL_GROUPS) == {"ca", "mime", "icons", "machine-id", "locale"})
+    check("ALL_GROUPS has the 6 documented groups",
+          set(ALL_GROUPS) == {"ca", "mime", "icons", "machine-id", "locale", "schemas"})
+    check("packages_for_groups(schemas)=gsettings-desktop-schemas",
+          packages_for_groups(["schemas"]) == ["gsettings-desktop-schemas"])
+    check("packages_for_groups(schemas, extra) appends app schema pkg",
+          packages_for_groups(["schemas"], schema_packages=("gnome-calculator",))
+          == ["gsettings-desktop-schemas", "gnome-calculator"])
 
     # --- machine-id only (no network, no ar) ------------------------------- #
     with tempfile.TemporaryDirectory() as t:
@@ -847,6 +1047,69 @@ def _selftest() -> int:
             check("locale overlay does NOT pack unrelated usr/bin/iconv",
                   "./usr/bin/iconv" not in names)
             check("locale file_count == 2", res.locale_file_count == 2)
+
+        # --- schemas group: host-compile gschemas.compiled (gnome-platform) ---- #
+        # Synthetic schema .deb (one app schema) + a synthetic BASE tar that already
+        # ships a GTK schema. The compile must run over BOTH → the shipped compiled
+        # binary is a superset; only the NEW app schema XML is re-shipped (base's not).
+        _gc = shutil.which("glib-compile-schemas")
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            app_schema = (
+                b'<?xml version="1.0" encoding="UTF-8"?>\n<schemalist>\n'
+                b'  <schema id="org.test.App" path="/org/test/App/">\n'
+                b'    <key name="width" type="i"><default>800</default></key>\n'
+                b'  </schema>\n</schemalist>\n'
+            )
+            base_schema = (
+                b'<?xml version="1.0" encoding="UTF-8"?>\n<schemalist>\n'
+                b'  <schema id="org.gtk.Base" path="/org/gtk/Base/">\n'
+                b'    <key name="theme" type="s"><default>"x"</default></key>\n'
+                b'  </schema>\n</schemalist>\n'
+            )
+            deb = _make_synthetic_deb(tmp, "synthetic-schemas.deb", {
+                SCHEMAS_DIR + "/org.test.App.gschema.xml": app_schema,
+                "usr/share/doc/x/README": b"not a schema\n",   # must NOT be packed
+            })
+            # synthetic base tar shipping the existing GTK schema (./-rooted)
+            base_tar = tmp / "base.tar"
+            with tarfile.open(base_tar, "w") as bt:
+                ti = tarfile.TarInfo("./" + SCHEMAS_DIR + "/org.gtk.Base.gschema.xml")
+                ti.size = len(base_schema); ti.mode = 0o644
+                bt.addfile(ti, io.BytesIO(base_schema))
+            idx = {"gsettings-desktop-schemas": {"Filename": "pool/x/gsds.deb"}}
+            cache = tmp / "cache"; cache.mkdir()
+            shutil.copy(deb, cache / "gsds.deb")
+            out = tmp / "schemas.tar"
+            res = build_common_data_overlay(
+                out, ["schemas"], index=idx, cache_dir=cache, base=base_tar)
+            with tarfile.open(out) as tar:
+                names = {m.name for m in tar.getmembers()}
+            new_xml = "./" + SCHEMAS_DIR + "/org.test.App.gschema.xml"
+            base_xml = "./" + SCHEMAS_DIR + "/org.gtk.Base.gschema.xml"
+            comp = "./" + SCHEMAS_COMPILED
+            check("schemas overlay ships the NEW app .gschema.xml", new_xml in names)
+            check("schemas overlay does NOT re-ship the base .gschema.xml",
+                  base_xml not in names)
+            check("schemas overlay does NOT pack unrelated doc file",
+                  ("./usr/share/doc/x/README") not in names)
+            check("schemas res.schema_xml_count == 1 (only the new XML)",
+                  res.schema_xml_count == 1)
+            if _gc is not None:
+                check("schemas ships gschemas.compiled (host glib-compile-schemas ran)",
+                      comp in names and res.schemas_compiled is True)
+                # The compiled binary must be a SUPERSET: contain BOTH schema ids.
+                with tarfile.open(out) as tar:
+                    if comp in names:
+                        blob = tar.extractfile(comp).read()
+                        check("gschemas.compiled is a superset (base+app schemas)",
+                              b"org.gtk.Base" in blob and b"org.test.App" in blob)
+                    else:
+                        check("gschemas.compiled is a superset (base+app schemas)", False)
+            else:
+                check("glib-compile-schemas absent → degrades to XML-only with a note",
+                      res.schemas_compiled is False
+                      and any("glib-compile-schemas not on PATH" in n for n in res.notes))
     else:
         check("ar available for deb-based selftests (skipped)", True)
 

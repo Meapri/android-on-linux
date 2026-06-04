@@ -52,6 +52,38 @@ its delta is galculator-class. Otherwise HEAVY.
 > `init-system-helpers`. galculator ships all of them in its delta and configures exit-0,
 > so by construction they cannot be the cause of any failure.
 
+### 2a. The X11 debconf/init-script postinst trigger (xpdf-class — device-corrected)
+
+A fifth bucket was added after a **device-proven miss**: `apt install xpdf` failed
+`dpkg --configure` with **`x11-common` postinst exit 127** + **`libpaper1` postinst exit 2**,
+yet the model had scored xpdf LIKELY-PASS. The maintainer-script forensics (reading the
+real noble `.deb` control archives) pin the cause: `libpaper1`'s postinst's FIRST line is
+`. /usr/share/debconf/confmodule` (the base ships no confmodule → sourcing it errors →
+exit 2) then `db_get … ; ucf …` (no debconf frontend, no `ucf`); `x11-common`'s postinst
+sources the confmodule (`db_purge`) and may call `update-rc.d`/`invoke-rc.d` (absent →
+127). So the trigger set now also includes **`x11-common`, `libpaper1`** and their X11
+siblings **`xfonts-utils`, `xfonts-encodings`, `xfonts-base`, `xserver-common`** (same
+`update-fonts-*`/`update-rc.d`/debconf postinst class).
+
+> This is NOT "all X11". `xcalc` (package `x11-apps`) is **not in noble main+universe** —
+> it is staged via the dedicated `x11-stage.tar` overlay, never an apt-configure, so it is
+> unaffected (it audits MISSING, not HEAVY). The trigger is specifically the
+> debconf/init-script postinst set in the *apt-install* delta.
+
+### 2b. The ALREADY-INSTALLED short-circuit (why gimp stays PASS)
+
+Adding x11-common/libpaper1 as triggers exposed a subtlety: **gimp's *closure* drags both**
+(gimp → poppler/motif → libpaper1, x11-common), yet gimp is device-PROVEN PASS. Resolution:
+**gimp is base-PROVIDED** (the base rootfs ships `/usr/bin/gimp`; the reconstructed dpkg DB
+marks `gimp`+`gimp-data` installed). `apt install gimp` is therefore a **no-op** — no
+maintainer script in its closure ever runs, so those postinsts cannot fail. The audit now
+checks this FIRST: a target already in the base installed-set is `ALREADY-INSTALLED`
+(PASS-class), regardless of triggers buried in its already-satisfied closure. Of the six
+proven-PASS apps only gimp is base-provided; the other five are real apt installs that
+don't pull x11-common/libpaper1. This keeps the **10/10** match while the X11 triggers are
+correctly active (xpdf → HEAVY, and its sibling **nsxiv** → HEAVY — both dropped from the
+catalog).
+
 ## 3. Validation (model vs device ground truth)
 
 `tools/app_closure_audit.py --live` against the real noble index + Contents, scored
@@ -62,15 +94,19 @@ against project-memory device results:
 | galculator | PASS | LIKELY-PASS | — |
 | l3afpad | PASS | LIKELY-PASS | — |
 | htop | PASS | LIKELY-PASS | — |
-| gimp | PASS | LIKELY-PASS | — |
+| gimp | PASS | **ALREADY-INSTALLED** | — (base-provided; apt no-op) |
 | foot | PASS | LIKELY-PASS | — |
 | netsurf-gtk | PASS | LIKELY-PASS | — |
 | mousepad | FAIL | HEAVY | perl |
 | gnome-calculator | FAIL | HEAVY | gnome |
 | gedit | FAIL | HEAVY | perl, gnome |
 | eog | FAIL | HEAVY | gnome, sandbox |
+| **xpdf** | **FAIL** | **HEAVY** | **x11 (x11-common+libpaper1)** |
+| **nsxiv** | (xpdf-sibling) | **HEAVY** | **x11 (x11-common+libpaper1+xfonts)** |
 
-**10/10 match.** (`tests/test_app_closure_audit.py::test_live_audit_matches_device_ground_truth`,
+**10/10 match** on the original ground truth, AND the device-corrected xpdf now predicts
+HEAVY (it previously under-counted as LIKELY-PASS). (`tests/test_app_closure_audit.py::
+test_live_audit_matches_device_ground_truth` + `::test_xpdf_is_heavy_via_x11_common_and_libpaper1`,
 network-gated `ALR_AUDIT_NET=1`.)
 
 ## 4. Heavy-app class breakdown — what blocks each, and the shim path
@@ -102,23 +138,43 @@ Representative apps, audited (delta size + trigger buckets):
 - Apps that assume **systemd-as-PID1** for their own lifecycle (login managers, session
   daemons, `gnome-session`, the GNOME Shell desktop itself).
 
-**(B) Reachable ONLY with a session-dbus / dconf shim (candidate future work):**
-- The **gnome-platform** bucket (gnome-calculator, gnome-text-editor, eog, file-roller,
-  gnome-terminal) fails at *configure* on `gsettings-desktop-schemas` / `appstream` /
-  `session-migration` / `dconf-service` postinsts. These do NOT need a real init — they
-  need (i) the gsettings schemas compiled into `glib-2.0/schemas/gschemas.compiled`
-  (the base already does this for its own set; the shim must re-run `glib-compile-schemas`
-  after the overlay lands), (ii) a **dbus session bus** for dconf to talk to at *runtime*
-  (a `dbus-launch`/`dbus-daemon --session` started by the launcher before the guest, with
-  `DBUS_SESSION_BUS_ADDRESS` exported), and (iii) suppressing or no-op-ing the appstream
-  pool refresh + session-migration triggers (e.g. `policy-rc.d` returning 101, or pre-
-  seeding the dpkg DB so those postinsts are skipped).
-  - **What the shim would unlock:** the gnome-platform-only apps (no perl, no sandbox, no
-    gstreamer) — i.e. **gnome-calculator, gnome-text-editor, eog, file-roller,
-    gnome-terminal** (the last still needs the PTY host). These are the realistic GNOME
-    wins IF a session-bus + schema-compile + skip-triggers shim is built.
+**(B) Reachable with the session-dbus / schema-compile / skip-triggers shim — NOW BUILT:**
+- The **gnome-platform** bucket (gnome-calculator, gnome-text-editor, eog, file-roller)
+  fails at *configure* on `gsettings-desktop-schemas` / `appstream` / `session-migration`
+  postinsts and at *runtime* on uncompiled schemas + a missing session bus. The three-part
+  shim that unblocks this is now implemented (host-built artifacts + launcher wiring):
+  - **(i) install-configure neutralizer** — `tools/build_maintscript_shim_overlay.py` ships
+    `maintscript-shim-stage.tar`: a NO-OP debconf `confmodule` (every `db_*` returns 0),
+    `policy-rc.d` → 101, and `exit 0` stubs for `ucf`/`update-rc.d`/`invoke-rc.d`/
+    `deb-systemd-helper`/`dpkg-reconfigure`. The forensics show the base ships NONE of these
+    (only `dpkg-trigger`), so `libpaper1` (sources confmodule → exit 2) and `x11-common`
+    (debconf/init → exit 127) and `session-migration` postinsts run to exit 0 with the stubs
+    present. `AptInstaller` stages this + sets `DEBIAN_FRONTEND=noninteractive` ONLY for a
+    gnome-platform package. *(Selftest proves the stub confmodule drives the real libpaper1
+    postinst body to exit 0.)*
+  - **(ii) precompiled gschemas** — `tools/build_common_data_overlay.py --schemas
+    --schema-package gnome-calculator` ships `gnome-schemas-stage.tar`: a host-run
+    `glib-compile-schemas` over (base schemas ∪ gsettings-desktop-schemas ∪ the app's own
+    `org.gnome.calculator`), so the device gets a `gschemas.compiled` SUPERSET with no
+    on-device compiler. *(Verified: the real compiled binary contains `org.gnome.calculator`
+    + `org.gnome.desktop.interface` + the base `org.gtk.*`, §5-E conformant.)*
+  - **(iii) runtime session bus** — `tools/build_dbus_overlay.py` ships `dbus-daemon-stage.tar`
+    (`/usr/bin/dbus-daemon` + `dbus-run-session`; the base has only the libdbus client). The
+    launcher's `NativeAppSession.GnomePlatformShim` WRAPS a gnome-platform launch in
+    `dbus-run-session -- <app>` (private session bus, `DBUS_SESSION_BUS_ADDRESS` exported,
+    torn down on exit, all in the one blocking guest call — no loader change) and points
+    `GSETTINGS_SCHEMA_DIR` at the rootfs schemas. The native runtime already sets
+    `GSETTINGS_BACKEND=memory`, so settings WRITES go to memory (no dconf-service needed);
+    only the compiled schema DEFAULTS (ii) + the bus for `GtkApplication` registration (iii)
+    are required.
+  - **HOST STATUS:** all three overlays build as real §5-E-conformant artifacts and the
+    audit/builders are pytest-green; `gnome-calculator` is added to `BundledCatalog`
+    (`org.gnome.Calculator`). **DEVICE STATUS:** the final "installs to `installed=true` →
+    launches → window renders" is the DEVICE-VERIFY gate (the device was owned by another
+    agent during this work) — see the checklist. Do not over-claim a device run.
   - **What it does NOT unlock:** evince/atril/nautilus (still drag sandbox + gstreamer +
-    perl on top of gnome-platform), and the perl bucket below.
+    perl on top of gnome-platform), and the perl bucket below. gnome-terminal additionally
+    needs a PTY host (separate track).
 - The **perl** bucket (mousepad, xfce4-terminal, gedit's gspell) needs `perl-base` present
   and the `dictionaries-common` / `emacsen-common` `dpkg-reconfigure` to complete non-
   interactively. Adding `perl-base` to the base/overlay + a `debconf` non-interactive
@@ -153,28 +209,83 @@ The delta model shows several "heavy-looking" apps actually configure clean toda
 ## 5. Recommended posture (catalog honesty)
 
 1. **Promise (device-proven or galculator-class host-audited):** galculator, l3afpad,
-   htop, gimp, foot, netsurf-gtk, gpicview, xarchiver, sakura, viewnior, xzgv, xpdf,
-   qalculate-gtk, nsxiv. (See `BundledCatalog`.)
+   htop, gimp, foot, netsurf-gtk, gpicview, xarchiver, sakura, viewnior, xzgv,
+   qalculate-gtk. (See `BundledCatalog`.) **xpdf + nsxiv were DROPPED** — both pull the
+   `x11-common`+`libpaper1` debconf/init-script postinsts that device-proved FAIL (the
+   corrected §2a model now flags them HEAVY).
 2. **Promote to "candidate, host-audited LIKELY-PASS" (configure-clean, run-pending):**
    geany, thunar, mate-calc, transmission-gtk. Light desktops (XFCE/MATE/LXDE) over GNOME.
-3. **Do NOT promise GNOME apps** (gnome-calculator/gedit/eog/file-roller/nautilus) until a
-   session-dbus + schema-compile + skip-triggers shim exists. When scoping that shim, the
-   *gnome-platform-only* apps are the reachable target; evince/atril/nautilus are not
-   (sandbox + gstreamer + perl on top).
+3. **GNOME gnome-platform apps — shim now BUILT (§4 class B):** `gnome-calculator` is in
+   `BundledCatalog` (`org.gnome.Calculator`) behind the install-configure neutralizer +
+   precompiled-gschemas + session-dbus shim. The *gnome-platform-only* apps
+   (gnome-text-editor/eog/file-roller) reuse the same path; evince/atril/nautilus are still
+   out (sandbox + gstreamer + perl on top). DEVICE-VERIFY pending (see §7).
 4. **Structurally out:** printing/mDNS/polkit/accountsservice/packagekit GUIs and anything
    that wants systemd-as-PID1 or a real privilege model.
 
 ## 6. How to reproduce / extend
 
 ```
-# offline logic + selftest
-uvx pytest tests/test_app_closure_audit.py -q
+# offline logic + selftest (audit model + the three gnome-platform overlay builders)
+uvx pytest tests/test_app_closure_audit.py tests/test_build_common_data_overlay.py \
+    tests/test_build_dbus_overlay.py tests/test_build_maintscript_shim_overlay.py -q
 
-# live audit of any package set against real noble (matches device ground truth)
+# live audit of any package set against real noble (matches device ground truth + xpdf)
 python -m tools.app_closure_audit --live --base app/src/main/assets/rootfs/payloads/tiny-rootfs.tar \
-    --package gnome-calculator --package mate-calc --package geany --json
+    --package gnome-calculator --package mate-calc --package geany --package xpdf --json
+
+# build the three gnome-platform overlays (real §5-E artifacts → out/)
+BASE=app/src/main/assets/rootfs/payloads/tiny-rootfs.tar
+python -m tools.build_common_data_overlay --out out/gnome-schemas-stage.tar \
+    --schemas --schema-package gnome-calculator --component main --component universe --base $BASE
+python -m tools.build_maintscript_shim_overlay --out out/maintscript-shim-stage.tar --base $BASE
+python -m tools.build_dbus_overlay --out out/dbus-daemon-stage.tar --base $BASE --component main
 ```
 
-The model is one function (`tools.app_closure_audit.classify`): resolve the noble
-closure, subtract the base installed-set (`tools.build_dpkg_db.installed_packages` over the
-noble `Contents` index), and report any `CASCADE_TRIGGERS` in the remaining delta.
+The audit model is one function (`tools.app_closure_audit.classify`): if the target is
+base-installed → `ALREADY-INSTALLED`; else resolve the noble closure, subtract the base
+installed-set (`tools.build_dpkg_db.installed_packages` over the noble `Contents` index),
+and report any `CASCADE_TRIGGERS` in the remaining delta.
+
+## 7. DEVICE-VERIFY CHECKLIST (gnome-calculator + xpdf-correction)
+
+Run on a real device (the host work above is green; these are the device gates). Always
+`am force-stop dev.chanwoo.androlinux` before a re-launch (project memory: onCreate skips
+overlays otherwise).
+
+**Setup — push the three gnome overlays (+ the standing apt/interpose overlays):**
+```
+adb push out/gnome-schemas-stage.tar   /data/local/tmp/gnome-schemas-stage.tar
+adb push out/maintscript-shim-stage.tar /data/local/tmp/maintscript-shim-stage.tar
+adb push out/dbus-daemon-stage.tar     /data/local/tmp/dbus-daemon-stage.tar
+# (apt path also needs the existing fakeroot/apt-dpkg/dpkg-db/apt-mirror/interpose tars)
+```
+
+**A. gnome-calculator INSTALL → `installed=true`:**
+1. Trigger the in-app install of `org.gnome.Calculator` (or the marker path
+   `echo install:gnome-calculator > /data/local/tmp/.alr-aptdrain`).
+2. EXPECT logcat: `aptinstall: pkg=gnome-calculator is gnome-platform — also staging
+   [maintscript-shim, gnome-schemas]`, then the `dpkg -i (set)` + `dpkg --configure -a`
+   lines, then **`aptinstall: installed=true (dpkg --status gnome-calculator)`** and
+   `Setting up gnome-calculator`. The libpaper1/x11-common/session-migration `Setting up`
+   lines must NOT abort (the stub confmodule/policy-rc.d neutralize them).
+3. CONFIRM no `dpkg --configure` exit-73 in the log; `/usr/bin/gnome-calculator` present.
+
+**B. gnome-calculator LAUNCH → window renders:**
+4. Tap the new `GNOME Calculator` launcher tile (it self-reconciles via DesktopEntryScanner
+   from `org.gnome.Calculator.desktop`).
+5. EXPECT logcat: `[org.gnome.Calculator] gnome-shim: wrapping launch in dbus-run-session
+   (session bus + GSETTINGS_SCHEMA_DIR=/usr/share/glib-2.0/schemas)` and the program line
+   `/usr/bin/dbus-run-session -- /usr/bin/gnome-calculator`.
+6. EXPECT: NO `Settings schema 'org.gnome.desktop.interface' is not installed` abort (the
+   precompiled gschemas overlay satisfies it); the calculator window renders on the
+   compositor (screencap shows the GTK4 calculator, not black).
+7. HONEST fallbacks to watch: if `dbus-run-session` isn't staged the log says "launching
+   without a session bus" and GTK4 falls back (warning, not crash); if the window is black
+   check the GTK4/wl_shm render path (separate track), not this shim.
+
+**C. xpdf correction (negative):**
+8. xpdf is no longer a catalog tile (dropped). The audit now marks it HEAVY; confirm
+   `python -m tools.app_closure_audit --live … --package xpdf` reports `HEAVY` with
+   `x11-common, libpaper1` — i.e. the app is correctly ABSENT/marked, not offered as a
+   broken install.

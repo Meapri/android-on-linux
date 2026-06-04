@@ -120,11 +120,34 @@ Package: brokenapp
 Version: 1.0
 Depends: libc6, libdoesnotexist-1
 Filename: pool/main/b/brokenapp/brokenapp_1.0_arm64.deb
+
+Package: x11app
+Version: 1.0
+Depends: libc6, x11-common, libpaper1
+Filename: pool/main/x/x11app/x11app_1.0_arm64.deb
+
+Package: x11-common
+Version: 7.7
+Depends: libc6
+Filename: pool/main/x/xorg/x11-common_7.7_arm64.deb
+
+Package: libpaper1
+Version: 1.1
+Depends: libc6
+Filename: pool/main/libp/libpaper/libpaper1_1.1_arm64.deb
+
+Package: baseapp
+Version: 1.0
+Depends: libc6, x11-common, libpaper1
+Filename: pool/main/b/baseapp/baseapp_1.0_arm64.deb
 """
 
 # What the reconstructed base dpkg DB marks installed (base ships the GTK .so + glib
 # + smi, but NOT the dbus/systemd/dconf-service/libpam-systemd daemon binaries).
-BASE_INSTALLED = {"libc6", "libgtk-3-0t64", "libglib2.0-0t64", "shared-mime-info"}
+# ``baseapp`` mirrors gimp: base-provided itself, so ALREADY-INSTALLED even though its
+# closure drags the exit-73 X11 triggers x11-common+libpaper1.
+BASE_INSTALLED = {"libc6", "libgtk-3-0t64", "libglib2.0-0t64", "shared-mime-info",
+                  "baseapp"}
 
 
 @pytest.fixture(scope="module")
@@ -159,6 +182,28 @@ def test_gnome_app_is_heavy_via_gsettings_appstream(index):
     assert {"gsettings-desktop-schemas", "libappstream5"} <= set(r.cascade_triggers)
 
 
+def test_x11_app_is_heavy_via_x11_common_and_libpaper1(index):
+    # xpdf-class: x11-common (postinst exit 127) + libpaper1 (postinst exit 2) are the
+    # device-proven debconf/init-script-postinst triggers in the install delta.
+    r = classify("x11app", index, BASE_INSTALLED)
+    assert r.verdict == Verdict.HEAVY.value
+    assert r.likely_pass is False
+    assert {"x11-common", "libpaper1"} <= set(r.cascade_triggers)
+
+
+def test_base_provided_target_is_already_installed_despite_x11_triggers(index):
+    # gimp-class: baseapp's CLOSURE drags x11-common+libpaper1 (exit-73 triggers), but the
+    # target is itself base-provided → `apt install` is a no-op → ALREADY-INSTALLED, PASS.
+    # This is the mechanism that keeps gimp PASS while x11-common/libpaper1 ARE triggers.
+    r = classify("baseapp", index, BASE_INSTALLED)
+    assert r.verdict == Verdict.ALREADY_INSTALLED.value
+    assert r.likely_pass is True
+    # closure is short-circuited (not computed) for an already-installed target.
+    assert r.cascade_triggers == ()
+    assert r.delta == ()
+    assert r.closure_size == 0
+
+
 def test_unsatisfiable_dep_is_unsat(index):
     r = classify("brokenapp", index, BASE_INSTALLED)
     assert r.verdict == Verdict.UNSAT.value
@@ -185,7 +230,9 @@ def test_systemd_dbus_dconf_are_NOT_cascade_triggers(pkg):
 @pytest.mark.parametrize("pkg", ["perl-base", "perl", "dictionaries-common",
                                  "emacsen-common", "gsettings-desktop-schemas",
                                  "appstream", "libappstream5", "session-migration",
-                                 "glib-networking", "bubblewrap", "ghostscript"])
+                                 "glib-networking", "bubblewrap", "ghostscript",
+                                 "x11-common", "libpaper1", "xfonts-utils",
+                                 "xfonts-encodings", "xfonts-base", "xserver-common"])
 def test_known_cascade_triggers(pkg):
     assert is_cascade_trigger(pkg)
     assert pkg in CASCADE_TRIGGERS or pkg == "appstream"
@@ -253,16 +300,26 @@ def test_live_audit_matches_device_ground_truth():
     cf = fetch_contents(NOBLE_MIRROR, NOBLE_SUITE, NOBLE_ARCH, components=NOBLE_COMPONENTS)
     base_installed = set(installed_packages(base_tar, parse_contents(cf.text)).packages)
 
-    # Device-proven ground truth (project memory).
+    # Device-proven ground truth (project memory). gimp is base-PROVIDED (the base rootfs
+    # ships /usr/bin/gimp), so it audits ALREADY-INSTALLED, not LIKELY-PASS: `apt install
+    # gimp` is a no-op and its closure's x11-common/libpaper1 postinsts never run. We assert
+    # via the `likely_pass` property, which is True for BOTH LIKELY-PASS and ALREADY-
+    # INSTALLED — i.e. "installs+configures clean on device" — keeping the 10/10 match while
+    # x11-common+libpaper1 are now (correctly) exit-73 triggers (see test_xpdf_* below).
     proven_pass = ["galculator", "l3afpad", "htop", "gimp", "foot", "netsurf-gtk"]
     proven_fail = ["mousepad", "gnome-calculator", "gedit", "eog"]
 
     for pkg in proven_pass:
         r = classify(pkg, index, base_installed)
-        assert r.verdict == "LIKELY-PASS", (
-            f"{pkg} should be LIKELY-PASS but got {r.verdict} "
-            f"(cascade={r.cascade_triggers})"
+        assert r.likely_pass, (
+            f"{pkg} should be PASS-class (LIKELY-PASS|ALREADY-INSTALLED) but got "
+            f"{r.verdict} (cascade={r.cascade_triggers})"
         )
+    # gimp specifically is the base-provided case → ALREADY-INSTALLED.
+    assert classify("gimp", index, base_installed).verdict == "ALREADY-INSTALLED", (
+        "gimp is base-provided; it must audit ALREADY-INSTALLED (apt no-op), not "
+        "LIKELY-PASS — that is WHY it passes despite x11-common/libpaper1 in its closure"
+    )
     for pkg in proven_fail:
         r = classify(pkg, index, base_installed)
         assert r.verdict == "HEAVY", (
@@ -270,11 +327,46 @@ def test_live_audit_matches_device_ground_truth():
         )
         assert r.cascade_triggers, f"{pkg} HEAVY must name ≥1 cascade trigger"
 
-    # The new catalog additions must all audit LIKELY-PASS.
-    for pkg in ["gpicview", "xarchiver", "sakura", "viewnior", "xzgv", "xpdf",
-                "qalculate-gtk", "nsxiv"]:
+    # The lightweight catalog additions must all audit LIKELY-PASS. NOTE xpdf + nsxiv are
+    # NOT here: both pull x11-common+libpaper1 and are device-proven / audit HEAVY (the
+    # xpdf-class miss this fix corrects) — they are dropped from the catalog.
+    for pkg in ["gpicview", "xarchiver", "sakura", "viewnior", "xzgv", "qalculate-gtk"]:
         r = classify(pkg, index, base_installed)
         assert r.verdict == "LIKELY-PASS", (
             f"catalog entry {pkg} should be LIKELY-PASS but got {r.verdict} "
             f"(cascade={r.cascade_triggers})"
+        )
+
+
+@pytest.mark.skipif(
+    os.environ.get("ALR_AUDIT_NET") != "1",
+    reason="network-gated; set ALR_AUDIT_NET=1 to fetch the real noble index + Contents",
+)
+def test_xpdf_is_heavy_via_x11_common_and_libpaper1():
+    """DEVICE-PROVEN regression: `apt install xpdf` failed `dpkg --configure` with
+    x11-common postinst exit 127 + libpaper1 postinst exit 2. The audit must now predict
+    xpdf HEAVY (it previously under-counted it as LIKELY-PASS). Its X11 image-viewer
+    sibling nsxiv (same x11-common+libpaper1 delta) must also be HEAVY."""
+    from pathlib import Path
+
+    from tools.app_closure_audit import fetch_packages_index
+    from tools.build_dpkg_db import fetch_contents, installed_packages, parse_contents
+
+    base_tar = Path(__file__).resolve().parents[1] / (
+        "app/src/main/assets/rootfs/payloads/tiny-rootfs.tar"
+    )
+    if not base_tar.is_file():
+        pytest.skip("base rootfs payload absent")
+
+    index = parse_packages(
+        fetch_packages_index(NOBLE_MIRROR, NOBLE_SUITE, NOBLE_ARCH, components=NOBLE_COMPONENTS)
+    )
+    cf = fetch_contents(NOBLE_MIRROR, NOBLE_SUITE, NOBLE_ARCH, components=NOBLE_COMPONENTS)
+    base_installed = set(installed_packages(base_tar, parse_contents(cf.text)).packages)
+
+    for pkg in ["xpdf", "nsxiv"]:
+        r = classify(pkg, index, base_installed)
+        assert r.verdict == "HEAVY", f"{pkg} should be HEAVY but got {r.verdict}"
+        assert {"x11-common", "libpaper1"} <= set(r.cascade_triggers), (
+            f"{pkg} HEAVY must name x11-common + libpaper1; got {r.cascade_triggers}"
         )

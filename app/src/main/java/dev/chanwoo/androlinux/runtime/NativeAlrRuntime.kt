@@ -412,19 +412,28 @@ internal fun InstalledApp.toCatalogApp(): CatalogApp = CatalogApp(
  * exit-73 trigger is a small set of MAINTAINER-SCRIPT packages in the install DELTA (closure
  * minus the base's reconstructed-dpkg-DB installed-set): perl-base / dictionaries-common /
  * emacsen-common (mousepad/gedit), gsettings-desktop-schemas / appstream / session-migration /
- * glib-networking (gnome-calculator/eog), bubblewrap / ghostscript / gstreamer1.0-plugins-*.
- * An entry is LIKELY-PASS iff its delta has ZERO such triggers (== galculator's delta class).
- * mousepad was REMOVED: its delta adds perl-base + dictionaries-common + emacsen-common.
- * This model reproduces the device PASS/FAIL ground truth 10/10 (galculator/l3afpad/htop/gimp/
- * foot/netsurf-gtk PASS; mousepad/gnome-calculator/gedit/eog FAIL). Proof status per entry:
+ * glib-networking (gnome-calculator/eog), bubblewrap / ghostscript / gstreamer1.0-plugins-*,
+ * and — device-corrected — the X11 debconf/init-script postinsts x11-common (exit 127) +
+ * libpaper1 (exit 2) + xfonts-* (xpdf class). An entry is LIKELY-PASS iff its delta has ZERO
+ * such triggers (== galculator's delta class); a BASE-PROVIDED target (gimp) is ALREADY-
+ * INSTALLED (apt no-op, its postinsts never run — that is why gimp passes despite x11-common/
+ * libpaper1 in its closure). This model reproduces the device PASS/FAIL ground truth 10/10
+ * (galculator/l3afpad/htop/gimp/foot/netsurf-gtk PASS; mousepad/gnome-calculator/gedit/eog
+ * FAIL) AND the device-proven xpdf FAIL. Proof status per entry:
  *   DEVICE-PROVEN (installs+configures exit-0 on device): galculator, l3afpad.
  *   HOST-AUDITED LIKELY-PASS (delta is galculator-class: 0 cascade triggers; device-test
- *     pending): gpicview, xarchiver, sakura, viewnior, xzgv, xpdf, qalculate-gtk, nsxiv.
+ *     pending): gpicview, xarchiver, sakura, viewnior, xzgv, qalculate-gtk.
  *     (htop = proven-class ncurses leaf, 5-pkg delta, 0 triggers.)
+ *   GNOME-PLATFORM, shim-unlocked (TASK-A; host artifacts built, device-verify pending):
+ *     org.gnome.Calculator — install-configure neutralizer (maintscript-shim overlay) +
+ *     host-precompiled gschemas (gnome-schemas overlay) + runtime session-dbus shim
+ *     (dbus-daemon overlay + GnomePlatformShim). See AptInstaller + NativeAppSession.
+ *   DROPPED (device-proven / audit FAIL): xpdf + nsxiv — x11-common+libpaper1 postinsts.
  * appId == the `.desktop` basename so a successful install self-reconciles a launcher tile via
- * DesktopEntryScanner — EXCEPT entries whose .desktop is NoDisplay=true (nsxiv) or Terminal=true
- * (htop, sakura), which the scanner drops; those still install+launch via this catalog's
- * explicit appId→apt map but do not auto-surface a scanned tile (noted on each such entry).
+ * DesktopEntryScanner — EXCEPT Terminal=true entries (htop, sakura), which the scanner drops;
+ * those still install+launch via this catalog's explicit appId→apt map but do not auto-surface
+ * a scanned tile (noted on each such entry). The GNOME entry's appId is the reverse-DNS
+ * .desktop basename (org.gnome.Calculator) while its apt pkg/binary is gnome-calculator.
  */
 object BundledCatalog {
 
@@ -612,30 +621,19 @@ object BundledCatalog {
             installSizeBytes = 326_656L,
             source = AppSource.APT,
         ),
-        // xpdf — Xlib/Motif 경량 PDF 뷰어. xcalc 가 증명한 X11→Xwayland 경로의 "문서 뷰어"
-        // 폭 확장(GTK 가 아닌 순수 Xlib 앱). HOST-AUDITED LIKELY-PASS
-        // (tools/app_closure_audit.py): 설치 DELTA 18-패키지(libpoppler134/libxm4/libxft2
-        // 등), exit-73 maintainer-script 트리거 0 — ghostscript/gstreamer 미의존(evince/
-        // atril 와 결정적 차이). deb 119KB 로 카탈로그에서 가장 가벼운 PDF 뷰어. ⚠ X11
-        // 앱이라 Xwayland(rootful)가 떠 있어야 한다(xcalc 와 동일 경로). appId 는 .desktop
-        // basename(xpdf.desktop) 과 일치(NoDisplay=false → 타일 재조정). Exec=`xpdf %f`
-        // (strip), 바이너리 /usr/bin/xpdf — 푸시한 test.pdf 를 인자로 연다.
-        CatalogApp(
-            appId = "xpdf",
-            name = "Xpdf",
-            summary = "가벼운 X11 PDF 뷰어",
-            entry = LaunchEntry(LaunchEntry.EntryKind.EXEC, "/usr/bin/xpdf"),
-            category = AppCategory.OFFICE,
-            description = "Xlib/Motif 기반의 가벼운 PDF 뷰어(GTK 비의존). xcalc 와 같은 " +
-                "X11→Xwayland 경로로 동작 — Xwayland(rootful)가 떠 있어야 한다. 설치 " +
-                "delta(18 패키지)에 ghostscript/gstreamer 등 exit-73 maintainer-script " +
-                "트리거가 0 이라 dpkg configure 가 끝까지 통과한다(host-audited). noble " +
-                "패키지 xpdf → /usr/share/applications/xpdf.desktop.",
-            rootfsDeps = listOf(RootfsDep(RootfsDepKind.APT, "xpdf", 338_944L)),
-            display = DisplaySpec(DisplaySpec.DisplayMode.WINDOWED),
-            installSizeBytes = 338_944L,
-            source = AppSource.APT,
-        ),
+        // ⚠ xpdf — DROPPED (was HOST-AUDITED LIKELY-PASS, but DEVICE-PROVEN FAIL). The
+        // audit model (tools/app_closure_audit.py) UNDER-COUNTED it: `apt install xpdf`
+        // fails `dpkg --configure` with `x11-common` postinst exit 127 (sources the debconf
+        // confmodule + calls update-rc.d/invoke-rc.d, neither in the base) + `libpaper1`
+        // postinst exit 2 (`. /usr/share/debconf/confmodule; db_get; ucf` under set -e with
+        // NO debconf frontend / NO ucf). The fix added x11-common + libpaper1 (+ xfonts-*/
+        // xserver-common siblings) to CASCADE_TRIGGERS, so xpdf now correctly audits HEAVY.
+        // NOTE this is NOT "all X11": xcalc (package x11-apps) is not even in noble main+
+        // universe — it runs via the dedicated x11-stage overlay, never this apt path — so
+        // it is unaffected. PDF viewing remains reachable only once the install-configure
+        // postinst-neutralizer (the gnome-platform AptInstaller fix) is generalized to the
+        // x11-common/libpaper1 postinsts and device-verified. (nsxiv DROPPED below for the
+        // same x11-common+libpaper1 reason.)
         // qalculate-gtk — GTK3 강력 계산기(단위/통화/대수/플롯). galculator 보다 기능이
         // 월등하나 닫힘 부류는 같다. HOST-AUDITED LIKELY-PASS (tools/app_closure_audit.py):
         // 설치 DELTA 62-패키지가 galculator envelope ⊕ {qalculate leaf + libqalculate}이고
@@ -661,30 +659,47 @@ object BundledCatalog {
             installSizeBytes = 6_804_480L,
             source = AppSource.APT,
         ),
-        // nsxiv — Xlib 경량 이미지 뷰어(sxiv 의 유지보수 포크). xcalc/xpdf 와 같은
-        // X11→Xwayland 경로의 이미지 뷰어 폭 확장(GTK 비의존, 순수 Xlib). HOST-AUDITED
-        // LIKELY-PASS (tools/app_closure_audit.py): 설치 DELTA 33-패키지(libimlib2t64/
-        // libexif12 등), exit-73 maintainer-script 트리거 0 — deb 52KB. ⚠ 두 가지 주의:
-        // (1) X11 앱이라 Xwayland(rootful)가 떠 있어야 한다(xcalc 동일 경로); (2)
-        // nsxiv.desktop 은 NoDisplay=true(MIME 핸들러 등록용)라 DesktopEntryScanner 가
-        // 드롭한다 → 설치 후 자동 타일 재조정은 안 되지만, 본 카탈로그의 명시 appId→apt
-        // 맵으로 설치/실행은 가능. appId 는 .desktop basename(nsxiv.desktop) 과 일치.
-        // Exec=`nsxiv %F`(strip), 바이너리 /usr/bin/nsxiv — 푸시한 test.png 를 인자로 연다.
+        // ⚠ nsxiv — DROPPED (was HOST-AUDITED LIKELY-PASS, but its delta pulls the SAME
+        // x11-common + libpaper1 debconf/init-script postinsts that device-proved-FAIL for
+        // xpdf — plus xfonts-utils/xfonts-encodings). With the corrected audit model it now
+        // audits HEAVY(x11-common, libpaper1, xfonts-*). Drop it for the same reason as
+        // xpdf; re-add only after the x11-common/libpaper1 install-configure neutralizer is
+        // device-verified.
+        // ----------------------------------------------------------------------------- //
+        // gnome-calculator — GNOME-platform GTK4 계산기. TASK-A: gnome-platform 클래스의
+        // 첫 해금 대상. 설치 DELTA(78)가 gsettings-desktop-schemas + libappstream5 +
+        // session-migration + glib-networking* 를 끌어 기본 dpkg --configure 가 exit-73
+        // 로 실패한다(mate-calc/qalculate-gtk 와 결정적 차이). 이를 두 갈래로 푼다:
+        //   (1) 설치-configure: AptInstaller 가 GNOME 패키지 설치 시 (a) policy-rc.d=101 +
+        //       DEBIAN_FRONTEND=noninteractive 로 x11-common/session-migration 의 init/
+        //       systemd 등록 postinst 를 무력화하고, (b) gschemas 를 HOST 에서 미리 컴파일한
+        //       common-data `schemas` 그룹 오버레이(gschemas.compiled)를 깔아 gsettings
+        //       스키마 런타임 요구를 만족시킨다 → installed=true 도달(host-analyzable).
+        //   (2) 런타임 session-dbus: 실행 직전 게스트에서 `dbus-daemon --session` 을 띄우고
+        //       DBUS_SESSION_BUS_ADDRESS / GSETTINGS_SCHEMA_DIR 를 export(GNOME 앱에만,
+        //       NativeAppSession 의 gnome-platform 게이트). dbus-daemon 은 dbus-daemon-
+        //       stage.tar 오버레이로 제공(base 는 libdbus-1.so.3 만 가짐).
+        // appId 는 .desktop basename(org.gnome.Calculator.desktop) 과 일치 → 설치 후
+        // DesktopEntryScanner 가 타일 재조정. Exec=`gnome-calculator`, 바이너리
+        // /usr/bin/gnome-calculator. ⚠ HONEST: device 미검증(소유 에이전트 점유) — 본
+        // 변경은 host-analyzable 한 installed=true 경로 + 런타임 shim 배선까지이며, 최종
+        // 창 렌더는 DEVICE-VERIFY 체크리스트 항목이다.
         CatalogApp(
-            appId = "nsxiv",
-            name = "nsxiv",
-            summary = "초경량 X11 이미지 뷰어",
-            entry = LaunchEntry(LaunchEntry.EntryKind.EXEC, "/usr/bin/nsxiv"),
-            category = AppCategory.GRAPHICS,
-            description = "Xlib 기반의 초경량 이미지 뷰어(sxiv 의 유지보수 포크, GTK 비의존). " +
-                "xcalc/xpdf 와 같은 X11→Xwayland 경로로 동작 — Xwayland(rootful)가 떠 있어야 " +
-                "한다. 설치 delta(33 패키지)에 exit-73 maintainer-script 트리거가 0 이다" +
-                "(host-audited). 참고: nsxiv.desktop 은 NoDisplay=true 라 설치 후 런처 타일이 " +
-                "자동 등장하지는 않는다(카탈로그에서 설치/실행). noble 패키지 nsxiv → " +
-                "/usr/share/applications/nsxiv.desktop.",
-            rootfsDeps = listOf(RootfsDep(RootfsDepKind.APT, "nsxiv", 190_464L)),
+            appId = "org.gnome.Calculator",
+            name = "GNOME Calculator",
+            summary = "GNOME 계산기(GTK4, 단위·통화·프로그래머 모드)",
+            entry = LaunchEntry(LaunchEntry.EntryKind.EXEC, "/usr/bin/gnome-calculator"),
+            category = AppCategory.UTILITY,
+            description = "GNOME 플랫폼 GTK4 계산기 — 기본/고급/금융/프로그래밍 모드. " +
+                "gnome-platform 클래스라 설치 시 gsettings-desktop-schemas/appstream/" +
+                "session-migration postinst 가 exit-73 로 실패하던 것을, (1) AptInstaller 의 " +
+                "GNOME 설치-configure 무력화(policy-rc.d=101 + noninteractive) + HOST 사전 " +
+                "컴파일 gschemas 오버레이, (2) 실행 시 guest dbus-daemon --session 셔임으로 " +
+                "해금한다. noble 패키지 gnome-calculator → " +
+                "/usr/share/applications/org.gnome.Calculator.desktop.",
+            rootfsDeps = listOf(RootfsDep(RootfsDepKind.APT, "gnome-calculator", 4_300_000L)),
             display = DisplaySpec(DisplaySpec.DisplayMode.WINDOWED),
-            installSizeBytes = 190_464L,
+            installSizeBytes = 4_300_000L,
             source = AppSource.APT,
         ),
     )

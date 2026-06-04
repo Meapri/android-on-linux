@@ -105,18 +105,33 @@ def test_every_entry_well_formed(catalog_block: str):
 
 
 def test_appid_equals_apt_name_equals_binary_basename(catalog_block: str):
-    # The reconciliation contract: appId == .desktop basename, and for these single-leaf
-    # apps appId == apt package name == the EXEC binary basename. (Qalculate ships
-    # qalculate-gtk for all three; x-prefixed Xlib apps likewise.)
+    # The reconciliation contract: appId == .desktop basename. For the simple single-leaf
+    # apps that is also == apt package name == the EXEC binary basename (galculator,
+    # qalculate ships qalculate-gtk for all three). GNOME-platform apps are the exception:
+    # their .desktop basename is the reverse-DNS app-id (org.gnome.Calculator) while the apt
+    # package + binary are the short name (gnome-calculator) — so for those we require
+    # apt-ref == binary basename, and the appId to be the reverse-DNS form of the binary.
     for e in _entries(catalog_block):
         app_id = e["appId"]
         binary = e["entryTarget"].rsplit("/", 1)[-1]
-        assert e["depRef"] == app_id, (
-            f"{app_id}: apt ref {e['depRef']!r} must equal appId for tile reconciliation"
-        )
-        assert binary == app_id, (
-            f"{app_id}: EXEC binary basename {binary!r} must equal appId"
-        )
+        if "." in app_id:  # reverse-DNS GNOME-platform app-id
+            assert e["depRef"] == binary, (
+                f"{app_id}: apt ref {e['depRef']!r} must equal the EXEC binary basename "
+                f"{binary!r} for a reverse-DNS GNOME app"
+            )
+            # the reverse-DNS id's last segment should relate to the binary (Calculator ↔
+            # gnome-calculator) — assert the binary is gnome-* and the id is org.gnome.*.
+            assert app_id.startswith("org.gnome.") and binary.startswith("gnome-"), (
+                f"{app_id}: reverse-DNS app-id must be an org.gnome.* / gnome-* pair, got "
+                f"binary {binary!r}"
+            )
+        else:
+            assert e["depRef"] == app_id, (
+                f"{app_id}: apt ref {e['depRef']!r} must equal appId for tile reconciliation"
+            )
+            assert binary == app_id, (
+                f"{app_id}: EXEC binary basename {binary!r} must equal appId"
+            )
 
 
 def test_appids_unique(catalog_block: str):
@@ -157,18 +172,35 @@ def test_no_stale_no_systemd_dbus_closure_claim(catalog_block: str):
 # --------------------------------------------------------------------------- #
 def test_new_likely_pass_apps_present(catalog_block: str):
     ids = {e["appId"] for e in _entries(catalog_block)}
-    # existing audited + new additions
+    # The galculator-class LIKELY-PASS set (xpdf + nsxiv DROPPED — see below — because the
+    # corrected audit flags their x11-common+libpaper1 postinsts), plus the gnome-platform
+    # TASK-A addition org.gnome.Calculator.
     expected = {
         "galculator", "htop", "sakura", "l3afpad", "gpicview", "xarchiver",
-        "viewnior", "xzgv", "xpdf", "qalculate-gtk", "nsxiv",
+        "viewnior", "xzgv", "qalculate-gtk", "org.gnome.Calculator",
     }
     missing = expected - ids
     assert not missing, f"catalog missing expected entries: {sorted(missing)}"
 
 
-def test_xpdf_and_nsxiv_marked_x11_path(catalog_block: str):
-    # The Xlib apps must document the Xwayland (rootful) requirement, since they don't
-    # use the Wayland GDK backend the GTK apps do.
-    assert "Xwayland" in catalog_block
-    # nsxiv must document its NoDisplay caveat (no auto-tile).
-    assert "NoDisplay=true" in catalog_block
+def test_xpdf_and_nsxiv_dropped_for_x11_postinst(catalog_block: str):
+    # xpdf + nsxiv were DROPPED as catalog *entries* (device-proven x11-common exit 127 +
+    # libpaper1 exit 2). They must NOT appear as installable CatalogApp entries, but the
+    # source must DOCUMENT why (the corrected audit, the x11-common/libpaper1 postinsts).
+    ids = {e["appId"] for e in _entries(catalog_block)}
+    assert "xpdf" not in ids, "xpdf must be dropped (device-proven configure FAIL)"
+    assert "nsxiv" not in ids, "nsxiv must be dropped (same x11-common+libpaper1 reason)"
+    # the drop must be explained with the empirical exit codes + trigger packages.
+    assert "x11-common" in catalog_block and "libpaper1" in catalog_block
+    assert "exit 127" in catalog_block and "exit 2" in catalog_block
+
+
+def test_gnome_calculator_documents_the_two_part_fix(catalog_block: str):
+    # The gnome-calculator entry must explain BOTH halves of the TASK-A unlock so the
+    # catalog stays self-documenting: (1) install-configure neutralizer + precompiled
+    # gschemas, (2) the runtime session-dbus shim.
+    assert "org.gnome.Calculator" in catalog_block
+    assert "gschemas" in catalog_block.lower() or "gschemas.compiled" in catalog_block
+    assert "dbus-daemon" in catalog_block or "dbus-run-session" in catalog_block
+    # honest device-pending note (do not overclaim a device run)
+    assert "device" in catalog_block.lower()

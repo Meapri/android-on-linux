@@ -97,6 +97,22 @@ CASCADE_TRIGGERS: frozenset[str] = frozenset({
     # explicit daemons whose postinst would need a live init
     "avahi-daemon", "cups-daemon", "rtkit",
     "policykit-1", "polkitd", "accountsservice", "packagekit", "colord",
+    # X11 init-script + debconf/ucf registration postinsts (xpdf class). DEVICE-PROVEN:
+    # `apt install xpdf` failed `dpkg --configure` with `x11-common` postinst exit 127 +
+    # `libpaper1` postinst exit 2 (project memory). x11-common's postinst sources the
+    # debconf confmodule (`db_purge`) and, when an init script exists, calls
+    # `update-rc.d`/`invoke-rc.d` — none of which the base ships (only dpkg-trigger is
+    # present), so it exits 127 (command not found). libpaper1's postinst does
+    # `. /usr/share/debconf/confmodule; db_get libpaper/defaultpaper; ucf …` under
+    # `set -e` with NO running debconf frontend and NO `ucf`, so it exits 2. Their X11
+    # siblings (`xfonts-*`/`xserver-common`) run the same `update-fonts-*`/`update-rc.d`
+    # registration and fail identically. This is NOT "all X11": a pure-Xlib app whose
+    # delta has none of these (e.g. one served by the x11-stage overlay) is unaffected —
+    # `xcalc` (package `x11-apps`) is not even in noble main+universe so it never reaches
+    # this audit; it runs via the dedicated x11 overlay, not an apt-configure. The
+    # exit-73 trigger is specifically this debconf/init-script-postinst set in the DELTA.
+    "x11-common", "libpaper1",
+    "xfonts-utils", "xfonts-encodings", "xfonts-base", "xserver-common",
 })
 
 # Package-name PREFIXES that are also cascade triggers (family installs that run a
@@ -118,6 +134,7 @@ class Verdict(str, Enum):
     HEAVY = "HEAVY"               # ≥1 cascade trigger in the install delta
     UNSAT = "UNSAT"               # closure has unsatisfied deps (cannot apt-install)
     MISSING = "MISSING"           # target package absent from the index
+    ALREADY_INSTALLED = "ALREADY-INSTALLED"  # target itself is base-provided (apt no-op)
 
 
 # --------------------------------------------------------------------------- #
@@ -137,7 +154,10 @@ class AuditResult:
 
     @property
     def likely_pass(self) -> bool:
-        return self.verdict == Verdict.LIKELY_PASS.value
+        """True iff the app installs+configures clean: galculator-class (LIKELY-PASS) OR
+        already in the base (ALREADY-INSTALLED — `apt install` is a no-op, so there is no
+        configure cascade to fail). Both are "reachable today, no shim"."""
+        return self.verdict in (Verdict.LIKELY_PASS.value, Verdict.ALREADY_INSTALLED.value)
 
     def as_dict(self) -> dict:
         return {
@@ -160,6 +180,13 @@ def classify(
     """Audit one package against ``index`` + the base ``base_installed`` set.
 
     PURE / offline. The verdict is:
+      * ALREADY-INSTALLED — the TARGET package is itself in ``base_installed`` (the base
+                   rootfs already ships it): ``apt install`` is a no-op, so NO maintainer
+                   script in its closure ever runs → it cannot trigger the exit-73 cascade.
+                   This is checked FIRST and is why a base-provided app like ``gimp`` (whose
+                   *closure* drags x11-common+libpaper1) is PASS on device even though those
+                   two packages ARE exit-73 triggers: their postinsts simply never execute,
+                   because gimp+its deps are already configured in the base.
       * MISSING  — the target does not resolve to any package in the index;
       * UNSAT    — the closure resolves but has ≥1 unsatisfied dep group;
       * HEAVY    — the install delta (closure − base_installed) contains ≥1 cascade
@@ -168,6 +195,16 @@ def classify(
     """
     if provides_map is None:
         provides_map = build_provides_map(index)
+
+    # Base-provided target → `apt install` is a no-op; no maintainer script runs. Checked
+    # BEFORE the trigger scan so a base app (gimp) is never condemned by a trigger that
+    # lives only in its already-satisfied closure (x11-common/libpaper1). This mirrors the
+    # runtime: NativeAlrRuntime.install() returns Done idempotently if already installed.
+    if package in base_installed:
+        return AuditResult(
+            package=package, verdict=Verdict.ALREADY_INSTALLED.value,
+            closure_size=0, delta_size=0, cascade_triggers=(), unsatisfied=(),
+        )
 
     log: list[str] = []
     closure = resolve_closure([package], index, provides_map=provides_map, log=log)
@@ -302,13 +339,35 @@ Package: brokenapp
 Version: 1.0
 Depends: libc6, libdoesnotexist-1
 Filename: pool/main/b/brokenapp/brokenapp_1.0_arm64.deb
+
+Package: x11app
+Version: 1.0
+Depends: libc6, x11-common, libpaper1
+Filename: pool/main/x/x11app/x11app_1.0_arm64.deb
+
+Package: x11-common
+Version: 7.7
+Depends: libc6
+Filename: pool/main/x/xorg/x11-common_7.7_arm64.deb
+
+Package: libpaper1
+Version: 1.1
+Depends: libc6
+Filename: pool/main/libp/libpaper/libpaper1_1.1_arm64.deb
+
+Package: baseapp
+Version: 1.0
+Depends: libc6, x11-common, libpaper1
+Filename: pool/main/b/baseapp/baseapp_1.0_arm64.deb
 """
 
 # What the reconstructed base dpkg DB marks installed: the GTK stack + glib + smi
 # (the base ships their .so/data) but NOT dbus/systemd/dconf-service/libpam-systemd
-# (no daemon binaries in the base) — matching the real base installed-set.
+# (no daemon binaries in the base) — matching the real base installed-set. ``baseapp``
+# mirrors gimp: it is itself base-provided, so it is ALREADY-INSTALLED even though its
+# closure drags the exit-73 X11 triggers x11-common+libpaper1 (their postinsts never run).
 _FIXTURE_BASE_INSTALLED = {
-    "libc6", "libgtk-3-0t64", "libglib2.0-0t64", "shared-mime-info",
+    "libc6", "libgtk-3-0t64", "libglib2.0-0t64", "shared-mime-info", "baseapp",
 }
 
 
@@ -347,6 +406,24 @@ def _selftest() -> int:
     check("gnomeapp cascade triggers include gsettings-desktop-schemas+libappstream5",
           {"gsettings-desktop-schemas", "libappstream5"} <= set(gn.cascade_triggers))
 
+    # --- x11app: xpdf-class — x11-common+libpaper1 debconf/init postinsts → HEAVY --- #
+    x11 = classify("x11app", index, base)
+    check("x11app verdict HEAVY (x11-common+libpaper1 postinsts)", x11.verdict == "HEAVY")
+    check("x11app cascade triggers include x11-common + libpaper1",
+          {"x11-common", "libpaper1"} <= set(x11.cascade_triggers))
+    check("x11app not likely_pass", x11.likely_pass is False)
+
+    # --- baseapp: gimp-class — base-provided target → ALREADY-INSTALLED ------ #
+    # Its closure ALSO drags x11-common+libpaper1, but because the TARGET itself is in the
+    # base installed-set, `apt install` is a no-op and those postinsts never run → PASS.
+    bp = classify("baseapp", index, base)
+    check("baseapp verdict ALREADY-INSTALLED (base-provided target)",
+          bp.verdict == "ALREADY-INSTALLED")
+    check("baseapp likely_pass True despite x11 triggers in its closure",
+          bp.likely_pass is True)
+    check("baseapp reports no triggers (closure not even computed)",
+          bp.cascade_triggers == () and bp.delta == ())
+
     # --- brokenapp: unsatisfiable dep → UNSAT ------------------------------ #
     bk = classify("brokenapp", index, base)
     check("brokenapp verdict UNSAT", bk.verdict == "UNSAT")
@@ -367,6 +444,12 @@ def _selftest() -> int:
           is_cascade_trigger("gsettings-desktop-schemas"))
     check("gstreamer1.0-plugins-base IS a cascade trigger (prefix)",
           is_cascade_trigger("gstreamer1.0-plugins-base"))
+    check("x11-common IS a cascade trigger (device-proven exit 127)",
+          is_cascade_trigger("x11-common"))
+    check("libpaper1 IS a cascade trigger (device-proven exit 2)",
+          is_cascade_trigger("libpaper1"))
+    check("xfonts-utils IS a cascade trigger (X11 sibling)",
+          is_cascade_trigger("xfonts-utils"))
 
     # --- determinism + catalog audit --------------------------------------- #
     res = audit_catalog(["gtkapp", "dictapp", "gnomeapp", "brokenapp"], index, base)

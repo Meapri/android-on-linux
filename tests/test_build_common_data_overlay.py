@@ -38,6 +38,8 @@ from tools.build_common_data_overlay import (
     DBUS_SESSION_CONF_PATH,
     LOCALE_PREFIX,
     MACHINE_ID_PATHS,
+    SCHEMAS_COMPILED,
+    SCHEMAS_DIR,
     STUB_MACHINE_ID,
     assemble_ca_bundle,
     build_common_data_overlay,
@@ -89,8 +91,19 @@ def test_builder_module_file_exists():
     assert Path(bcd.__file__).is_file()
 
 
-def test_all_groups_are_the_five_documented():
-    assert set(ALL_GROUPS) == {"ca", "mime", "icons", "machine-id", "locale"}
+def test_all_groups_are_the_six_documented():
+    assert set(ALL_GROUPS) == {"ca", "mime", "icons", "machine-id", "locale", "schemas"}
+
+
+def test_packages_for_groups_schemas():
+    assert packages_for_groups(["schemas"]) == ["gsettings-desktop-schemas"]
+
+
+def test_packages_for_groups_schemas_with_app_package():
+    # the extra per-app schema package is appended after gsettings-desktop-schemas
+    assert packages_for_groups(["schemas"], schema_packages=("gnome-calculator",)) == [
+        "gsettings-desktop-schemas", "gnome-calculator",
+    ]
 
 
 def test_canonical_paths_are_debian_rooted():
@@ -262,6 +275,75 @@ def test_locale_group_packs_only_c_utf8(tmp_path: Path):
     assert res.locale_file_count == 2
     rep = validate_stage_tar(str(out))
     assert rep.conformant, rep.errors
+
+
+# --------------------------------------------------------------------------- #
+# schemas group (gnome-platform unlock) — host glib-compile-schemas
+# --------------------------------------------------------------------------- #
+
+_APP_SCHEMA = (
+    b'<?xml version="1.0" encoding="UTF-8"?>\n<schemalist>\n'
+    b'  <schema id="org.test.App" path="/org/test/App/">\n'
+    b'    <key name="width" type="i"><default>800</default></key>\n'
+    b'  </schema>\n</schemalist>\n'
+)
+_BASE_SCHEMA = (
+    b'<?xml version="1.0" encoding="UTF-8"?>\n<schemalist>\n'
+    b'  <schema id="org.gtk.Base" path="/org/gtk/Base/">\n'
+    b'    <key name="theme" type="s"><default>"x"</default></key>\n'
+    b'  </schema>\n</schemalist>\n'
+)
+
+
+def _schemas_build(tmp_path: Path):
+    """Build the schemas overlay offline (synthetic schema deb + base) → (out, res, names)."""
+    deb = _make_synthetic_deb(tmp_path, "gsds.deb", {
+        SCHEMAS_DIR + "/org.test.App.gschema.xml": _APP_SCHEMA,
+        "usr/share/doc/x/README": b"not a schema\n",   # must NOT be packed
+    })
+    base_tar = tmp_path / "base.tar"
+    with tarfile.open(base_tar, "w") as bt:
+        ti = tarfile.TarInfo("./" + SCHEMAS_DIR + "/org.gtk.Base.gschema.xml")
+        ti.size = len(_BASE_SCHEMA); ti.mode = 0o644
+        bt.addfile(ti, io.BytesIO(_BASE_SCHEMA))
+    cache = tmp_path / "cache"; cache.mkdir()
+    shutil.copy(deb, cache / "gsds.deb")
+    idx = {"gsettings-desktop-schemas": {"Filename": "pool/x/gsds.deb"}}
+    out = tmp_path / "schemas.tar"
+    res = build_common_data_overlay(out, ["schemas"], index=idx, cache_dir=cache,
+                                    base=base_tar)
+    names, _ = _names_bodies(out)
+    return out, res, names
+
+
+@pytest.mark.skipif(shutil.which("ar") is None, reason="needs `ar` to synthesize a .deb")
+def test_schemas_group_ships_new_xml_not_base_and_skips_unrelated(tmp_path: Path):
+    out, res, names = _schemas_build(tmp_path)
+    new_xml = "./" + SCHEMAS_DIR + "/org.test.App.gschema.xml"
+    base_xml = "./" + SCHEMAS_DIR + "/org.gtk.Base.gschema.xml"
+    assert new_xml in names, "the new app .gschema.xml must be shipped"
+    assert base_xml not in names, "base .gschema.xml must NOT be re-shipped"
+    assert "./usr/share/doc/x/README" not in names, "unrelated file must not be packed"
+    assert res.schema_xml_count == 1
+    rep = validate_stage_tar(str(out))
+    assert rep.conformant, rep.errors
+
+
+@pytest.mark.skipif(
+    shutil.which("ar") is None or shutil.which("glib-compile-schemas") is None,
+    reason="needs `ar` + glib-compile-schemas to compile the gschemas binary",
+)
+def test_schemas_group_compiles_superset_gschemas(tmp_path: Path):
+    out, res, names = _schemas_build(tmp_path)
+    comp = "./" + SCHEMAS_COMPILED
+    assert comp in names, "gschemas.compiled must be shipped when the compiler is present"
+    assert res.schemas_compiled is True
+    # the compiled binary is a SUPERSET: it must contain BOTH the base and the app schema id
+    # (so re-compiling never drops the base GTK schemas).
+    with tarfile.open(out) as t:
+        blob = t.extractfile(comp).read()
+    assert b"org.gtk.Base" in blob, "compiled binary lost the base schema (not a superset)"
+    assert b"org.test.App" in blob, "compiled binary missing the new app schema"
 
 
 # --------------------------------------------------------------------------- #

@@ -117,10 +117,24 @@ class NativeAppSession internal constructor(
             setEnv("ALR_TEE_GUEST_STDOUT", "1")  // stream guest stderr/stdout to logcat
             for ((k, v) in request.env) setEnv(k, v)
 
+            // --- GNOME-platform session-dbus shim (TASK-A2; gated, no-op otherwise) ----
+            // GTK4/GNOME apps register a unique GtkApplication name on the SESSION bus and
+            // read GSettings; the base ships only the libdbus CLIENT (no dbus-daemon). For a
+            // gnome-platform appId we (a) point GSETTINGS_SCHEMA_DIR at the rootfs schemas
+            // dir (the host-precompiled gschemas.compiled from the common-data `schemas`
+            // overlay), and (b) WRAP the launch in `dbus-run-session --` (from the
+            // dbus-daemon overlay) so a private session bus is started, DBUS_SESSION_BUS_
+            // ADDRESS exported, and torn down on exit — all in the ONE blocking guest call,
+            // no loader change. Non-GNOME apps and a missing overlay degrade to the plain
+            // launch (GTK4 then falls back to a non-unique app, GSETTINGS_BACKEND=memory
+            // already set natively). See GnomePlatformShim.
+            for ((k, v) in GnomePlatformShim.envFor(appId, request.entryPath)) setEnv(k, v)
+            val launch = GnomePlatformShim.wrap(appId, rootfsDir, request.entryPath, request.args)
+
             // --- program-spec: NEWLINE-delimited argv ---------------------------------
             val program = buildString {
-                append(request.entryPath)
-                for (a in request.args) { append('\n'); append(a) }
+                append(launch.first)
+                for (a in launch.second) { append('\n'); append(a) }
             }
             Log.i(TAG, "[$appId] launching guest: ${program.replace('\n', ' ')}")
 
@@ -274,8 +288,13 @@ class NativeAppSession internal constructor(
         // androlinux SONAMEs (private-dir, so the frozen guard does not arbitrate), so
         // ANGLE is an explicit OPT-IN gated on /data/local/tmp/.alr-angle in
         // MainActivity — never auto-staged here where it could shadow gpushim.
+        // gnome-schemas ships the host-precompiled gschemas.compiled (+ new .gschema.xml)
+        // and dbus-daemon ships /usr/bin/dbus-daemon + dbus-run-session — the two overlays
+        // the gnome-platform launch shim (GnomePlatformShim) needs. Both staged best-effort
+        // (no-op when their tars are absent), so a non-GNOME launch is unaffected.
         private val OVERLAY_NAMES =
-            listOf("interpose", "nss", "xkb-gegl", "babl-gegl", "x11", "pulse", "vk-icd", "vk-loader")
+            listOf("interpose", "nss", "xkb-gegl", "babl-gegl", "x11", "pulse", "vk-icd",
+                   "vk-loader", "gnome-schemas", "dbus-daemon")
 
         // The loader report's status line, e.g. "alr native loader child exit=0 signal=0".
         private val SIGNAL_RE = Regex("""child exit=(-?\d+) signal=(\d+)""")
@@ -289,5 +308,108 @@ class NativeAppSession internal constructor(
             val m = SIGNAL_RE.find(report) ?: return false
             return m.groupValues[2].toIntOrNull() == 0
         }
+    }
+}
+
+// --------------------------------------------------------------------------- //
+// GnomePlatformShim — session-dbus + GSettings launch shaping for GNOME apps
+// --------------------------------------------------------------------------- //
+
+/**
+ * The runtime half of the GNOME-platform unlock (TASK-A2). GTK4 / GNOME apps differ from
+ * the galculator-class GTK3 apps in two startup requirements the base does not satisfy:
+ *
+ *   1. **GSettings schemas** — they read keys from many `org.gnome.*` schemas. The base
+ *      ships only ~4 GTK schemas compiled and has NO `glib-compile-schemas`. The
+ *      common-data `schemas` overlay (tools/build_common_data_overlay.py `--schemas`) ships
+ *      a host-precompiled `gschemas.compiled` that is a SUPERSET (base GTK ∪ gnome-desktop
+ *      ∪ the app's own). We point `GSETTINGS_SCHEMA_DIR` at that rootfs dir so GLib finds it
+ *      even if XDG_DATA_DIRS path-mediation is flaky. (The native runtime already sets
+ *      `GSETTINGS_BACKEND=memory`, so settings WRITES go to memory — no dconf/system bus
+ *      needed; only the compiled schema DEFAULTS must be present, which this provides.)
+ *
+ *   2. **Session D-Bus** — `GtkApplication` registers a unique bus name on the SESSION bus;
+ *      the base ships only the libdbus client (no `dbus-daemon`). When the dbus-daemon
+ *      overlay is staged we WRAP the launch in `dbus-run-session -- <app>`: it starts a
+ *      private session bus, exports `DBUS_SESSION_BUS_ADDRESS`, runs the app, and tears the
+ *      bus down on exit — entirely inside the ONE blocking guest call the loader already
+ *      runs (no loader / sandbox change). If `dbus-run-session` is absent (overlay not
+ *      staged) we launch the app directly; GTK4 then falls back to a non-unique application
+ *      (a warning, not a crash).
+ *
+ * Strictly GATED on the appId being a known GNOME-platform app (or its binary living under
+ * `/usr/bin/gnome-*` / `/usr/bin/org.gnome.*`), so every non-GNOME launch is byte-identical
+ * to before. PURE/deterministic given the rootfs dir + appId (the only IO is a `File.exists`
+ * probe of the staged `dbus-run-session`), which makes it host-unit-testable.
+ */
+internal object GnomePlatformShim {
+
+    /** Rootfs path of the session-bus wrapper shipped by the dbus-daemon overlay. */
+    private const val DBUS_RUN_SESSION = "usr/bin/dbus-run-session"
+    /** Rootfs dir holding the host-precompiled gschemas.compiled (schemas overlay). */
+    private const val SCHEMAS_DIR = "/usr/share/glib-2.0/schemas"
+
+    /**
+     * Known GNOME-platform appIds (= their `.desktop` basename, the catalog launch key).
+     * These are the gnome-platform-ONLY apps the feasibility doc marks reachable with this
+     * shim (no perl / sandbox / gstreamer): gnome-calculator and its close siblings.
+     */
+    private val GNOME_APP_IDS = setOf(
+        "org.gnome.Calculator",
+        "org.gnome.TextEditor",
+        "org.gnome.gedit",      // gedit's app-id form (older)
+        "gedit",
+        "org.gnome.eog",
+        "org.gnome.Eog",
+        "eog",
+        "org.gnome.FileRoller",
+        "file-roller",
+    )
+
+    /** True iff [appId] (or [entryPath]) identifies a GNOME-platform app this shim targets. */
+    fun isGnomePlatform(appId: String, entryPath: String = ""): Boolean {
+        if (appId in GNOME_APP_IDS) return true
+        // Fallback: gnome-* / org.gnome.* binaries under /usr/bin (covers discovered apps
+        // launched by .desktop Exec whose appId we didn't enumerate).
+        val bin = entryPath.substringAfterLast('/')
+        return bin.startsWith("gnome-") || appId.startsWith("org.gnome.")
+    }
+
+    /** Extra guest env for a GNOME app (empty for non-GNOME). */
+    fun envFor(appId: String, entryPath: String = ""): Map<String, String> =
+        if (isGnomePlatform(appId, entryPath))
+            mapOf("GSETTINGS_SCHEMA_DIR" to SCHEMAS_DIR)
+        else
+            emptyMap()
+
+    /**
+     * Shape the launch for [appId]. Returns (entryPath, args) — UNCHANGED for a non-GNOME
+     * app, or `dbus-run-session -- <entryPath> <args…>` for a GNOME app WHEN the dbus-daemon
+     * overlay is staged (so a session bus hosts GtkApplication). If the wrapper is absent the
+     * original launch is returned (graceful degradation — the app still starts).
+     */
+    fun wrap(
+        appId: String,
+        rootfsDir: File,
+        entryPath: String,
+        args: List<String>,
+    ): Pair<String, List<String>> {
+        if (!isGnomePlatform(appId, entryPath)) return entryPath to args
+        val wrapper = File(rootfsDir, DBUS_RUN_SESSION)
+        if (!wrapper.isFile) {
+            Log.i(TAG, "[$appId] gnome-shim: $DBUS_RUN_SESSION not staged — launching " +
+                "without a session bus (GtkApplication falls back to non-unique)")
+            return entryPath to args
+        }
+        Log.i(TAG, "[$appId] gnome-shim: wrapping launch in dbus-run-session (session bus + " +
+            "GSETTINGS_SCHEMA_DIR=$SCHEMAS_DIR)")
+        // dbus-run-session [--] <program> <args…>. The `--` guards against the app's own
+        // args being parsed as dbus-run-session options.
+        val wrapped = buildList {
+            add("--")
+            add(entryPath)
+            addAll(args)
+        }
+        return "/$DBUS_RUN_SESSION" to wrapped
     }
 }
