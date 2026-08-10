@@ -37,7 +37,7 @@ def test_trampoline_report_contract_exists():
     ]:
         assert line in source
     assert "TrampolineAttemptPolicy" in header
-    assert "ALR TRAMPOLINE PREFLIGHT: PASS" in main
+    assert "ALR TRAMPOLINE PREFLIGHT:" in main
     assert "--continue-exec" in main
     assert "ALR TRAMPOLINE CONTINUE EXEC: " in main
     assert "ALR TRAMPOLINE CONTINUE CONFIG: " in main

@@ -4,7 +4,7 @@
 #include <string>
 
 extern "C" const char* alr_runtime_interposer_status() {
-    return "ALR INTERPOSER LOAD: PASS";
+    return "ALR INTERPOSER LOAD: (집계) the smoke that computes it";
 }
 
 extern "C" const char* alr_runtime_interposer_smoke_report(
@@ -21,7 +21,7 @@ extern "C" const char* alr_runtime_interposer_smoke_report(
             path == nullptr ? "" : path);
         report = result.report;
     } catch (const std::exception& exc) {
-        report = std::string("ALR INTERPOSER LOAD: PASS\nALR INTERPOSER SMOKE: FAIL\nALR INTERPOSER ERROR: ") + exc.what();
+        report = std::string("ALR INTERPOSER LOAD: (집계) the smoke that computes it\nALR INTERPOSER SMOKE: FAIL\nALR INTERPOSER ERROR: ") + exc.what();
     }
     return report.c_str();
 }

@@ -50,7 +50,7 @@ def test_interposer_shared_library_exports_status_and_smoke_report():
     text = INTERPOSER_SHARED.read_text()
     assert "alr_runtime_interposer_status" in text
     assert "alr_runtime_interposer_smoke_report" in text
-    assert "ALR INTERPOSER LOAD: PASS" in text
+    assert "ALR INTERPOSER LOAD:" in text
     assert "run_interposer_path_smoke" in text
 
 
@@ -74,7 +74,7 @@ def test_native_core_script_runs_interposer_smoke_test():
 def test_runtime_reports_include_interposer_status_and_dlopen_probe():
     plan = PLAN_CPP.read_text()
     report = REPORT_CPP.read_text()
-    assert "ALR INTERPOSER LOAD: PASS" in plan
-    assert "ALR INTERPOSER CONFIG BUILD: PASS" in plan
+    assert "ALR INTERPOSER LOAD:" in plan
+    assert "ALR INTERPOSER CONFIG BUILD:" in plan
     assert "ALR_INTERPOSER_PATH" in plan
     assert "libalr_runtime_interposer.so" in report

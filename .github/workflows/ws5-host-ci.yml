@@ -29,3 +29,15 @@ jobs:
 
       - name: Run host pytest suite
         run: uvx pytest tests/ -q
+
+      # A line that reports PASS must be able to report FAIL. Several verdicts
+      # in the native report were string literals -- including one about
+      # app-data exec policy that contradicted the function two above it and
+      # had never asked the kernel anything.
+      - name: unconditional verdict gate
+        run: bash scripts/check-unconditional-verdicts.sh
+
+      # A Git LFS pointer builds, installs, and produces an app with no rootfs;
+      # a whole 1,592-line device report was captured in that state.
+      - name: git-lfs materialization gate
+        run: bash scripts/check-lfs-materialized.sh

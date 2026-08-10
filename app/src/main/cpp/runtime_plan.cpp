@@ -108,21 +108,34 @@ RuntimeReport build_runtime_report(const RuntimeReportInput& input, const Execut
     out << "can execute: " << (backend.can_execute ? "yes" : "no") << "\n";
     out << "backend reason: " << backend.reason << "\n";
     const auto alr_runtime = build_alr_runtime_launch_plan(input);
-    out << "ALR RUNTIME LAUNCHER AVAILABLE: PASS\n";
-    out << "ALR RUNTIME CONFIG BUILD: PASS\n";
+    // See alr_runtime_launcher.cpp: this was a literal, not a verdict.
+    out << "ALR RUNTIME LAUNCHER AVAILABLE: (측정) ALR BACKEND AVAILABLE\n";
+    // These four were literals in a row. Each names something that CAN fail
+    // -- a config that does not build, a hook or interposer that does not
+    // load -- and each said PASS unconditionally, so the block was decoration
+    // in the middle of an evidence report. They now report the real outcome
+    // where one is computable here, and point at the probe that measures it
+    // where it is not.
+    out << "ALR RUNTIME CONFIG BUILD: "
+        << (alr_runtime.env.count("ALR_ROOTFS") ? "PASS" : "FAIL") << "\n";
     // See alr_runtime_launcher.cpp: this was an unconditional literal about a
     // kernel behaviour nothing had measured. The real verdict comes from
     // build_direct_appdata_exec_probe().
     out << "ALR RUNTIME DIRECT APP-DATA EXEC POLICY: (측정) ALR DIRECT APP-DATA EXECVE\n";
-    out << "ALR HOOK LOAD: PASS\n";
-    out << "ALR HOOK CONFIG BUILD: PASS\n";
-    out << "ALR INTERPOSER LOAD: PASS\n";
-    out << "ALR INTERPOSER CONFIG BUILD: PASS\n";
+    // The hook and interposer report their own verdicts from alr_hook.cpp and
+    // alr_interposer.cpp, which compute them. Restating a PASS here would let
+    // this line disagree with the one that measured it.
+    out << "ALR HOOK LOAD: (집계) alr_hook smoke\n";
+    out << "ALR HOOK CONFIG BUILD: (집계) alr_hook smoke\n";
+    out << "ALR INTERPOSER LOAD: (집계) alr_interposer smoke\n";
+    out << "ALR INTERPOSER CONFIG BUILD: (집계) alr_interposer smoke\n";
     const auto serialized_config = runtime::serialize_runtime_config(build_alr_runtime_config(input, alr_runtime));
     const auto parsed_config = runtime::parse_runtime_config(serialized_config.text);
     const auto exec_resolution = runtime::resolve_guest_executable(parsed_config, input.program);
     const auto launch_attempt = runtime::attempt_guest_launch(parsed_config, input.program);
-    out << "ALR CONFIG SERIALIZE: PASS\n";
+    out << "ALR CONFIG SERIALIZE: "
+        << (!serialized_config.text.empty() && parsed_config.rootfs_dir == 
+            build_alr_runtime_config(input, alr_runtime).rootfs_dir ? "PASS" : "FAIL") << "\n";
     out << "ALR CONFIG PARSE: "
         << (parsed_config.program == input.program ? "PASS" : "FAIL") << "\n";
     out << exec_resolution.report << "\n";

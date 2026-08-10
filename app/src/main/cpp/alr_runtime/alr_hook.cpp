@@ -68,7 +68,13 @@ PathHookSmokeResult run_path_hook_smoke(
     }
 
     std::ostringstream report;
-    report << "ALR HOOK LOAD: PASS";
+    // Was an unconditional "PASS" printed directly above code that had
+    // already computed the outcome. A verdict line that cannot say FAIL is
+    // not a verdict; it is a label wearing one, and the reader cannot tell
+    // the difference. This repo has shipped that shape in several files.
+    report << "ALR HOOK LOAD: "
+           << ((result.opened && result.stated && result.error.empty()) ? "PASS" : "FAIL");
+    if (!result.error.empty()) report << "\nalr hook error=" << result.error;
     report << "\nALR HOOK MODE: host-path-smoke";
     report << "\nALR HOOK GUEST PATH: " << result.translation.guest_path;
     report << "\nALR HOOK HOST PATH: " << result.translation.host_path;

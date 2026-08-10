@@ -4,7 +4,7 @@
 #include <string>
 
 extern "C" const char* alr_runtime_hook_status() {
-    return "ALR HOOK LOAD: PASS";
+    return "ALR HOOK LOAD: (집계) the smoke that computes it";
 }
 
 extern "C" const char* alr_runtime_hook_smoke_report(
@@ -19,7 +19,7 @@ extern "C" const char* alr_runtime_hook_smoke_report(
             path == nullptr ? "" : path);
         report = result.report;
     } catch (const std::exception& exc) {
-        report = std::string("ALR HOOK LOAD: PASS\nALR HOOK SMOKE: FAIL\nALR HOOK ERROR: ") + exc.what();
+        report = std::string("ALR HOOK LOAD: (집계) the smoke that computes it\nALR HOOK SMOKE: FAIL\nALR HOOK ERROR: ") + exc.what();
     }
     return report.c_str();
 }

@@ -22,7 +22,12 @@ std::string required_env(const char* key) {
 }
 
 int run_preflight() {
-    std::cout << "ALR TRAMPOLINE PREFLIGHT: PASS\n";
+    // Not a verdict. Reaching this line means the packaged trampoline was
+    // exec'd, which is worth printing -- but it can never print FAIL, so it
+    // must not wear a PASS/FAIL token. The line that DOES decide is
+    // ALR PACKAGED TRAMPOLINE CONTINUE EXECUTION, which checks a child's
+    // stdout for this program's own marker.
+    std::cout << "ALR TRAMPOLINE PREFLIGHT: reached (the trampoline is running)\n";
     std::cout << "alr trampoline mode=" << env_or_none("ALR_TRAMPOLINE_MODE") << "\n";
     std::cout << "alr trampoline config checksum=" << env_or_none("ALR_CONFIG_CHECKSUM") << "\n";
     std::cout << "alr trampoline target guest=" << env_or_none("ALR_TRAMPOLINE_TARGET_GUEST_PATH") << "\n";

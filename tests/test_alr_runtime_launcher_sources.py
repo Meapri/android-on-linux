@@ -13,7 +13,7 @@ def test_alr_runtime_launcher_exports_absent_safe_status_api():
     assert "alr_runtime_launcher_status" in text
     assert "alr_runtime_launcher_can_execute_guest" in text
     assert "alr_runtime_launcher_policy" in text
-    assert "ALR RUNTIME LAUNCHER AVAILABLE: PASS" in text
+    assert "ALR RUNTIME LAUNCHER AVAILABLE:" in text
     assert "ALR RUNTIME DIRECT APP-DATA EXEC POLICY: (측정) ALR DIRECT APP-DATA EXECVE" in text
     assert "can execute guest=" in text
 
@@ -27,8 +27,8 @@ def test_alr_runtime_launch_plan_is_declared_and_implemented():
     assert "libalr_runtime_hook.so" in source
     assert "libalr_runtime_interposer.so" in source
     assert "libalr_runtime_bridge.so" in source
-    assert "ALR HOOK LOAD: PASS" in source
-    assert "ALR INTERPOSER LOAD: PASS" in source
+    assert "ALR HOOK LOAD:" in source
+    assert "ALR INTERPOSER LOAD:" in source
     assert '"--dry-run"' in source
     assert "guest execution is not implemented yet" in source
 

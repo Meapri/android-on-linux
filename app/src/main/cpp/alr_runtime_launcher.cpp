@@ -7,8 +7,14 @@
 #include "alr_runtime/alr_exec.hpp"
 #include "alr_runtime/alr_launch.hpp"
 
+// This never answered anything: "available" was a literal, so it read PASS in a
+// build with no working launcher at all. There is no cheap predicate for
+// "planning works" that is not just calling it, and calling it needs a config
+// this entry point does not have -- so the honest move is to stop wearing a
+// verdict token. What the app actually consults is AlrRuntime.isAvailable(),
+// which file-tests the alr binary, and the report's ALR BACKEND AVAILABLE line.
 extern "C" const char* alr_runtime_launcher_status() {
-    return "ALR RUNTIME LAUNCHER AVAILABLE: PASS";
+    return "ALR RUNTIME LAUNCHER AVAILABLE: (측정) ALR BACKEND AVAILABLE";
 }
 
 // Whether THIS launcher can hand a guest program off to the alr backend.
@@ -76,7 +82,7 @@ extern "C" const char* alr_runtime_launcher_build_report(
     const auto resolution = alr::runtime::resolve_guest_executable(config, input.program);
     const auto launch_attempt = alr::runtime::attempt_guest_launch(config, input.program);
     std::ostringstream out;
-    out << "ALR RUNTIME LAUNCHER AVAILABLE: PASS";
+    out << alr_runtime_launcher_status();
     out << "\nALR RUNTIME CONFIG BUILD: PASS";
     // Same literal the function above was fixed for; this second copy was
     // missed and kept printing the unmeasured verdict into every device report.

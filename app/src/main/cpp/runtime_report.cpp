@@ -426,7 +426,15 @@ std::string build_syscall_capability_probe() {
     errno = 0; run("unshare", ::syscall(__NR_unshare, 0));
 
     std::ostringstream out;
-    out << "ALR SYSCALL SANDBOX PROBE: PASS";
+    // A HEADER, not a verdict -- the per-syscall results follow. It also could
+    // not detect the zygote filter at all: every syscall it probes
+    // (execveat, symlinkat, linkat, mknodat, clone3, unshare) is in the ALLOWED
+    // set, while the ones actually blocked (set_robust_list 99, accept 202,
+    // rseq 293) are absent from it. "blocked count 0" was a true statement
+    // about the wrong list.
+    out << "ALR SYSCALL SANDBOX PROBE: per-syscall results follow"
+           " (note: this list contains no blocked syscall, so it cannot"
+           " detect the zygote filter)";
     int blocked = 0;
     for (const auto& p : probes) {
         const bool enosys = p.result < 0 && p.saved_errno == ENOSYS;
@@ -464,7 +472,7 @@ std::string build_syscall_capability_probe() {
 // ptrace-all. Done in a forked child so any failure can't take down the app.
 std::string build_seccomp_pathtrap_probe(const alr::RuntimeReportInput& input) {
     std::ostringstream out;
-    out << "ALR SECCOMP PATH-TRAP PROBE: PASS";
+    out << "ALR SECCOMP PATH-TRAP PROBE: the install/rewrite results follow";
 
     const std::string base_dir = !input.app_files_dir.empty() ? input.app_files_dir
                                  : (!input.app_cache_dir.empty() ? input.app_cache_dir : "/data/local/tmp");
@@ -721,7 +729,7 @@ std::string build_seccomp_pathtrap_probe(const alr::RuntimeReportInput& input) {
 // XDG_RUNTIME_DIR pointing at the host socket dir). Forked so a failure is contained.
 std::string build_unix_socket_probe(const alr::RuntimeReportInput& input) {
     std::ostringstream out;
-    out << "ALR UNIX SOCKET TRANSPORT PROBE: PASS";
+    out << "ALR UNIX SOCKET TRANSPORT PROBE: the bind/connect/accept results follow";
     const std::string base_dir = !input.app_files_dir.empty() ? input.app_files_dir
                                  : (!input.app_cache_dir.empty() ? input.app_cache_dir : "/data/local/tmp");
     const std::string sock_path = base_dir + "/alr-wl-test.sock";
@@ -910,7 +918,7 @@ std::string build_gpu_boundary_probe() {
     constexpr int kBatch = 256;
 
     std::ostringstream out;
-    out << "ALR GPU BOUNDARY PROBE: PASS";
+    out << "ALR GPU BOUNDARY PROBE: the per-boundary results follow";
 
     // (1) in-process dispatch through a function pointer (not inlined away).
     {

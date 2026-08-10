@@ -38,7 +38,7 @@ def test_config_is_built_into_native_runtime_library_and_host_tests():
 def test_runtime_report_includes_config_status_and_interposer_env():
     plan = PLAN_CPP.read_text()
     report = REPORT_CPP.read_text()
-    assert "ALR CONFIG SERIALIZE: PASS" in plan
+    assert "ALR CONFIG SERIALIZE:" in plan
     assert "ALR CONFIG PARSE: " in plan
     assert "alr runtime config bytes=" in plan
     assert "alr runtime config checksum=" in plan

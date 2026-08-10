@@ -93,7 +93,14 @@ InterposedPathResult run_interposer_path_smoke(
     }
 
     std::ostringstream report;
-    report << "ALR INTERPOSER LOAD: PASS";
+    // Was an unconditional "PASS" printed directly above code that had
+    // already computed the outcome. A verdict line that cannot say FAIL is
+    // not a verdict; it is a label wearing one, and the reader cannot tell
+    // the difference. This repo has shipped that shape in several files.
+    report << "ALR INTERPOSER LOAD: "
+           << ((result.opened && result.stated) ? "PASS" : "FAIL");
+    if (!result.opened) report << "\nalr interposer open errno=" << result.open_errno;
+    if (!result.stated) report << "\nalr interposer stat errno=" << result.stat_errno;
     report << "\nALR INTERPOSER MODE: translated-open-stat-smoke";
     report << "\nALR INTERPOSER GUEST PATH: " << result.translation.guest_path;
     report << "\nALR INTERPOSER HOST PATH: " << result.translation.host_path;
@@ -173,7 +180,15 @@ InterposedResolution resolve_interposed_access(
     }
 
     std::ostringstream report;
-    report << "ALR INTERPOSE RESOLVE: PASS";
+    // Was an unconditional "PASS" printed directly above code that had
+    // already computed the outcome. A verdict line that cannot say FAIL is
+    // not a verdict; it is a label wearing one, and the reader cannot tell
+    // the difference. This repo has shipped that shape in several files.
+    // Resolution succeeded iff it produced something to act on: a translated
+    // host path, or a synthesized answer for a /proc entry.
+    report << "ALR INTERPOSE RESOLVE: "
+           << ((!result.host_path.empty() || !result.synthetic_link_target.empty() ||
+                !result.synthetic_content.empty()) ? "PASS" : "FAIL");
     report << "\nALR INTERPOSE KIND: " << interposed_kind_name(result.kind);
     report << "\nALR INTERPOSE VIRTUALIZED: " << (result.virtualized ? "PASS" : "SKIP");
     report << "\nalr interpose guest path=" << result.guest_path;
