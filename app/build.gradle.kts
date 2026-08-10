@@ -47,7 +47,25 @@ android {
     defaultConfig {
         applicationId = "dev.chanwoo.androlinux"
         minSdk = 26
-        targetSdk = 35
+        // 28, not 35, and this is the single most consequential line in the project.
+        //
+        // The SELinux domain an app runs in is chosen by targetSdk, and only the
+        // legacy domains may execute a file in app-private storage.  From the AOSP
+        // policy source (system/sepolicy/private/untrusted_app_27.te):
+        //     allow untrusted_app_27 app_data_file:file execute_no_trans;
+        // No such rule exists for untrusted_app_29/30/32 or untrusted_app.
+        //
+        // Running a stock Ubuntu glibc rootfs means execve()ing a downloaded
+        // ld.so.  At targetSdk >= 29 that is denied and the only ways left are a
+        // userspace ELF loader (bionic/glibc TLS coexistence -- a research
+        // project) or PRoot's ptrace emulation (measured here: cannot even
+        // `dpkg -i`).  At 28 the kernel just runs it.
+        //
+        // The cost is Google Play, which requires a recent targetSdk.  That was
+        // already given up deliberately; distribution is sideload/F-Droid, the
+        // same trade Termux makes.  ALR DIRECT APP-DATA EXECVE in the device
+        // report is what proves this line is doing its job.
+        targetSdk = 28
         versionCode = 163
         versionName = "0.4.163-sd-v163"
         ndkVersion = "27.2.12479018"

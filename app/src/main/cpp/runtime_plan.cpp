@@ -110,7 +110,10 @@ RuntimeReport build_runtime_report(const RuntimeReportInput& input, const Execut
     const auto alr_runtime = build_alr_runtime_launch_plan(input);
     out << "ALR RUNTIME LAUNCHER AVAILABLE: PASS\n";
     out << "ALR RUNTIME CONFIG BUILD: PASS\n";
-    out << "ALR RUNTIME DIRECT APP-DATA EXEC POLICY: PASS\n";
+    // See alr_runtime_launcher.cpp: this was an unconditional literal about a
+    // kernel behaviour nothing had measured. The real verdict comes from
+    // build_direct_appdata_exec_probe().
+    out << "ALR RUNTIME DIRECT APP-DATA EXEC POLICY: (측정) ALR DIRECT APP-DATA EXECVE\n";
     out << "ALR HOOK LOAD: PASS\n";
     out << "ALR HOOK CONFIG BUILD: PASS\n";
     out << "ALR INTERPOSER LOAD: PASS\n";

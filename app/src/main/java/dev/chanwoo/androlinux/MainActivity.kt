@@ -585,6 +585,14 @@ class MainActivity : Activity() {
             rootfsManifest.name,
             "/bin/hello",
         )
+        val alrDirectExecProbe = nativeAlrDirectExecProbe(
+            packageName,
+            applicationInfo.nativeLibraryDir,
+            filesDir.absolutePath,
+            cacheDir.absolutePath,
+            rootfsManifest.name,
+            "/bin/hello",
+        )
         val alrSyscallSandboxProbe = nativeAlrSyscallSandboxProbe()
         val alrSeccompPathTrapProbe = nativeAlrSeccompPathTrapProbe(
             filesDir.absolutePath,
@@ -1337,6 +1345,8 @@ class MainActivity : Activity() {
             "\n$alrInterposeProcfsProbe" +
             "\n\nALR memfd W^X-safe native exec probe:" +
             "\n$alrMemfdExecProbe" +
+            "\n\nALR direct app-data execve probe (does this SELinux domain allow it?):" +
+            "\n$alrDirectExecProbe" +
             "\n\nALR syscall sandbox capability probe:" +
             "\n$alrSyscallSandboxProbe" +
             "\n\nALR seccomp path-mediation probe (rootfs path rewrite via seccomp-trace):" +
@@ -1427,6 +1437,12 @@ class MainActivity : Activity() {
             optionalResultBlock("proot hello verbose on failure", prootHelloVerboseResult)
 
         val report = executionSummary + "\n\n--- verbose report ---\n" + verboseReport
+        // Also persist it. docs/evidence/*-app-report.txt was previously captured
+        // by scraping the UI with uiautomator, which cannot see text that has not
+        // been scrolled into view -- so evidence depended on what happened to be
+        // on screen. Writing the same string to filesDir makes the report
+        // pullable in full with `run-as <pkg> cat files/app-report.txt`.
+        runCatching { java.io.File(filesDir, "app-report.txt").writeText(report) }
 
         val view = TextView(this).apply {
             text = report
@@ -4542,6 +4558,15 @@ class MainActivity : Activity() {
     ): String
 
     private external fun nativeAlrMemfdExecProbe(
+        packageName: String,
+        nativeLibraryDir: String,
+        appFilesDir: String,
+        appCacheDir: String,
+        rootfsName: String,
+        program: String,
+    ): String
+
+    private external fun nativeAlrDirectExecProbe(
         packageName: String,
         nativeLibraryDir: String,
         appFilesDir: String,

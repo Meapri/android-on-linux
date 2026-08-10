@@ -1040,6 +1040,112 @@ std::string build_gpu_boundary_probe() {
 // packaged static guest ELF into an anonymous in-memory fd (not an
 // app_data_file) and execveat() it with AT_EMPTY_PATH. This measures the real
 // on-device SELinux/W^X outcome for memfd-execveat in the app domain.
+// Does THIS app domain allow execve() of a file in app-private storage?
+//
+// Everything about the runtime design turns on this one answer, and until now
+// nothing measured it.  `alr_runtime_launcher_policy()` returns the string
+// "ALR RUNTIME DIRECT APP-DATA EXEC POLICY: PASS" unconditionally -- a literal,
+// not a verdict -- while `alr_runtime_launcher_can_execute_guest()` in the same
+// file returns 0.  The two disagree and neither consulted the kernel.
+//
+// The AOSP policy source says the permission exists for untrusted_app_25 and
+// untrusted_app_27 and for no later domain:
+//     allow untrusted_app_27 app_data_file:file execute_no_trans;
+// so at targetSdk <= 28 this should SUCCEED and at >= 29 it should fail with
+// EACCES.  That is the prediction; this probe is what turns it into a fact on
+// the device in front of us.
+//
+// Runs in a forked child so a denial cannot take down the app, and reports the
+// raw errno rather than a verdict, because EACCES (SELinux said no) and ENOENT
+// (we pointed at nothing) are completely different answers and collapsing them
+// is how this question stayed open.
+std::string build_direct_appdata_exec_probe(const alr::RuntimeReportInput& input) {
+    std::ostringstream out;
+    out << "ALR DIRECT APP-DATA EXEC PROBE: android-native-attempt";
+
+    const auto launch = alr::build_alr_runtime_launch_plan(input);
+    const auto config = alr_runtime_config_from_input(input, launch);
+    const std::string guest = config.rootfs_dir + "/bin/hello";
+    out << "\nalr direct-exec target=" << guest;
+
+    struct stat st {};
+    if (::stat(guest.c_str(), &st) != 0) {
+        out << "\nALR DIRECT APP-DATA EXECVE: SKIP";
+        out << "\nalr direct-exec error=stat errno=" << errno;
+        return out.str();
+    }
+    out << "\nalr direct-exec mode=" << std::oct << (st.st_mode & 07777) << std::dec
+        << " size=" << static_cast<long long>(st.st_size);
+
+    int out_pipe[2] = {-1, -1};
+    if (::pipe(out_pipe) != 0) {
+        out << "\nALR DIRECT APP-DATA EXECVE: SKIP";
+        out << "\nalr direct-exec error=pipe errno=" << errno;
+        return out.str();
+    }
+
+    const pid_t pid = ::fork();
+    if (pid == 0) {
+        ::dup2(out_pipe[1], STDOUT_FILENO);
+        ::dup2(out_pipe[1], STDERR_FILENO);
+        ::close(out_pipe[0]);
+        ::close(out_pipe[1]);
+        char* child_argv[] = {const_cast<char*>(guest.c_str()), nullptr};
+        char* child_envp[] = {nullptr};
+        ::execve(guest.c_str(), child_argv, child_envp);
+        const int e = errno;
+        ::dprintf(STDOUT_FILENO, "DIRECT_EXECVE_ERRNO=%d", e);
+        _exit(127);
+    }
+    ::close(out_pipe[1]);
+    if (pid < 0) {
+        ::close(out_pipe[0]);
+        out << "\nALR DIRECT APP-DATA EXECVE: SKIP";
+        out << "\nalr direct-exec error=fork errno=" << errno;
+        return out.str();
+    }
+
+    std::string child_out;
+    {
+        char buffer[4096];
+        ssize_t n = 0;
+        while ((n = ::read(out_pipe[0], buffer, sizeof(buffer))) > 0) {
+            child_out.append(buffer, static_cast<std::size_t>(n));
+        }
+    }
+    ::close(out_pipe[0]);
+    int status = 0;
+    ::waitpid(pid, &status, 0);
+
+    const bool exited = WIFEXITED(status);
+    const int code = exited ? WEXITSTATUS(status) : -1;
+    // The question is "did execve() succeed", NOT "did the program like its
+    // arguments".  Requiring exit==0 got this wrong on the first run: toybox
+    // execed fine and then printed `Unknown command .../bin/hello` and exited
+    // 127, because it is a multicall binary dispatching on argv[0].  That
+    // output is itself proof the exec worked -- a denied execve produces no
+    // program output at all.  So the only reliable signal is whether our
+    // post-execve fallback ran: if execve returns, we print DIRECT_EXECVE_ERRNO.
+    const bool ran = exited &&
+                     child_out.find("DIRECT_EXECVE_ERRNO=") == std::string::npos;
+
+    out << "\nalr direct-exec child_exit=" << code
+        << " child_out=" << (child_out.empty() ? "(empty)" : child_out);
+    out << "\nALR DIRECT APP-DATA EXECVE: " << (ran ? "PASS" : "FAIL");
+    out << "\nalr direct-exec domain-note=verdict is about execve() only;"
+           " child_exit is the program's own business";
+    if (!ran) {
+        // 13 = EACCES: SELinux refused. Anything else means we measured
+        // something other than the policy question.
+        out << "\nalr direct-exec verdict=denied-or-failed"
+               " (13=EACCES means the SELinux domain lacks execute_no_trans)";
+    } else {
+        out << "\nalr direct-exec verdict=app-data execve is PERMITTED in this"
+               " domain -- the alr native backend can run without a loader";
+    }
+    return out.str();
+}
+
 std::string build_memfd_exec_probe(const alr::RuntimeReportInput& input) {
     constexpr unsigned kMfdCloexec = 0x0001u;
     constexpr unsigned kMfdExec = 0x0008u;       // Linux 6.3+; memfd is NOEXEC by default otherwise
@@ -7729,6 +7835,28 @@ Java_dev_chanwoo_androlinux_MainActivity_nativeAlrUnixSocketProbe(
     input.app_files_dir = jstring_to_string(env, app_files_dir);
     input.app_cache_dir = jstring_to_string(env, app_cache_dir);
     const auto report = build_unix_socket_probe(input);
+    return env->NewStringUTF(report.c_str());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_chanwoo_androlinux_MainActivity_nativeAlrDirectExecProbe(
+    JNIEnv* env,
+    jobject /* thiz */,
+    jstring package_name,
+    jstring native_library_dir,
+    jstring app_files_dir,
+    jstring app_cache_dir,
+    jstring rootfs_name,
+    jstring program) {
+    const auto input = alr::RuntimeReportInput{
+        .package_name = jstring_to_string(env, package_name),
+        .native_library_dir = jstring_to_string(env, native_library_dir),
+        .app_files_dir = jstring_to_string(env, app_files_dir),
+        .app_cache_dir = jstring_to_string(env, app_cache_dir),
+        .rootfs_name = jstring_to_string(env, rootfs_name),
+        .program = jstring_to_string(env, program),
+    };
+    const auto report = build_direct_appdata_exec_probe(input);
     return env->NewStringUTF(report.c_str());
 }
 

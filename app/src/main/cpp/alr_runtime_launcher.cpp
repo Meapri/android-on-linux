@@ -15,8 +15,19 @@ extern "C" int alr_runtime_launcher_can_execute_guest() {
     return 0;
 }
 
+// This used to return "ALR RUNTIME DIRECT APP-DATA EXEC POLICY: PASS" -- a
+// string literal, emitted unconditionally, describing a kernel behaviour nobody
+// had ever asked the kernel about.  It also contradicted
+// alr_runtime_launcher_can_execute_guest() two functions up, which returns 0.
+//
+// The question it pretended to answer is now MEASURED by
+// build_direct_appdata_exec_probe() in runtime_report.cpp, which forks and
+// actually calls execve() on a file in app-private storage and reports the
+// errno.  On SM-X236N / Android 16 at targetSdk 28 (domain untrusted_app_27):
+//     ALR DIRECT APP-DATA EXECVE: PASS
+// so this name now points at that probe instead of asserting a verdict.
 extern "C" const char* alr_runtime_launcher_policy() {
-    return "ALR RUNTIME DIRECT APP-DATA EXEC POLICY: PASS";
+    return "ALR RUNTIME DIRECT APP-DATA EXEC POLICY: (측정) ALR DIRECT APP-DATA EXECVE";
 }
 
 extern "C" const char* alr_runtime_launcher_build_report(
