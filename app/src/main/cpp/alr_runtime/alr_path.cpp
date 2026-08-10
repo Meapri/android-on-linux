@@ -5,6 +5,11 @@
 #include <string_view>
 #include <vector>
 
+// The path rule that is on the product path and has tests behind it.
+extern "C" {
+#include "alr_path_rule.h"
+}
+
 namespace alr::runtime {
 namespace {
 
@@ -99,7 +104,33 @@ PathTranslation translate_rootfs_path(
 
     const std::string rootfs = trim_trailing_slashes(rootfs_dir);
     const std::string guest = normalize_guest_path(path, cwd);
-    const std::string host = guest == "/" ? rootfs : rootfs + guest;
+
+    // TWO CASES THIS USED TO GET WRONG, both found by a differential test
+    // against runtime/alr's alr_rw() -- the same rule, on the product path,
+    // with 73 host assertions behind it. 7 of 14 shared cases disagreed.
+    //
+    //   sysdirs   /proc, /sys and /dev must resolve against ANDROID. The guest
+    //             rootfs has empty stubs for them, and prefixing sent the
+    //             loader to read /proc/self/exe out of a directory that has no
+    //             kernel behind it.
+    //
+    //   already-host  a path that is ALREADY under the rootfs was prefixed a
+    //             SECOND time:
+    //               <R>/etc/os-release -> <R><R>/etc/os-release
+    //             which is how a host path handed back to us turns into a file
+    //             that does not exist.
+    //
+    // Delegating to alr_rw rather than re-deriving the rule here: one of these
+    // implementations is tested and on the product path, and it is not this
+    // one. Divergence between two copies of a path rule is not a tidiness
+    // problem -- it resolves to two different files and nothing reports it.
+    char buf[4096];
+    int err = 0;
+    const char* rewritten =
+        alr_rw(guest.c_str(), rootfs.c_str(), rootfs.size(), buf, sizeof buf, &err);
+    const std::string host =
+        (rewritten == nullptr) ? (guest == "/" ? rootfs : rootfs + guest)
+                               : std::string(rewritten);
     return PathTranslation{
         .guest_path = guest,
         .host_path = host,

@@ -44,6 +44,10 @@ target_compile_features(alr_test_command PRIVATE cxx_std_20)
 target_compile_features(alr_runtime_trampoline PRIVATE cxx_std_20)
 
 target_include_directories(alr_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+# The product-path guest path rule. alr_path.cpp delegates to it rather than
+# keeping a second copy that can drift -- see scripts/check-path-rule-divergence.sh.
+target_include_directories(alr_runtime PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../../runtime/alr/src/common)
 target_link_libraries(alr_loader PRIVATE alr_runtime log android EGL GLESv2 GLESv3 vulkan)
 
 # Gate the resident trampoline under the SAME strictness as the loader's C++ TUs.
