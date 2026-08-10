@@ -1337,7 +1337,10 @@ static void warn_uutils_coreutils(const char *R)
         "       coreutils: unknown program 'ld-linux-aarch64.so'\n"
         "     Everything else in the image (bash, dash, apt, dpkg, grep, sed,\n"
         "     awk, tar) is unaffected.\n"
-        "     FIX, from the same archive:  apt install coreutils-from-gnu\n"
+        "     FIX, and it needs no network: the GNU binaries are ALREADY in\n"
+        "     this image (Ubuntu's own coreutils-from-gnu package turns out to\n"
+        "     be nothing but symlinks), so this only repoints them --\n"
+        "       alr use-gnu-coreutils <distro>\n"
         "     reason=uutils-coreutils  (docs/adr/0006-raw-syscall-binaries.md)\n");
 }
 
@@ -1695,16 +1698,34 @@ static int install_verify(const char *distro, const char *R,
         const char *used = "(none)";
         t0 = now_ms();
         for (bi = 0; boots[bi]; bi++) {
+            /* Exit 0 is NOT enough. On a uutils image every tool is one
+             * multicall binary that resolves its own name with a raw syscall,
+             * and under an explicit loader it sees the LOADER's name:
+             *     coreutils: unknown program 'ld-linux-aarch64.so'
+             * `/bin/true` prints that and STILL EXITS 0, so this check passed
+             * on a binary that had not done its job -- MEASURED on Ubuntu
+             * 26.04. A working /bin/true is silent, so require silence too. */
             snprintf(cmd, sizeof cmd,
-                     "ALR_ROOT_DIR='%s' '%s' -d '%s' run %s >/dev/null 2>&1; echo $?",
+                     "ALR_ROOT_DIR='%s' '%s' -d '%s' run %s 2>&1 >/dev/null "
+                     "| grep -c . ; ",
                      getenv("ALR_ROOT_DIR") ? getenv("ALR_ROOT_DIR") : "",
                      g_self, distro, boots[bi]);
-            code = read_long_cmd(cmd, -1);
-            if (code == 0) { used = boots[bi]; break; }
+            {
+                long noise = read_long_cmd(cmd, -1);
+                snprintf(cmd, sizeof cmd,
+                         "ALR_ROOT_DIR='%s' '%s' -d '%s' run %s >/dev/null 2>&1; echo $?",
+                         getenv("ALR_ROOT_DIR") ? getenv("ALR_ROOT_DIR") : "",
+                         g_self, distro, boots[bi]);
+                code = read_long_cmd(cmd, -1);
+                if (code == 0 && noise == 0) { used = boots[bi]; break; }
+                if (code == 0 && noise > 0) code = -2;   /* ran, complained */
+            }
         }
         ms = now_ms() - t0;
         rline(&bad, "INSTALL BOOT:", code == 0,
-              "%s exit=%ld elapsed_ms=%ld", used, code, ms);
+              "%s exit=%ld elapsed_ms=%ld%s", used, code, ms,
+              code == -2 ? " (exited 0 but wrote to stderr -- a multicall"
+                           " binary that could not resolve its own name)" : "");
     }
 
     /* Same reasoning: /bin/echo is coreutils. `sh -c 'echo alr'` proves the
@@ -2330,6 +2351,71 @@ static int cmd_adopt(const char *distro)
         die("rootfs-unbootable",
             "the rootfs was adopted but does not boot; it was LEFT IN PLACE "
             "for inspection (docs/05-provisioning-spec.md §4)");
+    return 0;
+}
+
+/* `alr use-gnu-coreutils <distro>` -- repoint coreutils at the GNU binaries.
+ *
+ * Ubuntu 26.04 ships uutils as the default coreutils, and every tool in it is
+ * ONE multicall binary that resolves its own identity with a raw syscall. Under
+ * an explicit loader (ADR 0002) that resolves to the LOADER:
+ *
+ *     $ alr run /bin/echo hi
+ *     coreutils: unknown program 'ld-linux-aarch64.so'
+ *
+ * LD_PRELOAD cannot see a raw syscall and the supervisor is signal-only
+ * (ADR 0001), so there is nothing to interpose. Everything else in the image is
+ * unaffected -- MEASURED on 26.04: bash and dpkg 1.23.7 both fine.
+ *
+ * The fix is Ubuntu's own. The archive ships `coreutils-from-gnu` as a
+ * first-class alternative to `coreutils-from-uutils`, and that package turns
+ * out to be nothing but symlinks: /usr/bin/ls -> gnuls, /usr/bin/cat -> gnucat.
+ * The GNU binaries are ALREADY IN THE BASE IMAGE -- 104 of them, measured. So
+ * this needs no download, no apt and no network: it repoints the symlinks that
+ * are already there at the binaries that are already there.
+ *
+ * Not done automatically at adopt. Replacing a distribution's default userland
+ * is the user's call, and `alr adopt` says so and names this command. */
+static int cmd_use_gnu_coreutils(const char *distro)
+{
+    char R[ALR_PBUF], bindir[ALR_PBUF];
+    DIR *d;
+    struct dirent *e;
+    int moved = 0, absent = 0;
+
+    distro_root(R, sizeof R, distro);
+    if (!is_dir(R)) die("rootfs-missing", "no such rootfs");
+    snprintf(bindir, sizeof bindir, "%s/usr/bin", R);
+    if (!(d = opendir(bindir)))
+        die("rootfs-incomplete", "the rootfs has no usr/bin");
+
+    /* Drive the loop from the gnu* binaries that exist, not from a hardcoded
+     * tool list: the set differs between releases, and a list would silently
+     * stop covering whatever was added. */
+    while ((e = readdir(d)) != NULL) {
+        char src[ALR_PBUF], dst[ALR_PBUF], tmp[ALR_PBUF];
+        struct stat st;
+        if (strncmp(e->d_name, "gnu", 3) != 0 || e->d_name[3] == '\0') continue;
+        snprintf(src, sizeof src, "%s/%s", bindir, e->d_name);
+        if (stat(src, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        snprintf(dst, sizeof dst, "%s/%s", bindir, e->d_name + 3);
+        if (access(dst, F_OK) != 0) { absent++; continue; }
+        /* Atomic: build the new link beside the target and rename over it, so
+         * an interrupted run never leaves /usr/bin/ls missing entirely. */
+        snprintf(tmp, sizeof tmp, "%s.alr-new", dst);
+        unlink(tmp);
+        if (symlink(e->d_name, tmp) != 0) continue;
+        if (rename(tmp, dst) == 0) moved++;
+        else unlink(tmp);
+    }
+    closedir(d);
+
+    printf("alr: repointed %d coreutils tool(s) at their GNU binaries%s\n",
+           moved, absent ? " (some had no existing entry and were skipped)" : "");
+    if (moved == 0)
+        die("no-gnu-coreutils",
+            "this rootfs has no gnu* binaries in /usr/bin; it is probably not "
+            "a uutils-based Ubuntu image");
     return 0;
 }
 
@@ -3153,6 +3239,7 @@ static void usage(void)
         "  exec [opts] -- <cmd> [args...]     run, with -- ending option parsing\n"
         "  shell [opts]                       interactive guest shell\n"
         "  adopt [<distro>]                   make an already-extracted tree a rootfs\n"
+        "  use-gnu-coreutils [<distro>]       repoint uutils coreutils at GNU (26.04+)\n"
         "  update-components [<distro>]       refresh the guest preload copy\n"
         "  config [get <k> | set <k> <v>]     settings and where they come from\n"
         "  version                            version and preload identity\n"
@@ -3231,6 +3318,10 @@ int main(int argc, char **argv)
         runopts_init(&ro);
         (void)parse_runopts(argc - i - 1, argv + i + 1, &ro, &distro, 0);
         return cmd_run(distro, 0, NULL, 1, &ro);
+    }
+    if (!strcmp(argv[i], "use-gnu-coreutils")) {
+        const char *d = (i + 1 < argc && argv[i + 1][0] != '-') ? argv[i + 1] : distro;
+        return cmd_use_gnu_coreutils(d);
     }
     if (!strcmp(argv[i], "adopt")) {
         const char *d = (i + 1 < argc && argv[i + 1][0] != '-') ? argv[i + 1] : distro;

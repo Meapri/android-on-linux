@@ -1,0 +1,4 @@
+PRETTY_NAME="Ubuntu 26.04 LTS"
+390
+Debian 'dpkg' package management program version 1.23.7 (arm64).
+ok

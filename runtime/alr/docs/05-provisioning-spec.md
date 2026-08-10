@@ -264,7 +264,7 @@ config-write-failed        doctor-missing             doctor-unknown-option
 download-corrupt           download-network           env-reserved
 extract-permission         extract-traversal-reject   install-unknown-option
 ldso-missing
-no-supervisor-requested    not-a-rootfs               preload-install-failed
+no-gnu-coreutils           no-supervisor-requested    not-a-rootfs               preload-install-failed
 preload-missing-in-rootfs  preload-stale              remove-failed
 rootfs-incomplete          rootfs-missing             rootfs-missing-interposer-deps
 rootfs-unbootable
