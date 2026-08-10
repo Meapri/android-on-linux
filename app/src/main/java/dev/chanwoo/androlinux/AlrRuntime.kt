@@ -140,10 +140,36 @@ class AlrRuntime(
         timeoutSeconds: Long = 60,
         /** ALR_LOG=1 makes alr print its supervisor counters on exit. */
         verbose: Boolean = false,
+        /**
+         * Extra variables for the GUEST, passed as `alr -e KEY=VAL`.
+         *
+         * The GUI probes carry their contract here -- XDG_RUNTIME_DIR,
+         * WAYLAND_DISPLAY, DISPLAY -- and alr builds a DELIBERATE environment,
+         * so anything the caller needs has to be handed over explicitly. The
+         * PRoot path merged this map and the alr path dropped it, which is why
+         * alr-wl-test reported "XDG_RUNTIME_DIR is invalid or not set".
+         */
+        guestEnv: Map<String, String> = emptyMap(),
     ): AlrResult {
         ensureAdopted(distro)
+        // PROOT_* means nothing to alr, and alr REFUSES -e for the variables it
+        // owns (ALR_*, LD_PRELOAD, LD_LIBRARY_PATH, LOCPATH, GLIBC_TUNABLES) --
+        // passing those would fail the whole invocation with env-reserved.
+        // alr refuses -e only for the variables it OWNS, not for the whole ALR_
+        // prefix -- this app's GPU bridge legitimately uses ALR_GPU_BRIDGE_*,
+        // and filtering the prefix here made the guest client miss its host and
+        // port and write frames to stdout instead of the socket.
+        val reserved = setOf(
+            "LD_PRELOAD", "LD_LIBRARY_PATH", "LOCPATH", "GLIBC_TUNABLES",
+            "ALR_COUNT", "ALR_DISTRO", "ALR_FAKEROOT", "ALR_GUEST_ARGV0",
+            "ALR_GUEST_EXE", "ALR_GUEST_PATH", "ALR_LDSO", "ALR_LIBPATH",
+            "ALR_LOG", "ALR_LOG_FD", "ALR_PRELOAD", "ALR_ROOT", "ALR_ROOT_DIR",
+        )
+        val eArgs = guestEnv.entries
+            .filterNot { it.key.startsWith("PROOT_") || it.key in reserved }
+            .flatMap { listOf("-e", "${it.key}=${it.value}") }
         return exec(
-        listOf("-d", distro, "run", program) + arguments,
+        listOf("-d", distro, "run") + eArgs + listOf(program) + arguments,
         timeoutSeconds,
         extraEnv = buildMap {
             if (fakeroot) put("ALR_FAKEROOT", "1")

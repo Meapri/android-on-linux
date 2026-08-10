@@ -209,6 +209,11 @@ class NativeCommandRunner(
                 arguments = arguments,
                 fakeroot = rootId,
                 timeoutSeconds = COMMAND_TIMEOUT_SECONDS * 4,
+                // The callers' own contract -- XDG_RUNTIME_DIR, WAYLAND_DISPLAY,
+                // DISPLAY for the GUI bridges. The PRoot path merged this and
+                // this one dropped it, so every Wayland/X11 probe failed on a
+                // missing variable rather than on anything about graphics.
+                guestEnv = extraEnvironment,
             )
             return NativeCommandResult(
                 command = backend.binary,

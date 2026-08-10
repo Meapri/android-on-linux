@@ -2432,8 +2432,29 @@ static void runopts_init(struct runopts *ro)
  * our bug.  Refuse loudly instead. */
 static int env_is_reserved(const char *kv)
 {
-    return !strncmp(kv, "ALR_", 4)
-        || !strncmp(kv, "LD_PRELOAD=", 11)
+    /* alr's OWN variables, enumerated -- not the whole ALR_ prefix.
+     *
+     * Reserving the prefix wholesale meant a host application could not use it
+     * for its own guest protocol, and one already did: this project's GPU
+     * bridge passes ALR_GPU_BRIDGE_HOST/PORT/TRANSPORT to a guest client. Those
+     * were refused, the client never learned where to connect, and it wrote its
+     * frames to stdout instead of the socket -- which surfaced as
+     * "timeout waiting for guest gpu ipc client" and read as a graphics bug.
+     *
+     * These names are load-bearing: each is either read by the supervisor and
+     * the interposer or is how the launch is configured, so letting -e
+     * overwrite one breaks the launch itself. Everything else under ALR_ is the
+     * embedder's to use. */
+    static const char *const own[] = {
+        "ALR_COUNT=", "ALR_DISTRO=", "ALR_FAKEROOT=", "ALR_GUEST_ARGV0=",
+        "ALR_GUEST_EXE=", "ALR_GUEST_PATH=", "ALR_LDSO=", "ALR_LIBPATH=",
+        "ALR_LOG=", "ALR_LOG_FD=", "ALR_PRELOAD=", "ALR_ROOT=", "ALR_ROOT_DIR=",
+        NULL
+    };
+    int i;
+    for (i = 0; own[i]; i++)
+        if (!strncmp(kv, own[i], strlen(own[i]))) return 1;
+    return !strncmp(kv, "LD_PRELOAD=", 11)
         || !strncmp(kv, "LD_LIBRARY_PATH=", 16)
         /* Also load-bearing: LOCPATH is how the guest finds its only generated
          * locale (without it tmux refuses to start), and GLIBC_TUNABLES is how
