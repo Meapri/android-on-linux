@@ -1,0 +1,280 @@
+# alr — device-free CI.
+#
+# ── WHAT THIS FILE CAN NEVER COVER ───────────────────────────────────────────
+# A hosted GitHub runner is an x86_64 Linux (or arm64 macOS) VM.  It is not an
+# Android app process, so the entire seccomp-dependent half of the acceptance
+# surface is out of reach here.  Specifically, CI can NEVER run:
+#
+#   * tests/device/test_supervisor.c  — refuses unless uid>=10000 (:158) and
+#     /proc/self/status Seccomp==2 (:169)
+#   * tests/device/acceptance.sh      — same refusal at :65
+#   * tests/device/breadth.sh         — same refusal at :30
+#
+#   Why the refusal is correct and must not be "fixed" for CI: the app seccomp
+#   filter that kills set_robust_list & co. is installed BY THE ZYGOTE, for
+#   uid>=10000 only.  Anywhere else the banned syscalls simply succeed, SIGSYS
+#   never fires, and every supervisor assertion passes vacuously.  A green
+#   supervisor run off-device is worse than no run: it is a false negative.
+#
+#   * SIGSYS rescue, path_traps==0 / syscall_stops==0 — same reason.  These are
+#     the hard invariants of the regression gate (docs/07-acceptance.md §3) and
+#     all but one of them are device measurements.  The single device-free one,
+#     preload.glibc_verneed_max <= "2.17", is enforced by scripts/check-preload.sh
+#     in the `preload` job below.
+#   * The 96-package breadth number — needs a provisioned rootfs, network, apt,
+#     and hours on real hardware.
+#   * Every PRoot A/B figure (git status, spawn throughput, npm ci) — those are
+#     same-device, same-storage comparisons.  A cloud-VM number would be a
+#     different machine and, under docs/00-product.md §6.1/§6.2, could not be
+#     labelled MEASURED at all.
+#
+# So: green here means "it compiles, and the host-side path/exec rule logic is
+# self-consistent".  It does NOT mean alr runs.  Only a human on a device with
+# `getenforce == Enforcing` and `Seccomp: 2` can say that.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ── host core tests ────────────────────────────────────────────────────────
+  # `make test` builds tests/host/{test_path,test_exec_rule}.c against the same
+  # src/common sources the device uses.  The path rule must produce identical
+  # answers on every libc — that is the whole point of running it twice here.
+  #
+  # macOS leg: MEASURED green (the dev host).  The ubuntu leg is new: these
+  # sources have run on macOS/libSystem and on-device under Termux clang/bionic
+  # (scripts/dev-push.sh test compiles and runs both binaries there), but never
+  # against glibc.  A first-run failure on ubuntu is information — most likely a
+  # missing feature-test macro — not a regression.
+  host-tests:
+    name: host core tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: cc identity
+        run: cc --version
+
+      - name: make test
+        run: make test
+
+      # Every claim in this repo cites the evidence file that measured it, so a
+      # dead relative link reads exactly like a citation.  Three were sitting in
+      # the tree when this step was added.  Needs no device and no toolchain.
+      - name: doc link gate
+        run: make check-docs
+
+      # G6 says every failure carries a stable reason= code, and the vocabulary
+      # that measures it had drifted to a five-code overlap with reality.  Both
+      # directions, so neither side can rot.  No device, no toolchain.
+      - name: reason= registry gate
+        run: bash scripts/check-reasons.sh
+
+      # ADR 0001's invariant, the half CI can see.  The runtime counter for it
+      # needs a device; this catches the source change at commit time.
+      - name: PTRACE_SYSCALL invariant gate
+        run: bash scripts/check-invariants.sh
+
+      # docs/07 §2 states "no status token without a test" and had been broken
+      # three times, once at a scale of 35 orphaned names carrying 32 PASSes.
+      - name: acceptance name gate
+        run: bash scripts/check-acceptance-names.sh
+
+      # The scraper once answered node_cold_ms with the exec-throughput number
+      # from the next line, and --update wrote it into the baseline as fact.  A
+      # regex that matches the wrong thing looks exactly like one that works,
+      # so it gets a canned transcript with known answers.
+      - name: regression gate self-test
+        run: bench/regression_gate.py --self-test
+
+  # ── guest-side interposer ──────────────────────────────────────────────────
+  # zig is pinned to the exact patch version on purpose: reproducibility only
+  # holds under an exact pin, because a zig upgrade changes bundled compiler-rt
+  # and LLVM codegen (scripts/build-preload.sh enforces this and exits 1 on a
+  # mismatch).  Do not relax the pin to make a run go green.
+  preload:
+    name: preload build + ELF gates
+    runs-on: ubuntu-latest
+    env:
+      ZIG_VERSION: 0.16.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install pinned zig
+        run: |
+          set -euo pipefail
+          arch=$(uname -m)
+          # UNVERIFIED: upstream flipped its archive naming from
+          # zig-<os>-<arch>-<ver> to zig-<arch>-<os>-<ver> at some point in the
+          # 0.14/0.15 line.  Rather than guess which side of the flip 0.16.0
+          # lands on, try both and fail loudly if neither resolves.
+          for name in "zig-${arch}-linux-${ZIG_VERSION}" "zig-linux-${arch}-${ZIG_VERSION}"; do
+            url="https://ziglang.org/download/${ZIG_VERSION}/${name}.tar.xz"
+            echo "trying $url"
+            if curl -fsSL -o zig.tar.xz "$url"; then found="$name"; break; fi
+          done
+          if [ -z "${found:-}" ]; then
+            echo "no zig ${ZIG_VERSION} tarball found for arch=${arch}." >&2
+            echo "Check the upstream archive naming before touching the pin." >&2
+            exit 1
+          fi
+          tar -xf zig.tar.xz
+          echo "$PWD/$found" >> "$GITHUB_PATH"
+
+      - name: zig is the exact pin
+        run: |
+          set -euo pipefail
+          v=$(zig version)
+          [ "$v" = "$ZIG_VERSION" ] || { echo "zig $ZIG_VERSION required, found $v" >&2; exit 1; }
+
+      - name: build libalr_preload.so
+        run: scripts/build-preload.sh
+
+      # Uploaded BEFORE the ELF gates run, deliberately: when a gate fails the
+      # .so is exactly the thing a human wants in hand to inspect.
+      - name: upload preload + manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: libalr_preload-${{ github.sha }}
+          path: |
+            build/libalr_preload.so
+            build/libalr_preload.manifest.json
+          if-no-files-found: error
+
+      # Note this script does NOT inspect build/ above: it rebuilds the .so
+      # twice from cold, isolated zig caches, so "identical" means recompiled,
+      # not cache-hit.  Gates: zig pin, ELF identity (ET_DYN/EM_AARCH64), glibc
+      # verneed floor == GLIBC_2.17 and nothing else, PT_GNU_STACK non-exec,
+      # byte-identical rebuild, manifest sha256 agreeing with the bytes.
+      # Stock objdump only — macOS runners ship neither readelf nor
+      # llvm-readelf.
+      - name: scripts/check-preload.sh
+        run: scripts/check-preload.sh
+
+      # check-preload.sh builds into scratch dirs, so give the gate a build/ to
+      # read.  Artifact invariants only: everything runtime lives behind a
+      # device gate no hosted runner can satisfy, and the gate refuses rather
+      # than reporting green on facts it never saw.
+      # bind()/connect() were never interposed at all, so every AF_UNIX address
+      # in the guest resolved against Android.  Nothing could have pointed at
+      # them: the coverage argument was "the ones we thought of".  This diffs
+      # the .so's exports against an inventory of path-taking libc entry points.
+      - name: path coverage gate
+        run: |
+          scripts/build-preload.sh
+          bash scripts/check-path-coverage.sh
+
+      - name: regression gate (build-side invariants)
+        run: |
+          scripts/build-preload.sh
+          python3 bench/regression_gate.py --build-only
+
+  # ── host-ABI cross-build ───────────────────────────────────────────────────
+  # ┌───────────────────────────────────────────────────────────────────────┐
+  # │ VERIFIED 2026-08-03, run 30757467197: this job passes.                │
+  # │                                                                       │
+  # │ It was authored as an experiment — no NDK build of `alr` existed in    │
+  # │ this repo or in docs/evidence/, because every `alr` binary to date     │
+  # │ came from Termux's own on-device clang, which the Makefile documents   │
+  # │ as a dev inner loop and never a release path.  The first run settled   │
+  # │ it: all five sources cross-build and link against bionic, and the      │
+  # │ outputs are aarch64.  That is the ABI claim, not a release: release    │
+  # │ builds come from a pinned NDK, not the runner image's.                 │
+  # └───────────────────────────────────────────────────────────────────────┘
+  #
+  # Two further caveats, stated plainly:
+  #  * NDK version is whatever the runner image ships.  The Makefile asks for
+  #    r29+; this job prints source.properties rather than pretending to pin it.
+  #    A real release needs a pinned NDK, which this is not.
+  #  * Flags here are byte-for-byte scripts/make-release.sh's HOST_CFLAGS and
+  #    HOST_LDFLAGS, which in turn match scripts/dev-push.sh CFLAGS_DEV (:52):
+  #    -O1 (the only optimisation level ever run under the zygote seccomp
+  #    filter) and -Wall -Wextra WITHOUT -Werror.  `make doctor` is deliberately
+  #    NOT used for alr-doctor because the Makefile adds -Werror, which no build
+  #    of doctor.c has ever used — dev-push.sh :128 compiles it as plain
+  #    `clang -O1`.  Whether these sources are warning-clean under NDK headers
+  #    is not asserted; letting a warning kill the run would hide the linkage/ABI
+  #    answer this job exists to get.  Warnings still print.
+  cross-build-ndk:
+    name: NDK cross-build (bionic)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: locate NDK on the runner image
+        run: |
+          set -euo pipefail
+          ndk="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}}"
+          if [ -z "$ndk" ] || [ ! -d "$ndk" ]; then
+            echo "no Android NDK on this runner image" >&2
+            exit 1
+          fi
+          echo "ALR_NDK=$ndk" >> "$GITHUB_ENV"
+          echo "NDK at $ndk"
+          cat "$ndk/source.properties" || true
+
+      - name: cross-build alr (bionic, aarch64-linux-android24)
+        run: |
+          set -euo pipefail
+          cc="$ALR_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+          "$cc" --version
+          mkdir -p build
+          # 16 KB page flags are not optional: Android 15+ devices boot with a
+          # 16 KB page size and a 4 KB-aligned binary will not load there.
+          "$cc" --target=aarch64-linux-android24 \
+            -O1 -Wall -Wextra -std=c11 -D_GNU_SOURCE \
+            -Isrc/common -Isrc/supervisor \
+            -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384 \
+            -o build/alr \
+            src/cli/alr.c \
+            src/cli/alr_resolvd.c \
+            src/common/alr_exec_rule.c \
+            src/common/alr_elf.c \
+            src/supervisor/alr_supervisor.c
+
+      - name: cross-build alr-doctor
+        run: |
+          set -euo pipefail
+          cc="$ALR_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+          "$cc" --target=aarch64-linux-android24 \
+            -O1 -Wall -Wextra -std=c11 -D_GNU_SOURCE \
+            -Isrc/common -Isrc/supervisor \
+            -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384 \
+            -o build/alr-doctor \
+            src/cli/doctor.c
+
+      - name: produced binaries are aarch64
+        run: file build/alr build/alr-doctor
+
+      # These are CI artifacts, not release binaries: the NDK here is whatever
+      # the runner image carries, while a release pins it.  scripts/make-release.sh
+      # is the only thing that produces a shippable tarball.
+      - name: upload cross-built binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: alr-ndk-UNVERIFIED-${{ github.sha }}
+          path: |
+            build/alr
+            build/alr-doctor
+          if-no-files-found: error

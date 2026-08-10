@@ -1,0 +1,286 @@
+# wrappers.def — the single source of truth for the symbols
+# libalr_preload.so MUST define.  docs/04-preload-spec.md §6 designates this
+# file as canonical, and §14 requires the PRELOAD CHK SYMBOLS PRESENT gate that
+# reads it (scripts/check-preload.sh).
+#
+# WHY THIS FILE EXISTS
+# Six mandatory exec entry points (posix_spawn, posix_spawnp, system, popen,
+# pclose, fexecve/execveat) were absent for the entire life of the project and
+# NOTHING flagged it: `make` was broken end to end, and every test passed
+# because each one happened to reach the guest through a shell.  Eighteen more
+# §6 symbols -- including fstat/fstat64, which §6.2 documents as mandatory for
+# link-identity consistency -- were missing for the same reason.  A list that
+# is merely dumped from the binary would be a tautology and could never catch
+# this; the point is that this file records what the SPEC requires, and the
+# gate reports the difference.
+#
+# ADDING A SYMBOL: add it here first, then implement it.  If the gate fails,
+# the gate is right.
+#
+# Format: one symbol per line.  '#' starts a comment.
+
+# --- 6.1  open family
+# docs/04-preload-spec.md §6.1
+open
+open64
+openat
+openat64
+creat
+creat64
+__open_2
+__open64_2
+__openat_2
+__openat64_2
+fopen
+fopen64
+freopen
+freopen64
+
+# --- 6.2  stat family (BOTH name sets)
+# §6.2 — fstat/fstat64 are mandatory for §8.2 link identity
+stat
+stat64
+lstat
+lstat64
+fstat
+fstat64
+fstatat
+fstatat64
+newfstatat
+statx
+statvfs
+statvfs64
+statfs
+statfs64
+__xstat
+__xstat64
+__lxstat
+__lxstat64
+__fxstat
+__fxstat64
+__fxstatat
+__fxstatat64
+
+# --- 6.3  access family
+# §6.3
+access
+eaccess
+euidaccess
+faccessat
+faccessat2
+
+# --- 6.4  link / symlink
+# §6.4 + §8 link2symlink
+readlink
+readlinkat
+__readlink_chk
+__readlinkat_chk
+symlink
+symlinkat
+link
+linkat
+
+# --- 6.5  directories and cwd
+# §6.5
+opendir
+scandir
+scandir64
+mkdir
+mkdirat
+rmdir
+chdir
+getcwd
+__getcwd_chk
+getwd
+__getwd_chk
+get_current_dir_name
+
+# --- 6.6  remove / rename
+# §6.6
+unlink
+unlinkat
+remove
+rename
+renameat
+renameat2
+truncate
+truncate64
+
+# --- 6.7  nodes and mounts
+# §6.7
+mknod
+mknodat
+mkfifo
+mkfifoat
+name_to_handle_at
+mount
+umount
+umount2
+pivot_root
+chroot
+
+# --- 6.8  ownership and mode
+# §6.8
+chmod
+fchmodat
+chown
+lchown
+fchown
+fchownat
+
+# --- 6.9  timestamps
+# §6.9
+utime
+utimes
+lutimes
+futimesat
+utimensat
+
+# --- 6.10 identity (fakeroot)
+# §6.10 — ALR_FAKEROOT spoofing
+getuid
+geteuid
+getgid
+getegid
+getresuid
+getresgid
+getgroups
+
+# --- 6.12 terminal
+# §6.12 + §5.3 guest_canon
+ttyname
+ttyname_r
+__ttyname_r_chk
+
+# --- 6.13 dynamic loading
+# §6.13
+dlopen
+dlmopen
+
+# --- 6.14 temp files
+# §6.14 — glibc builds these against a LITERAL /tmp
+mkstemp
+mkstemp64
+mkstemps
+mkstemps64
+mkostemp
+mkostemp64
+mkostemps
+mkostemps64
+mkdtemp
+tmpfile
+tmpfile64
+tmpnam
+tmpnam_r
+tempnam
+
+# --- 6.16 symlink target relativization
+# §6.16
+
+# --- 6.17 glibc-internal bypass
+# §6.17 — public entry point interposed because the internal one cannot be
+lckpwdf
+ulckpwdf
+getpwnam
+getpwnam_r
+getpwuid
+getpwuid_r
+getgrnam
+getgrnam_r
+getgrgid
+getgrgid_r
+setpwent
+getpwent
+endpwent
+setgrent
+getgrent
+endgrent
+getgrouplist
+socket
+# AF_UNIX addresses carry a PATH in sun_path and nothing rewrote it until
+# 2026-08-03: tmux could not create its socket even with the directory present,
+# because the directory was rewritten and the address was not.  Abstract
+# sockets (sun_path[0]=='\0') must NOT be touched.
+bind
+connect
+# accept(2) is BLOCKED by the zygote filter while accept4(2) is allowed, so the
+# supervisor emulated accept as -ENOSYS and every guest server failed to take a
+# connection.  accept(f,a,l) == accept4(f,a,l,0).
+accept
+
+# --- 7    /proc virtualization
+# §7 — /proc/self/cmdline is synthesised through the open/fopen wrappers above;
+# leaving it raw exposed the whole loader invocation and made every uutils
+# coreutils tool on Ubuntu 26.04 unusable (it resolves its own name from there).
+setmntent
+
+# --- 9    exec re-dispatch
+# §9 + §9.4 — glibc's posix_spawn never reaches our execve
+execve
+execv
+execvp
+execvpe
+execl
+execlp
+execle
+execveat
+fexecve
+posix_spawn
+posix_spawnp
+system
+popen
+pclose
+
+# --- 10   syscall() interposition
+# §10 — Node requires it
+syscall
+
+# --- 11   ioctl translation
+# §11 — measured: Android denies TCGETS2/TIOCGSID/TIOCGETD/TIOCEXCL/TIOCSTI.
+# FIONREAD is ALLOWED, falsifying the spec's "emulate via the master fd" premise.
+ioctl
+
+# --- --   resolver bridge
+# hosts: files dns; the bridge answers from bionic
+getaddrinfo
+freeaddrinfo
+getnameinfo
+gethostbyname
+gethostbyname2
+gethostbyname_r
+gethostbyname2_r
+gethostbyaddr
+gethostbyaddr_r
+
+# --- --   path canonicalisation
+# §5.3
+realpath
+canonicalize_file_name
+
+# --- 5.3 (cont.) fortified realpath
+__realpath_chk
+
+
+# =====================================================================
+# DELIBERATELY NOT IMPLEMENTED
+# =====================================================================
+# The gate must not flag these.  Each is a decision, not an oversight.
+#
+# §6.15 fd-state write surface -- write pwrite pwrite64 writev pwritev
+#   pwritev2 fwrite fputs fputc fprintf vfprintf fflush
+#   These exist only to serve /dev/full (§12), which is now a permanent
+#   non-goal (docs/RISKS.md): serving it means interposing write(), the
+#   hottest syscall in the process, for a device node no target workload
+#   touches -- and any stdio symbol missed fails SILENTLY as a successful
+#   write, unlike the enumerable, loud failure modes of every other group
+#   above.  The preload also calls write() internally, so defining it would
+#   capture our own calls.
+#
+# glibc internals -- __open __open64_nocancel __nss_files_fopen
+#   __gen_tempname __mkdir
+#   Not public symbols.  LD_PRELOAD cannot reach them at all; they are named
+#   in the spec only to explain WHY the public entry point above it is
+#   interposed.
+#
+# blocked by the platform -- setgroups
+#   seccomp denies it; there is nothing to virtualise.

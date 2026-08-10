@@ -1,0 +1,75 @@
+# ── build outputs ───────────────────────────────────────────────────────────
+# Everything the Makefile and scripts/build-preload.sh emit lands in build/:
+# libalr_preload.so, libalr_preload.manifest.json, test_path, test_exec_rule,
+# alr, alr-doctor.  The manifest is generated too — it records the zig version
+# and the .so's sha256, so a committed copy would go stale on the next build
+# and start lying about what is in the tree.
+build/
+
+# ── binaries built outside build/ ───────────────────────────────────────────
+# scripts/dev-push.sh compiles with a bare `-o alr`, `-o test_path`, … inside
+# the synced tree.  Anyone running those command lines by hand from the repo
+# root drops the artifacts here instead of in build/.  Root-anchored so a
+# future source file named e.g. src/cli/alr is not swallowed.
+/alr
+/alr-doctor
+/alr-resolvd
+/test_path
+/test_exec_rule
+/test_supervisor
+/probe_spawn
+/rw_cost
+
+*.o
+*.a
+*.so
+*.dSYM/
+
+# ── release tarballs / downloaded rootfs archives ───────────────────────────
+# alr-<version>-aarch64.tar.gz is a build product.  Ubuntu base archives pulled
+# for provisioning are hundreds of MB and must never enter git history.
+/dist/
+*.tar.gz
+*.tar.xz
+*.tar.zst
+
+# ── scratch rootfs and runtime state ────────────────────────────────────────
+# The real host data root is $PREFIX/var/lib/alr/, outside the repo, but local
+# experiments with ALR_ROOT_DIR / ALR_DISTROS_DIR routinely point at a path
+# inside the checkout.  An extracted rootfs is ~1 GB of files, some of them
+# symlinks to absolute guest paths — catastrophic to commit by accident.
+/rootfs/
+/rootfs-*/
+/distros/
+/var/
+/tmp/
+/scratch/
+
+# ── toolchain caches ────────────────────────────────────────────────────────
+# `zig cc` normally uses the global cache under ~/.cache/zig, but a local
+# .zig-cache/ appears if anyone runs zig from inside the tree.
+.zig-cache/
+zig-out/
+compile_commands.json
+.cache/
+.ccls-cache/
+
+# ── editor / OS noise ───────────────────────────────────────────────────────
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.orig
+*.rej
+
+# Machine-local agent permissions; the shared .claude/settings.json (if one is
+# ever added) stays tracked.
+.claude/settings.local.json
+
+# Python bytecode. A .pyc for bench/regression_gate.py was committed by
+# accident and would have shipped inside the tag's source archive, and thus
+# inside the termux recipe's TERMUX_PKG_SHA256.
+__pycache__/
+*.pyc

@@ -1,0 +1,122 @@
+# Release: build the tarball on a tag and publish it.
+#
+# The release is built HERE rather than on a maintainer's laptop because it
+# needs two toolchains that must be pinned, and neither is on a typical dev
+# machine:
+#
+#   guest side  zig 0.16.0, --target=aarch64-linux-gnu.2.17  (libalr_preload.so)
+#   host side   Android NDK clang, --target=aarch64-linux-android24  (alr, alr-doctor)
+#
+# The .2.17 floor is load-bearing, not cosmetic: it makes the linker REFUSE any
+# accidental call into the stat family, which the interposer must only DEFINE
+# (docs/04-preload-spec.md §1).  scripts/check-preload.sh asserts it.
+#
+# WHAT THIS CANNOT DO: none of tests/device/ runs here.  Those self-refuse
+# unless uid>=10000 and Seccomp==2 on a real Android app process, so the
+# acceptance number, the 96-package breadth number and every PRoot A/B figure
+# come from a human-driven device session.  A green release job means the
+# artifacts BUILD and pass the ELF gates -- not that the runtime was retested.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "existing tag to build (workflow_dispatch only)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: build and publish
+    runs-on: ubuntu-latest
+    env:
+      ZIG_VERSION: 0.16.0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: install pinned zig
+        run: |
+          set -euo pipefail
+          arch=$(uname -m)
+          # Upstream flipped its archive naming between zig-<os>-<arch>-<ver>
+          # and zig-<arch>-<os>-<ver>; try both rather than guess.
+          for name in "zig-${arch}-linux-${ZIG_VERSION}" "zig-linux-${arch}-${ZIG_VERSION}"; do
+            url="https://ziglang.org/download/${ZIG_VERSION}/${name}.tar.xz"
+            echo "trying $url"
+            if curl -fsSL -o zig.tar.xz "$url"; then found="$name"; break; fi
+          done
+          if [ -z "${found:-}" ]; then
+            echo "no zig ${ZIG_VERSION} tarball found for arch=${arch}" >&2
+            exit 1
+          fi
+          tar -xf zig.tar.xz
+          echo "$PWD/$found" >> "$GITHUB_PATH"
+
+      - name: locate NDK on the runner image
+        run: |
+          set -euo pipefail
+          ndk="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}}"
+          [ -n "$ndk" ] && [ -d "$ndk" ] || { echo "no Android NDK on this runner" >&2; exit 1; }
+          echo "NDK=$ndk" >> "$GITHUB_ENV"
+          cat "$ndk/source.properties" || true
+
+      - name: version and tag must agree
+        run: |
+          set -euo pipefail
+          v=$(sed -n 's/^#define ALR_VERSION "\(.*\)"$/\1/p' src/common/alr_version.h)
+          # Use the SAME expression the checkout step used.  This was
+          # "${GITHUB_REF_NAME:-<input>}", and on a workflow_dispatch
+          # GITHUB_REF_NAME is the selected BRANCH, not the input tag -- it is
+          # always set, so the `:-` fallback was dead code and the check
+          # compared the header against a branch name.  Checkout took the
+          # input; validation has to look at the same thing.
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "header=$v tag=$tag"
+          # A tag that disagrees with the header ships a binary whose `alr
+          # version` contradicts its own download URL.  Refuse.
+          [ "v$v" = "$tag" ] || { echo "tag $tag != v$v from alr_version.h" >&2; exit 1; }
+
+      # `make check`, not `make test`.  The tag path used to run only the host
+      # core tests, so the doc cross-reference gate never ran on a release --
+      # even though README.md ships INSIDE the tarball.  `make check` is
+      # test + check-preload.sh + check-docs.sh + the gate self-test, all of
+      # which are device-free.  (check-preload.sh runs again below because it
+      # is cheap and the ordering there is deliberate.)
+      - name: host core tests, doc links, gate self-test
+        run: make check
+
+      - name: preload gates
+        run: bash scripts/check-preload.sh
+
+      # check-preload.sh builds into a scratch dir on purpose (it verifies
+      # reproducibility by building twice into isolated caches), so build/ is
+      # still empty at this point.  make-release.sh consumes build/ and refuses
+      # without it -- which is how the first tag failed, correctly.
+      - name: build the guest .so into build/
+        run: scripts/build-preload.sh
+
+      - name: build release tarball
+        run: scripts/make-release.sh
+
+      - name: show what will be published
+        run: |
+          set -euo pipefail
+          ls -l dist/
+          cat dist/SHA256SUMS
+          tar -tzf dist/*.tar.gz
+
+      - name: publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          generate_release_notes: true
+          fail_on_unmatched_files: true

@@ -1,0 +1,120 @@
+# alr guest->host path translation cases.
+# Consumed by tests/host (C) and the Python reference model.
+# Adding a case here is the ONLY sanctioned way to change rewrite behaviour:
+# both consumers must agree, which is what stops the supervisor-side and
+# preload-side rewriters from drifting apart.
+#
+# Columns: root <TAB> input <TAB> expected
+#
+# "=" in expected means "unchanged, AND the implementation must return the
+# input pointer itself, not a copy" (docs/04-preload-spec.md R1/§5.1). The
+# harness asserts pointer identity for these rows, not just string equality --
+# returning a copy is a silent per-call memcpy in the hot path.
+#
+# A literal string in expected means "must return a rewritten/normalized
+# buffer". Note that a path needing normalization which then turns out to be a
+# sysdir (e.g. /proc/./self/maps) returns the NORMALIZED string, not the input
+# pointer -- so its expected column is the normalized form, never "=".
+#
+# "!TOOLONG" means the call must return NULL with err == ALR_E_TOOLONG.
+
+# --- guest absolute -> host ------------------------------------------------
+/data/alr/ubuntu	/usr/bin/git	/data/alr/ubuntu/usr/bin/git
+/data/alr/ubuntu	/etc/passwd	/data/alr/ubuntu/etc/passwd
+/data/alr/ubuntu	/	/data/alr/ubuntu
+/data/alr/ubuntu	/a	/data/alr/ubuntu/a
+/data/alr/ubuntu	/lib/aarch64-linux-gnu/libc.so.6	/data/alr/ubuntu/lib/aarch64-linux-gnu/libc.so.6
+
+# --- relative paths are never rewritten ------------------------------------
+# (hot path: git increasingly uses openat(dirfd, relative))
+/data/alr/ubuntu	src/main.c	=
+/data/alr/ubuntu	.	=
+/data/alr/ubuntu	..	=
+/data/alr/ubuntu	./configure	=
+/data/alr/ubuntu	../sibling	=
+/data/alr/ubuntu	a/b/c	=
+/data/alr/ubuntu	x	=
+
+# --- kernel virtual filesystems pass through -------------------------------
+/data/alr/ubuntu	/proc/self/maps	=
+/data/alr/ubuntu	/proc	=
+/data/alr/ubuntu	/proc/1/status	=
+/data/alr/ubuntu	/sys/kernel/mm	=
+/data/alr/ubuntu	/sys	=
+/data/alr/ubuntu	/dev/null	=
+/data/alr/ubuntu	/dev	=
+/data/alr/ubuntu	/dev/pts/1	=
+
+# --- component boundary: these are NOT sysdirs -----------------------------
+/data/alr/ubuntu	/proctology	/data/alr/ubuntu/proctology
+/data/alr/ubuntu	/system-config	/data/alr/ubuntu/system-config
+/data/alr/ubuntu	/devel	/data/alr/ubuntu/devel
+/data/alr/ubuntu	/procs	/data/alr/ubuntu/procs
+/data/alr/ubuntu	/sysroot	/data/alr/ubuntu/sysroot
+
+# --- idempotency: already under root ---------------------------------------
+/data/alr/ubuntu	/data/alr/ubuntu/etc/passwd	=
+/data/alr/ubuntu	/data/alr/ubuntu	=
+/data/alr/ubuntu	/data/alr/ubuntu/	/data/alr/ubuntu
+# ...but a sibling that merely shares a string prefix is NOT under root
+/data/alr/ubuntu	/data/alr/ubuntu-old/etc	/data/alr/ubuntu/data/alr/ubuntu-old/etc
+/data/alr/ubuntu	/data/alr/ubuntux	/data/alr/ubuntu/data/alr/ubuntux
+
+# --- dotdot clamps at the guest root, never escapes ------------------------
+/data/alr/ubuntu	/../../etc/passwd	/data/alr/ubuntu/etc/passwd
+/data/alr/ubuntu	/..	/data/alr/ubuntu
+/data/alr/ubuntu	/../	/data/alr/ubuntu
+/data/alr/ubuntu	/usr/../etc	/data/alr/ubuntu/etc
+/data/alr/ubuntu	/usr/bin/../../etc/passwd	/data/alr/ubuntu/etc/passwd
+/data/alr/ubuntu	/usr/../../../../../etc	/data/alr/ubuntu/etc
+/data/alr/ubuntu	/a/b/c/../../../..	/data/alr/ubuntu
+/data/alr/ubuntu	/usr/bin/..	/data/alr/ubuntu/usr
+
+# --- ESCAPE VIA SYSDIR / ROOT PREFIX ---------------------------------------
+# THE most important block in this file. These pass only if alr_rw normalizes
+# BEFORE the sysdir and already-under-root checks. Both of those are
+# component-boundary prefix matches, so they fire on UNNORMALIZED input and
+# return early -- with the wrong ordering the guest silently reads the ANDROID
+# HOST's file instead of the rootfs's.
+# Acceptance string: PRELOAD NORMALIZE BEFORE SYSDIR.
+/data/alr/ubuntu	/proc/../etc/passwd	/data/alr/ubuntu/etc/passwd
+/data/alr/ubuntu	/dev/../etc/shadow	/data/alr/ubuntu/etc/shadow
+/data/alr/ubuntu	/sys/../usr/bin/git	/data/alr/ubuntu/usr/bin/git
+/data/alr/ubuntu	/proc/self/../../etc/passwd	/data/alr/ubuntu/etc/passwd
+/data/alr/ubuntu	/dev/./../root/.ssh/id_ed25519	/data/alr/ubuntu/root/.ssh/id_ed25519
+# same trick against the idempotency guard
+/data/alr/ubuntu	/data/alr/ubuntu/../x	/data/alr/ubuntu/data/alr/x
+# normalization happened, so the NORMALIZED buffer comes back even though the
+# result is already under root -- not the input pointer. See the header note.
+/data/alr/ubuntu	/data/alr/ubuntu/./etc	/data/alr/ubuntu/etc
+# ...and legitimate sysdir paths must still pass through after normalizing
+/data/alr/ubuntu	/proc/./self/maps	/proc/self/maps
+/data/alr/ubuntu	/proc/self/fd/../maps	/proc/self/maps
+/data/alr/ubuntu	/dev//null	/dev/null
+
+# --- dot removal and slash squashing ---------------------------------------
+/data/alr/ubuntu	/usr/./bin//git	/data/alr/ubuntu/usr/bin/git
+/data/alr/ubuntu	/usr/bin/	/data/alr/ubuntu/usr/bin
+/data/alr/ubuntu	//usr//bin//	/data/alr/ubuntu/usr/bin
+/data/alr/ubuntu	/./	/data/alr/ubuntu
+/data/alr/ubuntu	/.	/data/alr/ubuntu
+/data/alr/ubuntu	///	/data/alr/ubuntu
+/data/alr/ubuntu	/usr/.	/data/alr/ubuntu/usr
+/data/alr/ubuntu	/././usr	/data/alr/ubuntu/usr
+
+# --- root with a trailing slash is normalised away by alr_trim_root --------
+/data/alr/ubuntu/	/usr/bin/git	/data/alr/ubuntu/usr/bin/git
+/data/alr/ubuntu///	/etc	/data/alr/ubuntu/etc
+
+# --- a deep but legal root -------------------------------------------------
+/data/data/com.termux/files/usr/var/lib/alr/distros/ubuntu-24.04	/usr/bin/git	/data/data/com.termux/files/usr/var/lib/alr/distros/ubuntu-24.04/usr/bin/git
+/data/data/com.termux/files/usr/var/lib/alr/distros/ubuntu-24.04	/proc/self/exe	=
+
+# --- empty root = passthrough mode (ALR_ROOT unset or invalid) --------------
+	/usr/bin/git	=
+	/proc/self/maps	=
+	rel/path	=
+
+# --- length guard ----------------------------------------------------------
+# 4000-char guest path under a 16-char root overflows ALR_PBUF(4096).
+# Generated by the harness (see GEN_TOOLONG), not spelled out here.

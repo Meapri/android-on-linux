@@ -1,0 +1,41 @@
+{
+  "_comment": [
+    "Soft regression baselines, keyed BY DEVICE.",
+    "",
+    "They were flat until 2026-08-03, and the first run on a second phone",
+    "compared its node cold start (61 ms) against the first phone's recorded",
+    "57 ms and printed 'ok'.  That is not a regression check -- byte-identical",
+    "code gives 55 ms on one reference device and 61 ms on the other.  A flat",
+    "baseline both hides a real regression behind a faster phone and invents a",
+    "fake one on a slower one.",
+    "",
+    "The key comes from tests/device/bench.sh:  model/platform/androidNN/K.K",
+    "Record a device with:  bench/regression_gate.py --from <outputs> --update",
+    "Hard invariants are device-independent and are NOT keyed here.",
+    "",
+    "Both reference devices are now recorded.  Reference #1 was absent for a",
+    "while because its ro.board.platform was unknown and a guessed key would",
+    "have silently never matched; it was filled in by running the harness on",
+    "that phone (mt6878), which is how the gate is meant to learn a device."
+  ],
+  "devices": {
+    "SM-S937N/sun/android16/6.6": {
+      "exec_per_sec": 320,
+      "node_cold_ms": 56.0,
+      "preload.rw_abs_ns": 93.0,
+      "preload.rw_pinned": 1,
+      "preload.rw_rel_ns": 7.0,
+      "preload.rw_sysdir_ns": 32.0,
+      "preload.rw_under_ns": 116.7
+    },
+    "SM-X236N/mt6878/android16/6.1": {
+      "exec_per_sec": 342,
+      "node_cold_ms": 51.0,
+      "preload.rw_abs_ns": 58.9,
+      "preload.rw_pinned": 1,
+      "preload.rw_rel_ns": 3.6,
+      "preload.rw_sysdir_ns": 13.5,
+      "preload.rw_under_ns": 53.2
+    }
+  }
+}
