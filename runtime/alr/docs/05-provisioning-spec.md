@@ -269,6 +269,7 @@ preload-missing-in-rootfs  preload-stale              remove-failed
 rootfs-incomplete          rootfs-missing             rootfs-missing-interposer-deps
 rootfs-unbootable
 too-many-env               unhooked-static-binary     unsupported-distro
+uutils-coreutils
 with-failed                workdir-enoent
 ```
 

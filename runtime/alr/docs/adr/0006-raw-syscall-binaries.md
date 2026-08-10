@@ -124,3 +124,37 @@ Unknown signal 31        # SIGSYS — ADR 0001 이 말하는 그것
 - **arm64 SUD 를 지원하는 커널이 흔해지면** 이 결정을 뒤집어야 한다. SUD 는 프로세스 안에서 처리되므로 알림 왕복이 없고, raw-syscall 바이너리를 native 에 가까운 비용으로 지원할 수 있는 유일한 알려진 길이다.
   - **커널 6.6 에서도 아직 없다** — 참조 기기 #2(Snapdragon 8 Elite, `6.6.98-android15`)에서 `PR_SET_SYSCALL_USER_DISPATCH` 는 인자 두 형태 모두 `EINVAL` 이다([M19 §2](../evidence/2026-08-03-m19-snapdragon.md)). 이 ADR 의 근거는 6.1 과 6.6 양쪽에서 성립한다.
 - Ubuntu 가 26.04 이후로도 uutils 를 유지하고 사용자가 최신 LTS 를 요구하면, 위 3번(선택적 적용)이 "느리지만 동작" 과 "아예 안 됨" 중 하나를 고르는 문제가 된다. 그 전에 심링크 팜 가설부터 시험한다.
+
+
+## 탈출로가 있다 — 26.04 는 지원 가능하다 (2026-08-11, 실측)
+
+위의 분석은 그대로 옳다. 바뀐 것은 **결론**이다: uutils 를 후킹할 수 없다는 것과 26.04 를 쓸 수 없다는 것은 다른 문장이고, 우분투가 스스로 갈아끼울 방법을 만들어 뒀다.
+
+26.04(`resolute`) 아카이브의 실제 패키지 구성:
+
+| 패키지 | arch | 역할 |
+|---|---|---|
+| `coreutils-from-uutils` | all | priority **required** — 기본 선택자 |
+| `coreutils-from-gnu` | all | `Provides: coreutils` — **공식 대안 선택자** |
+| `gnu-coreutils` | **arm64** | GNU 실물 (`gnuls`·`gnucat` … 104개) |
+| `rust-coreutils` | arm64 | uutils 실물 |
+
+즉 GNU 로 되돌리는 것은 꼼수가 아니라 **우분투가 마련해 둔 경로**다.
+
+`MEASURED` 2026-08-11, SM-X236N / Android 16, 앱 샌드박스 안의 26.04 rootfs:
+
+```
+$ alr -d ubuntu-26.04 run /usr/bin/gnuls -la /etc/os-release
+lrwxrwxrwx. 1 alr alr 21 Apr 20 08:46 /etc/os-release -> ../usr/lib/os-release
+
+$ alr -d ubuntu-26.04 run /usr/bin/gnucat /etc/os-release
+PRETTY_NAME="Ubuntu 26.04 LTS"
+```
+
+`gnu-coreutils` 9.7-3ubuntu2 의 바이너리는 **경로 가상화가 완전히 걸린 채로** 동작한다 — 심볼릭 링크 표시(`-> ../usr/lib/os-release`)와 소유자(`alr alr`, uid 항목이 들어간 게스트 passwd) 둘 다 게스트 형식이다.
+
+같은 rootfs 의 나머지도 정상이다: `dpkg 1.23.7`, `apt 3.2.0`, `dash`.
+
+**그러므로 26.04 대응의 비용은 런타임 변경 0 이다.** 프로비저닝 시점에 `coreutils-from-gnu` 를 선택하면 된다. 반대로 uutils 를 그대로 두고 후킹하려는 길(seccomp user notification, 154 µs/syscall)은 여전히 [ADR 0001](0001-signal-only-ptrace-supervisor.md) 을 무너뜨리므로 택하지 않는다.
+
+**남은 정직한 한계**: 이것은 "26.04 를 스톡 그대로 쓴다" 가 아니라 "26.04 를 GNU coreutils 로 쓴다" 이다. 그리고 우분투가 러스트로 옮긴 것이 coreutils 만은 아닐 수 있으므로(예: `sudo-rs`), 같은 부류가 다른 패키지에서 또 나올 수 있다 — 그건 나올 때 재서 판단한다.

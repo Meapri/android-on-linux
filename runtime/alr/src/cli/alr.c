@@ -1248,6 +1248,47 @@ static int install_hostbin(const char *distro, const char *R)
     return bad ? -1 : 0;
 }
 
+/* Is this rootfs's coreutils the uutils multicall binary?
+ *
+ * If it is, every one of ls/cat/echo/cp is one Rust binary that decides which
+ * applet to be from its OWN identity -- and it reads that identity with a raw
+ * `svc`, not through libc, so neither the interposer's synthetic /proc/self/exe
+ * nor --argv0 reaches it. Under the explicit loader (ADR 0002) it therefore
+ * sees the LOADER:
+ *
+ *     coreutils: unknown program 'ld-linux-aarch64.so'
+ *
+ * There is nothing to fix in alr -- catching those syscalls means ptrace per
+ * syscall, which is what this project exists not to do (ADR 0001). But Ubuntu
+ * ships the way out: coreutils-from-gnu is a first-class selector in the same
+ * archive, and MEASURED 2026-08-11, gnu-coreutils 9.7 runs under alr with path
+ * virtualization fully applied.
+ *
+ * Said once, at provisioning, because the alternative is the user discovering
+ * it when `ls` fails with a message about a loader they never invoked. */
+static void warn_uutils_coreutils(const char *R)
+{
+    char p[ALR_PBUF];
+    struct stat st;
+
+    /* The tell: /usr/bin/coreutils is a large multicall binary, and the tools
+     * are symlinks into /usr/lib/cargo/bin/coreutils/. GNU coreutils has no
+     * such file at all. */
+    snprintf(p, sizeof p, "%s/usr/lib/cargo/bin/coreutils", R);
+    if (stat(p, &st) != 0 || !S_ISDIR(st.st_mode)) return;
+
+    fprintf(stderr,
+        "alr: NOTE this rootfs uses uutils coreutils (Rust), not GNU.\n"
+        "     ls, cat, echo, cp and the rest are ONE multicall binary that\n"
+        "     reads its own identity with a raw syscall, which no LD_PRELOAD\n"
+        "     can see.  Under an explicit loader they report\n"
+        "       coreutils: unknown program 'ld-linux-aarch64.so'\n"
+        "     Everything else in the image (bash, dash, apt, dpkg, grep, sed,\n"
+        "     awk, tar) is unaffected.\n"
+        "     FIX, from the same archive:  apt install coreutils-from-gnu\n"
+        "     reason=uutils-coreutils  (docs/adr/0006-raw-syscall-binaries.md)\n");
+}
+
 /* `alr update-components [<distro>]` -- docs/05-provisioning-spec.md.
  *
  * It exists because the .so the guest loads is a COPY made at install time,
@@ -1867,6 +1908,7 @@ static int cmd_install(const char *distro, const char *url_override)
 
     repair(part);
     rep.repaired = access_ok_all(part);
+    warn_uutils_coreutils(part);
     /* NOT ignorable.  This used to discard the return value, so a rootfs with
      * NO path virtualization was reported as a successful install: the warning
      * scrolled past, cmd_install returned 0, and `alr run` then booted it
@@ -2205,6 +2247,11 @@ static int cmd_adopt(const char *distro)
 
     repair(R);
     rep.repaired = access_ok_all(R);
+    /* Before any verification can abort: a uutils rootfs is exactly the kind
+     * that fails verify_rootfs (its /usr/bin/env is a link into the multicall
+     * tree), and a bare "missing usr/bin/env" tells the user nothing about
+     * why. */
+    warn_uutils_coreutils(R);
     install_hostbin(distro, R);
 
     if (install_preload(R) != 0)
