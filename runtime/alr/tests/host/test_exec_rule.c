@@ -256,5 +256,26 @@ int main(void)
         printf("ALR EXEC RULE TESTS: %s\n", fail > before ? "FAIL" : "PASS");
     }
     printf("  assertions: %d passed, %d failed\n", pass, fail);
+    /* The ZYGOTE's environment, not Termux's.
+     *
+     * This blocklist was written against Termux, whose environment is
+     * comparatively clean. An APK-hosted alr inherits the zygote's, and the
+     * guest saw all of these -- MEASURED 2026-08-11 inside a real app:
+     * ANDROID_BOOTLOGO, ASEC_MOUNTPOINT, DOWNLOAD_CACHE, KNOX_STORAGE,
+     * ENC_EMULATED_STORAGE_TARGET, HOSTNAME=gta11p. No Termux-hosted test
+     * could ever have caught it, because those variables are not in Termux's
+     * environment to leak. */
+    ck(alr_env_is_blocked("ANDROID_BOOTLOGO=1"), "block ANDROID_BOOTLOGO (zygote)", "", "blocked");
+    ck(alr_env_is_blocked("ASEC_MOUNTPOINT=/mnt/asec"), "block ASEC_MOUNTPOINT (zygote)", "", "blocked");
+    ck(alr_env_is_blocked("DOWNLOAD_CACHE=/data/cache"), "block DOWNLOAD_CACHE (zygote)", "", "blocked");
+    ck(alr_env_is_blocked("KNOX_STORAGE=/data/knox"), "block KNOX_STORAGE (OEM)", "", "blocked");
+    ck(alr_env_is_blocked("KNOX_ANYTHING=x"), "block KNOX_* family", "", "blocked");
+    ck(alr_env_is_blocked("ENC_EMULATED_STORAGE_TARGET=/s"), "block ENC_EMULATED_STORAGE_TARGET", "", "blocked");
+    ck(alr_env_is_blocked("HOSTNAME=gta11p"), "block HOSTNAME (programs act on it)", "", "blocked");
+    /* ...and the guest's own variables must still get through. */
+    ck(!alr_env_is_blocked("PATH=/usr/bin"), "PATH survives", "", "kept");
+    ck(!alr_env_is_blocked("HOME=/root"), "HOME survives", "", "kept");
+    ck(!alr_env_is_blocked("ANDROIDX_THING=1"), "unrelated ANDROID-ish name survives", "", "kept");
+
     return fail ? 1 : 0;
 }

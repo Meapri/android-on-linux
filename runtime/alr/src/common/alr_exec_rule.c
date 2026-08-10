@@ -115,6 +115,25 @@ int alr_env_is_blocked(const char *entry)
         "SYSTEMSERVERCLASSPATH", "EXTERNAL_STORAGE", "PREFIX",
         "TERMUX_APK_RELEASE", "TERMUX_APP_PID", "TERMUX_IS_DEBUGGABLE_BUILD",
         "TERMUX_MAIN_PACKAGE_FORMAT", "TERMUX_VERSION", "TERMUX__USER_ID",
+        /* The zygote's environment, which is what an APK-hosted alr inherits.
+         *
+         * This list was written against TERMUX's environment, which is
+         * comparatively clean. Inside an Android app the parent is the zygote
+         * and the guest saw all of these -- MEASURED 2026-08-11 in
+         * dev.chanwoo.androlinux:
+         *     ANDROID_BOOTLOGO=1  ASEC_MOUNTPOINT=/mnt/asec
+         *     DOWNLOAD_CACHE=/data/cache  KNOX_STORAGE=/data/knox/ext_sdcard
+         *     ENC_EMULATED_STORAGE_TARGET=/storage/enc_emulated
+         *     HOSTNAME=gta11p
+         * A guest that inherits these is not a clean userland: configure
+         * scripts and build systems read the environment, and HOSTNAME in
+         * particular is a variable real programs act on. */
+        "ANDROID_BOOTLOGO", "ANDROID_CONSOLE_LOGLEVEL", "ANDROID_LOG_TAGS",
+        "ASEC_MOUNTPOINT", "DOWNLOAD_CACHE", "LOOP_MOUNTPOINT",
+        "EMULATED_STORAGE_SOURCE", "EMULATED_STORAGE_TARGET",
+        "ENC_EMULATED_STORAGE_SOURCE", "ENC_EMULATED_STORAGE_TARGET",
+        "KNOX_STORAGE", "SECONDARY_STORAGE", "VENDOR_ROOT",
+        "ART_APEX_DATA", "HOSTNAME",
         NULL
     };
     const char *val;
@@ -128,5 +147,10 @@ int alr_env_is_blocked(const char *entry)
     /* Whole families. */
     if (klen > 15 && memcmp(entry, "ANDROID_SOCKET_", 15) == 0) return 1;
     if (klen >= 7 && memcmp(entry, "TERMUX_", 7) == 0)          return 1;
+    /* Samsung and other OEM images add their own families. Dropping a variable
+     * the guest never needed is cheap; letting one through is what produced
+     * KNOX_STORAGE in an Ubuntu shell. */
+    if (klen >= 5 && memcmp(entry, "KNOX_", 5) == 0)            return 1;
+    if (klen >= 4 && memcmp(entry, "SEC_", 4) == 0)             return 1;
     return 0;
 }

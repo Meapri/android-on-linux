@@ -518,8 +518,11 @@ class MainActivity : Activity() {
 
         val prootHelloResult = nativeCommandRunner.runProotRootfsProgram(rootfsStatus.rootfsDir, "/bin/hello")
         val prootScriptResult = nativeCommandRunner.runProotRootfsProgram(rootfsStatus.rootfsDir, "/bin/script-hello")
+        // Back on the fixtures tree: this probe asserts the bundled image's own
+        // os-release string, so pointing it at a distro rootfs made it fail for
+        // being in the wrong place rather than for anything about shells.
         val prootShellResult = nativeCommandRunner.runProotRootfsShell(
-            userlandRootfsDir,
+            rootfsStatus.rootfsDir,
             "echo shell-c ok; /bin/hello; /bin/cat /etc/os-release",
         )
         val prootGlibcResult = nativeCommandRunner.runProotRootfsProgram(rootfsStatus.rootfsDir, "/bin/glibc-hello")
@@ -1039,7 +1042,11 @@ class MainActivity : Activity() {
         }
         val distroUserlandExecutionPassed = prootDashResult.exitCode == 0 &&
             prootDashResult.stdout.contains("dash-c ok") &&
-            prootDashResult.stdout.contains("ALR_ROOTFS=") &&
+            // alr exports ALR_ROOT (and ALR_ROOT_DIR); ALR_ROOTFS was the
+            // PRoot wrapper's own name for it. The assertion is that the guest
+            // gets a DELIBERATE environment, not that it gets one specific
+            // legacy spelling.
+            prootDashResult.stdout.contains("ALR_ROOT=") &&
             prootDashResult.stdout.contains("PATH=") &&
             !guestEnvLeakedAndroidVars
         val identityNumericRoot = prootIdResult.exitCode == 0 &&
