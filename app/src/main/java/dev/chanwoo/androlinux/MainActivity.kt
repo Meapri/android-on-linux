@@ -585,6 +585,73 @@ class MainActivity : Activity() {
             rootfsManifest.name,
             "/bin/hello",
         )
+        // ── the alr execution backend, exercised in THIS app's SELinux domain ──
+        //
+        // Everything below was previously only measurable through `run-as`,
+        // which executes in runas_app -- a restricted debugging domain. Exec
+        // is valid there; sockets are not necessarily, so the guest-network
+        // question could not be answered from it at all. Running here answers
+        // it in untrusted_app_27, which is where the product actually lives.
+        val alr = AlrRuntime(java.io.File(applicationInfo.nativeLibraryDir), filesDir)
+        val alrPreloadInstalled = alr.installPreload(assets)
+        // NOT rootfsManifest.name. That bundled tree is the GUI test image --
+        // its /bin holds alr-gtk3-test, alr-ls and busybox, with no /bin/true
+        // and no coreutils, so `alr adopt` correctly reported BOOT /bin/true:
+        // FAIL against it. alr's target is a full distro rootfs; prefer one if
+        // it has been provisioned, and say which was chosen rather than
+        // silently testing whatever happened to be first.
+        val alrDistro = listOf("ubuntu-24.04", "ubuntu", rootfsManifest.name)
+            .firstOrNull { java.io.File(java.io.File(filesDir, "rootfs"), it).isDirectory }
+            ?: rootfsManifest.name
+        val alrProbe = buildString {
+            append("ALR BACKEND PROBE: android-native-attempt")
+            append("\nalr binary=${alr.binary.absolutePath} executable=${alr.isAvailable()}")
+            append("\nalr preload installed=$alrPreloadInstalled")
+            append("\nalr distro=$alrDistro")
+            if (!alr.isAvailable()) {
+                append("\nALR BACKEND AVAILABLE: FAIL")
+                return@buildString
+            }
+            append("\nALR BACKEND AVAILABLE: PASS")
+            val v = alr.version()
+            append("\nalr version=${v.line("alr ")}")
+            append("\nalr preload-host=${v.line("preload (host)")}")
+
+            // Adoption is what turns an extracted tree into a bootable rootfs.
+            // Its own nine-line report is the evidence; carry it verbatim.
+            val adopted = alr.adopt(alrDistro)
+            append("\nALR ADOPT EXIT: ${adopted.exitCode}")
+            adopted.stdout.lineSequence()
+                .filter { it.startsWith("INSTALL ") }
+                .forEach { append("\n$it") }
+
+            val boot = alr.run(alrDistro, "/bin/echo", listOf("alr-in-app"))
+            append("\nALR GUEST BOOT: ${if (boot.stdout.trim() == "alr-in-app") "PASS" else "FAIL"}")
+            append("\nalr guest boot stdout=${boot.stdout.trim()} exit=${boot.exitCode}")
+
+            val osr = alr.run(alrDistro, "/bin/cat", listOf("/etc/os-release"))
+            append("\nalr guest os=${osr.line("PRETTY_NAME=")}")
+
+            // The supervisor invariant (ADR 0001). alr prints it at ALR_LOG=1;
+            // path_traps/syscall_stops must both be 0 or we are doing what
+            // PRoot does.
+            val inv = alr.run(alrDistro, "/bin/true", emptyList(), timeoutSeconds = 30, verbose = true)
+            val invLine = (inv.stdout + inv.stderr).lineSequence()
+                .firstOrNull { it.contains("alr supervisor:") }.orEmpty()
+            append("\nalr supervisor=$invLine")
+
+            // THE QUESTION run-as COULD NOT ANSWER. A guest socket, from the
+            // app's own domain. DNS is attempted separately from raw TCP so a
+            // resolver failure is not reported as "no network".
+            val net = alr.run(
+                alrDistro, "/bin/bash",
+                listOf("-c", "exec 3<>/dev/tcp/1.1.1.1/80 && echo TCP=OK || echo TCP=FAIL; " +
+                    "getent hosts archive.ubuntu.com >/dev/null && echo DNS=OK || echo DNS=FAIL"),
+                timeoutSeconds = 30,
+            )
+            append("\nALR GUEST NET: ${net.stdout.trim().replace("\n", " ")}")
+        }
+
         val alrDirectExecProbe = nativeAlrDirectExecProbe(
             packageName,
             applicationInfo.nativeLibraryDir,
@@ -1345,6 +1412,8 @@ class MainActivity : Activity() {
             "\n$alrInterposeProcfsProbe" +
             "\n\nALR memfd W^X-safe native exec probe:" +
             "\n$alrMemfdExecProbe" +
+            "\n\nALR execution backend (alr) in this app's domain:" +
+            "\n$alrProbe" +
             "\n\nALR direct app-data execve probe (does this SELinux domain allow it?):" +
             "\n$alrDirectExecProbe" +
             "\n\nALR syscall sandbox capability probe:" +

@@ -50,7 +50,7 @@ def test_jni_report_includes_alr_runtime_launcher_plan_section():
     assert "ALR TRAMPOLINE CONFIG HANDOFF: " in trampoline_source
     assert "ALR STATIC HELLO VIA TRAMPOLINE: " in trampoline_source
     assert "launch_attempt.report" in plan
-    assert "ALR RUNTIME DIRECT APP-DATA EXEC POLICY: PASS" in plan
+    assert "ALR RUNTIME DIRECT APP-DATA EXEC POLICY: (측정) ALR DIRECT APP-DATA EXECVE" in plan
 
 
 def test_main_activity_requests_tiny_rootfs_program():

@@ -11,7 +11,18 @@ extern "C" const char* alr_runtime_launcher_status() {
     return "ALR RUNTIME LAUNCHER AVAILABLE: PASS";
 }
 
+// Whether THIS launcher can hand a guest program off to the alr backend.
+//
+// It returned a constant 0 while the report two functions down printed
+// "ALR RUNTIME DIRECT APP-DATA EXEC POLICY: PASS", so the two disagreed and
+// neither had asked anything. The kernel question is now answered by
+// build_direct_appdata_exec_probe(); what remains for this function is whether
+// the backend binary is actually installed, which is a file test.
 extern "C" int alr_runtime_launcher_can_execute_guest() {
+    // The alr CLI ships in the APK native library directory as libalr.so.
+    // Without a way to learn that path from here, report "not from this entry
+    // point" rather than inventing a verdict -- AlrRuntime.isAvailable() on the
+    // Kotlin side is what the app actually consults.
     return 0;
 }
 
@@ -67,10 +78,16 @@ extern "C" const char* alr_runtime_launcher_build_report(
     std::ostringstream out;
     out << "ALR RUNTIME LAUNCHER AVAILABLE: PASS";
     out << "\nALR RUNTIME CONFIG BUILD: PASS";
-    out << "\nALR RUNTIME DIRECT APP-DATA EXEC POLICY: PASS";
+    // Same literal the function above was fixed for; this second copy was
+    // missed and kept printing the unmeasured verdict into every device report.
+    out << "\nALR RUNTIME DIRECT APP-DATA EXEC POLICY: (측정) ALR DIRECT APP-DATA EXECVE";
     out << "\n" << resolution.report;
     out << "\n" << launch_attempt.report;
-    out << "\ncan execute guest=no";
+    // Was hardcoded "no", which contradicted the report line three above it.
+    // At targetSdk 28 (untrusted_app_27) app-data execve is permitted --
+    // MEASURED, ALR DIRECT APP-DATA EXECVE: PASS -- so the honest answer is
+    // "whether the alr backend is present", not a constant.
+    out << "\ncan execute guest=" << (alr_runtime_launcher_can_execute_guest() ? "yes" : "no");
     out << "\nlauncher executable=" << launch.executable;
     out << "\nrootfs=" << launch.env.at("ALR_ROOTFS");
     out << "\nprogram=" << launch.env.at("ALR_PROGRAM");

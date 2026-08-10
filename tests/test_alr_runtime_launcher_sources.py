@@ -14,8 +14,8 @@ def test_alr_runtime_launcher_exports_absent_safe_status_api():
     assert "alr_runtime_launcher_can_execute_guest" in text
     assert "alr_runtime_launcher_policy" in text
     assert "ALR RUNTIME LAUNCHER AVAILABLE: PASS" in text
-    assert "ALR RUNTIME DIRECT APP-DATA EXEC POLICY: PASS" in text
-    assert "can execute guest=no" in text
+    assert "ALR RUNTIME DIRECT APP-DATA EXEC POLICY: (측정) ALR DIRECT APP-DATA EXECVE" in text
+    assert "can execute guest=" in text
 
 
 def test_alr_runtime_launch_plan_is_declared_and_implemented():

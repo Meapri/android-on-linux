@@ -1126,11 +1126,23 @@ std::string build_direct_appdata_exec_probe(const alr::RuntimeReportInput& input
     // output is itself proof the exec worked -- a denied execve produces no
     // program output at all.  So the only reliable signal is whether our
     // post-execve fallback ran: if execve returns, we print DIRECT_EXECVE_ERRNO.
-    const bool ran = exited &&
-                     child_out.find("DIRECT_EXECVE_ERRNO=") == std::string::npos;
+    // A child killed by a SIGNAL also proves execve() succeeded -- and this is
+    // the common case here, not an edge one: a real glibc program exec'd
+    // without alr's supervisor dies on SIGSYS at set_robust_list, which the
+    // zygote filter blocks, before it reaches main(). Requiring WIFEXITED
+    // reported that as a denied exec.
+    const bool signaled = WIFSIGNALED(status);
+    const bool ran = signaled ||
+                     (exited && child_out.find("DIRECT_EXECVE_ERRNO=") == std::string::npos);
 
     out << "\nalr direct-exec child_exit=" << code
+        << (signaled ? " child_signal=" : "")
+        << (signaled ? std::to_string(WTERMSIG(status)) : std::string())
         << " child_out=" << (child_out.empty() ? "(empty)" : child_out);
+    if (signaled && WTERMSIG(status) == SIGSYS)
+        out << "\nalr direct-exec note=SIGSYS -- the program STARTED and then hit"
+               " a syscall the zygote filter blocks; that is what alr's"
+               " supervisor exists to rescue";
     out << "\nALR DIRECT APP-DATA EXECVE: " << (ran ? "PASS" : "FAIL");
     out << "\nalr direct-exec domain-note=verdict is about execve() only;"
            " child_exit is the program's own business";
