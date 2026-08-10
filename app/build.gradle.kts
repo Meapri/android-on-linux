@@ -190,45 +190,15 @@ tasks.register("buildAlrRuntime") {
 tasks.matching { it.name.startsWith("merge") && (it.name.endsWith("Assets") || it.name.endsWith("JniLibFolders") || it.name.endsWith("NativeLibs")) }
     .configureEach { dependsOn("buildAlrRuntime") }
 
-tasks.register("packageProotCandidate") {
-    val generatedDir = layout.buildDirectory.dir("generated/native-test-command/jniLibs")
-    val prebuiltNativeDir = layout.projectDirectory.dir("src/main/prebuiltNative")
-    outputs.dir(generatedDir)
-    inputs.dir(prebuiltNativeDir).optional()
-    outputs.upToDateWhen { false }
-    doLast {
-        val abis = listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
-        abis.forEach { abi ->
-            val destDir = generatedDir.get().dir(abi).asFile
-            destDir.mkdirs()
-            val prebuiltProot = prebuiltNativeDir.dir(abi).file("libalr_proot.so").asFile
-            if (prebuiltProot.isFile) {
-                prebuiltProot.copyTo(destDir.resolve("libalr_proot.so"), overwrite = true)
-                val prebuiltTalloc = prebuiltNativeDir.dir(abi).file("libtalloc.so").asFile
-                if (prebuiltTalloc.isFile) {
-                    prebuiltTalloc.copyTo(destDir.resolve("libtalloc.so"), overwrite = true)
-                }
-                val prebuiltProotLoader = prebuiltNativeDir.dir(abi).file("libproot-loader.so").asFile
-                if (prebuiltProotLoader.isFile) {
-                    prebuiltProotLoader.copyTo(destDir.resolve("libproot-loader.so"), overwrite = true)
-                }
-            } else {
-                val built = fileTree(layout.buildDirectory.dir("intermediates/cxx/Debug")) {
-                    include("**/obj/$abi/alr-proot-candidate")
-                }.files.singleOrNull()
-                    ?: throw GradleException("missing alr-proot-candidate for $abi; run buildCMakeDebug[$abi] first")
-                built.copyTo(destDir.resolve("libalr_proot.so"), overwrite = true)
-            }
-        }
-    }
-}
+// packageProotCandidate removed: nothing bundles PRoot any more.
+
 
 tasks.matching { it.name == "mergeDebugJniLibFolders" }.configureEach {
-    dependsOn("packageNativeTestCommand", "packageProotCandidate", "buildAlrRuntime")
+    dependsOn("packageNativeTestCommand", "buildAlrRuntime")
 }
 
 tasks.matching { it.name.startsWith("buildCMakeDebug") }.configureEach {
-    finalizedBy("packageNativeTestCommand", "packageProotCandidate", "buildAlrRuntime")
+    finalizedBy("packageNativeTestCommand", "buildAlrRuntime")
 }
 
 dependencies {

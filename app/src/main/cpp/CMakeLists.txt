@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 3.22.1)
+# alr_proot_candidate removed with PRoot: alr is the only execution backend.
 # C is enabled project-wide (not just inside the arm64-v8a compositor block) so the
 # resident in-process re-exec trampoline (alr_inproc_reexec.c, a freestanding .c
 # file) links into alr_loader for ALL 4 NDK ABIs. The compositor block's
@@ -30,10 +31,8 @@ add_library(alr_runtime_launcher SHARED alr_runtime_launcher.cpp runtime_plan.cp
 add_library(alr_runtime_hook SHARED alr_runtime_hook.cpp)
 add_library(alr_runtime_interposer SHARED alr_runtime_interposer.cpp)
 add_executable(alr_test_command test_command.cpp)
-add_executable(alr_proot_candidate proot_candidate.cpp)
 add_executable(alr_runtime_trampoline alr_runtime_trampoline.cpp)
 set_target_properties(alr_test_command PROPERTIES OUTPUT_NAME "alr-test-command")
-set_target_properties(alr_proot_candidate PROPERTIES OUTPUT_NAME "alr-proot-candidate")
 set_target_properties(alr_runtime_trampoline PROPERTIES OUTPUT_NAME "alr-runtime-trampoline")
 
 target_compile_features(alr_runtime PRIVATE cxx_std_20)
@@ -42,7 +41,6 @@ target_compile_features(alr_runtime_launcher PRIVATE cxx_std_20)
 target_compile_features(alr_runtime_hook PRIVATE cxx_std_20)
 target_compile_features(alr_runtime_interposer PRIVATE cxx_std_20)
 target_compile_features(alr_test_command PRIVATE cxx_std_20)
-target_compile_features(alr_proot_candidate PRIVATE cxx_std_20)
 target_compile_features(alr_runtime_trampoline PRIVATE cxx_std_20)
 
 target_include_directories(alr_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

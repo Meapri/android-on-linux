@@ -33,34 +33,9 @@ class NativeCommandRunner(
 
     fun runSmokeTest(): NativeCommandResult = runPackagedCommand("libalr_test_command.so", listOf("smoke"))
 
-    fun runProotCandidateSmokeTest(): NativeCommandResult =
-        runPackagedCommand("libalr_proot.so", listOf("--version"), prootEnvironment())
-
-    fun runProotHelpProbe(): NativeCommandResult =
-        runPackagedCommand("libalr_proot.so", listOf("--help"), prootEnvironment())
-
-    fun runProotShortVersionProbe(): NativeCommandResult =
-        runPackagedCommand("libalr_proot.so", listOf("-V"), prootEnvironment())
-
-    fun runProotNoEnvVersionProbe(): NativeCommandResult =
-        runPackagedCommand("libalr_proot.so", listOf("--version"))
-
-    fun runProotViaLinkerVersionProbe(): NativeCommandResult =
-        runAbsoluteCommand(
-            File("/system/bin/linker64"),
-            listOf(File(nativeLibraryDir, "libalr_proot.so").absolutePath, "--version"),
-            prootEnvironment(),
-        )
-
-    fun runProotLoaderDirectProbe(): NativeCommandResult =
-        runPackagedCommand("libproot-loader.so", emptyList(), prootEnvironment())
-
-    fun runTallocViaLinkerProbe(): NativeCommandResult =
-        runAbsoluteCommand(
-            File("/system/bin/linker64"),
-            listOf(File(nativeLibraryDir, "libtalloc.so").absolutePath),
-            mapOf("LD_LIBRARY_PATH" to nativeLibraryDir.absolutePath),
-        )
+    // The six probes that ran PRoot's own binary (--version, --help, -V, the
+    // loader, talloc, and the linker64 route) are gone with PRoot itself.
+    // They tested whether a bundled PRoot could start; nothing bundles it now.
 
     fun runProotRootfsProgram(rootfsDir: File, program: String): NativeCommandResult =
         runProotRootfsCommand(rootfsDir, program)
@@ -199,39 +174,35 @@ class NativeCommandRunner(
         //
         // The PRoot path stays for now as a fallback for a build without alr;
         // it goes when nothing selects it.
-        val backend = alr
-        if (backend != null) {
-            lastBackend = "alr"
-            val distro = rootfsDir.name
-            val r = backend.run(
-                distro = distro,
-                program = program,
-                arguments = arguments,
-                fakeroot = rootId,
-                timeoutSeconds = COMMAND_TIMEOUT_SECONDS * 4,
-                // The callers' own contract -- XDG_RUNTIME_DIR, WAYLAND_DISPLAY,
-                // DISPLAY for the GUI bridges. The PRoot path merged this and
-                // this one dropped it, so every Wayland/X11 probe failed on a
-                // missing variable rather than on anything about graphics.
-                guestEnv = extraEnvironment,
-            )
-            return NativeCommandResult(
-                command = backend.binary,
-                environment = sortedMapOf("ALR_BACKEND" to "1", "ALR_DISTRO" to distro),
-                exitCode = r.exitCode,
-                stdout = r.stdout.trim(),
-                stderr = r.stderr.trim(),
-            )
-        }
-        lastBackend = "proot"
-        return runPackagedCommand(
-            "libalr_proot.so",
-            listOf(if (rawRootfs) "-r" else "-R", rootfsDir.absolutePath) +
-                (if (linkToSymlink) listOf("-l") else emptyList()) +
-                binds.flatMap { listOf("-b", it) } +
-                (if (rootId) listOf("-0") else emptyList()) +
-                listOf("-w", "/", program) + arguments,
-            prootEnvironment(verbose = verbose, rootfsDir = rootfsDir, program = program) + extraEnvironment,
+        // alr is THE backend. PRoot is gone.
+        //
+        // It could not `dpkg -i` in this app's SELinux domain, and at
+        // targetSdk 28 it broke outright: its void-syscall cancellation lands
+        // in a SIGSYS handler that returns ENOSYS, so execve("/bin/hello")
+        // failed with "Function not implemented". Keeping a fallback that
+        // cannot run anything is worse than not having one -- it invites a
+        // silent downgrade to a path nobody tests. Removing it also drops the
+        // last GPL2 component, which is why this project can be MIT.
+        val backend = alr ?: error(
+            "alr backend unavailable: libalr.so missing from the native library " +
+            "directory. The APK must ship it -- see :app:buildAlrRuntime."
+        )
+        lastBackend = "alr"
+        val distro = rootfsDir.name
+        val r = backend.run(
+            distro = distro,
+            program = program,
+            arguments = arguments,
+            fakeroot = rootId,
+            timeoutSeconds = COMMAND_TIMEOUT_SECONDS * 4,
+            guestEnv = extraEnvironment,
+        )
+        return NativeCommandResult(
+            command = backend.binary,
+            environment = sortedMapOf("ALR_BACKEND" to "1", "ALR_DISTRO" to distro),
+            exitCode = r.exitCode,
+            stdout = r.stdout.trim(),
+            stderr = r.stderr.trim(),
         )
     }
 
@@ -241,31 +212,9 @@ class NativeCommandRunner(
         "/dev/urandom:/dev/urandom",
     )
 
-    private fun prootEnvironment(
-        verbose: String = "-1",
-        rootfsDir: File? = null,
-        program: String? = null,
-    ): Map<String, String> {
-        prootTmpDir.mkdirs()
-        val environment = mutableMapOf(
-            "PROOT_LOADER" to File(nativeLibraryDir, "libproot-loader.so").absolutePath,
-            "PROOT_TMP_DIR" to prootTmpDir.absolutePath,
-            "PROOT_NO_SECCOMP" to "1",
-            "PROOT_VERBOSE" to verbose,
-            "LD_LIBRARY_PATH" to nativeLibraryDir.absolutePath,
-            "GLIBC_TUNABLES" to "glibc.pthread.rseq=0",
-            "HOME" to "/root",
-            "TMPDIR" to "/tmp",
-            "PATH" to "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        )
-        if (rootfsDir != null) {
-            environment["ALR_ROOTFS"] = rootfsDir.absolutePath
-        }
-        if (program != null) {
-            environment["ALR_PROGRAM"] = program
-        }
-        return environment
-    }
+    // prootEnvironment() removed with PRoot; alr builds the guest
+    // environment itself and takes additions through `alr -e`.
+
 
     private fun runPackagedCommand(
         fileName: String,

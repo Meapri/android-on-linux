@@ -488,11 +488,6 @@ class MainActivity : Activity() {
             filesDir,
         )
         val nativeCommandResult = nativeCommandRunner.runSmokeTest()
-        val prootCandidateResult = nativeCommandRunner.runProotCandidateSmokeTest()
-        val prootShortVersionResult = nativeCommandRunner.runProotShortVersionProbe()
-        val prootHelpResult = nativeCommandRunner.runProotHelpProbe()
-        val prootNoEnvResult = nativeCommandRunner.runProotNoEnvVersionProbe()
-        val prootViaLinkerResult = nativeCommandRunner.runProotViaLinkerVersionProbe()
         // WHICH ROOTFS THE DISTRO PROBES RUN IN.
         //
         // The bundled image is a purpose-built GUI test tree: /bin/hello,
@@ -1389,8 +1384,6 @@ class MainActivity : Activity() {
             "\nalr native loader reached=${alrNativeLoaderProbe.lineStartingWith("alr native loader reached=").substringAfter("reached=", "")}" +
             "\nalr native loader child=${alrNativeLoaderProbe.lineStartingWith("alr native loader child exit=").substringAfter("exit=", "")}" +
             "\nalr native loader diag=${alrNativeLoaderProbe.lineStartingWith("alr native loader diag=").substringAfter("diag=", "")}" +
-            "\nproot --version exit=${prootCandidateResult.exitCode}" +
-            "\nlinker64 proot --version exit=${prootViaLinkerResult.exitCode}" +
             "\nproot hello quiet exit=${prootHelloResult.exitCode}" +
             "\nproot hello quiet stdout=${prootHelloResult.stdout}" +
             "\nproot hello quiet stderr=${prootHelloResult.stderr}" +
@@ -1438,9 +1431,6 @@ class MainActivity : Activity() {
             "\nproot installed package smoke stderr=${prootInstalledPackageSmokeResult.stderr}" +
             "\nprobe dlopen talloc=${nativeProbe.lineStartingWith("dlopen libtalloc.so")}" +
             "\nprobe dlopen proot=${nativeProbe.lineStartingWith("dlopen libalr_proot.so")}" +
-            "\nproot loader=${prootCandidateResult.environment["PROOT_LOADER"]}" +
-            "\nproot tmp=${prootCandidateResult.environment["PROOT_TMP_DIR"]}" +
-            "\nproot verbose=${prootCandidateResult.environment["PROOT_VERBOSE"]}" +
             "\nhost gpu renderer=${hostGpuProbe.lineStartingWith("gl renderer=")}" +
             "\nhost gpu vendor=${hostGpuProbe.lineStartingWith("gl vendor=")}" +
             "\nhost gpu software renderer=${hostGpuProbe.lineStartingWith("host gpu software renderer=")}" +
@@ -1547,16 +1537,7 @@ class MainActivity : Activity() {
             "\n$hostVulkanProbe" +
             "\n\nproot backend candidate: packaged native executable" +
             "\nproot actual env:" +
-            prootCandidateResult.environment.entries.joinToString(separator = "") { "\n  ${it.key}=${it.value}" } +
-            "\nproot candidate exit=${prootCandidateResult.exitCode}" +
-            "\nproot candidate stdout=${prootCandidateResult.stdout}" +
-            "\nproot candidate stderr=${prootCandidateResult.stderr}" +
             "\n\ndiagnostic note: libproot-loader.so is a PRoot loader executable, not a dlopen-able shared library; libtalloc.so is a dependency, not a standalone command. Direct crash probes are skipped in the default success report." +
-            resultBlock("proot --version", prootCandidateResult) +
-            resultBlock("proot -V", prootShortVersionResult) +
-            resultBlock("proot --help", prootHelpResult) +
-            resultBlock("proot no-env --version", prootNoEnvResult) +
-            resultBlock("linker64 proot --version", prootViaLinkerResult) +
             resultBlock("proot hello quiet", prootHelloResult) +
             resultBlock("proot script", prootScriptResult) +
             resultBlock("proot shell -c", prootShellResult) +
