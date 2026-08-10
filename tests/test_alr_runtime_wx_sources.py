@@ -44,6 +44,9 @@ def test_wx_strategy_ranks_native_methods_with_proot_fallback():
     assert "proot-baseline" in source
     # PRoot is only a fallback: a viable plan needs a native-exec primary.
     assert "primary != GuestLoadMethod::ProotBaseline" in source
+    # The domain decides, and it is READ rather than inferred from targetSdk.
+    assert "domain_allows_app_data_exec" in source
+    assert "/proc/self/attr/current" in source
     # The native mechanisms still require on-device SELinux verification.
     assert "execmem" in source
     assert "requires_device_selinux_check" in WX_HPP.read_text()
@@ -62,6 +65,9 @@ def test_wx_strategy_is_built_and_host_tested():
 
 def test_wx_native_test_covers_packaged_and_rejected_entrypoints():
     native = NATIVE_TEST.read_text()
-    assert "primary is memfd-execveat" in native
+    # Not a single pinned method any more: the primary depends on the SELinux
+    # domain the process is in, and pinning one answer is what let the model
+    # contradict the device for a whole release.
+    assert "primary is direct-rootfs-execve or anon-mmap-loader" in native
     assert "rootfs-internal entrypoint refused" in native
     assert "prefix-sibling entrypoint is packaged" in native
