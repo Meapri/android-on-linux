@@ -85,6 +85,10 @@ android {
 
     sourceSets.getByName("main") {
         jniLibs.srcDir(layout.buildDirectory.dir("generated/native-test-command/jniLibs"))
+        // alr's CLI (libalr.so) and its guest interposer (an asset, because it
+        // is a glibc object bionic must never try to load). See buildAlrRuntime.
+        jniLibs.srcDir(layout.buildDirectory.dir("generated/alr/jniLibs"))
+        assets.srcDir(layout.buildDirectory.dir("generated/alr/assets"))
     }
 }
 
@@ -110,6 +114,74 @@ tasks.register("packageNativeTestCommand") {
         }
     }
 }
+
+// Build the alr runtime from runtime/alr and package it.
+//
+// Two artifacts, two toolchains, and they are NOT interchangeable:
+//
+//   libalr.so   the CLI + ptrace supervisor. An ANDROID/bionic aarch64
+//               executable, built with the NDK. It ships in jniLibs, which is
+//               how an APK ships an executable -- files named lib*.so there are
+//               extracted to nativeLibraryDir with the execute bit.
+//
+//   libalr_preload.so
+//               the guest interposer. A GLIBC object that is LD_PRELOADed into
+//               Ubuntu binaries inside the rootfs. The NDK cannot build it --
+//               it must link against glibc 2.17, which is what runtime/alr's
+//               zig build does. It ships as an ASSET and is copied into the
+//               rootfs at provisioning time; putting it in jniLibs would ask
+//               bionic's linker to load a glibc object, which fails.
+//
+// Both fail loudly if their toolchain is missing. A build that silently ships
+// without the runtime produces an app that looks fine and cannot execute
+// anything, which is the most expensive failure this project has.
+tasks.register("buildAlrRuntime") {
+    val alrDir = layout.projectDirectory.dir("../runtime/alr")
+    val jniOut = layout.buildDirectory.dir("generated/alr/jniLibs")
+    val assetOut = layout.buildDirectory.dir("generated/alr/assets/alr")
+    inputs.dir(alrDir.dir("src"))
+    inputs.file(alrDir.file("Makefile"))
+    outputs.dir(jniOut)
+    outputs.dir(assetOut)
+    doLast {
+        val ndk = android.ndkDirectory
+        require(ndk.isDirectory) { "NDK not found at $ndk; set ndkVersion or ANDROID_NDK_HOME" }
+
+        // 1. the CLI, via the NDK
+        val alrBuild = alrDir.dir("build").asFile
+        alrBuild.mkdirs()
+        providers.exec {
+            workingDir = alrDir.asFile
+            commandLine("make", "alr", "NDK=${ndk.absolutePath}")
+        }.result.get().assertNormalExitValue()
+        val alrBin = alrBuild.resolve("alr")
+        require(alrBin.isFile) { "runtime/alr build produced no build/alr" }
+        val abiDir = jniOut.get().dir("arm64-v8a").asFile
+        abiDir.mkdirs()
+        alrBin.copyTo(abiDir.resolve("libalr.so"), overwrite = true)
+
+        // 2. the guest interposer, via zig (pinned 0.16.0 by runtime/alr)
+        providers.exec {
+            workingDir = alrDir.asFile
+            commandLine("bash", "scripts/build-preload.sh")
+        }.result.get().assertNormalExitValue()
+        val preload = alrBuild.resolve("libalr_preload.so")
+        require(preload.isFile) { "runtime/alr build produced no build/libalr_preload.so" }
+        val assets = assetOut.get().asFile
+        assets.mkdirs()
+        preload.copyTo(assets.resolve("libalr_preload.so"), overwrite = true)
+        val manifest = alrBuild.resolve("libalr_preload.manifest.json")
+        if (manifest.isFile) manifest.copyTo(assets.resolve("manifest.json"), overwrite = true)
+
+        logger.lifecycle("alr runtime packaged: libalr.so + libalr_preload.so")
+    }
+}
+
+// The asset/jniLib merge tasks consume buildAlrRuntime's output directories, so
+// Gradle needs the edge declared or it refuses to order them (and would
+// otherwise be free to package an empty or stale runtime).
+tasks.matching { it.name.startsWith("merge") && (it.name.endsWith("Assets") || it.name.endsWith("JniLibFolders") || it.name.endsWith("NativeLibs")) }
+    .configureEach { dependsOn("buildAlrRuntime") }
 
 tasks.register("packageProotCandidate") {
     val generatedDir = layout.buildDirectory.dir("generated/native-test-command/jniLibs")
@@ -145,11 +217,11 @@ tasks.register("packageProotCandidate") {
 }
 
 tasks.matching { it.name == "mergeDebugJniLibFolders" }.configureEach {
-    dependsOn("packageNativeTestCommand", "packageProotCandidate")
+    dependsOn("packageNativeTestCommand", "packageProotCandidate", "buildAlrRuntime")
 }
 
 tasks.matching { it.name.startsWith("buildCMakeDebug") }.configureEach {
-    finalizedBy("packageNativeTestCommand", "packageProotCandidate")
+    finalizedBy("packageNativeTestCommand", "packageProotCandidate", "buildAlrRuntime")
 }
 
 dependencies {

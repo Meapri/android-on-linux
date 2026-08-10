@@ -1,0 +1,14 @@
+Leaving 'local diversion of /usr/sbin/ldconfig to /usr/sbin/ldconfig.distrib'
+alr: adopting /data/user/0/dev.chanwoo.androlinux/files/usr/var/lib/alr/distros/ubuntu-24.04
+alr: absolute symlinks: 0 relativized, 0 failed
+alr: preload installed from /data/user/0/dev.chanwoo.androlinux/files/usr/share/alr/libalr_preload.so
+
+INSTALL DOWNLOAD:        SKIP  the host app fetched and verified the archive
+INSTALL VERIFY SHA256:   SKIP  verified by the host app before extraction
+INSTALL EXTRACT:         SKIP  extracted by the host app; alr adopted the tree
+INSTALL REPAIR:          PASS
+INSTALL LDSO PRESENT:    PASS  /data/user/0/dev.chanwoo.androlinux/files/usr/var/lib/alr/distros/ubuntu-24.04/lib/ld-linux-aarch64.so.1
+INSTALL LDSO OPTIONS:    PASS  argv0=yes preload=yes library-path=yes inhibit-cache=yes
+INSTALL BOOT /bin/true:  PASS  exit=0 elapsed_ms=26
+INSTALL BOOT /bin/echo:  PASS  stdout="alr"
+INSTALL GLIBC VERSION:   2.39

@@ -1219,6 +1219,11 @@ static int install_hostbin(const char *distro, const char *R)
      * 28 files that all fail at the first use. */
     if (!distro || !*distro) distro = "ubuntu-24.04";
 
+    /* mkdir -p: on a tree alr did not extract itself, usr/lib/alr may not
+     * exist yet, and a single mkdir then fails with ENOENT on the PARENT --
+     * which reads as "cannot create hostbin" and hides the real reason. */
+    snprintf(dir, sizeof dir, "%s/usr/lib", R);       (void)mkdir(dir, 0755);
+    snprintf(dir, sizeof dir, "%s/usr/lib/alr", R);   (void)mkdir(dir, 0755);
     snprintf(dir, sizeof dir, "%s/usr/lib/alr/hostbin", R);
     if (mkdir(dir, 0755) != 0 && errno != EEXIST) {
         fprintf(stderr, "alr: cannot create %s: %s\n", dir, strerror(errno));
@@ -1455,6 +1460,7 @@ static int access_ok_all(const char *R)
 }
 
 struct install_report {
+    int  adopted;          /* the tree was extracted by a host app, not by us */
     int  fetched;          /* 1 downloaded, 0 served from cache */
     int  sha;              /* 1 verified, 0 mismatch, -1 no digest to check */
     long members, special, setuid;
@@ -1512,19 +1518,33 @@ static int install_verify(const char *distro, const char *R,
     long t0, ms;
 
     printf("\n");
-    rline(&bad, "INSTALL DOWNLOAD:", 1, "%s",
-          rep->fetched ? "fetched" : "cache hit");
+    if (rep->adopted)
+        printf("%-24s %s  %s\n", "INSTALL DOWNLOAD:", "SKIP",
+               "the host app fetched and verified the archive");
+    else
+        rline(&bad, "INSTALL DOWNLOAD:", 1, "%s",
+              rep->fetched ? "fetched" : "cache hit");
     /* An unverified download is not a pass.  ubuntu-base is fetched over
      * HTTPS, but the fallback path when SHA256SUMS is unreachable has no
      * digest at all, and the report must not launder that into PASS. */
-    if (rep->sha < 0)
+    if (rep->adopted)
+        printf("%-24s %s  %s\n", "INSTALL VERIFY SHA256:", "SKIP",
+               "verified by the host app before extraction");
+    else if (rep->sha < 0)
         printf("%-24s %s  %s\n", "INSTALL VERIFY SHA256:", "SKIP",
                "no digest available (--url, or SHA256SUMS unreachable)");
     else
         rline(&bad, "INSTALL VERIFY SHA256:", rep->sha, "");
-    rline(&bad, "INSTALL EXTRACT:", rep->members > 0,
-          "files=%ld skipped_special=%ld setuid_masked=%ld",
-          rep->members, rep->special, rep->setuid);
+    /* SKIP, not FAIL, for an adopted tree: alr never saw the archive, so a
+     * member count of zero is the truth and not a defect.  Reporting FAIL here
+     * would be the report inventing a failure to describe work it did not do. */
+    if (rep->adopted)
+        printf("%-24s %s  %s\n", "INSTALL EXTRACT:", "SKIP",
+               "extracted by the host app; alr adopted the tree");
+    else
+        rline(&bad, "INSTALL EXTRACT:", rep->members > 0,
+              "files=%ld skipped_special=%ld setuid_masked=%ld",
+              rep->members, rep->special, rep->setuid);
     rline(&bad, "INSTALL REPAIR:", rep->repaired, "");
 
     snprintf(ld, sizeof ld, "%s/lib/ld-linux-aarch64.so.1", R);
@@ -2026,6 +2046,84 @@ static int cmd_config(int argc, char **argv)
 
     die("bad-option", "usage: alr config [get <key> | set <key> <value>]");
     return 1;
+}
+
+/* `alr adopt <distro>` -- make an already-extracted directory an alr rootfs.
+ *
+ * THE SEAM BETWEEN A HOST APP AND THIS RUNTIME.
+ *
+ * `alr install` downloads and untars, and to untar it shells out to GNU tar.
+ * That is fine inside Termux and wrong everywhere else: Android ships toybox,
+ * whose tar rejects the GNU-only flags this code passes --
+ *     tar: Unknown option 'no-overwrite-dir'
+ * -- and the install then fails, correctly, with reason=rootfs-incomplete.
+ *
+ * The answer is not to teach alr another tar. A host app that provisions a
+ * rootfs already has an extractor, and it is the right place for one: it can
+ * verify a signature before writing a byte, it runs before any guest exists,
+ * and it is not on any hot path.  ADR 0009 declined to write an in-process
+ * untar here for reasons that all still hold.
+ *
+ * So provisioning splits cleanly:
+ *   the app   downloads, verifies, extracts, owns the bytes
+ *   alr       repairs /etc, installs the interposer and the host wrappers,
+ *             relativises absolute symlinks, and PROVES the result boots
+ *
+ * Everything after extraction is identical to `install`, including the
+ * nine-line first-boot report -- an adopted rootfs is held to exactly the same
+ * standard as one alr extracted itself, because the failure modes are the same
+ * and only the source of the bytes differs.
+ */
+static int cmd_adopt(const char *distro)
+{
+    char R[ALR_PBUF];
+    struct install_report rep;
+
+    distro_root(R, sizeof R, distro);
+    if (!is_dir(R))
+        die("rootfs-missing",
+            "nothing to adopt at that path; the host app extracts the rootfs "
+            "first, then calls `alr adopt`");
+
+    memset(&rep, 0, sizeof rep);
+    rep.fetched = 0;
+    rep.adopted = 1;
+    rep.sha = -1;            /* the app verified it; alr did not see the bytes */
+    rep.members = rep.special = rep.setuid = 0;
+
+    printf("alr: adopting %s\n", R);
+
+    {   /* The app's extractor may leave image symlinks absolute.  Left alone
+         * they resolve against ANDROID -- /usr/bin/awk -> /etc/alternatives/awk
+         * is the one that made ucf, locales and php die with "awk: not found". */
+        int fixed = 0, failed = 0, escaped = 0;
+        relativize_tree(R, 0, &fixed, &failed, &escaped);
+        printf("alr: absolute symlinks: %d relativized, %d failed\n", fixed, failed);
+        if (escaped)
+            die("extract-traversal-reject",
+                "the extracted tree contains symlinks pointing outside the "
+                "rootfs; they were removed and the rootfs was NOT adopted");
+    }
+
+    repair(R);
+    rep.repaired = access_ok_all(R);
+    install_hostbin(distro, R);
+
+    if (install_preload(R) != 0)
+        die("preload-install-failed",
+            "the rootfs would run WITHOUT path virtualization");
+
+    if (verify_rootfs(R) != 0)
+        die("rootfs-incomplete",
+            "the extracted tree is missing files a usable rootfs must have");
+
+    divert_ldconfig(distro, R);
+
+    if (install_verify(distro, R, &rep) != 0)
+        die("rootfs-unbootable",
+            "the rootfs was adopted but does not boot; it was LEFT IN PLACE "
+            "for inspection (docs/05-provisioning-spec.md §4)");
+    return 0;
 }
 
 /* ── launch ──────────────────────────────────────────────────────────── */
@@ -2750,6 +2848,7 @@ static void usage(void)
         "  run [opts] <cmd> [args...]         run one guest command\n"
         "  exec [opts] -- <cmd> [args...]     run, with -- ending option parsing\n"
         "  shell [opts]                       interactive guest shell\n"
+        "  adopt [<distro>]                   make an already-extracted tree a rootfs\n"
         "  update-components [<distro>]       refresh the guest preload copy\n"
         "  config [get <k> | set <k> <v>]     settings and where they come from\n"
         "  version                            version and preload identity\n"
@@ -2828,6 +2927,10 @@ int main(int argc, char **argv)
         runopts_init(&ro);
         (void)parse_runopts(argc - i - 1, argv + i + 1, &ro, &distro, 0);
         return cmd_run(distro, 0, NULL, 1, &ro);
+    }
+    if (!strcmp(argv[i], "adopt")) {
+        const char *d = (i + 1 < argc && argv[i + 1][0] != '-') ? argv[i + 1] : distro;
+        return cmd_adopt(d);
     }
     if (!strcmp(argv[i], "config"))
         return cmd_config(argc - i - 1, argv + i + 1);
