@@ -1197,15 +1197,14 @@ class MainActivity : Activity() {
             "\nALR NATIVE LOADER GUEST EXEC (glibc threads+fork): ${if (alrNativeLoaderMtPassed) "PASS" else "FAIL"}" +
             "\nALR SECCOMP PATH-MEDIATION (seccomp-trace rootfs path rewrite): ${if (alrSeccompPathTrapViable) "VIABLE" else "BLOCKED"}" +
             "\nALR WAYLAND SOCKET TRANSPORT (named AF_UNIX host↔guest): ${if (alrUnixSocketViable) "VIABLE" else "BLOCKED"}" +
-            // STAYS FAIL, deliberately. This is the in-process anon-mmap
-            // loader -- the research route for a future where targetSdk 28 is
-            // no longer installable -- and its mediation is genuinely
-            // unfinished: the probe reports traps firing with rewrites=0, so
-            // the hook is reached and the rewrite is not applied. That is an
-            // open defect, not a platform fact like the memfd EACCES above, and
-            // relabelling it KNOWN_FAIL would be relabelling a research path
-            // green. The product path (alr) does not use this loader.
-            "\nALR LOADER PATH-MEDIATION REAL FILE READ (glibc opens /etc via rootfs): ${if (alrNativeLoaderFileioMediated) "PASS" else "FAIL"} (research loader; traps fire, rewrites=0 -- open)" +
+            // Was FAIL with "traps fire, rewrites=0". The cause was PCGATE:
+            // that mode traces only execve and RET_ALLOWs the nine path
+            // syscalls, because the in-process interposer is supposed to catch
+            // them -- and a STATIC guest never loads the interposer, so nobody
+            // mediated. The loader now takes the full path-trace filter when
+            // the guest is static. traps=4 rewrites=2, and the probe's open of
+            // /etc/alr-probe.txt resolves inside the rootfs.
+            "\nALR LOADER PATH-MEDIATION REAL FILE READ (glibc opens /etc via rootfs): ${if (alrNativeLoaderFileioMediated) "PASS" else "FAIL"}" +
             "\nALR NATIVE LOADER GUEST EXEC (glibc DYNAMIC via in-process ld.so): ${if (alrNativeLoaderDynPassed) "PASS" else "FAIL"}" +
             "\nALR REAL DEBIAN PROGRAM (/usr/bin/env, dynamic coreutils): ${if (alrLoaderRealEnvPassed) "PASS" else "FAIL"}" +
             "\nALR REAL DEBIAN PROGRAM (/usr/bin/id, libselinux+rootfs /etc): ${if (alrLoaderRealIdPassed) "PASS" else "FAIL"}" +

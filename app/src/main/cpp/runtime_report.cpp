@@ -2449,7 +2449,22 @@ std::string build_native_loader_probe(const alr::RuntimeReportInput& input) {
         // Polarity matches the parent: on unless the first char is exactly '0'.
         {
             const char* pcgate = ::getenv("ALR_PCGATE");
-            const bool pcgate_on = !(pcgate != nullptr && pcgate[0] == '0');
+            // PCGATE assumes SOMEONE ELSE mediates paths: it traces only
+            // execve/execveat and RET_ALLOWs the nine path syscalls, because
+            // the in-process LD_PRELOAD interposer is supposed to catch them
+            // with its own PC-gated filter.
+            //
+            // A STATIC guest never loads that interposer. So on a static guest
+            // PCGATE means NOBODY mediates -- MEASURED: the fileio-test probe
+            // reported `path-mediation traps=0 rewrites=0` and its open of
+            // /etc/alr-probe.txt failed with ENOENT, because it went to
+            // Android's /etc. The machinery was fine; the mode was wrong for
+            // the guest.
+            //
+            // So the fast path is only available when there is an interposer to
+            // be fast for. Static guests get the full path-trace filter.
+            const bool pcgate_on =
+                dynamic && !(pcgate != nullptr && pcgate[0] == '0');
             if (pcgate_on) {
                 alr_install_execve_trace_filter(dg);
             } else {
