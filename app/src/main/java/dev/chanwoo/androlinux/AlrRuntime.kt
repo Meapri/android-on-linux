@@ -74,7 +74,15 @@ class AlrRuntime(
         dest.parentFile?.mkdirs()
         assets.open("alr/libalr_preload.so").use { input ->
             val bytes = input.readBytes()
-            if (!dest.isFile || dest.length() != bytes.size.toLong()) dest.writeBytes(bytes)
+            // Compare CONTENT, not length. Two builds of the same source tree
+            // differ by a few instructions and land on the same byte count more
+            // often than you would guess -- MEASURED: a rebuilt interposer with
+            // a real behaviour change was skipped because it was the same size,
+            // and the device kept running the old one while every hash I
+            // printed said the build was fine.
+            val same = dest.isFile && dest.length() == bytes.size.toLong() &&
+                dest.readBytes().contentEquals(bytes)
+            if (!same) dest.writeBytes(bytes)
         }
         runCatching {
             assets.open("alr/manifest.json").use { m ->

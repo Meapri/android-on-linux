@@ -1634,7 +1634,37 @@ static int exec_build(const char *guest, char *const argv[],
             if (lvl[j].arg) av[argc++] = lvl[j].arg;
             av[argc++] = lvl[j].file;
         }
-        for (i = 1; argv[i] && argc < avmax - 2; i++) av[argc++] = argv[i];
+        /* A static child gets HOST-form path arguments.
+         *
+         * It never loads this interposer, so a guest path in its argv resolves
+         * against ANDROID. MEASURED: a dynamic dash running
+         *     /bin/cat /etc/os-release
+         * where /bin/cat is static busybox produced
+         *     cat: can't open '/etc/os-release': No such file or directory
+         * -- the shell was virtualized, the child was not, and the argument
+         * was written for the virtualized view.
+         *
+         * Same rule the launcher applies to a static target's environment and
+         * to shebang script paths: host paths for a binary we cannot rewrite.
+         * Only ABSOLUTE arguments that actually exist under the root are
+         * touched, so flags, `-c` strings and ordinary words are left alone --
+         * rewriting something that merely looks like a path would change the
+         * meaning of the command. */
+        {
+            static char abuf[8][ALR_PBUF];
+            int nb = 0;
+            for (i = 1; argv[i] && argc < avmax - 2; i++) {
+                const char *a = argv[i];
+                if (a[0] == '/' && nb < 8) {
+                    const char *h = rw(a, abuf[nb], sizeof abuf[nb]);
+                    if (h && h != a && access(h, F_OK) == 0) {
+                        av[argc++] = abuf[nb++];
+                        continue;
+                    }
+                }
+                av[argc++] = (char *)a;
+            }
+        }
         av[argc] = NULL;
         return 1;
     }

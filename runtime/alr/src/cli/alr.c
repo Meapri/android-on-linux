@@ -2860,6 +2860,7 @@ static int cmd_run(const char *distro, int argc, char **argv, int login_shell,
     int n = 0, i, status = 0, rc;
     const char *pre[4];
     int npre = 0;
+    int target_static = 0;
 
     rc = prepare(&L, distro);
     if (rc == -1) die("rootfs-missing", "rootfs not installed; run `alr install`");
@@ -2955,7 +2956,8 @@ static int cmd_run(const char *distro, int argc, char **argv, int login_shell,
      * rewrite -- extended to the arguments we synthesise for it. Only entries
      * that are absolute AND exist under the root are touched, so a shebang
      * ARGUMENT like `-e` is left alone. */
-    if (npre > 0 && exe_is_static(host)) {
+    target_static = exe_is_static(host);
+    if (npre > 0 && target_static) {
         int i;
         for (i = 0; i < npre; i++) {
             char cand[ALR_PBUF];
@@ -2999,7 +3001,39 @@ static int cmd_run(const char *distro, int argc, char **argv, int login_shell,
     av[n++] = host;
     for (i = 0; i < npre; i++) av[n++] = (char *)pre[i];   /* shebang arg + script */
     if (login_shell) av[n++] = (char *)"-l";
-    else for (i = 1; i < argc && n < ALR_MAX_ARGV - 2; i++) av[n++] = argv[i];
+    else if (!target_static) {
+        for (i = 1; i < argc && n < ALR_MAX_ARGV - 2; i++) av[n++] = argv[i];
+    } else {
+        /* A STATIC target gets HOST-form path arguments too.
+         *
+         * The environment and the shebang script path already follow this
+         * rule; the user's own arguments were the one place left, and it is
+         * the one that shows:
+         *     alr run /bin/cat /etc/os-release   -> can't open '/etc/os-release'
+         *     alr run /bin/cat <R>/etc/os-release -> NAME="AndroLinux Tiny Rootfs"
+         * Same file, same static busybox, and the only difference is which
+         * view the path was written for.
+         *
+         * Only ABSOLUTE arguments that exist under the root are rewritten, so
+         * flags, `-c` command strings and ordinary words pass through --
+         * rewriting anything that merely looks like a path would change what
+         * the command means. */
+        static char abuf[16][ALR_PBUF];
+        int nb = 0;
+        for (i = 1; i < argc && n < ALR_MAX_ARGV - 2; i++) {
+            const char *a = argv[i];
+            if (a && a[0] == '/' && nb < 16) {
+                char cand[ALR_PBUF];
+                snprintf(cand, sizeof cand, "%s%s", L.root, a);
+                if (access(cand, F_OK) == 0) {
+                    snprintf(abuf[nb], sizeof abuf[nb], "%s", cand);
+                    av[n++] = abuf[nb++];
+                    continue;
+                }
+            }
+            av[n++] = (char *)a;
+        }
+    }
     av[n] = NULL;
 
     if (g_log >= 2) {
@@ -3018,8 +3052,7 @@ static int cmd_run(const char *distro, int argc, char **argv, int login_shell,
     memset(&o, 0, sizeof o);
     o.path = L.ldso;
     o.argv = av;
-    o.envp = build_env(&L, guest_cmd, exe_is_static(host), av[5], ro,
-                       g_guest_cwd);
+    o.envp = build_env(&L, guest_cmd, target_static, av[5], ro, g_guest_cwd);
     o.log_level = g_log;
     o.log_fd = -1;
 

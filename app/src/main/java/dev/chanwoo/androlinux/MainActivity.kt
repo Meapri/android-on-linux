@@ -539,8 +539,12 @@ class MainActivity : Activity() {
         val prootAptGetVersionResult = nativeCommandRunner.runProotRootfsAptGetVersion(userlandRootfsDir)
         val prootAptCacheVersionResult = nativeCommandRunner.runProotRootfsAptCacheVersion(userlandRootfsDir)
         val prootAptConfigVersionResult = nativeCommandRunner.runProotRootfsAptConfigVersion(userlandRootfsDir)
-        val prootDpkgInstallLocalResult = nativeCommandRunner.runProotRootfsDpkgInstallLocalSmoke(userlandRootfsDir)
-        val prootInstalledPackageSmokeResult = nativeCommandRunner.runProotRootfsInstalledPackageSmoke(userlandRootfsDir)
+        // These two use FIXTURES that live in the bundled image: the .deb at
+        // /var/cache/apt/archives/alr-smoke_1.0_arm64.deb, and the binary that
+        // .deb installs. Pointing them at a distro rootfs made them fail for
+        // the fixture being absent rather than for anything about dpkg.
+        val prootDpkgInstallLocalResult = nativeCommandRunner.runProotRootfsDpkgInstallLocalSmoke(rootfsStatus.rootfsDir)
+        val prootInstalledPackageSmokeResult = nativeCommandRunner.runProotRootfsInstalledPackageSmoke(rootfsStatus.rootfsDir)
         val prootGuestGpuClientResult = nativeCommandRunner.runProotRootfsGuestGpuClient(rootfsStatus.rootfsDir)
         val guestGpuCommands = parseGuestGpuCommands(prootGuestGpuClientResult.stdout)
         val guestGpuIpcBridgeResult = runGuestGpuIpcBridge(nativeCommandRunner, rootfsStatus.rootfsDir)
@@ -1138,7 +1142,23 @@ class MainActivity : Activity() {
             "\nrootfs fixtures tree=${rootfsStatus.rootfsDir.name}" +
             "\nrootfs userland tree=${userlandRootfsDir.name}" +
             "\nSHELL SCRIPT EXECUTION: ${if (shellScriptExecutionPassed) "PASS" else "FAIL"}" +
-            "\nSHELL -C EXECUTION: ${if (shellCommandExecutionPassed) "PASS" else "FAIL"}" +
+            // A STATIC shell cannot host a guest session, and this probe uses
+            // /bin/sh, which in the bundled image is static busybox. alr can
+            // rewrite a static binary's ARGUMENTS (measured: `alr run /bin/cat
+            // /etc/os-release` works) but not paths INSIDE a `-c` string --
+            // those are data the shell resolves itself, against Android.
+            //
+            // That is ADR 0008's boundary, not a defect, and PRoot covered it
+            // only because chroot applies to static binaries too. Reported as
+            // a known limitation rather than a bare FAIL, and rather than
+            // quietly switching the probe to a dynamic shell -- DISTRO
+            // USERLAND EXECUTION already covers that with dash.
+            "\nSHELL -C EXECUTION: ${
+                if (shellCommandExecutionPassed) "PASS"
+                else if (prootShellResult.stderr.contains("unhooked-static-binary"))
+                    "KNOWN_FAIL:static-shell (ADR 0008; a static /bin/sh resolves -c paths against Android)"
+                else "FAIL"
+            }" +
             "\nGLIBC DYNAMIC EXECUTION: ${if (glibcDynamicExecutionPassed) "PASS" else "FAIL"}" +
             "\nDISTRO USERLAND EXECUTION: ${if (distroUserlandExecutionPassed) "PASS" else "FAIL"}" +
             "\nCLEAN GUEST ENVIRONMENT: ${if (!guestEnvLeakedAndroidVars) "PASS" else "FAIL"}" +
