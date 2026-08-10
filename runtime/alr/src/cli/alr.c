@@ -1248,6 +1248,58 @@ static int install_hostbin(const char *distro, const char *R)
     return bad ? -1 : 0;
 }
 
+/* Put a libdl.so.2 in the rootfs if it has none.
+ *
+ * ONLY if it has none. A distro's own stub is the right file and this never
+ * replaces it -- overwriting a real library because we shipped a lookalike is
+ * how a runtime breaks a guest in a way nobody can trace.
+ *
+ * What we ship is a 3 KB object with SONAME libdl.so.2 exporting exactly
+ * __libdl_version_placeholder@GLIBC_2.17, which is what Ubuntu 24.04's own
+ * 67 KB stub exports (measured). It carries no code: the real dlsym and
+ * dlopen still resolve from the guest's libc, which keeps the GLIBC_2.17
+ * aliases. It exists so our DT_NEEDED has something to bind to. */
+static void install_libdl_stub(const char *R)
+{
+    static const char *dirs[] = { "lib/aarch64-linux-gnu", "usr/lib/aarch64-linux-gnu",
+                                  "lib", "usr/lib", NULL };
+    char p[ALR_PBUF], src[ALR_PBUF], selfdir[ALR_PBUF], *slash;
+    int i;
+
+    for (i = 0; dirs[i]; i++) {
+        snprintf(p, sizeof p, "%s/%s/libdl.so.2", R, dirs[i]);
+        if (access(p, F_OK) == 0) return;          /* the distro has one */
+    }
+
+    snprintf(selfdir, sizeof selfdir, "%s", g_self);
+    if ((slash = strrchr(selfdir, '/'))) *slash = '\0';
+    else snprintf(selfdir, sizeof selfdir, ".");
+
+    {   const char *cands[3];
+        static char c0[ALR_PBUF], c1[ALR_PBUF], c2[ALR_PBUF];
+        snprintf(c0, sizeof c0, "%s/libdl.so.2", selfdir);
+        snprintf(c1, sizeof c1, "%s/share/alr/libdl.so.2", prefix());
+        snprintf(c2, sizeof c2, "%s/build/libdl.so.2", selfdir);
+        cands[0] = c0; cands[1] = c1; cands[2] = c2;
+        src[0] = '\0';
+        for (i = 0; i < 3; i++)
+            if (access(cands[i], R_OK) == 0) { snprintf(src, sizeof src, "%s", cands[i]); break; }
+    }
+    if (!*src) return;                              /* nothing to install */
+
+    snprintf(p, sizeof p, "%s/usr/lib/aarch64-linux-gnu", R);
+    if (access(p, F_OK) != 0) snprintf(p, sizeof p, "%s/lib/aarch64-linux-gnu", R);
+    if (access(p, F_OK) != 0) return;
+    {   char dst[ALR_PBUF];
+        snprintf(dst, sizeof dst, "%s/libdl.so.2", p);
+        if (copy_file(src, dst) == 0) {
+            chmod(dst, 0644);
+            printf("alr: installed a libdl.so.2 stub (%s had none; the "
+                   "interposer's DT_NEEDED requires it)\n", R);
+        }
+    }
+}
+
 /* Is this rootfs's coreutils the uutils multicall binary?
  *
  * If it is, every one of ls/cat/echo/cp is one Rust binary that decides which
@@ -2261,6 +2313,8 @@ static int cmd_adopt(const char *distro)
     if (verify_rootfs(R) != 0)
         die("rootfs-incomplete",
             "the extracted tree is missing files a usable rootfs must have");
+
+    install_libdl_stub(R);
 
     {   char pl[ALR_PBUF];
         snprintf(pl, sizeof pl, "%s/usr/lib/alr/libalr_preload.so", R);

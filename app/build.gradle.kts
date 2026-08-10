@@ -173,6 +173,13 @@ tasks.register("buildAlrRuntime") {
         val manifest = alrBuild.resolve("libalr_preload.manifest.json")
         if (manifest.isFile) manifest.copyTo(assets.resolve("manifest.json"), overwrite = true)
 
+        // 3. the libdl.so.2 stub our own DT_NEEDED needs, for rootfs images
+        // that were trimmed without it. alr installs it only when the guest
+        // has none of its own.
+        val libdl = alrBuild.resolve("libdl.so.2")
+        require(libdl.isFile) { "runtime/alr build produced no build/libdl.so.2" }
+        libdl.copyTo(assets.resolve("libdl.so.2"), overwrite = true)
+
         logger.lifecycle("alr runtime packaged: libalr.so + libalr_preload.so")
     }
 }

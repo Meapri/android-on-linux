@@ -174,3 +174,19 @@ EOF
 
 echo "built $OUT"
 echo "  $(grep -oE 'GLIBC_[0-9.]+' "$OUT" | sort -uV | tr '\n' ' ')"
+
+# The libdl.so.2 our own DT_NEEDED asks for.
+#
+# See src/preload/libdl_stub.c: we target glibc 2.17, where dlsym lives in
+# libdl, so the interposer needs the name and the GLIBC_2.17 version node to
+# resolve. Stock distro images ship a stub that provides exactly that and
+# nothing else; images trimmed by closure analysis over their own binaries can
+# drop it, and then EVERY dynamic guest program fails to start while naming
+# itself. `alr adopt` installs this only when the rootfs has none.
+"$ZIG" cc --target=aarch64-linux-gnu.2.17 \
+    -shared -fPIC -O2 -nostdlib \
+    -Wl,-soname,libdl.so.2 \
+    -Wl,--version-script=src/preload/libdl_stub.map \
+    -Wl,--build-id=none \
+    -o "$(dirname "$OUT")/libdl.so.2" src/preload/libdl_stub.c
+echo "built $(dirname "$OUT")/libdl.so.2"

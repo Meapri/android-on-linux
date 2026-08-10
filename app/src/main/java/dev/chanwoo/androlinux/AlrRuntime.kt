@@ -81,6 +81,13 @@ class AlrRuntime(
                 File(prefix, "share/alr/manifest.json").writeBytes(m.readBytes())
             }
         }
+        // The libdl.so.2 stub, staged where alr looks for it. alr installs it
+        // into a rootfs only when that rootfs has none of its own.
+        runCatching {
+            assets.open("alr/libdl.so.2").use { s ->
+                File(prefix, "share/alr/libdl.so.2").writeBytes(s.readBytes())
+            }
+        }
         dest.isFile
     }.getOrDefault(false)
 

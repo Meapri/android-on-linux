@@ -1,0 +1,6 @@
+GLIBC_2.17 {
+  global:
+    __libdl_version_placeholder;
+  local:
+    *;
+};
