@@ -16,7 +16,21 @@ data class NativeCommandResult(
 class NativeCommandRunner(
     private val nativeLibraryDir: File,
     private val prootTmpDir: File,
+    /**
+     * Where alr lives. When non-null, every rootfs command runs through the
+     * alr backend instead of PRoot; when null the PRoot path is used, so a
+     * device without a built alr still behaves as before.
+     */
+    private val filesDir: File? = null,
 ) {
+    private val alr: AlrRuntime? by lazy {
+        filesDir?.let { AlrRuntime(nativeLibraryDir, it) }?.takeIf { it.isAvailable() }
+    }
+
+    /** Which backend actually served the last rootfs command. */
+    var lastBackend: String = "none"
+        private set
+
     fun runSmokeTest(): NativeCommandResult = runPackagedCommand("libalr_test_command.so", listOf("smoke"))
 
     fun runProotCandidateSmokeTest(): NativeCommandResult =
@@ -167,8 +181,45 @@ class NativeCommandRunner(
         // fails without it and succeeds with it.
         linkToSymlink: Boolean = false,
         extraEnvironment: Map<String, String> = emptyMap(),
-    ): NativeCommandResult =
-        runPackagedCommand(
+    ): NativeCommandResult {
+        // THE BACKEND SWITCH. Every rootfs command in this class funnels
+        // through here, so replacing this body replaces the backend for all
+        // ~50 of them without touching a call site.
+        //
+        // alr when it is available. PRoot mediates every syscall through
+        // ptrace; alr invokes the guest's own ld.so with --preload and runs a
+        // signal-only supervisor that never issues PTRACE_SYSCALL. Measured in
+        // this app's domain: Ubuntu 24.04 boots, networks, and reports
+        // path_traps=0 syscall_stops=0.
+        //
+        // PRoot also stopped working here. At targetSdk 28 its void-syscall
+        // cancellation lands in a SIGSYS handler that returns ENOSYS, so
+        // `execve("/bin/hello")` fails with "Function not implemented" -- and
+        // it could never `dpkg -i` in this domain even before that.
+        //
+        // The PRoot path stays for now as a fallback for a build without alr;
+        // it goes when nothing selects it.
+        val backend = alr
+        if (backend != null) {
+            lastBackend = "alr"
+            val distro = rootfsDir.name
+            val r = backend.run(
+                distro = distro,
+                program = program,
+                arguments = arguments,
+                fakeroot = rootId,
+                timeoutSeconds = COMMAND_TIMEOUT_SECONDS * 4,
+            )
+            return NativeCommandResult(
+                command = backend.binary,
+                environment = sortedMapOf("ALR_BACKEND" to "1", "ALR_DISTRO" to distro),
+                exitCode = r.exitCode,
+                stdout = r.stdout.trim(),
+                stderr = r.stderr.trim(),
+            )
+        }
+        lastBackend = "proot"
+        return runPackagedCommand(
             "libalr_proot.so",
             listOf(if (rawRootfs) "-r" else "-R", rootfsDir.absolutePath) +
                 (if (linkToSymlink) listOf("-l") else emptyList()) +
@@ -177,6 +228,7 @@ class NativeCommandRunner(
                 listOf("-w", "/", program) + arguments,
             prootEnvironment(verbose = verbose, rootfsDir = rootfsDir, program = program) + extraEnvironment,
         )
+    }
 
     private fun minimalPackageManagerBinds(): List<String> = listOf(
         "/dev/null:/dev/null",

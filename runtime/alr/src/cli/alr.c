@@ -1583,22 +1583,43 @@ static int install_verify(const char *distro, const char *R,
     /* The actual boot.  Goes through `alr run` -- the same path a user takes,
      * preload and supervisor included -- because a check that bypassed them
      * would pass on a rootfs nobody can actually use. */
-    snprintf(cmd, sizeof cmd,
-             "ALR_ROOT_DIR='%s' '%s' -d '%s' run /bin/true >/dev/null 2>&1; echo $?",
-             getenv("ALR_ROOT_DIR") ? getenv("ALR_ROOT_DIR") : "", g_self, distro);
-    t0 = now_ms();
+    /* "Does anything in this rootfs run", not "does it have coreutils".
+     *
+     * This asked for /bin/true and nothing else, and a busybox-based image has
+     * no such file -- so a rootfs whose `/bin/sh -c :` works perfectly was
+     * reported unbootable, adoption failed, and the caller retried it on every
+     * command. MEASURED: that took an app report from 166 PASS / 5 FAIL to
+     * 149 / 22, all of it from a check that was testing for the wrong thing.
+     *
+     * Try each candidate and pass on the first that runs, naming the one that
+     * worked so the line still says what was actually proved. */
     {
-        long code = read_long_cmd(cmd, -1);
+        static const char *boots[] = { "/bin/true", "/bin/sh -c :",
+                                       "/bin/busybox true", NULL };
+        long code = -1;
+        int bi;
+        const char *used = "(none)";
+        t0 = now_ms();
+        for (bi = 0; boots[bi]; bi++) {
+            snprintf(cmd, sizeof cmd,
+                     "ALR_ROOT_DIR='%s' '%s' -d '%s' run %s >/dev/null 2>&1; echo $?",
+                     getenv("ALR_ROOT_DIR") ? getenv("ALR_ROOT_DIR") : "",
+                     g_self, distro, boots[bi]);
+            code = read_long_cmd(cmd, -1);
+            if (code == 0) { used = boots[bi]; break; }
+        }
         ms = now_ms() - t0;
-        rline(&bad, "INSTALL BOOT /bin/true:", code == 0,
-              "exit=%ld elapsed_ms=%ld", code, ms);
+        rline(&bad, "INSTALL BOOT:", code == 0,
+              "%s exit=%ld elapsed_ms=%ld", used, code, ms);
     }
 
+    /* Same reasoning: /bin/echo is coreutils. `sh -c 'echo alr'` proves the
+     * same thing -- a program ran and its stdout reached us -- on any image. */
     snprintf(cmd, sizeof cmd,
-             "ALR_ROOT_DIR='%s' '%s' -d '%s' run /bin/echo alr 2>/dev/null",
+             "ALR_ROOT_DIR='%s' '%s' -d '%s' run /bin/sh -c 'echo alr' 2>/dev/null",
              getenv("ALR_ROOT_DIR") ? getenv("ALR_ROOT_DIR") : "", g_self, distro);
     read_line_cmd(cmd, line, sizeof line);
-    rline(&bad, "INSTALL BOOT /bin/echo:", strcmp(line, "alr") == 0,
+    rline(&bad, "INSTALL BOOT STDOUT:", strcmp(line, "alr") == 0,
           "stdout=\"%s\"", line);
 
     /* Not a pass/fail -- a recorded fact.  The guest's glibc version decides

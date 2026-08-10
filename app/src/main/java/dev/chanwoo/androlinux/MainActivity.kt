@@ -485,6 +485,7 @@ class MainActivity : Activity() {
         val nativeCommandRunner = NativeCommandRunner(
             File(applicationInfo.nativeLibraryDir),
             File(cacheDir, "proot-tmp"),
+            filesDir,
         )
         val nativeCommandResult = nativeCommandRunner.runSmokeTest()
         val prootCandidateResult = nativeCommandRunner.runProotCandidateSmokeTest()

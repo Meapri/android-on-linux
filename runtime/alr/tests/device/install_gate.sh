@@ -82,7 +82,7 @@ rc=$?
 missing=
 for n in "INSTALL DOWNLOAD" "INSTALL VERIFY SHA256" "INSTALL EXTRACT" \
          "INSTALL REPAIR" "INSTALL LDSO PRESENT" "INSTALL LDSO OPTIONS" \
-         "INSTALL BOOT /bin/true" "INSTALL BOOT /bin/echo" \
+         "INSTALL BOOT" "INSTALL BOOT STDOUT" \
          "INSTALL GLIBC VERSION"; do
     grep -q "^$n:" "$GATE_ROOT/install.log" || missing="$missing $n"
 done
@@ -97,10 +97,10 @@ grep -q "^INSTALL LDSO OPTIONS: *PASS  argv0=yes preload=yes library-path=yes in
     && emit "INSTALL REPORT LDSO OPTIONS" PASS \
     || emit "INSTALL REPORT LDSO OPTIONS" FAIL \
             "$(grep -m1 "^INSTALL LDSO OPTIONS" "$GATE_ROOT/install.log")"
-grep -q "^INSTALL BOOT /bin/echo: *PASS  stdout=\"alr\"" "$GATE_ROOT/install.log" \
+grep -q "^INSTALL BOOT STDOUT: *PASS  stdout=\"alr\"" "$GATE_ROOT/install.log" \
     && emit "INSTALL REPORT BOOT ECHO" PASS \
     || emit "INSTALL REPORT BOOT ECHO" FAIL \
-            "$(grep -m1 "^INSTALL BOOT /bin/echo" "$GATE_ROOT/install.log")"
+            "$(grep -m1 "^INSTALL BOOT STDOUT" "$GATE_ROOT/install.log")"
 
 # An unverified download must not be laundered into PASS.  This install used
 # --url, so there is no digest and the only honest token is SKIP.

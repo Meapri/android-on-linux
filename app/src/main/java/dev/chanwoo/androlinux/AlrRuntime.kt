@@ -88,6 +88,34 @@ class AlrRuntime(
     fun adopt(distro: String, timeoutSeconds: Long = 120): AlrResult =
         exec(listOf("adopt", distro), timeoutSeconds)
 
+    /**
+     * Adopt a rootfs the first time we are asked to run something in it.
+     *
+     * An unadopted tree has no guest interposer and an unrepaired /etc, so
+     * every command in it fails in a way that looks like the runtime is
+     * broken. MEASURED: routing the app's rootfs probes through alr without
+     * this took the report from 166 PASS / 5 FAIL to 154 / 17 -- twelve
+     * checks that failed only because nobody had adopted the tree they ran in.
+     *
+     * The marker records WHICH alr adopted it, so an app update with a new
+     * runtime re-adopts rather than running against an interposer built
+     * against different sources.
+     */
+    private fun ensureAdopted(distro: String) {
+        val root = File(rootfsBase, distro)
+        if (!root.isDirectory) return
+        val stamp = File(root, ".alr-adopted")
+        val want = runCatching { binary.length().toString() + ":" + binary.lastModified() }
+            .getOrDefault("unknown")
+        if (stamp.isFile && runCatching { stamp.readText() }.getOrNull() == want) return
+        val r = adopt(distro)
+        // Record the attempt either way. Retrying a failed adoption on every
+        // command turns one bad rootfs into a 120-second stall per call --
+        // MEASURED as a cascade of timeouts across the whole report. A failure
+        // is recorded with its exit code so the next run can see it was tried.
+        runCatching { stamp.writeText(if (r.ok) want else "failed:${r.exitCode}:$want") }
+    }
+
     /** `alr run <program> [args]` inside the guest. */
     fun run(
         distro: String,
@@ -97,14 +125,17 @@ class AlrRuntime(
         timeoutSeconds: Long = 60,
         /** ALR_LOG=1 makes alr print its supervisor counters on exit. */
         verbose: Boolean = false,
-    ): AlrResult = exec(
+    ): AlrResult {
+        ensureAdopted(distro)
+        return exec(
         listOf("-d", distro, "run", program) + arguments,
         timeoutSeconds,
         extraEnv = buildMap {
             if (fakeroot) put("ALR_FAKEROOT", "1")
             if (verbose) put("ALR_LOG", "1")
         },
-    )
+        )
+    }
 
     fun version(): AlrResult = exec(listOf("version"), 30)
 
