@@ -266,7 +266,8 @@ extract-permission         extract-traversal-reject   install-unknown-option
 ldso-missing
 no-supervisor-requested    not-a-rootfs               preload-install-failed
 preload-missing-in-rootfs  preload-stale              remove-failed
-rootfs-incomplete          rootfs-missing             rootfs-unbootable
+rootfs-incomplete          rootfs-missing             rootfs-missing-interposer-deps
+rootfs-unbootable
 too-many-env               unhooked-static-binary     unsupported-distro
 with-failed                workdir-enoent
 ```

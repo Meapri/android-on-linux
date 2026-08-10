@@ -28,6 +28,7 @@ void alr_resolvd_stop(void);
 
 #include <errno.h>
 #include <fcntl.h>
+#include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <time.h>
@@ -2069,6 +2070,82 @@ static int cmd_config(int argc, char **argv)
     return 1;
 }
 
+/* Can the guest loader satisfy the INTERPOSER's own dependencies?
+ *
+ * The interposer is injected with --preload, so its DT_NEEDED list is resolved
+ * in the guest's namespace just like the program's. If one is missing, ld.so
+ * fails the whole process and names THE PROGRAM, not us:
+ *
+ *     /usr/bin/dpkg: error while loading shared libraries: libdl.so.2:
+ *       cannot open shared object file
+ *
+ * which reads as a broken rootfs. It cost a day of chasing the wrong thing.
+ * The tell is that STATIC guest binaries keep working -- they never load us.
+ *
+ * We target glibc 2.17, where dlsym/dlopen really do live in libdl.so.2, so
+ * the dependency is legitimate; every stock Debian/Ubuntu rootfs ships the
+ * stub. An image built by closure analysis over its OWN binaries can miss it,
+ * because the interposer is injected afterwards and was never in that closure.
+ *
+ * Checked at adoption, where one clear message beats the same failure repeated
+ * by every program the user ever runs. */
+static int preload_deps_ok(const char *R, const char *preload)
+{
+    unsigned char *b = NULL;
+    long n = 0;
+    FILE *f = fopen(preload, "rb");
+    int missing = 0;
+    if (!f) return 1;                    /* nothing to check against */
+    fseek(f, 0, SEEK_END); n = ftell(f); fseek(f, 0, SEEK_SET);
+    if (n > 0 && n < (1 << 24) && (b = malloc((size_t)n))) {
+        if (fread(b, 1, (size_t)n, f) != (size_t)n) { free(b); b = NULL; }
+    }
+    fclose(f);
+    if (!b) return 1;
+
+    /* Scan the file for "libNAME.so.N" strings and require each to exist under
+     * one of the loader's search directories. Reading DT_NEEDED properly would
+     * be better; this is deliberately loose because a false ALARM here is
+     * cheap (a warning) and a false CLEAR is what we are trying to prevent. */
+    {
+        static const char *dirs[] = { "lib/aarch64-linux-gnu", "usr/lib/aarch64-linux-gnu",
+                                      "lib", "usr/lib", NULL };
+        long i;
+        for (i = 0; i + 8 < n; i++) {
+            char name[128], p[ALR_PBUF];
+            int k = 0, d, found = 0;
+            if (memcmp(b + i, "lib", 3) != 0) continue;
+            if (i > 0 && b[i - 1] != '\0') continue;
+            while (i + k < n && b[i + k] && k < (int)sizeof name - 1 &&
+                   (isalnum(b[i + k]) || strchr("._-+", b[i + k]))) {
+                name[k] = (char)b[i + k]; k++;
+            }
+            name[k] = '\0';
+            if (k < 8 || !strstr(name, ".so")) continue;
+            for (d = 0; dirs[d] && !found; d++) {
+                snprintf(p, sizeof p, "%s/%s/%s", R, dirs[d], name);
+                if (access(p, F_OK) == 0) found = 1;
+            }
+            if (!found) {
+                fprintf(stderr,
+                    "alr: the guest rootfs has no %s, which the interposer needs.\n"
+                    "     Every DYNAMIC guest program will fail to start with\n"
+                    "     \"error while loading shared libraries: %s\" naming\n"
+                    "     ITSELF, not us.  Static programs will keep working,\n"
+                    "     which makes this look like a broken rootfs.\n"
+                    "     Stock Debian/Ubuntu images ship it; an image trimmed by\n"
+                    "     closure analysis over its own binaries can miss it,\n"
+                    "     because the interposer is injected afterwards.\n",
+                    name, name);
+                missing++;
+            }
+            i += k;
+        }
+    }
+    free(b);
+    return missing == 0;
+}
+
 /* `alr adopt <distro>` -- make an already-extracted directory an alr rootfs.
  *
  * THE SEAM BETWEEN A HOST APP AND THIS RUNTIME.
@@ -2137,6 +2214,14 @@ static int cmd_adopt(const char *distro)
     if (verify_rootfs(R) != 0)
         die("rootfs-incomplete",
             "the extracted tree is missing files a usable rootfs must have");
+
+    {   char pl[ALR_PBUF];
+        snprintf(pl, sizeof pl, "%s/usr/lib/alr/libalr_preload.so", R);
+        if (!preload_deps_ok(R, pl))
+            die("rootfs-missing-interposer-deps",
+                "the rootfs cannot load the guest interposer; add the missing "
+                "libraries to the image (see the lines above)");
+    }
 
     divert_ldconfig(distro, R);
 
@@ -2755,6 +2840,32 @@ static int cmd_run(const char *distro, int argc, char **argv, int login_shell,
         }
     }
 
+    /* A STATIC interpreter needs the script in HOST form.
+     *
+     * shebang_resolve stores each script as `host + root_len` -- guest form --
+     * which is right when the interpreter is dynamic, because our interposer
+     * rewrites it. A static interpreter never loads the interposer, so a guest
+     * path resolves against ANDROID:
+     *
+     *     /bin/sh: can't open '/bin/script-hello': No such file or directory
+     *
+     * (that /bin/sh is busybox, static). This is the same rule v0.5.0 applies
+     * to a static target's environment -- host paths for a binary we cannot
+     * rewrite -- extended to the arguments we synthesise for it. Only entries
+     * that are absolute AND exist under the root are touched, so a shebang
+     * ARGUMENT like `-e` is left alone. */
+    if (npre > 0 && exe_is_static(host)) {
+        int i;
+        for (i = 0; i < npre; i++) {
+            char cand[ALR_PBUF];
+            if (!pre[i] || pre[i][0] != '/') continue;
+            snprintf(cand, sizeof cand, "%s%s", L.root, pre[i]);
+            if (access(cand, F_OK) != 0) continue;
+            { char *h = malloc(ALR_PBUF);
+              if (h) { snprintf(h, ALR_PBUF, "%s", cand); pre[i] = h; } }
+        }
+    }
+
     /* ADR 0002: the program argument MUST contain a '/' -- glibc's dl-load.c
      * treats a slash-free name as a LIBRARY name and searches the library path
      * for it, not $PATH.  We always pass an absolute host path. */
@@ -2765,7 +2876,24 @@ static int cmd_run(const char *distro, int argc, char **argv, int login_shell,
      * appeared it would silently poison every library resolution. */
     av[n++] = (char *)"--inhibit-cache";
     av[n++] = (char *)"--argv0";
-    av[n++] = (char *)(login_shell ? "-bash" : argv[0]);
+    /* For a SHEBANG, argv[0] is the INTERPRETER, not the script.
+     *
+     * Linux exec of a script S with a `#!/bin/sh` line runs /bin/sh with
+     * argv = { "/bin/sh", S, ... }. This passed the script path as argv[0]
+     * instead, which is harmless for dash and bash -- they read the script
+     * from argv[1] either way -- and fatal for a MULTICALL interpreter, which
+     * dispatches on argv[0]:
+     *
+     *     $ alr run /bin/script-hello
+     *     script-hello: applet not found        <- busybox, asked to be
+     *                                              an applet named after
+     *                                              the script
+     *
+     * The same mechanism is why a uutils-based coreutils cannot work under an
+     * explicit loader: every tool in it is one binary dispatching on argv[0].
+     * npre > 0 means shebang_resolve replaced `host` with the interpreter, so
+     * that is what the program must see. */
+    av[n++] = (char *)(login_shell ? "-bash" : (npre > 0 ? host : argv[0]));
     if (L.have_preload) { av[n++] = (char *)"--preload"; av[n++] = L.preload; }
     av[n++] = host;
     for (i = 0; i < npre; i++) av[n++] = (char *)pre[i];   /* shebang arg + script */

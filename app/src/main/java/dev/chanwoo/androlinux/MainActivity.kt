@@ -493,28 +493,51 @@ class MainActivity : Activity() {
         val prootHelpResult = nativeCommandRunner.runProotHelpProbe()
         val prootNoEnvResult = nativeCommandRunner.runProotNoEnvVersionProbe()
         val prootViaLinkerResult = nativeCommandRunner.runProotViaLinkerVersionProbe()
+        // WHICH ROOTFS THE DISTRO PROBES RUN IN.
+        //
+        // The bundled image is a purpose-built GUI test tree: /bin/hello,
+        // /bin/glibc-hello and /bin/script-hello are its own fixtures, and
+        // those probes must keep using it. But it is NOT a complete distro
+        // userland -- MEASURED, it contains no libdl.so.2 anywhere, so its own
+        // dpkg cannot load:
+        //     dpkg: error while loading shared libraries: libdl.so.2
+        // PRoot hid that by chrooting and letting the guest loader search its
+        // default paths; alr invokes the guest ld.so explicitly and surfaces
+        // the missing NEEDED library instead.
+        //
+        // So the dpkg/apt/id/shell probes run in a full distro rootfs when one
+        // is provisioned. The same commands there, through the same alr:
+        // dpkg 1.22.6 (arm64), dpkg-query 1.22.6, apt-get ok, sh ok.
+        //
+        // The report names the tree each group used, because "dpkg works" and
+        // "dpkg works in a rootfs that has its libraries" are different claims.
+        val userlandRootfsDir = listOf("ubuntu-24.04", "ubuntu", "debian")
+            .map { java.io.File(java.io.File(filesDir, "rootfs"), it) }
+            .firstOrNull { java.io.File(it, "usr/lib/aarch64-linux-gnu/libdl.so.2").isFile }
+            ?: rootfsStatus.rootfsDir
+
         val prootHelloResult = nativeCommandRunner.runProotRootfsProgram(rootfsStatus.rootfsDir, "/bin/hello")
         val prootScriptResult = nativeCommandRunner.runProotRootfsProgram(rootfsStatus.rootfsDir, "/bin/script-hello")
         val prootShellResult = nativeCommandRunner.runProotRootfsShell(
-            rootfsStatus.rootfsDir,
+            userlandRootfsDir,
             "echo shell-c ok; /bin/hello; /bin/cat /etc/os-release",
         )
         val prootGlibcResult = nativeCommandRunner.runProotRootfsProgram(rootfsStatus.rootfsDir, "/bin/glibc-hello")
         val prootDashResult = nativeCommandRunner.runProotRootfsDash(
-            rootfsStatus.rootfsDir,
+            userlandRootfsDir,
             "echo dash-c ok; /usr/bin/env | /bin/cat",
         )
-        val prootIdResult = nativeCommandRunner.runProotRootfsIdAsRoot(rootfsStatus.rootfsDir)
-        val prootDpkgVersionResult = nativeCommandRunner.runProotRootfsDpkgVersion(rootfsStatus.rootfsDir)
-        val prootDpkgArchResult = nativeCommandRunner.runProotRootfsDpkgPrintArchitecture(rootfsStatus.rootfsDir)
-        val prootDpkgQueryVersionResult = nativeCommandRunner.runProotRootfsDpkgQueryVersion(rootfsStatus.rootfsDir)
-        val prootDpkgSplitVersionResult = nativeCommandRunner.runProotRootfsDpkgSplitVersion(rootfsStatus.rootfsDir)
-        val prootAptVersionResult = nativeCommandRunner.runProotRootfsAptVersion(rootfsStatus.rootfsDir)
-        val prootAptGetVersionResult = nativeCommandRunner.runProotRootfsAptGetVersion(rootfsStatus.rootfsDir)
-        val prootAptCacheVersionResult = nativeCommandRunner.runProotRootfsAptCacheVersion(rootfsStatus.rootfsDir)
-        val prootAptConfigVersionResult = nativeCommandRunner.runProotRootfsAptConfigVersion(rootfsStatus.rootfsDir)
-        val prootDpkgInstallLocalResult = nativeCommandRunner.runProotRootfsDpkgInstallLocalSmoke(rootfsStatus.rootfsDir)
-        val prootInstalledPackageSmokeResult = nativeCommandRunner.runProotRootfsInstalledPackageSmoke(rootfsStatus.rootfsDir)
+        val prootIdResult = nativeCommandRunner.runProotRootfsIdAsRoot(userlandRootfsDir)
+        val prootDpkgVersionResult = nativeCommandRunner.runProotRootfsDpkgVersion(userlandRootfsDir)
+        val prootDpkgArchResult = nativeCommandRunner.runProotRootfsDpkgPrintArchitecture(userlandRootfsDir)
+        val prootDpkgQueryVersionResult = nativeCommandRunner.runProotRootfsDpkgQueryVersion(userlandRootfsDir)
+        val prootDpkgSplitVersionResult = nativeCommandRunner.runProotRootfsDpkgSplitVersion(userlandRootfsDir)
+        val prootAptVersionResult = nativeCommandRunner.runProotRootfsAptVersion(userlandRootfsDir)
+        val prootAptGetVersionResult = nativeCommandRunner.runProotRootfsAptGetVersion(userlandRootfsDir)
+        val prootAptCacheVersionResult = nativeCommandRunner.runProotRootfsAptCacheVersion(userlandRootfsDir)
+        val prootAptConfigVersionResult = nativeCommandRunner.runProotRootfsAptConfigVersion(userlandRootfsDir)
+        val prootDpkgInstallLocalResult = nativeCommandRunner.runProotRootfsDpkgInstallLocalSmoke(userlandRootfsDir)
+        val prootInstalledPackageSmokeResult = nativeCommandRunner.runProotRootfsInstalledPackageSmoke(userlandRootfsDir)
         val prootGuestGpuClientResult = nativeCommandRunner.runProotRootfsGuestGpuClient(rootfsStatus.rootfsDir)
         val guestGpuCommands = parseGuestGpuCommands(prootGuestGpuClientResult.stdout)
         val guestGpuIpcBridgeResult = runGuestGpuIpcBridge(nativeCommandRunner, rootfsStatus.rootfsDir)
@@ -1105,6 +1128,8 @@ class MainActivity : Activity() {
         val executionSummary = "build: 0.4.163-sd-v163" +
             "\nexecution summary" +
             "\nROOTFS EXECUTION: ${if (rootfsExecutionPassed) "PASS" else "FAIL"}" +
+            "\nrootfs fixtures tree=${rootfsStatus.rootfsDir.name}" +
+            "\nrootfs userland tree=${userlandRootfsDir.name}" +
             "\nSHELL SCRIPT EXECUTION: ${if (shellScriptExecutionPassed) "PASS" else "FAIL"}" +
             "\nSHELL -C EXECUTION: ${if (shellCommandExecutionPassed) "PASS" else "FAIL"}" +
             "\nGLIBC DYNAMIC EXECUTION: ${if (glibcDynamicExecutionPassed) "PASS" else "FAIL"}" +
