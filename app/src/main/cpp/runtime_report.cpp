@@ -1277,7 +1277,29 @@ std::string build_memfd_exec_probe(const alr::RuntimeReportInput& input) {
                      : WIFSIGNALED(status) ? 128 + WTERMSIG(status)
                                            : -1;
     const bool ran = child_stdout.find("hello from static arm64 rootfs") != std::string::npos;
-    out << "\nALR MEMFD EXECVEAT W^X-SAFE EXECUTION: " << (ran ? "PASS" : "FAIL");
+    /* EACCES here is a MEASURED PLATFORM PROPERTY, not a defect: SELinux
+     * denies executing a file-backed memfd from an untrusted app, and it did so
+     * at targetSdk 35 as well, so the domain change did not cause it.
+     *
+     * memfd-execveat was a candidate mechanism for targetSdk >= 29, where
+     * app-data execve is refused. At 28 the direct route works (see
+     * ALR DIRECT APP-DATA EXECVE), so this is off the product path -- kept
+     * because it is exactly what the research loader must work around if the
+     * installable-targetSdk floor ever rises above 28.
+     *
+     * Any OTHER errno stays a plain FAIL: it would mean we measured something
+     * other than the policy, and collapsing the two is how a probe stops
+     * distinguishing "denied" from "broken". */
+    {
+        const bool selinux_denied =
+            !ran && child_stderr.find("EXECVEAT_ERRNO=13") != std::string::npos;
+        out << "\nALR MEMFD EXECVEAT W^X-SAFE EXECUTION: "
+            << (ran ? "PASS"
+                    : selinux_denied
+                        ? "KNOWN_FAIL:selinux-memfd-exec (EACCES; off the "
+                          "product path at targetSdk 28)"
+                        : "FAIL");
+    }
     out << "\nalr memfd child exit=" << code;
     out << "\nalr memfd child stdout=" << child_stdout;
     out << "\nalr memfd child stderr=" << child_stderr;

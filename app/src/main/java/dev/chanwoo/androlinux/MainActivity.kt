@@ -1179,14 +1179,38 @@ class MainActivity : Activity() {
             "\nALR PERF HARNESS: ${if (alrPerfHarnessRan) "PASS" else "FAIL"}" +
             "\nALR PERF PROOT VS ALR DEVICE COMPARISON: ${alrPerfComparisonProbe.lineStartingWith("ALR PERF PROOT VS ALR DEVICE COMPARISON:").substringAfter("COMPARISON: ", "PENDING_DEVICE")}" +
             "\nALR PROCFS INTERPOSE MECHANISM: ${if (alrInterposeProcfsPassed) "PASS" else "FAIL"}" +
-            "\nALR MEMFD W^X-SAFE NATIVE EXEC: ${if (alrMemfdExecPassed) "PASS" else "FAIL"}" +
+            // Not a defect: a MEASURED property of the platform. SELinux denies
+            // executing a file-backed memfd from an untrusted app -- the child
+            // reports EXECVEAT_ERRNO=13 (EACCES), and it did so at targetSdk 35
+            // too, so the domain change did not cause it.
+            //
+            // memfd-execveat was a candidate mechanism for targetSdk >= 29,
+            // where app-data execve is denied. At 28 the direct route works
+            // (ALR DIRECT APP-DATA EXECVE: PASS), so the question this answers
+            // is no longer on the product path -- but the answer is worth
+            // keeping, because it is what the research loader has to work
+            // around if the targetSdk floor ever rises.
+            "\nALR MEMFD W^X-SAFE NATIVE EXEC: ${
+                if (alrMemfdExecPassed) "PASS"
+                else if (alrMemfdExecProbe.contains("EXECVEAT_ERRNO=13"))
+                    "KNOWN_FAIL:selinux-memfd-exec (EACCES; not on the product path at targetSdk 28)"
+                else "FAIL"
+            }" +
             "\nALR EXECMEM ANON RX NATIVE EXEC: ${if (alrExecmemPassed) "PASS" else "FAIL"}" +
             "\nALR NATIVE LOADER MECHANISM (freestanding): ${if (alrNativeLoaderSelftestPassed) "PASS" else "FAIL"}" +
             "\nALR NATIVE LOADER GUEST EXEC (glibc static): ${if (alrNativeLoaderGuestExecPassed) "PASS" else "FAIL"}" +
             "\nALR NATIVE LOADER GUEST EXEC (glibc threads+fork): ${if (alrNativeLoaderMtPassed) "PASS" else "FAIL"}" +
             "\nALR SECCOMP PATH-MEDIATION (seccomp-trace rootfs path rewrite): ${if (alrSeccompPathTrapViable) "VIABLE" else "BLOCKED"}" +
             "\nALR WAYLAND SOCKET TRANSPORT (named AF_UNIX host↔guest): ${if (alrUnixSocketViable) "VIABLE" else "BLOCKED"}" +
-            "\nALR LOADER PATH-MEDIATION REAL FILE READ (glibc opens /etc via rootfs): ${if (alrNativeLoaderFileioMediated) "PASS" else "FAIL"}" +
+            // STAYS FAIL, deliberately. This is the in-process anon-mmap
+            // loader -- the research route for a future where targetSdk 28 is
+            // no longer installable -- and its mediation is genuinely
+            // unfinished: the probe reports traps firing with rewrites=0, so
+            // the hook is reached and the rewrite is not applied. That is an
+            // open defect, not a platform fact like the memfd EACCES above, and
+            // relabelling it KNOWN_FAIL would be relabelling a research path
+            // green. The product path (alr) does not use this loader.
+            "\nALR LOADER PATH-MEDIATION REAL FILE READ (glibc opens /etc via rootfs): ${if (alrNativeLoaderFileioMediated) "PASS" else "FAIL"} (research loader; traps fire, rewrites=0 -- open)" +
             "\nALR NATIVE LOADER GUEST EXEC (glibc DYNAMIC via in-process ld.so): ${if (alrNativeLoaderDynPassed) "PASS" else "FAIL"}" +
             "\nALR REAL DEBIAN PROGRAM (/usr/bin/env, dynamic coreutils): ${if (alrLoaderRealEnvPassed) "PASS" else "FAIL"}" +
             "\nALR REAL DEBIAN PROGRAM (/usr/bin/id, libselinux+rootfs /etc): ${if (alrLoaderRealIdPassed) "PASS" else "FAIL"}" +
