@@ -150,6 +150,27 @@ object AptInstaller {
         /** Run a guest program (NEWLINE-delimited argv); BLOCKS until it exits; returns stdout. */
         fun loaderProbe(rootfsName: String, program: String): String
 
+        /**
+         * True when the runner behind [loaderProbe] supplies uid-0 emulation and
+         * path virtualization ITSELF, so the staged overlays are not needed.
+         *
+         * The alr backend does: `ALR_FAKEROOT=1` is its own fakeroot, its
+         * interposer is the path layer, and its resolver bridge answers apt's
+         * DNS -- so `libalr_fakeroot.so`, `libalr_interpose.so` and the
+         * mirror-IP `.sources` pin are all redundant there. Under the legacy
+         * loader they are load-bearing, which is why this is a property of the
+         * host and not a constant.
+         *
+         * MEASURED on Ubuntu 26.04: `apt-get update` fetched 28.2 MB and
+         * `apt-get install sakura` pulled, unpacked and configured 108 packages
+         * through alr with NO overlay staged at all. The install UI was
+         * refusing that same operation with "apt 오버레이가 준비되지 않았습니다"
+         * because the four dev-time stage tars were absent -- they only ever
+         * existed in /data/local/tmp on a developer's device, so a clean
+         * install could never install anything.
+         */
+        val selfSufficient: Boolean get() = false
+
         /** Extract an overlay stage-tar with the lib-downgrade guard. Returns (extracted#, skipped#). */
         fun extractOverlay(tar: File, rootfsDir: File): Pair<Int, Int>
     }
@@ -228,7 +249,7 @@ object AptInstaller {
             interposeStageTar.isFile &&
                 (rootfsDir.listFiles { f -> f.name.startsWith(".interpose-staged-") }?.isEmpty() ?: true)
         }
-        var w = 0
+        var w = if (host.selfSufficient) 40000 else 0
         while (w < 40000 &&
             !(fakerootSo.isFile && aptGetBin.isFile && srcFile.isFile &&
                 interposeSo.isFile && !interposeStaging())
@@ -238,7 +259,12 @@ object AptInstaller {
             "aptinstall: fakeroot.so=${fakerootSo.isFile} apt-get=${aptGetBin.isFile} " +
                 "sources=${srcFile.isFile} (waited ${w}ms)",
         )
-        if (!(fakerootSo.isFile && aptGetBin.isFile && srcFile.isFile)) {
+        if (!aptGetBin.isFile) {
+            Log.w(TAG, "aptinstall: the rootfs has no /usr/bin/apt-get")
+            return Result(installed = false, downloaded = false, binaryPresent = false,
+                error = "이 rootfs 에는 apt 가 없습니다 (/usr/bin/apt-get)")
+        }
+        if (!host.selfSufficient && !(fakerootSo.isFile && srcFile.isFile)) {
             Log.w(TAG, "aptinstall: prerequisites missing — push fakeroot/apt-dpkg/dpkg-db/apt-mirror stage tars")
             return Result(installed = false, downloaded = false, binaryPresent = false,
                 error = "apt 오버레이가 준비되지 않았습니다 (fakeroot/apt-dpkg/dpkg-db/apt-mirror)")

@@ -2678,14 +2678,14 @@ static char **build_env(const struct launch *L, const char *guest_exe,
          * environment carried ALR_GUEST_EXE twice and the stale one, naming
          * the host binary its parent had exec'd, came first.
          *
-         * ALR_LOG, ALR_DISTRO and ALR_ROOT_DIR are NOT here: alr never PUT()s
-         * them, so there is nothing to shadow, and inheriting them is how a
-         * nested alr finds the same rootfs and the same verbosity. */
+         * ALR_LOG and ALR_ROOT_DIR are NOT here: alr never PUT()s them, so
+         * there is nothing to shadow, and inheriting them is how a nested alr
+         * finds the same rootfs base and the same verbosity. */
         {
             static const char *const own[] = {
                 "ALR_ROOT=", "ALR_LDSO=", "ALR_LIBPATH=", "ALR_PRELOAD=",
                 "ALR_GUEST_EXE=", "ALR_GUEST_ARGV0=", "ALR_GUEST_PATH=",
-                "ALR_FAKEROOT=", "ALR_COUNT=", "ALR_LOG_FD=", NULL
+                "ALR_FAKEROOT=", "ALR_COUNT=", "ALR_LOG_FD=", "ALR_DISTRO=", NULL
             };
             int o, drop = 0;
             for (o = 0; own[o]; o++) {
@@ -2743,6 +2743,19 @@ static char **build_env(const struct launch *L, const char *guest_exe,
                   env[n++] = (char *)ro->envs[u]; }
 
     PUT("ALR_ROOT=%s", L->root);
+    /* Which tree, by NAME.  ALR_ROOT gives a nested alr the path; only the name
+     * makes `alr run` inside the guest target the same rootfs, because that is
+     * what -d and default_distro speak.
+     *
+     * MEASURED: the acceptance suite, running inside ubuntu-26.04, had every
+     * one of its `$ALR run` calls land in ubuntu-24.04 -- the nested alr found
+     * no ALR_DISTRO, fell back to the configured default, and the suite
+     * reported 100 PASS about a rootfs it was not in. It surfaced only because
+     * one check reads /etc/os-release and printed "Ubuntu 24.04.3 LTS" from
+     * inside 26.04. */
+    {   const char *slash = strrchr(L->root, '/');
+        PUT("ALR_DISTRO=%s", slash && slash[1] ? slash + 1 : L->root);
+    }
     /* The preload needs these to re-dispatch the guest's own exec* calls
      * through the same loader invocation we used for the first program. */
     PUT("ALR_LDSO=%s", L->ldso);
@@ -2915,6 +2928,57 @@ static int exe_is_static(const char *host)
                      interp_probe, sizeof interp_probe);
     close(fd);
     return k == ALR_EXE_ELF_STATIC;
+}
+
+/* Append the target's own DT_RUNPATH/DT_RPATH to the loader search path,
+ * rewritten into host form.
+ *
+ * ld.so is the one component the interposer cannot reach -- it does its own
+ * opening, before any LD_PRELOAD is loaded -- so ADR 0002 hands it a
+ * --library-path of HOST directories.  A binary's RUNPATH is not in that list
+ * and is not host-form: it is written for a system rooted at the rootfs, so
+ * `/usr/lib/aarch64-linux-gnu/systemd` is looked up under ANDROID's root and
+ * comes up empty.  Nothing reports it as a path problem; ld.so just says the
+ * library is missing, about a file that is present.
+ *
+ * MEASURED on Ubuntu 26.04: `apt-get install sakura` pulls in systemd, whose
+ * postinst runs systemctl, whose libsystemd-shared-259.so lives only on its
+ * RUNPATH.  Four "cannot open shared object file" lines, exit 127, and the
+ * whole install failed at dpkg --configure.
+ *
+ * Relative and $ORIGIN entries are deliberately NOT copied: ld.so expands
+ * $ORIGIN against the object's own location, and that location is already the
+ * host path we exec'd, so its own handling is correct.  Only absolute entries
+ * are wrong, and only those are translated.
+ */
+static void libpath_add_rpath(struct launch *L, const char *host)
+{
+    unsigned char head[ALR_PROBE_BYTES];
+    char rpath[ALR_PBUF];
+    struct rdctx ctx;
+    ssize_t n;
+    int fd;
+    char *save, *tok;
+    size_t o;
+
+    if ((fd = open(host, O_RDONLY | O_CLOEXEC)) < 0) return;
+    n = read(fd, head, sizeof head);
+    ctx.fd = fd;
+    if (!alr_rpath(rd_pread, &ctx, head, n < 0 ? 0 : (size_t)n,
+                   rpath, sizeof rpath)) { close(fd); return; }
+    close(fd);
+    if (rpath[0] == '\0') return;
+
+    o = strlen(L->libpath);
+    for (tok = strtok_r(rpath, ":", &save); tok; tok = strtok_r(NULL, ":", &save)) {
+        char cand[ALR_PBUF];
+        if (tok[0] != '/') continue;
+        if (snprintf(cand, sizeof cand, "%s%s", L->root, tok) >= (int)sizeof cand)
+            continue;
+        if (!is_dir(cand)) continue;
+        o += (size_t)snprintf(L->libpath + o, sizeof L->libpath - o, ":%s", cand);
+        if (o >= sizeof L->libpath - 1) break;
+    }
 }
 
 /* Classify the target the way the preload does for guest-initiated execs.
@@ -3147,6 +3211,10 @@ static int cmd_run(const char *distro, int argc, char **argv, int login_shell,
      * that are absolute AND exist under the root are touched, so a shebang
      * ARGUMENT like `-e` is left alone. */
     target_static = exe_is_static(host);
+    /* Before anything reads L.libpath -- build_env PUTs it as LD_LIBRARY_PATH
+     * and the exec passes it as --library-path, so the RUNPATH entries have to
+     * be in it by now or neither sees them. */
+    if (!target_static) libpath_add_rpath(&L, host);
     if (npre > 0 && target_static) {
         int i;
         for (i = 0; i < npre; i++) {

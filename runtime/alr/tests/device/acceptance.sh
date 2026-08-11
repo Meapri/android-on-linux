@@ -42,8 +42,14 @@ ALR=${ALR:-./alr}
 # reason, and the outside-the-guest run still covers them.
 INSIDE_GUEST=0; [ -n "${ALR_ROOT:-}" ] && INSIDE_GUEST=1
 
-if [ -z "${ALR_ROOT_DIR:-}" ] && [ -n "${ALR_ROOT:-}" ]; then
-    ALR_ROOT_DIR=$(dirname "$ALR_ROOT")
+# ALR_ROOT names the exact tree we are inside, so BOTH halves come from it --
+# and they are set independently. Deriving the distro only when ALR_ROOT_DIR
+# happened to be unset meant that the moment alr started passing ALR_ROOT_DIR
+# through to the guest, the suite kept the right directory and silently fell
+# back to the DEFAULT distro name: it ran `ALR ROOTFS: FAIL not installed:
+# .../ubuntu-24.04` while sitting inside ubuntu-26.04.
+if [ -n "${ALR_ROOT:-}" ]; then
+    : "${ALR_ROOT_DIR:=$(dirname "$ALR_ROOT")}"
     : "${ALR_DISTRO:=$(basename "$ALR_ROOT")}"
 fi
 export ALR_ROOT_DIR=${ALR_ROOT_DIR:-$HOME/alr-distros}
@@ -172,7 +178,14 @@ echo "── M3 첫 부팅 ──"
 ckrc "ALR BOOT /bin/true"        0     $ALR run /bin/true
 ck   "ALR BOOT /bin/echo"        alr   $ALR run /bin/echo alr
 ckrc "ALR BOOT bash -c true"     0     $ALR run /bin/bash -c true
-ckc  "ALR GUEST GLIBC VERSION"   "2.39" $ALR run /lib/aarch64-linux-gnu/libc.so.6
+# Any glibc, not a pinned one: 24.04 is 2.39 and 26.04 is 2.43, and the claim
+# under test is "the guest's own libc answered", not which release it is.
+# ckc, not ckre: the banner goes to STDERR under an explicit loader and ckre
+# reads stdout only -- it reported got='' about a libc that had just printed
+# its version. ckc searches the whole 2>&1 output. And the version is not
+# pinned: 24.04 is 2.39, 26.04 is 2.43, and the claim is that the GUEST libc
+# answered, not which release it is.
+ckc  "ALR GUEST GLIBC VERSION"   "stable release version 2." $ALR run /lib/aarch64-linux-gnu/libc.so.6
 
 # The counterproofs: these are what make ADR 0001 and ADR 0002 evidence
 # rather than argument.  Both MUST fail, and fail in the specific way.
@@ -680,7 +693,10 @@ rm -rf "$_lh"
 # a test suite.
 _cfghome="$SCRATCH_G/alrcfghome"; rm -rf "$_cfghome"; mkdir -p "$_cfghome"
 _cfghomeh="$SCRATCH_H/alrcfghome"
-ck  "CLI CONFIG GET DEFAULT" "ubuntu-24.04" \
+# The distro UNDER TEST, not a literal. alr now puts ALR_DISTRO in every guest
+# environment so a nested alr targets the same tree, which means this reports
+# whatever tree the suite is running in -- as it should.
+ck  "CLI CONFIG GET DEFAULT" "$ALR_DISTRO_NAME" \
     env HOME="$_cfghomeh" $ALR config get default_distro
 # The confirmation line must report the value AFTER the write.  cfg() memoises
 # and main() has already called it, so the first version printed the value from
@@ -726,7 +742,9 @@ else
 fi
 
 echo "── M4 경로 가상화 ──"
-ckc "PRELOAD GUEST ETC"          "Ubuntu 24.04" $ALR run /bin/cat /etc/os-release
+# ID=ubuntu, not a release string: what this proves is that /etc/os-release came
+# from the ROOTFS rather than from Android, and every Ubuntu carries that line.
+ckc "PRELOAD GUEST ETC"          "ID=ubuntu" $ALR run /bin/cat /etc/os-release
 ck  "PRELOAD PROC SELF EXE"      /bin/readlink  $ALR run /bin/readlink /proc/self/exe
 # bash's builtin `pwd` answers from its OWN logical $PWD and never calls
 # getcwd, so the original form of this check proved nothing about the
@@ -792,7 +810,16 @@ $ALR run /bin/bash -c 'rm -f /tmp/alrsl /tmp/alrsy /usr/local/bin/alrsl' >/dev/n
 # a dynamic guest too, because rw() passes an already-under-root path through
 # unchanged.  Counting them made this check fail the moment codex started
 # working, which is the opposite of what it is for.
-n=$(find "$R" -type l -lname '/*' 2>/dev/null \
+# A target under /proc, /sys or /dev is CORRECT as an absolute link and must
+# not be relativized: those are the sysdirs alr_rw() passes straight through, so
+# the guest reaches Android's real ones. 26.04 ships two --
+# /etc/systemd/system-generators/systemd-gpt-auto-generator -> /dev/null (the
+# packaging idiom for "disabled") and /run/shm -> /dev/shm -- and counting them
+# asked `alr adopt` to break links that work. The old filter tested the link's
+# PATH; what decides this is its TARGET.
+n=$(find "$R" -type l -lname '/*' \
+        ! -lname '/proc/*' ! -lname '/sys/*' ! -lname '/dev/*' \
+        ! -lname '/proc' ! -lname '/sys' ! -lname '/dev' 2>/dev/null \
     | grep -vE '/(proc|sys|dev)/' \
     | grep -vE "^$R/(tmp|var/tmp|run)/" \
     | grep -vE "^$R/root/\\." | wc -l | tr -d ' ')
@@ -850,7 +877,11 @@ echo
 
 # ── M5: exec continuity ─────────────────────────────────────────────────
 echo "── M5 exec 연속성 ──"
-ck  "PRELOAD EXEC DYNAMIC"       OLLEH $ALR run /bin/bash -c 'echo hello | tr a-z A-Z | rev'
+# `rev` is in bsdextrautils, which ubuntu-base does not ship -- 26.04 turned this
+# into "rev: command not found" and reported a working pipeline as broken. cat
+# and tr are both coreutils (essential), so the chain still crosses three
+# processes and two dynamic guest binaries, which is what it is for.
+ck  "PRELOAD EXEC DYNAMIC"       OLLEH $ALR run /bin/bash -c 'echo olleh | cat | tr a-z A-Z'
 ck  "PRELOAD EXEC NESTED"        NEST_OK $ALR run /bin/bash -c 'bash -c "bash -c \"echo NEST_OK\""'
 ck  "PRELOAD EXEC SHEBANG"       SHEBANG_OK $ALR run /bin/bash -c \
     'printf "#!/bin/sh\necho SHEBANG_OK\n" > /tmp/t.sh; chmod +x /tmp/t.sh; /tmp/t.sh'
@@ -862,7 +893,9 @@ echo
 
 # ── M6 preflight (package managers respond; transactions need fakeroot) ──
 echo "── M6 사전점검 ──"
-ckc "ALR APT VERSION"            "apt 2." $ALR run /usr/bin/apt-get --version
+# 24.04 is apt 2.7, 26.04 is apt 3.2; the check is that apt runs and identifies
+# itself, not which major it is.
+ckre "ALR APT VERSION"            "^apt [0-9]+\\." $ALR run /usr/bin/apt-get --version
 ck  "ALR DPKG ARCH"              arm64    $ALR run /usr/bin/dpkg --print-architecture
 ckc "ALR DPKG VERSION"           "Debian" $ALR run /usr/bin/dpkg --version
 echo

@@ -1,0 +1,182 @@
+ACCEPTANCE CONTEXT:                    PASS   uid=10284 Seccomp=2 u:r:untrusted_app_27:s0
+
+── M3 첫 부팅 ──
+ALR BOOT /bin/true:                    PASS
+ALR BOOT /bin/echo:                    PASS
+ALR BOOT bash -c true:                 PASS
+ALR GUEST GLIBC VERSION:               PASS
+ADR0001 NO SUPERVISOR DIES:            SKIP   needs a process alr is not supervising
+ADR0002 BARE EXECVE FAILS:             SKIP   needs a process the interposer is not in
+
+── CLI 공통 옵션 (docs/06-cli-spec.md §1.1/§1.2) ──
+CLI ENV OPTION:                        PASS
+CLI ENV BEATS INHERITED:               PASS
+CLI WORKDIR OPTION:                    PASS
+CLI WORKDIR SETS PWD:                  PASS
+CLI EXEC DDASH:                        PASS
+CLI WORKDIR CLAMPS DOTDOT:             PASS
+CLI WORKDIR NORMALIZES:                PASS
+CLI WORKDIR PWD CANONICAL:             PASS
+CLI WORKDIR SYSDIR PASS:               PASS
+CLI ENV REPLACES DEFAULT:              PASS
+CLI ENV NO DUPLICATE:                  PASS
+CLI ENV LOCPATH RESERVED:              PASS
+CLI OLDPWD NOT INHERITED:              PASS
+CLI PWD STILL SET:                     SKIP   needs a caller whose cwd is outside the rootfs
+CLI ENV RESERVED REFUSED:              PASS
+CLI BAD OPTION REFUSED:                PASS
+CLI CWD FALLBACK:                      SKIP   needs a caller whose cwd is outside the rootfs
+CLI VERSION SHOWS GUEST PRELOAD:       PASS
+CLI VERSION DETECTS STALE PRELOAD:     SKIP   no second .so to swap in
+CLI UPDATE COMPONENTS:                 PASS
+CLI LIST:                              PASS
+SUPERVISOR STATS ELAPSED:              SKIP   nested alr inherits the outer supervisor and owns no counters
+SUPERVISOR SIGNAL PASSTHROUGH:         SKIP   nested alr inherits the outer supervisor and owns no counters
+SUPERVISOR ELAPSED TRACKS TIME:        SKIP   nested alr inherits the outer supervisor and owns no counters
+CLI REJECTS DOTDOT DISTRO:             PASS
+CLI REJECTS ABS DISTRO:                PASS
+CLI REMOVE NEEDS CONFIRMATION:         PASS
+CLI REMOVE ON CONFIRMATION:            PASS
+CLI REMOVE FORCE:                      PASS
+CLI REMOVE REFUSES FOREIGN DIR:        PASS
+ERROR: ld.so: object '/data/user/0/dev.chanwoo.androlinux/files/rootfs/ubuntu-26.04/usr/lib/alr/libalr_preload.so' from LD_PRELOAD cannot be preloaded (cannot open shared object file): ignored.
+ERROR: ld.so: object '/data/user/0/dev.chanwoo.androlinux/files/rootfs/ubuntu-26.04/usr/lib/alr/libalr_preload.so' from --preload cannot be preloaded (cannot open shared object file): ignored.
+ERROR: ld.so: object '/data/user/0/dev.chanwoo.androlinux/files/rootfs/ubuntu-26.04/usr/lib/alr/libalr_preload.so' from LD_PRELOAD cannot be preloaded (cannot open shared object file): ignored.
+ERROR: ld.so: object '/data/user/0/dev.chanwoo.androlinux/files/rootfs/ubuntu-26.04/usr/lib/alr/libalr_preload.so' from --preload cannot be preloaded (cannot open shared object file): ignored.
+CLI WARNS UNVIRTUALIZED BOOT:          PASS
+CLI UNVIRTUALIZED SEES ANDROID:        PASS
+CLI PRELOAD RESTORED:                  PASS
+CLI STATIC BINARY WARNS:               SKIP   codex not installed
+CLI DYNAMIC NO FALSE WARN:             PASS
+── 워크로드 (docs/07 §2 이름들, 지금까지 러너가 없던 것) ──
+ALR LDSO INVOKE:                       PASS
+ALR PIPELINE:                          PASS
+ALR FAKEROOT IDENTITY:                 PASS
+ALR APT UPDATE:                        PASS
+ALR DPKG DEB BUILD:                    PASS
+ALR DPKG LOCAL INSTALL:                PASS
+ALR GIT CLONE LOCAL:                   SKIP   git not installed in this rootfs
+PRELOAD SYMLINKAT ASYMMETRY:           PASS
+PRELOAD EXEC SHEBANG RECURSION:        PASS
+ALR GIT STATUS 10K:                    SKIP   git not installed in this rootfs
+ALR GIT HOOKS:                         SKIP   git not installed in this rootfs
+ALR GIT CLONE HTTPS:                   SKIP   git not installed
+PRELOAD DLOPEN ABS PATH:               SKIP   python3 not installed in this rootfs
+PRELOAD SYSCALL REWRITE:               SKIP   no libc6-dev in the guest
+PRELOAD EXEC ENVP IDEMPOTENT:          PASS
+SUPERVISOR SIGNAL FORWARD:             PASS
+ALR BASH INTERACTIVE:                  PASS
+PRELOAD UNIX SOCKET PATH:              SKIP   no libc6-dev in the guest
+PRELOAD PATH COVERAGE:                 SKIP   no libc6-dev in the guest
+RESOLV SERVICE PORT:                   SKIP   no libc6-dev in the guest
+CLI HOSTBIN PRESENT:                   PASS   28 wrappers
+CLI HOSTBIN RUNS GUEST TOOL:           SKIP   git not installed in this rootfs
+CLI HOSTBIN SELF CONTAINED:            SKIP   git not installed in this rootfs
+ALR CODEX FINDS GUEST GIT:             SKIP   codex not installed
+ALR CODEX FINDS GUEST RG:              SKIP   codex not installed
+ALR CODEX CONFIG IN ROOTFS:            SKIP   codex not installed
+DOCTOR P11 DYNAMIC CLEAN:              SKIP   alr-doctor not built
+DOCTOR P11 STATIC FLAGGED:             SKIP   alr-doctor not built
+DOCTOR P11 COUNTS NONZERO:             SKIP   alr-doctor not built
+DOCTOR P11 REJECTS NON ELF:            SKIP   alr-doctor not built
+DOCTOR P12 PHANTOM:                    SKIP   alr-doctor not built
+CLI LIST HONOURS CONFIG ROOT:          PASS
+CLI VERSION HONOURS -d:                PASS
+CLI CONFIG GET DEFAULT:                PASS
+CLI CONFIG SET REPORTS NEW:            PASS
+CLI CONFIG AFFECTS RUNTIME:            PASS
+CLI CONFIG FLAG OUTRANKS:              PASS
+CLI CONFIG UNKNOWN KEY:                PASS
+CLI CONFIG BAD VALUE:                  PASS
+CLI GUEST USERDB:                      PASS
+CLI GUEST USERDB LS:                   PASS
+ALR PTY TMUX:                          SKIP   tmux not installed
+── M4 경로 가상화 ──
+PRELOAD GUEST ETC:                     PASS
+PRELOAD PROC SELF EXE:                 PASS
+PRELOAD GETCWD CANON:                  PASS
+PRELOAD GETCWD ALLOCATING:             PASS
+PRELOAD REALPATH CANON:                PASS
+PRELOAD PATH SEARCH GUEST:             PASS
+PRELOAD NORMALIZE BEFORE SYSDIR:       PASS
+PRELOAD SYSDIR PASSTHROUGH:            PASS
+PRELOAD PROC CMDLINE:                  PASS
+PRELOAD CMDLINE NO HOST PATH:          PASS
+PRELOAD OPENDIR:                       PASS
+PRELOAD LS ENTRY COUNT:                PASS   18 entries
+PRELOAD SYMLINK RELATIVIZED:           PASS
+PRELOAD SYMLINK DEREFERENCES:          PASS
+PRELOAD SYMLINK DEPTH:                 PASS
+PRELOAD SYMLINK SYSDIR ABS:            PASS
+ROOTFS NO ABSOLUTE SYMLINKS:           PASS
+ROOTFS AWK RESOLVES:                   PASS
+ROOTFS LDCONFIG DIVERTED:              PASS
+ROOTFS DPKG LISTS PACKAGES:            PASS
+ROOTFS NO BROKEN PACKAGES:             PASS
+PRELOAD NSS GETPWNAM:                  PASS
+PRELOAD NSS GETGRNAM:                  PASS
+PRELOAD NSS GETPWUID:                  PASS
+PRELOAD NSS ENUMERATE:                 PASS   21 entries
+PRELOAD SHADOW LOCK:                   PASS
+
+── M5 exec 연속성 ──
+PRELOAD EXEC DYNAMIC:                  PASS
+PRELOAD EXEC NESTED:                   PASS
+PRELOAD EXEC SHEBANG:                  PASS
+PRELOAD EXEC SHEBANG ENV:              PASS
+PRELOAD EXEC FIND:                     PASS
+
+── M6 사전점검 ──
+ALR APT VERSION:                       PASS   apt 3.2.0 (arm64)
+ALR DPKG ARCH:                         PASS
+ALR DPKG VERSION:                      PASS
+
+── M6 패키지 매니저 ──
+ALR GIT VERSION:                       SKIP   git not installed; run apt-get install git
+
+── M7 타깃 워크로드 ──
+ALR NODE VERSION:                      SKIP   node not installed
+ALR CODEX VERSION:                     SKIP   codex not installed
+
+── 슈퍼바이저 불변식 ──
+SUPERVISOR NO SYSCALL STOPS:           SKIP   nested alr inherits the outer supervisor and owns no counters
+SUPERVISOR SIGSYS PER RUN:             SKIP   nested alr inherits the outer supervisor and owns no counters
+
+ALR STABILITY 10x:                     PASS   10/10
+
+── 프로세스 생성 (docs/04-preload-spec.md §9.4) ──
+SPAWN MAKE RECIPE:                     SKIP   make not installed
+SPAWN LIBC SYSTEM:                     SKIP   python3 not installed
+SPAWN POSIX_SPAWN:                     SKIP   no libc6-dev (spawn.h absent)
+IOCTL PTY TRANSLATED:                  SKIP   no libc6-dev (spawn.h absent)
+
+── 호스트 이름 해석 ──
+RESOLV HOSTS FILES:                    PASS
+RESOLV AHOSTS FILES:                   PASS
+RESOLV REVERSE FILES:                  PASS
+RESOLV LEGACY DNS:                     PASS
+RESOLV BRIDGE ABSENT:                  PASS
+ALR DIG VERSION:                       SKIP   dnsutils not installed
+ALR DIG VERSION NO BRIDGE:             SKIP   dnsutils not installed
+
+── 알려진 미구현 (회귀 감시) ──
+PROC STAT CPU COUNT:                   SKIP   node not installed
+PRELOAD PROC MOUNTS:                   PASS
+PRELOAD DF READS SYNTH:                PASS
+PRELOAD PROC SELF STATUS:              PASS   Name:	grep
+PRELOAD PROC SELF COMM:                PASS
+PRELOAD EXEC IDENTITY EXE:             PASS
+PRELOAD EXEC IDENTITY COMM:            PASS
+PRELOAD MKSTEMP:                       PASS
+PRELOAD LINK IDENTITY NLINK:           SKIP   no libc6-dev (spawn.h absent)
+PRELOAD LINK FALLBACK:                 PASS   ln succeeded, content identical
+PRELOAD DEV FULL ENOSPC:               KNOWN_FAIL:non-goal-devfull
+
+─────────────────────────────────────────────────────────────
+  PASS=103  FAIL=0  KNOWN_FAIL=1  SKIP=42
+ALR DEVICE ACCEPTANCE: PASS
+
+--- alr exit=0 ---
+EXIT=0
+
+--- stderr ---

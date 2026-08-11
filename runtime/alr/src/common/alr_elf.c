@@ -92,3 +92,75 @@ enum alr_exe_kind alr_classify(const unsigned char *head, size_t n,
     }
     return ALR_EXE_ELF_STATIC;
 }
+
+/* ── DT_RUNPATH / DT_RPATH ───────────────────────────────────────────────
+ * Walks PT_DYNAMIC, maps DT_STRTAB's virtual address back to a file offset
+ * through the PT_LOAD headers, and reads the string.  RUNPATH wins when both
+ * are present -- that is the linker's rule, and DT_RPATH is ignored entirely
+ * once a DT_RUNPATH exists. */
+struct alr_dyn64 { int64_t d_tag; uint64_t d_val; };
+
+int alr_rpath(alr_pread_fn pread, void *ctx, const unsigned char *head,
+              size_t n, char *out, size_t outsz)
+{
+    struct alr_ehdr64 eh;
+    struct alr_phdr64 loads[16];
+    int nloads = 0;
+    uint64_t dyn_off = 0, dyn_sz = 0;
+    uint64_t strtab_va = 0, rpath_off = 0, runpath_off = 0;
+    int have_rpath = 0, have_runpath = 0;
+    uint16_t i;
+    uint64_t k;
+
+    if (!out || outsz == 0) return 0;
+    out[0] = '\0';
+    if (!pread || n < sizeof eh) return 0;
+    if (memcmp(head, "\177ELF", 4) != 0) return 0;
+    memcpy(&eh, head, sizeof eh);
+    if (eh.e_ident[4] != 2 || eh.e_phentsize != sizeof(struct alr_phdr64)) return 0;
+    if (eh.e_phnum == 0 || eh.e_phnum > 512) return 0;
+
+    for (i = 0; i < eh.e_phnum; i++) {
+        struct alr_phdr64 ph;
+        if (!pread(ctx, &ph, sizeof ph, eh.e_phoff + (uint64_t)i * eh.e_phentsize))
+            return 0;
+        if (ph.p_type == ALR_PT_LOAD && nloads < 16) loads[nloads++] = ph;
+        else if (ph.p_type == ALR_PT_DYNAMIC) { dyn_off = ph.p_offset; dyn_sz = ph.p_filesz; }
+    }
+    if (dyn_sz == 0) return 1;                       /* static-ish: no rpath */
+    if (dyn_sz > (uint64_t)1 << 20) return 0;
+
+    for (k = 0; k + sizeof(struct alr_dyn64) <= dyn_sz; k += sizeof(struct alr_dyn64)) {
+        struct alr_dyn64 d;
+        if (!pread(ctx, &d, sizeof d, dyn_off + k)) return 0;
+        if (d.d_tag == ALR_DT_NULL) break;
+        else if (d.d_tag == ALR_DT_STRTAB)  strtab_va  = d.d_val;
+        else if (d.d_tag == ALR_DT_RPATH)   { rpath_off   = d.d_val; have_rpath = 1; }
+        else if (d.d_tag == ALR_DT_RUNPATH) { runpath_off = d.d_val; have_runpath = 1; }
+    }
+    if (!strtab_va || !(have_rpath || have_runpath)) return 1;
+
+    {   uint64_t want = have_runpath ? runpath_off : rpath_off;
+        uint64_t str_file_off = 0;
+        int found = 0, j;
+        for (j = 0; j < nloads; j++) {
+            /* DT_STRTAB is a vaddr; PT_LOAD is the only mapping that can tell
+             * us where those bytes live in the file. */
+            if (strtab_va >= loads[j].p_vaddr &&
+                strtab_va <  loads[j].p_vaddr + loads[j].p_filesz) {
+                str_file_off = loads[j].p_offset + (strtab_va - loads[j].p_vaddr);
+                found = 1;
+                break;
+            }
+        }
+        if (!found) return 0;
+        for (k = 0; k + 1 < outsz; k++) {
+            char c;
+            if (!pread(ctx, &c, 1, str_file_off + want + k)) return 0;
+            out[k] = c;
+            if (c == '\0') return 1;
+        }
+        out[outsz - 1] = '\0';
+        return 1;                                    /* truncated but usable */
+    }
+}

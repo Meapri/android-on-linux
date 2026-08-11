@@ -85,9 +85,22 @@ class NativeAlrRuntime(private val appContext: Context) : AlrRuntime {
         Thread({
             try {
                 val status = RootfsInstaller(appContext).prepareBundledTinyRootfs()
-                rootfsDirCached = status.rootfsDir
-                rootfsNameCached = status.manifestName
-                Log.i(TAG, "rootfs ready: ${status.manifestName} at ${status.rootfsDir} (extracted=${status.extracted})")
+                // The bundled tree is still extracted -- it carries the staged
+                // interposer and the GTK closure the bundled demos use -- but it
+                // is not automatically the guest. A provisioned Ubuntu tree wins
+                // when there is one: the launcher was running the PoC rootfs
+                // while the probe harness measured Ubuntu, so "it works in the
+                // app" and "it works in the report" were claims about two
+                // different filesystems.
+                val picked = dev.chanwoo.androlinux.GuestRootfs.pick(appContext.filesDir)
+                rootfsDirCached = picked?.first ?: status.rootfsDir
+                rootfsNameCached = picked?.second ?: status.manifestName
+                Log.i(
+                    TAG,
+                    "rootfs ready: ${rootfsNameCached} at ${rootfsDirCached} " +
+                        "(bundled ${status.manifestName} extracted=${status.extracted}" +
+                        "${if (picked == null) "; no provisioned Ubuntu tree" else ""})",
+                )
                 refreshInstalledApps()
             } catch (e: Throwable) {
                 Log.e(TAG, "rootfs prep failed: ${Log.getStackTraceString(e)}")
@@ -396,10 +409,40 @@ class NativeAlrRuntime(private val appContext: Context) : AlrRuntime {
         override val nativeLibraryDir: String get() = this@NativeAlrRuntime.nativeLibraryDir
         override val filesDir: String get() = this@NativeAlrRuntime.filesDirPath
         override val cacheDir: String get() = this@NativeAlrRuntime.cacheDirPath
-        override fun loaderProbe(rootfsName: String, program: String): String =
-            AlrNative.nativeAlrNativeLoaderProbe(
-                packageName, nativeLibraryDir, filesDir, cacheDir, rootfsName, program,
+        // apt runs through alr, not the legacy native loader.
+        //
+        // alr already is what the four staged overlays were emulating:
+        // ALR_FAKEROOT=1 is the uid-0 shim dpkg needs to chown its unpacked
+        // files, its interposer is the path layer, and its resolver bridge is
+        // what lets apt resolve the mirror without raw UDP/53. Routing here
+        // means a clean device can install; the overlay path required stage
+        // tars that only existed in /data/local/tmp on a dev machine.
+        override val selfSufficient: Boolean get() = true
+
+        override fun loaderProbe(rootfsName: String, program: String): String {
+            val argv = program.split("\n").filter { it.isNotEmpty() }
+            if (argv.isEmpty()) return ""
+            val alr = dev.chanwoo.androlinux.AlrRuntime(
+                java.io.File(nativeLibraryDir), java.io.File(filesDir),
             )
+            val r = alr.run(
+                distro = rootfsName,
+                program = argv.first(),
+                arguments = argv.drop(1),
+                fakeroot = true,
+                // apt/dpkg on a cold index fetches tens of MB and runs every
+                // maintainer script in the closure; the 60s default expired
+                // mid-`Setting up` and reported a timeout as an install failure.
+                timeoutSeconds = 1800,
+                guestEnv = mapOf(
+                    "DEBIAN_FRONTEND" to "noninteractive",
+                    "DEBCONF_NONINTERACTIVE_SEEN" to "true",
+                ),
+            )
+            // The caller greps stdout for apt's own phrases ("Get:",
+            // "Setting up <pkg>"), and dpkg writes some of them to stderr.
+            return r.stdout + "\n" + r.stderr
+        }
         override fun extractOverlay(tar: File, rootfsDir: File): Pair<Int, Int> {
             val ovr = this@NativeAlrRuntime.extractOverlay(tar, rootfsDir)
             return ovr.extracted to ovr.skipped.size

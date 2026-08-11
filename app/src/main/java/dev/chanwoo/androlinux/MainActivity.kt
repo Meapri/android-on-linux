@@ -506,7 +506,7 @@ class MainActivity : Activity() {
         //
         // The report names the tree each group used, because "dpkg works" and
         // "dpkg works in a rootfs that has its libraries" are different claims.
-        val userlandRootfsDir = listOf("ubuntu-24.04", "ubuntu", "debian")
+        val userlandRootfsDir = (GuestRootfs.PREFERENCE + "debian")
             .map { java.io.File(java.io.File(filesDir, "rootfs"), it) }
             .firstOrNull { java.io.File(it, "usr/lib/aarch64-linux-gnu/libdl.so.2").isFile }
             ?: rootfsStatus.rootfsDir
@@ -626,9 +626,7 @@ class MainActivity : Activity() {
         // FAIL against it. alr's target is a full distro rootfs; prefer one if
         // it has been provisioned, and say which was chosen rather than
         // silently testing whatever happened to be first.
-        val alrDistro = listOf("ubuntu-24.04", "ubuntu", rootfsManifest.name)
-            .firstOrNull { java.io.File(java.io.File(filesDir, "rootfs"), it).isDirectory }
-            ?: rootfsManifest.name
+        val alrDistro = GuestRootfs.pick(filesDir)?.second ?: rootfsManifest.name
         val alrProbe = buildString {
             append("ALR BACKEND PROBE: android-native-attempt")
             append("\nalr binary=${alr.binary.absolutePath} executable=${alr.isAvailable()}")

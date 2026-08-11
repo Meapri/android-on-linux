@@ -328,7 +328,14 @@ private fun RuntimeInfoSection(installedApps: List<InstalledApp>) {
     val totalBytes = remember(installedApps) { installedApps.sumOf { it.installedSizeBytes } }
     SettingsCard(title = "런타임 정보") {
         InfoRow("런타임", "ALR (Android Linux Runtime)")
-        InfoRow("실행 환경", "Ubuntu noble 24.04 · glibc 2.39 · arm64")
+        // Read from the tree that is actually mounted, not from a constant that
+        // said "24.04" while the launcher was running the bundled PoC rootfs.
+        InfoRow(
+            "실행 환경",
+            dev.chanwoo.androlinux.GuestRootfs.describe(
+                androidx.compose.ui.platform.LocalContext.current.filesDir,
+            ),
+        )
         InfoRow("컴포지터", "Wayland (in-process)")
         InfoRow("설치 앱", "${installedApps.size}개 · ${formatBytes(totalBytes)}")
         // 빌드/버전 스탬프는 통합 세션이 BuildConfig 로 채운다(이 트랙은 version stamp 불변).

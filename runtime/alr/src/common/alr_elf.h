@@ -41,8 +41,13 @@ struct alr_shebang {
 #define ALR_ET_EXEC   2
 #define ALR_ET_DYN    3
 #define ALR_EM_AARCH64 183
-#define ALR_PT_LOAD   1
-#define ALR_PT_INTERP 3
+#define ALR_PT_LOAD    1
+#define ALR_PT_DYNAMIC 2
+#define ALR_PT_INTERP  3
+#define ALR_DT_NULL     0
+#define ALR_DT_STRTAB   5
+#define ALR_DT_RPATH   15
+#define ALR_DT_RUNPATH 29
 
 struct alr_ehdr64 {
     unsigned char e_ident[ALR_EI_NIDENT];
@@ -78,5 +83,28 @@ enum alr_exe_kind alr_classify(const unsigned char *head, size_t n,
  * next blank, then ONE argument which is NOT split further and keeps its
  * internal blanks.  Returns 1 on success, 0 if no interpreter. */
 int alr_parse_shebang(const char *line, size_t len, struct alr_shebang *sb);
+
+/* Read the target's DT_RUNPATH (or DT_RPATH when there is no RUNPATH) into
+ * `out` as the raw colon-separated string, "" when it has neither.
+ *
+ * WHY THE LAUNCH NEEDS THIS.  ADR 0002 runs the guest ld.so explicitly with
+ * --library-path and --inhibit-cache, and every directory in that list is a
+ * HOST path.  DT_RUNPATH is not: it is written for a system rooted at the
+ * rootfs, so `/usr/lib/aarch64-linux-gnu/systemd` resolves against ANDROID and
+ * the search silently comes up empty.  ld.so does its own opening, below any
+ * LD_PRELOAD, so the interposer cannot reach it -- the translation has to
+ * happen before exec, which is here.
+ *
+ * MEASURED: `apt-get install sakura` on Ubuntu 26.04 pulled in systemd, whose
+ * postinst runs systemctl, whose only private library lives on its RUNPATH:
+ *     systemctl: error while loading shared libraries:
+ *     libsystemd-shared-259.so: cannot open shared object file
+ * The file was present and correct the whole time.
+ *
+ * Returns 1 on success (including "no rpath", out[0]=='\0'), 0 on a malformed
+ * or unreadable file.  Entries containing $ORIGIN are returned verbatim; the
+ * caller decides what to do with them. */
+int alr_rpath(alr_pread_fn pread, void *ctx, const unsigned char *head,
+              size_t n, char *out, size_t outsz);
 
 #endif /* ALR_ELF_H */

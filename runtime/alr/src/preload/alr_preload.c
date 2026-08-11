@@ -1524,6 +1524,63 @@ static int pctx_read(void *c, void *dst, size_t len, uint64_t off)
     return r == (ssize_t)len;
 }
 
+/* The loader search path for THIS target, with its own DT_RUNPATH folded in.
+ *
+ * ALR_LIBPATH is computed once, by alr, for the process it launched.  Every
+ * exec below that inherits it -- and a child's RUNPATH is its own.  ld.so does
+ * its own opening, beneath any LD_PRELOAD, so this is the one search we cannot
+ * hook and have to answer declaratively, before the exec.
+ *
+ * MEASURED on Ubuntu 26.04: `apt-get install sakura` pulls in systemd; dpkg
+ * runs its postinst; the postinst runs systemctl, whose libsystemd-shared-259.so
+ * exists only on its RUNPATH.  Fixing this in the CLI made `alr run systemctl`
+ * work while the postinst kept failing with exit 127 -- because that systemctl
+ * is exec'd by a shell inside the guest, and comes through here.
+ *
+ * $ORIGIN and relative entries are left to ld.so: it expands $ORIGIN against
+ * the object's own location, which is already the host path being exec'd. */
+static const char *libpath_for(const char *host)
+{
+    static char lp[ALR_PBUF * 3];
+    unsigned char head[ALR_PROBE_BYTES];
+    char rpath[ALR_PBUF];
+    struct pctx ctx;
+    ssize_t n;
+    int fd;
+    size_t o;
+    char *save, *tok;
+
+    if (!g_libpath) return NULL;
+    if (!real_open) return g_libpath;
+    fd = real_open(host, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return g_libpath;
+    n = read(fd, head, sizeof head);
+    ctx.fd = fd;
+    if (n < 0 || !alr_rpath(pctx_read, &ctx, head, (size_t)n, rpath, sizeof rpath)) {
+        close(fd);
+        return g_libpath;
+    }
+    close(fd);
+    if (rpath[0] == '\0') return g_libpath;
+
+    o = (size_t)snprintf(lp, sizeof lp, "%s", g_libpath);
+    for (tok = strtok_r(rpath, ":", &save); tok; tok = strtok_r(NULL, ":", &save)) {
+        char cand[ALR_PBUF];
+        struct stat st;
+        if (tok[0] != '/') continue;
+        if ((size_t)snprintf(cand, sizeof cand, "%s%s", g_root, tok) >= sizeof cand)
+            continue;
+        /* The raw syscall, not access(2)/stat(2): those are interposed, and
+         * `cand` is ALREADY a host path -- routing it back through the
+         * rewriter would prefix the root a second time. */
+        if (syscall(SYS_newfstatat, AT_FDCWD, cand, &st, 0) != 0) continue;
+        if (!S_ISDIR(st.st_mode)) continue;
+        o += (size_t)snprintf(lp + o, sizeof lp - o, ":%s", cand);
+        if (o >= sizeof lp - 1) break;
+    }
+    return lp;
+}
+
 #define ALR_EXEC_MAXARG 4096
 
 /* ALR_GUEST_EXE is what /proc/self/exe answers with, and it also names the
@@ -1722,7 +1779,9 @@ static int exec_build(const char *guest, char *const argv[],
 
     *file_out = g_ldso;
     av[argc++] = g_ldso;
-    if (g_libpath) { av[argc++] = "--library-path"; av[argc++] = g_libpath; }
+    {   const char *lp = libpath_for(host);
+        if (lp) { av[argc++] = "--library-path"; av[argc++] = (char *)lp; }
+    }
     av[argc++] = "--inhibit-cache";
     av[argc++] = "--argv0";
     /* Below the first level argv[0] belongs to the SCRIPT, not the interpreter
