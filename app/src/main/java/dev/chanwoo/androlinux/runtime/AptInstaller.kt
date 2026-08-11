@@ -218,11 +218,22 @@ object AptInstaller {
         // class configure clean (unblocks the X11-viewer + apt-Qt-GUI classes). The
         // GNOME-SPECIFIC overlays (precompiled gschemas) stay gated to gnome-platform pkgs so a
         // plain X11/Qt app does NOT pull the gnome schema/dbus baggage.
-        val overlaysToStage = APT_OVERLAYS + MAINTSCRIPT_SHIM_OVERLAY + (
-            if (isGnomePlatformPkg(pkg)) GNOME_CONFIGURE_OVERLAYS else emptyList()
-        )
-        Log.i(TAG, "aptinstall: staging general maintscript-shim (always) for pkg=$pkg")
-        if (isGnomePlatformPkg(pkg)) {
+        // A backend that provides a session needs none of these.
+        //
+        // maintscript-shim was hand-written stubs for update-rc.d, invoke-rc.d,
+        // deb-systemd-helper and dpkg-maintscript-helper; GuestSession writes
+        // policy-rc.d, which is the mechanism Debian defines for exactly this
+        // and which those stubs were re-implementing per symptom.
+        // gnome-schemas shipped a host-precompiled gschemas.compiled because
+        // the guest had no glib-compile-schemas; the session installs
+        // libglib2.0-bin, whose trigger compiles them in the guest. And
+        // isGnomePlatformPkg() -- a hardcoded list of package names -- is
+        // exactly the per-app knowledge being removed.
+        val overlaysToStage = if (host.selfSufficient) emptyList() else
+            APT_OVERLAYS + MAINTSCRIPT_SHIM_OVERLAY + (
+                if (isGnomePlatformPkg(pkg)) GNOME_CONFIGURE_OVERLAYS else emptyList()
+            )
+        if (!host.selfSufficient && isGnomePlatformPkg(pkg)) {
             Log.i(TAG, "aptinstall: pkg=$pkg is gnome-platform — ALSO staging " +
                 "$GNOME_CONFIGURE_OVERLAYS (precompiled gschemas on top of the shim)")
         }

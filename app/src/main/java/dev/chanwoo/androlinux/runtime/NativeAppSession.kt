@@ -184,8 +184,27 @@ class NativeAppSession internal constructor(
             // no loader change. Non-GNOME apps and a missing overlay degrade to the plain
             // launch (GTK4 then falls back to a non-unique app, GSETTINGS_BACKEND=memory
             // already set natively). See GnomePlatformShim.
-            for ((k, v) in GnomePlatformShim.envFor(appId, request.entryPath)) setEnv(k, v)
-            val launch = GnomePlatformShim.wrap(appId, rootfsDir, request.entryPath, request.args)
+            // The GNOME shim is only for the legacy backend now.
+            //
+            // It wrapped a gnome-platform app in `dbus-run-session` and pointed
+            // GSETTINGS_SCHEMA_DIR at a host-precompiled gschemas.compiled --
+            // both because the guest had neither a bus nor
+            // glib-compile-schemas. GuestSession installs libglib2.0-bin (whose
+            // dpkg trigger compiles the schemas IN the guest) and runs ONE bus
+            // for the whole session, so under alr this would wrap a second,
+            // private bus around an app that already has one, which is the
+            // thing that makes apps unable to talk to each other.
+            //
+            // It also keyed off a hardcoded list of which packages are
+            // "gnome-platform" -- the per-app knowledge this whole change is
+            // about removing. It stays for the bundled PoC tree, which has no
+            // session and no apt.
+            val launch = if (alrBackend) {
+                request.entryPath to request.args
+            } else {
+                for ((k, v) in GnomePlatformShim.envFor(appId, request.entryPath)) setEnv(k, v)
+                GnomePlatformShim.wrap(appId, rootfsDir, request.entryPath, request.args)
+            }
 
             // --- program-spec: NEWLINE-delimited argv ---------------------------------
             val program = buildString {
