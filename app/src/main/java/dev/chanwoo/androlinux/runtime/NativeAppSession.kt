@@ -163,7 +163,8 @@ class NativeAppSession internal constructor(
             // the xcalc device-proven path), waits for the X0 socket, and yields DISPLAY=:0
             // for the guest env. For a Wayland-capable app it is a complete no-op (byte-
             // identical to before). Gated entirely inside the helper.
-            if (XwaylandLaunch.needsX11(appId, request.protocol, request.entryPath)) {
+            val entryHostPath = File(rootfsDir, request.entryPath.removePrefix("/")).absolutePath
+            if (XwaylandLaunch.needsX11(appId, request.protocol, entryHostPath)) {
                 // Pass densityDpi so the helper seeds the X resource DB with the touch DPI
                 // (Xft.dpi) for pure-Xlib clients that read xrdb rather than the env (BUG-1).
                 val xReady = XwaylandLaunch.ensureUp(
@@ -677,8 +678,71 @@ internal object XwaylandLaunch {
      * accepted for symmetry with GnomePlatformShim (and future binary-name heuristics) but
      * the authoritative signal is the catalog flag / explicit protocol — never a guess.
      */
-    fun needsX11(appId: String, protocol: SurfaceProtocol, entryPath: String = ""): Boolean =
-        protocol == SurfaceProtocol.X11 || appId in X11_ONLY_APP_IDS
+    /**
+     * Does this program need Xwayland? Ask the BINARY, not a list of appIds.
+     *
+     * The property that decides it is objective and is in the executable:
+     * a program that links libX11 and NOT libwayland-client has no way to talk
+     * to the compositor directly. One that links both -- every GTK and Qt app
+     * -- picks its backend at runtime, and we pin GDK_BACKEND/QT_QPA_PLATFORM
+     * to wayland, so it does not need an X server.
+     *
+     * This was a hardcoded set of appIds, which meant an X11-only app nobody
+     * had added to it launched against a display that was never started and
+     * died with "cannot open display" -- and adding it required knowing about
+     * that app here. DT_NEEDED lives in .dynstr as a plain string, so a
+     * substring scan answers it without an ELF parser; the SONAMEs are
+     * specific enough that a false positive would have to be deliberate.
+     */
+    fun needsX11(
+        appId: String,
+        protocol: SurfaceProtocol,
+        /** HOST path of the executable -- the guest-form entryPath cannot be
+         *  opened from here, and reading the wrong file answers nothing. */
+        hostBinaryPath: String = "",
+    ): Boolean {
+        if (protocol == SurfaceProtocol.X11) return true
+        if (appId in X11_ONLY_APP_IDS) return true
+        return linksX11Only(hostBinaryPath)
+    }
+
+    /** Cached per binary path: this reads the file, and launches repeat. */
+    private val x11OnlyCache = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+
+    private fun linksX11Only(hostBinaryPath: String): Boolean {
+        if (hostBinaryPath.isBlank()) return false
+        return x11OnlyCache.getOrPut(hostBinaryPath) {
+            runCatching {
+                val f = File(hostBinaryPath)
+                if (!f.isFile || f.length() > 64L * 1024 * 1024) return@runCatching false
+                val bytes = f.readBytes()
+                fun has(s: String): Boolean {
+                    val n = s.toByteArray()
+                    outer@ for (i in 0..bytes.size - n.size) {
+                        for (j in n.indices) if (bytes[i + j] != n[j]) continue@outer
+                        return true
+                    }
+                    return false
+                }
+                // NOT just "links libX11 and not libwayland-client".
+                //
+                // A program's DT_NEEDED names its TOOLKIT, not the toolkit's
+                // backends: gpicview links libgtk-3 and libX11 and never names
+                // libwayland-client, because GTK is what carries that. The
+                // simple test called it X11-only and started an Xwayland it did
+                // not need -- it had already been observed rendering straight
+                // to the compositor. So a toolkit that can speak wayland is
+                // itself the evidence, and only a program with none of them is
+                // X11-only.
+                val WAYLAND_CAPABLE = listOf(
+                    "libwayland-client.so", "libgtk-3.so", "libgtk-4.so",
+                    "libQt5Gui.so", "libQt6Gui.so", "libSDL2-", "libglfw.so",
+                    "libEGL.so",
+                )
+                has("libX11.so") && WAYLAND_CAPABLE.none { has(it) }
+            }.getOrDefault(false)
+        }
+    }
 
     /** Guest env for an X11-routed app: point DISPLAY at the rootful Xwayland. */
     fun envFor(): Map<String, String> = mapOf("DISPLAY" to DISPLAY_VALUE)
