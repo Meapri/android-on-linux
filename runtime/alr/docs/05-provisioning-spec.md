@@ -256,12 +256,16 @@ alr update-components ubuntu-24.04   libalr_preload.so 만 갱신
 
 모든 실패는 안정적 `reason=` 코드를 갖는다. **이 목록은 코드가 실제로 방출하는 것과 정확히 일치해야 한다** — `scripts/check-reasons.sh` 가 양방향으로 검사하고 `make check` 에 걸려 있다.
 
+> **`discovery-failed`** — cdimage 의 `SHA256SUMS` 를 못 읽어서 설치할 이미지를 특정하지 못한 경우. 24.04 에는 핀 박힌 파일명으로의 무검증 폴백이 있지만, 그 이름은 24.04 이미지라서 **다른 릴리스에는 쓸 수 없다** — 틀린 릴리스를 검증 없이 내려받는 것이 실패보다 나쁘다. 그래서 24.04 가 아니면 폴백하지 않고 이 사유로 멈춘다.
+
+
 ```
 bad-distro-name            bad-env
 bad-option                 bad-workdir                boot-enoent
 boot-failed                config-bad-value           config-unknown-key
-config-write-failed        doctor-missing             doctor-unknown-option
-download-corrupt           download-network           env-reserved
+config-write-failed        discovery-failed           doctor-missing
+doctor-unknown-option      download-corrupt           download-network
+env-reserved
 extract-permission         extract-traversal-reject   install-unknown-option
 ldso-missing
 no-gnu-coreutils           no-supervisor-requested    not-a-rootfs               preload-install-failed
