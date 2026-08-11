@@ -678,6 +678,74 @@ class MainActivity : Activity() {
             append("\nALR GUEST NET: ${net.stdout.trim().replace("\n", " ")}")
         }
 
+        // ── alr's own acceptance suite, run from THIS process ──────────────
+        //
+        // The suite refuses to report anything from a context where the app
+        // seccomp filter is absent -- `run-as` lands in runas_app with
+        // Seccomp: 0, where every syscall would look ALLOWED and every number
+        // would be a lie. It says so and exits 2. That gate is the reason the
+        // suite has to run from the app's own process, which is this one:
+        // untrusted_app_27, Seccomp: 2.
+        //
+        // Opt-in, because it takes minutes: `touch files/run-acceptance` (or
+        // adb shell run-as <pkg> touch files/run-acceptance) and relaunch. The
+        // full transcript goes to files/acceptance.txt; the report carries the
+        // tally so a regression is visible without pulling the file.
+        val acceptanceMarker = java.io.File(filesDir, "run-acceptance")
+        val alrAcceptance = if (!acceptanceMarker.isFile) {
+            "ALR ACCEPTANCE SUITE: SKIP  (touch files/run-acceptance to run it)"
+        } else {
+            val staged = alr.installTests(assets, alrDistro)
+            val suite = "/opt/alr-tests/device/acceptance.sh"
+            // The transcript goes to a FILE inside the guest, not down the
+            // pipe, and we read the file afterwards. Two reasons, both
+            // measured: a 1,000-line suite through a pipe that is only drained
+            // after the process exits can fill the pipe buffer and deadlock,
+            // and a transcript that ends mid-run gives no way to tell a hang
+            // from a crash. With `; echo EXIT=$?` the pipe carries one short
+            // line and the file carries everything.
+            val transcript = "/opt/alr-tests/last.txt"
+            val r = alr.run(
+                distro = alrDistro,
+                program = "/bin/bash",
+                arguments = listOf("-c", "bash '$suite' >'$transcript' 2>&1; echo EXIT=\$?"),
+                timeoutSeconds = 900,
+                guestEnv = mapOf(
+                    // The suite drives alr itself. Inside the guest that is the
+                    // copy `alr adopt` installs, reachable because the
+                    // interposer passes through binaries whose PT_INTERP is not
+                    // in the rootfs.
+                    // The guest reaches alr through the copy `alr adopt`
+                    // installs; the interposer passes through binaries whose
+                    // PT_INTERP is not inside the rootfs. ALR_ROOT_DIR and the
+                    // distro name are NOT passed -- they are reserved, and the
+                    // suite derives both from ALR_ROOT, which alr already puts
+                    // in every guest environment.
+                    "ALR" to "/usr/lib/alr/alr",
+                ),
+            )
+            val body = runCatching {
+                java.io.File(filesDir, "rootfs/$alrDistro$transcript").readText()
+            }.getOrElse { "(no transcript: ${it.message})" }
+            runCatching {
+                java.io.File(filesDir, "acceptance.txt").writeText(
+                    body + "\n--- alr exit=${r.exitCode} ---\n" +
+                        r.stdout + "\n--- stderr ---\n" + r.stderr
+                )
+            }
+            val tally = (body + r.stdout + r.stderr).lineSequence()
+                .lastOrNull { it.contains("PASS=") && it.contains("FAIL=") }
+                .orEmpty()
+            buildString {
+                append("ALR ACCEPTANCE SUITE: ")
+                append(if (tally.contains("FAIL=0")) "PASS" else "FAIL")
+                append("  ")
+                append(if (tally.isBlank()) "no tally line (exit=${r.exitCode})" else tally.trim())
+                append("  staged=$staged")
+                append("\nalr acceptance transcript=filesDir/acceptance.txt")
+            }
+        }
+
         val alrDirectExecProbe = nativeAlrDirectExecProbe(
             packageName,
             applicationInfo.nativeLibraryDir,
@@ -1478,6 +1546,7 @@ class MainActivity : Activity() {
             "\n$alrInterposeProcfsProbe" +
             "\n\nALR memfd W^X-safe native exec probe:" +
             "\n$alrMemfdExecProbe" +
+            "\n\n$alrAcceptance" +
             "\n\nALR execution backend (alr) in this app's domain:" +
             "\n$alrProbe" +
             "\n\nALR direct app-data execve probe (does this SELinux domain allow it?):" +

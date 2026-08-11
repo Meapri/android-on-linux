@@ -99,6 +99,44 @@ class AlrRuntime(
         dest.isFile
     }.getOrDefault(false)
 
+    /**
+     * Stage alr's acceptance suite into the guest at `/opt/alr-tests`.
+     *
+     * It has to live INSIDE the rootfs because that is where it runs: the suite
+     * is bash and calls awk, and Android has neither, so the only shell on this
+     * device that can execute it is the guest's. That costs nothing in
+     * validity -- a guest process forked from the app still carries the app's
+     * uid and seccomp filter, which is exactly what the suite's own gate
+     * checks before it will report a number.
+     *
+     * Returns the count of files staged; 0 means the caller should not pretend
+     * it ran a suite.
+     */
+    fun installTests(assets: android.content.res.AssetManager, distro: String): Int {
+        val root = File(rootfsBase, distro)
+        if (!root.isDirectory) return 0
+        val dest = File(root, "opt/alr-tests")
+        var n = 0
+        fun walk(assetDir: String, into: File) {
+            val entries = runCatching { assets.list(assetDir) }.getOrNull() ?: return
+            if (entries.isEmpty()) {
+                into.parentFile?.mkdirs()
+                runCatching {
+                    assets.open(assetDir).use { s -> into.writeBytes(s.readBytes()) }
+                    // The suite and its helpers are invoked as `bash file`, but
+                    // acceptance.sh also re-execs helpers by path.
+                    if (into.name.endsWith(".sh")) into.setExecutable(true, false)
+                    n++
+                }
+                return
+            }
+            into.mkdirs()
+            entries.forEach { walk("$assetDir/$it", File(into, it)) }
+        }
+        walk("alr/tests", dest)
+        return n
+    }
+
     /** `alr adopt <distro>` -- take the app-extracted tree and make it bootable. */
     fun adopt(distro: String, timeoutSeconds: Long = 120): AlrResult =
         exec(listOf("adopt", distro), timeoutSeconds)

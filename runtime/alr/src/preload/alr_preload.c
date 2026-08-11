@@ -1587,7 +1587,8 @@ static int exec_build(const char *guest, char *const argv[],
                       const char **av, int avmax,
                       char *hb, size_t hbsz,
                       char ibuf[][ALR_SHEBANG_IBUF], int maxdepth,
-                      const char **file_out, const char **ident_out)
+                      const char **file_out, const char **ident_out,
+                     int *host_out)
 {
     struct { const char *arg, *file; } lvl[ALR_SHEBANG_MAX_DEPTH];
     unsigned char head[ALR_PROBE_BYTES];
@@ -1623,6 +1624,56 @@ static int exec_build(const char *guest, char *const argv[],
 
     if (kind == ALR_EXE_UNSUPPORTED) { errno = ENOEXEC; return -1; }
     *ident_out = cur;
+
+    /* A HOST binary, exec'd from inside the guest.
+     *
+     * PT_INTERP tells us whose loader a program wants. A guest binary names
+     * the rootfs's ld-linux; an ANDROID binary names /system/bin/linker64,
+     * which is not under the rootfs at all. Handing the second kind to the
+     * guest's glibc loader cannot work -- bionic and glibc are not
+     * interchangeable -- and it fails in a way that reads as a broken rootfs.
+     *
+     * So: if the interpreter is not inside the rootfs, this is not our
+     * program. exec it exactly as asked and let the kernel use its own
+     * interpreter. Everything the guest passes it stays untouched, because a
+     * host binary wants host paths and already has them -- it was named by a
+     * path that resolved outside the root.
+     *
+     * This is what lets a guest script drive host tooling: `alr` itself,
+     * anything under $PREFIX/bin, an Android utility. Without it a guest can
+     * only ever call other guest programs. */
+    /* A HOST binary, exec'd from inside the guest.
+     *
+     * Whose loader does it want? PT_INTERP is written in the TARGET's own
+     * namespace, so comparing it against the host root says nothing -- a guest
+     * binary names /lib/ld-linux-aarch64.so.1, which does not start with <R>
+     * either. The first version of this rule did exactly that and classified
+     * /bin/bash as a host binary.
+     *
+     * The real test: a GUEST interp exists inside the rootfs; a HOST interp
+     * (/system/bin/linker64) exists outside it and not in.
+     *
+     * Handing an Android binary to the guest's glibc loader cannot work -- it
+     * hunts for bionic's DT_NEEDED names and reports "libdl.so: cannot open
+     * shared object file", naming a library that exists on both sides in
+     * incompatible forms. This is what lets a guest script drive host tooling:
+     * alr itself, anything under $PREFIX/bin, an Android utility. Without it a
+     * guest can only ever call other guest programs.
+     */
+    if (kind != ALR_EXE_SHEBANG && ibuf[nl][0] != '\0' && real_access) {
+        char inroot[ALR_PBUF];
+        snprintf(inroot, sizeof inroot, "%s%s", g_root, ibuf[nl]);
+        if (real_access(inroot, F_OK) != 0 && real_access(ibuf[nl], F_OK) == 0) {
+            lg("alr exec: host binary (interp %s is not in the rootfs) %s\n",
+               ibuf[nl], cur);
+            if (host_out) *host_out = 1;
+            *file_out = host;
+            av[argc++] = argv[0] ? argv[0] : cur;
+            for (i = 1; argv[i] && argc < avmax - 2; i++) av[argc++] = (char *)argv[i];
+            av[argc] = NULL;
+            return 1;
+        }
+    }
 
     if (kind == ALR_EXE_ELF_STATIC || !g_ldso) {
         /* Static binaries cannot be LD_PRELOADed at all; they run unhooked and
@@ -1702,10 +1753,31 @@ static int exec_dispatch(const char *guest, char *const argv[],
 
     (void)depth;                       /* depth now lives inside exec_build */
     if (!real_execve) { errno = ENOSYS; return -1; }
+    int is_host = 0;
     if (exec_build(guest, argv, av, ALR_EXEC_MAXARG, hb, sizeof hb,
-                   ibuf, ALR_SHEBANG_MAX_DEPTH, &file, &ident) < 0)
+                   ibuf, ALR_SHEBANG_MAX_DEPTH, &file, &ident, &is_host) < 0)
         return -1;
     ep = env_set_exe(envp, ident, kv, sizeof kv, ne);
+    if (is_host) {
+        /* A host binary must not inherit the GUEST's loader environment.
+         *
+         * LD_LIBRARY_PATH and LD_PRELOAD point into the rootfs at glibc
+         * objects; an Android binary asks bionic to load them and gets
+         *     alr: error while loading shared libraries: libdl.so
+         * naming a library that exists on both sides in incompatible forms.
+         * Same rule as everywhere else in this runtime: host paths and a host
+         * environment for something we are not virtualizing. */
+        static const char *hostenv[ALR_ENV_MAX + 1];
+        int hn = 0, k;
+        for (k = 0; ep[k] && hn < ALR_ENV_MAX; k++) {
+            if (!strncmp(ep[k], "LD_PRELOAD=", 11))      continue;
+            if (!strncmp(ep[k], "LD_LIBRARY_PATH=", 16)) continue;
+            if (!strncmp(ep[k], "LOCPATH=", 8))          continue;
+            hostenv[hn++] = ep[k];
+        }
+        hostenv[hn] = NULL;
+        return real_execve(file, (char *const *)av, (char *const *)hostenv);
+    }
     return real_execve(file, (char *const *)av, ep);
 }
 
@@ -1819,11 +1891,27 @@ static int spawn_common(pid_t *pid, const char *path,
     if (!real_posix_spawn)
         real_posix_spawn = dlsym(RTLD_NEXT, "posix_spawn");
     if (!real_posix_spawn) return ENOSYS;
-    if (exec_build(path, argv, av, ALR_EXEC_MAXARG, hb, sizeof hb,
-                   ibuf, ALR_SHEBANG_MAX_DEPTH, &file, &ident) < 0)
-        return errno ? errno : ENOEXEC;
-    ep = env_set_exe(envp, ident, kv, sizeof kv, ne);
-    return real_posix_spawn(pid, file, fa, attr, (char *const *)av, ep);
+    {
+        int is_host = 0;
+        if (exec_build(path, argv, av, ALR_EXEC_MAXARG, hb, sizeof hb,
+                       ibuf, ALR_SHEBANG_MAX_DEPTH, &file, &ident, &is_host) < 0)
+            return errno ? errno : ENOEXEC;
+        ep = env_set_exe(envp, ident, kv, sizeof kv, ne);
+        if (is_host) {
+            /* Same host-binary rule as execve: no guest loader environment. */
+            static const char *hostenv[ALR_ENV_MAX + 1];
+            int hn = 0, k;
+            for (k = 0; ep[k] && hn < ALR_ENV_MAX; k++) {
+                if (!strncmp(ep[k], "LD_PRELOAD=", 11))      continue;
+                if (!strncmp(ep[k], "LD_LIBRARY_PATH=", 16)) continue;
+                if (!strncmp(ep[k], "LOCPATH=", 8))          continue;
+                hostenv[hn++] = ep[k];
+            }
+            hostenv[hn] = NULL;
+            ep = (char *const *)hostenv;
+        }
+        return real_posix_spawn(pid, file, fa, attr, (char *const *)av, ep);
+    }
 }
 
 int posix_spawn(pid_t *pid, const char *path,

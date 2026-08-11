@@ -14,9 +14,77 @@ set -u
 
 cd "$(dirname "$0")/../.." 2>/dev/null || true
 ALR=${ALR:-./alr}
+
+# WHERE THE ROOTFS IS.  Three sources, most specific first.
+#
+# The third is the Termux layout this suite grew up in.  The second is what
+# makes it runnable from inside the guest: alr puts the host path of the rootfs
+# into every guest environment as ALR_ROOT (src/cli/alr.c, PUT("ALR_ROOT=%s")),
+# because the interposer needs it to rewrite paths.  A shell running in the
+# guest therefore already knows, exactly, which tree it is in -- and a path
+# under the rootfs is passed through UNREWRITTEN by alr_rw(), so `$R/usr/...`
+# from inside the guest names the same bytes it names from outside.
+#
+# That is the whole trick behind running this suite in the Android app: there
+# is no bash on Android and no awk in toybox, but the guest has both, and a
+# guest process forked from the app still carries the app's seccomp filter and
+# uid -- which is what the validity gate below insists on.
+# ARE WE INSIDE THE GUEST?  alr puts ALR_ROOT into every guest environment and
+# nothing else does, so this is exact rather than a guess.
+#
+# It matters because a handful of checks have a precondition that CANNOT be
+# created from in there. Two are the ADR 0001/0002 counterproofs, which have to
+# run unsupervised and un-interposed -- inside the guest the supervisor rescues
+# the SIGSYS and the interposer rewrites the execve, so both "succeed" and the
+# counterproof reports FAIL while measuring nothing. The others need a caller
+# whose cwd is outside the rootfs. Reporting these as FAIL would be a lie about
+# the code; reporting them as PASS would be a bigger one. They SKIP, with the
+# reason, and the outside-the-guest run still covers them.
+INSIDE_GUEST=0; [ -n "${ALR_ROOT:-}" ] && INSIDE_GUEST=1
+
+if [ -z "${ALR_ROOT_DIR:-}" ] && [ -n "${ALR_ROOT:-}" ]; then
+    ALR_ROOT_DIR=$(dirname "$ALR_ROOT")
+    : "${ALR_DISTRO:=$(basename "$ALR_ROOT")}"
+fi
 export ALR_ROOT_DIR=${ALR_ROOT_DIR:-$HOME/alr-distros}
 R="$ALR_ROOT_DIR/${ALR_DISTRO:-ubuntu-24.04}"
 ALR_DISTRO_NAME="${ALR_DISTRO:-ubuntu-24.04}"
+# `set -u` is on and PREFIX is a Termux variable: unset it aborts the run at
+# the first mention rather than skipping the check that mentions it.
+: "${PREFIX:=/nonexistent}"
+: "${TMPDIR:=/tmp}"
+
+# ONE directory, TWO names.
+#
+# Several checks need scratch siblings of the rootfs -- `alr remove` has to
+# refuse a directory that is not one of ours, which means there has to be one
+# -- and scratch HOMEs, so the suite never edits the real ~/.alr/config.toml.
+# Outside the guest, next to the rootfs, and one name does for everything.
+#
+# Inside the guest the shell and the CLI are on opposite sides of the path
+# rewrite and neither name works for both:
+#
+#   ALR_ROOT_DIR is the PARENT of the root, so from in here alr_rw() maps it
+#   straight back INTO the rootfs. The shell creates a directory the CLI is not
+#   looking at, and the check reports a result about code it never reached.
+#
+#   A host-form path UNDER the root looks safe -- alr_rw() passes those through
+#   -- and is not. MEASURED: `mkdir -p "$R/tmp/x/usr/lib/alr"` returns 0 and
+#   creates nothing there. GNU mkdir -p walks the path component by component,
+#   and its chdir("/") lands in the rootfs, so it faithfully rebuilds the entire
+#   host path INSIDE the guest: $R/data/user/0/<pkg>/files/rootfs/<distro>/tmp/x.
+#   The passthrough is a property of whole absolute paths, not of the walk.
+#
+# So: the shell uses the guest name, alr is given the host name, and they are
+# the same directory.
+if [ "$INSIDE_GUEST" = 1 ]; then
+    SCRATCH_G="/tmp/alr-acceptance"          # what THIS shell must say
+    SCRATCH_H="$R/tmp/alr-acceptance"        # the same bytes, as alr says it
+else
+    SCRATCH_G="$ALR_ROOT_DIR"
+    SCRATCH_H="$ALR_ROOT_DIR"
+fi
+mkdir -p "$SCRATCH_G"
 
 pass=0; fail=0; known=0; skip=0; pending=0
 
@@ -86,6 +154,16 @@ if [ "${uid:-0}" -lt 10000 ] || [ "${sec:-0}" != "2" ]; then
 fi
 emit "ACCEPTANCE CONTEXT" PASS "uid=$uid Seccomp=$sec ${ctx%%:c*}"
 [ -x "$ALR" ] || { emit "ALR BINARY" FAIL "not built: $ALR"; exit 2; }
+
+# WHAT IS ACTUALLY INSTALLED IN THE GUEST.
+#
+# Probed once, because each probe costs a full guest launch. A rootfs that has
+# no git is not a broken runtime -- the image the Android app bundles is
+# ubuntu-base, which ships neither git nor python3 -- and a check that FAILs
+# because a package is absent reports on apt, not on alr. It says SKIP and
+# names the package, so the gap is visible instead of being counted as a defect.
+HAVE_GIT=0; $ALR run /usr/bin/git --version >/dev/null 2>&1 && HAVE_GIT=1
+HAVE_PY3=0; $ALR run /usr/bin/python3 --version >/dev/null 2>&1 && HAVE_PY3=1
 [ -d "$R" ]   || { emit "ALR ROOTFS" FAIL "not installed: $R"; exit 2; }
 echo
 
@@ -98,6 +176,10 @@ ckc  "ALR GUEST GLIBC VERSION"   "2.39" $ALR run /lib/aarch64-linux-gnu/libc.so.
 
 # The counterproofs: these are what make ADR 0001 and ADR 0002 evidence
 # rather than argument.  Both MUST fail, and fail in the specific way.
+if [ "$INSIDE_GUEST" = 1 ]; then
+    emit "ADR0001 NO SUPERVISOR DIES" SKIP "needs a process alr is not supervising"
+    emit "ADR0002 BARE EXECVE FAILS"  SKIP "needs a process the interposer is not in"
+else
 LP="$R/lib/aarch64-linux-gnu:$R/usr/lib/aarch64-linux-gnu:$R/lib:$R/usr/lib"
 env -i "$R/lib/ld-linux-aarch64.so.1" --library-path "$LP" --inhibit-cache \
         --argv0 true "$R/usr/bin/true" >/dev/null 2>&1
@@ -108,6 +190,7 @@ env -i "$R/usr/bin/true" >/dev/null 2>&1
 rc=$?
 [ $rc -ne 0 ] && emit "ADR0002 BARE EXECVE FAILS" PASS "exit=$rc (PT_INTERP unresolved)" \
               || emit "ADR0002 BARE EXECVE FAILS" FAIL "bare execve unexpectedly worked"
+fi
 echo
 
 # ── M4: path virtualization ─────────────────────────────────────────────
@@ -134,11 +217,21 @@ ckrc "CLI ENV LOCPATH RESERVED"  125            $ALR run -e LOCPATH=/x /bin/true
 # The host OLDPWD is a Termux path; leaked, `cd -` lands on <R>/data/... and
 # fails with a bare ENOENT that reads as a corrupt rootfs.
 ck  "CLI OLDPWD NOT INHERITED"   unset          env OLDPWD=/data/data/com.termux/files/home $ALR run /bin/sh -c 'echo ${OLDPWD:-unset}'
+if [ "$INSIDE_GUEST" = 1 ]; then
+    emit "CLI PWD STILL SET" SKIP "needs a caller whose cwd is outside the rootfs"
+else
 ck  "CLI PWD STILL SET"          /root          env OLDPWD=/data/data/com.termux/files/home $ALR run /bin/sh -c 'echo $PWD'
+fi
 ckrc "CLI ENV RESERVED REFUSED"  125            $ALR run -e ALR_ROOT=/evil /bin/true
 ckrc "CLI BAD OPTION REFUSED"    125            $ALR run --bogus /bin/true
-# cwd mapping falls back to /root when the host cwd is outside the rootfs
+# cwd mapping falls back to /root when the host cwd is outside the rootfs.
+# From inside the guest the cwd is ALWAYS under the rootfs, so the fallback is
+# unreachable by construction and alr correctly carries the cwd through.
+if [ "$INSIDE_GUEST" = 1 ]; then
+    emit "CLI CWD FALLBACK" SKIP "needs a caller whose cwd is outside the rootfs"
+else
 ck  "CLI CWD FALLBACK"           /root          $ALR run /bin/pwd
+fi
 
 # The identity `alr version` reports must be the one the guest LOADS.  It was
 # not: install_preload() copies the .so into the rootfs once and cmd_install
@@ -150,10 +243,10 @@ ckc "CLI VERSION SHOWS GUEST PRELOAD" "preload (guest)" $ALR version
 _gp="$R/usr/lib/alr/libalr_preload.so"
 if [ -r "$_gp" ] && [ -r "$PREFIX/share/alr/libalr_preload.so" ] \
    && ! cmp -s "$_gp" "$PREFIX/share/alr/libalr_preload.so"; then
-    cp "$_gp" "$TMPDIR/.alr-preload-save" 2>/dev/null
+    cp "$_gp" "$R/tmp/.alr-preload-save" 2>/dev/null
     cp "$PREFIX/share/alr/libalr_preload.so" "$_gp" 2>/dev/null
     "$ALR" version >/dev/null 2>&1; _rc=$?
-    cp "$TMPDIR/.alr-preload-save" "$_gp" 2>/dev/null; rm -f "$TMPDIR/.alr-preload-save"
+    cp "$R/tmp/.alr-preload-save" "$_gp" 2>/dev/null; rm -f "$R/tmp/.alr-preload-save"
     [ "$_rc" = 1 ] && emit "CLI VERSION DETECTS STALE PRELOAD" PASS \
                    || emit "CLI VERSION DETECTS STALE PRELOAD" FAIL "rc=$_rc want=1"
     cmp -s "$_gp" "$PREFIX/share/alr/libalr_preload.so" \
@@ -167,6 +260,20 @@ ckc  "CLI LIST"                  "$(basename "$R")"  $ALR list
 # docs/03-supervisor-spec.md §6 names these two and neither existed in the
 # struct.  Both are asserted to be PRESENT and, for passthrough, to actually
 # move -- a counter nobody has seen change is the same defect one step along.
+# THE COUNTERS BELONG TO WHOEVER OWNS THE TRACER.
+#
+# One tracer per process (ADR 0001): an alr started from inside a guest finds
+# TracerPid != 0, inherits the outer supervisor rather than starting its own,
+# and so prints no stats line at all. Every check below reads that line, so
+# from in here they measure the absence of a second supervisor -- which is the
+# design, not a defect. The invariant itself is not going unmeasured: the
+# outside-the-guest run covers it, and in the Android app the runtime report
+# asserts path_traps=0 syscall_stops=0 on the supervisor that does exist.
+if [ "$INSIDE_GUEST" = 1 ]; then
+    emit "SUPERVISOR STATS ELAPSED"      SKIP "nested alr inherits the outer supervisor and owns no counters"
+    emit "SUPERVISOR SIGNAL PASSTHROUGH" SKIP "nested alr inherits the outer supervisor and owns no counters"
+    emit "SUPERVISOR ELAPSED TRACKS TIME" SKIP "nested alr inherits the outer supervisor and owns no counters"
+else
 ckc  "SUPERVISOR STATS ELAPSED"  "elapsed_ms=" \
      env ALR_LOG=1 $ALR run /bin/true
 _ps=$(env ALR_LOG=1 $ALR run /bin/bash -c 'kill -WINCH $$; kill -USR1 $$ 2>/dev/null; echo ok' 2>&1 \
@@ -180,27 +287,29 @@ _e2=$(env ALR_LOG=1 $ALR run /bin/bash -c 'sleep 0.4' 2>&1 | grep -oE 'elapsed_m
 [ "${_e2:-0}" -gt "${_e1:-0}" ] && [ "${_e2:-0}" -ge 300 ] \
     && emit "SUPERVISOR ELAPSED TRACKS TIME" PASS "true=${_e1}ms sleep0.4=${_e2}ms" \
     || emit "SUPERVISOR ELAPSED TRACKS TIME" FAIL "true=${_e1} sleep0.4=${_e2}"
+fi
 # A distro name becomes a path component AND is interpolated into a shell
 # command, and `remove` deletes what it resolves to.  Nothing validated it.
 ckrc "CLI REJECTS DOTDOT DISTRO" 125  $ALR -d ../escape run /bin/true
 ckrc "CLI REJECTS ABS DISTRO"    125  $ALR -d /abs run /bin/true
 # remove: the confirmation must actually protect, --force must actually skip
 # it, and neither may touch a directory that is not one of ours.
-_dsp="$ALR_ROOT_DIR/alrdisposable"
+_dsp="$SCRATCH_G/alrdisposable"
+_ALRS="env ALR_ROOT_DIR=$SCRATCH_H $ALR"
 mkdir -p "$_dsp/usr/lib/alr"
-echo wrong-name | $ALR remove alrdisposable >/dev/null 2>&1
+echo wrong-name | $_ALRS remove alrdisposable >/dev/null 2>&1
 [ -d "$_dsp" ] && emit "CLI REMOVE NEEDS CONFIRMATION" PASS \
                || emit "CLI REMOVE NEEDS CONFIRMATION" FAIL "deleted without a matching name"
-echo alrdisposable | $ALR remove alrdisposable >/dev/null 2>&1
+echo alrdisposable | $_ALRS remove alrdisposable >/dev/null 2>&1
 [ -d "$_dsp" ] && emit "CLI REMOVE ON CONFIRMATION" FAIL "survived a matching name" \
                || emit "CLI REMOVE ON CONFIRMATION" PASS
-mkdir -p "$_dsp/usr/lib/alr"; $ALR remove alrdisposable --force >/dev/null 2>&1
+mkdir -p "$_dsp/usr/lib/alr"; $_ALRS remove alrdisposable --force >/dev/null 2>&1
 [ -d "$_dsp" ] && emit "CLI REMOVE FORCE" FAIL "survived --force" \
                || emit "CLI REMOVE FORCE" PASS
 # The refusal that matters: a directory with neither a guest ld.so nor
 # usr/lib/alr is not ours, and --force must not override that.
-_na="$ALR_ROOT_DIR/alrnotours"; mkdir -p "$_na/somefile.d"
-$ALR remove alrnotours --force >/dev/null 2>&1
+_na="$SCRATCH_G/alrnotours"; mkdir -p "$_na/somefile.d"
+$_ALRS remove alrnotours --force >/dev/null 2>&1
 [ -d "$_na" ] && emit "CLI REMOVE REFUSES FOREIGN DIR" PASS \
               || emit "CLI REMOVE REFUSES FOREIGN DIR" FAIL "deleted a non-rootfs directory"
 rm -rf "$_na" "$_dsp"
@@ -212,10 +321,15 @@ rm -rf "$_na" "$_dsp"
 # for every later check.
 _pl="$R/usr/lib/alr/libalr_preload.so"
 if [ -r "$_pl" ]; then
-    mv "$_pl" "$TMPDIR/.alr-pl-save" 2>/dev/null
+    # HOST form on both sides, and deliberately: the restoring mv runs after
+    # the preload has been moved away, so it runs WITHOUT the interposer and a
+    # guest-form path would resolve against Android. MEASURED -- the restore
+    # silently failed and every one of the 60 checks after it reported FAIL
+    # against a rootfs that no longer had a preload.
+    mv "$_pl" "$R/tmp/.alr-pl-save" 2>/dev/null
     _w=$("$ALR" run /bin/echo hi 2>&1 | grep -c 'reason=preload-missing-in-rootfs')
     _seen=$("$ALR" run /bin/cat /etc/os-release 2>/dev/null | head -1)
-    mv "$TMPDIR/.alr-pl-save" "$_pl" 2>/dev/null
+    mv "$R/tmp/.alr-pl-save" "$_pl" 2>/dev/null
     [ "${_w:-0}" -ge 1 ] && emit "CLI WARNS UNVIRTUALIZED BOOT" PASS \
                          || emit "CLI WARNS UNVIRTUALIZED BOOT" FAIL "no warning"
     # Positive control for the warning's claim: with no preload the guest must
@@ -282,11 +396,15 @@ ckc "ALR DPKG LOCAL INSTALL" "install ok installed" \
     env ALR_FAKEROOT=1 $ALR run /bin/sh -c \
     'dpkg -i /tmp/alrtest.deb >/dev/null 2>&1; dpkg-query -W -f="\${Status}" alrtest'
 # git clone --local is the other hardlink-heavy path (ADR 0004).
+if [ "$HAVE_GIT" = 1 ]; then
 $ALR run /bin/bash -c 'rm -rf /tmp/gsrc /tmp/gdst && mkdir -p /tmp/gsrc && cd /tmp/gsrc &&
     git init -q . && echo x > a && git add -A &&
     git -c user.email=a@b -c user.name=c commit -qm i' >/dev/null 2>&1
 ckc "ALR GIT CLONE LOCAL" "done" \
     $ALR run /usr/bin/git clone --local /tmp/gsrc /tmp/gdst
+else
+    emit "ALR GIT CLONE LOCAL" SKIP "git not installed in this rootfs"
+fi
 # symlinkat's target must NOT be rewritten while its dirfd path is -- the
 # asymmetry docs/04 §5.3 calls out.
 ck  "PRELOAD SYMLINKAT ASYMMETRY" ../etc/os-release \
@@ -306,19 +424,27 @@ ck  "PRELOAD EXEC SHEBANG RECURSION" deep-ok  $ALR run /tmp/s2
 # rootfs.  Build the repo, then assert git actually walked it: `status
 # --porcelain` on a clean tree prints NOTHING, so the falsifiable assertion is
 # the rc plus a count from `status --porcelain` after a modification.
+if [ "$HAVE_GIT" = 1 ]; then
 $ALR run /bin/sh -c 'rm -rf /tmp/bigrepo && mkdir -p /tmp/bigrepo && cd /tmp/bigrepo &&
     git init -q . && for i in $(seq 1 200); do echo x > f$i; done &&
     git add -A && git -c user.email=a@b -c user.name=c commit -qm init &&
     echo changed > f7 && echo new > untracked' >/dev/null 2>&1
 ckc "ALR GIT STATUS 10K" " M f7" \
     $ALR run /usr/bin/git -C /tmp/bigrepo status --porcelain
+else
+    emit "ALR GIT STATUS 10K" SKIP "git not installed in this rootfs"
+fi
 # git hooks are a shebang+exec path through the guest, which is exactly what
 # ADR 0002's loader invocation has to get right.
+if [ "$HAVE_GIT" = 1 ]; then
 $ALR run /bin/bash -c 'cd /tmp/gsrc 2>/dev/null || exit 0;
     printf "#!/bin/sh\necho hook-ran\n" > .git/hooks/pre-commit &&
     chmod +x .git/hooks/pre-commit' >/dev/null 2>&1
 ckc "ALR GIT HOOKS" "hook-ran" $ALR run /bin/bash -c \
     'cd /tmp/gsrc && echo y >> a && git add -A && git -c user.email=a@b -c user.name=c commit -m h'
+else
+    emit "ALR GIT HOOKS" SKIP "git not installed in this rootfs"
+fi
 # Was: matched "done", which the command's own trailing `; echo done` prints
 # unconditionally -- it passed with no network, no git, and no clone.  Assert
 # the artifact instead: a successful clone leaves a readable HEAD.
@@ -335,8 +461,12 @@ else
     emit "ALR GIT CLONE HTTPS" SKIP "git not installed"
 fi
 # dlopen with an absolute guest path must be rewritten like any other path.
+if [ "$HAVE_PY3" = 1 ]; then
 ckc "PRELOAD DLOPEN ABS PATH" "ok" $ALR run /usr/bin/python3 -c \
     'import ctypes; ctypes.CDLL("/lib/aarch64-linux-gnu/libm.so.6"); print("ok")'
+else
+    emit "PRELOAD DLOPEN ABS PATH" SKIP "python3 not installed in this rootfs"
+fi
 # syscall(2) called directly must be rewritten too.  A C probe, not ctypes:
 # CDLL("libc.so.6") dlsym's libc's OWN syscall and never consults the global
 # scope where LD_PRELOAD lives, so the ctypes version measured dlsym semantics
@@ -438,13 +568,21 @@ if [ -d "$_hb" ]; then
                          || emit "CLI HOSTBIN PRESENT" FAIL "only ${n:-0}"
     # The wrapper must reach the GUEST's copy, not a host one: git is 2.43.0 in
     # the rootfs and Termux ships no git at all, so the version is the proof.
+    if [ "$HAVE_GIT" != 1 ]; then
+        emit "CLI HOSTBIN RUNS GUEST TOOL" SKIP "git not installed in this rootfs"
+    else
     ckc "CLI HOSTBIN RUNS GUEST TOOL" "git version 2." "$_hb/git" --version
+    fi
     # And it must work with NOTHING inherited -- every child of a static binary
     # starts from that binary's environment, not the harness's.  The first
     # version read ALR_ROOT_DIR from the environment and silently resolved
     # against the default rootfs.
+    if [ "$HAVE_GIT" != 1 ]; then
+        emit "CLI HOSTBIN SELF CONTAINED" SKIP "git not installed in this rootfs"
+    else
     ckc "CLI HOSTBIN SELF CONTAINED" "git version 2." \
         env -i PATH=/data/data/com.termux/files/usr/bin "$_hb/git" --version
+    fi
 else
     emit "CLI HOSTBIN PRESENT" FAIL "no $_hb; run alr update-components"
     emit "CLI HOSTBIN RUNS GUEST TOOL" SKIP "no hostbin"
@@ -525,10 +663,11 @@ fi
 
 # `alr list` read only ALR_ROOT_DIR, so after `alr config set paths.root X`
 # every other subcommand used X and this one reported "no rootfs installed".
-_lh="$ALR_ROOT_DIR/alrlisthome"; rm -rf "$_lh"; mkdir -p "$_lh"
-env HOME="$_lh" $ALR config set paths.root "$ALR_ROOT_DIR" >/dev/null 2>&1
+_lh="$SCRATCH_G/alrlisthome"; rm -rf "$_lh"; mkdir -p "$_lh"
+_lhh="$SCRATCH_H/alrlisthome"
+env HOME="$_lhh" $ALR config set paths.root "$ALR_ROOT_DIR" >/dev/null 2>&1
 ckc "CLI LIST HONOURS CONFIG ROOT" "$ALR_DISTRO_NAME" \
-    env HOME="$_lh" ALR_ROOT_DIR= $ALR list
+    env HOME="$_lhh" ALR_ROOT_DIR= $ALR list
 # `alr version` resolved the rootfs from ALR_DISTRO alone, so -d inspected a
 # different rootfs than the one named and reported on the wrong preload.
 ckc "CLI VERSION HONOURS -d" "alrnosuchdistro" \
@@ -539,27 +678,28 @@ rm -rf "$_lh"
 # Run under a scratch HOME so this never touches the user's real
 # ~/.alr/config.toml -- a test suite that edits the machine it measures is not
 # a test suite.
-_cfghome="$ALR_ROOT_DIR/alrcfghome"; rm -rf "$_cfghome"; mkdir -p "$_cfghome"
+_cfghome="$SCRATCH_G/alrcfghome"; rm -rf "$_cfghome"; mkdir -p "$_cfghome"
+_cfghomeh="$SCRATCH_H/alrcfghome"
 ck  "CLI CONFIG GET DEFAULT" "ubuntu-24.04" \
-    env HOME="$_cfghome" $ALR config get default_distro
+    env HOME="$_cfghomeh" $ALR config get default_distro
 # The confirmation line must report the value AFTER the write.  cfg() memoises
 # and main() has already called it, so the first version printed the value from
 # before the write -- "runtime.fakeroot = false" one line after writing true.
 ckc "CLI CONFIG SET REPORTS NEW" "runtime.fakeroot = true   (config)" \
-    env HOME="$_cfghome" $ALR config set runtime.fakeroot true
+    env HOME="$_cfghomeh" $ALR config set runtime.fakeroot true
 # The one that matters: does the file change what the runtime DOES.  A config
 # command that only round-trips its own file proves nothing.
 ck  "CLI CONFIG AFFECTS RUNTIME" "0" \
-    env HOME="$_cfghome" $ALR run id -u
+    env HOME="$_cfghomeh" $ALR run id -u
 # ...and a flag still outranks it (§1.1: 기본 "설정값").
 ck  "CLI CONFIG FLAG OUTRANKS" "$(id -u)" \
-    env HOME="$_cfghome" $ALR run --no-fakeroot id -u
+    env HOME="$_cfghomeh" $ALR run --no-fakeroot id -u
 # An unknown key must be refused, not accepted-and-ignored: a typo'd setting
 # that looks accepted is the classic config-file failure.
 ckc "CLI CONFIG UNKNOWN KEY" "reason=config-unknown-key" \
-    env HOME="$_cfghome" $ALR config get no_such_setting
+    env HOME="$_cfghomeh" $ALR config get no_such_setting
 ckc "CLI CONFIG BAD VALUE" "reason=config-bad-value" \
-    env HOME="$_cfghome" $ALR config set runtime.log notanumber
+    env HOME="$_cfghomeh" $ALR config set runtime.log notanumber
 rm -rf "$_cfghome"
 
 # The Termux uid has no entry in the guest's user databases, so every ownership
@@ -804,6 +944,10 @@ echo
 
 # ── supervisor invariants — the line separating this from PRoot ─────────
 echo "── 슈퍼바이저 불변식 ──"
+if [ "$INSIDE_GUEST" = 1 ]; then
+    emit "SUPERVISOR NO SYSCALL STOPS" SKIP "nested alr inherits the outer supervisor and owns no counters"
+    emit "SUPERVISOR SIGSYS PER RUN"   SKIP "nested alr inherits the outer supervisor and owns no counters"
+else
 stats=$(ALR_LOG=1 $ALR run /bin/bash -c 'ls / >/dev/null' 2>&1 >/dev/null | tail -1)
 case "$stats" in
   *"path_traps=0"*"syscall_stops=0"*) emit "SUPERVISOR NO SYSCALL STOPS" PASS "$stats";;
@@ -812,6 +956,7 @@ esac
 sig=$(printf '%s' "$stats" | grep -oE 'sigsys=[0-9]+' | cut -d= -f2)
 [ "${sig:-99}" -le 8 ] && emit "SUPERVISOR SIGSYS PER RUN" PASS "sigsys=$sig (<=8)" \
                        || emit "SUPERVISOR SIGSYS PER RUN" FAIL "sigsys=$sig"
+fi
 echo
 
 # ── stability ───────────────────────────────────────────────────────────

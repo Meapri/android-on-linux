@@ -436,9 +436,27 @@ static void repair(const char *R)
     }
 }
 
+/* Copy `from` onto `to` by writing a sibling and rename()ing it into place.
+ *
+ * NOT O_TRUNC, and the difference is not stylistic.  Every file this function
+ * installs is a shared object or an executable, and truncating one that a live
+ * process has mmap'd makes the pages beyond the new end-of-file disappear
+ * underneath it -- the next touch is SIGBUS.
+ *
+ * MEASURED: the acceptance suite, running inside the guest, reached
+ * `alr update-components`; that re-installed libalr_preload.so over the copy
+ * every guest process on the device had mapped, and the suite's own bash died
+ * at 128+7 with no message and no stderr.  The transcript simply stopped, one
+ * check short of 176, which reads exactly like a hang.
+ *
+ * rename(2) is atomic and unlinks rather than truncates, so the old inode
+ * stays alive for anyone still mapping it and new execs pick up the new one.
+ * The temp name is a sibling because rename cannot cross filesystems.
+ */
 static int copy_file(const char *from, const char *to)
 {
     char buf[65536];
+    char tmp[ALR_PBUF];
     int in, out;
     ssize_t n;
     struct stat st;
@@ -446,19 +464,27 @@ static int copy_file(const char *from, const char *to)
     in = open(from, O_RDONLY);
     if (in < 0) return -1;
     if (fstat(in, &st) != 0) { close(in); return -1; }
-    out = open(to, O_WRONLY | O_CREAT | O_TRUNC, st.st_mode & 07777);
+
+    if (snprintf(tmp, sizeof tmp, "%s.alrtmp.%d", to, (int)getpid())
+            >= (int)sizeof tmp) { close(in); errno = ENAMETOOLONG; return -1; }
+    out = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, st.st_mode & 07777);
     if (out < 0) { close(in); return -1; }
     while ((n = read(in, buf, sizeof buf)) > 0) {
         ssize_t off = 0;
         while (off < n) {
             ssize_t w = write(out, buf + off, (size_t)(n - off));
-            if (w <= 0) { close(in); close(out); return -1; }
+            if (w <= 0) { close(in); close(out); unlink(tmp); return -1; }
             off += w;
         }
     }
     close(in);
+    /* Mode is set by open(), but only modulo umask; the source mode is the
+     * contract (0755 on the loader shim matters). */
+    fchmod(out, st.st_mode & 07777);
     close(out);
-    return n < 0 ? -1 : 0;
+    if (n < 0)                  { unlink(tmp); return -1; }
+    if (rename(tmp, to) != 0)   { unlink(tmp); return -1; }
+    return 0;
 }
 
 /* ubuntu-base DOES contain hardlink members (perl5.38.2 -> perl,
@@ -2337,6 +2363,21 @@ static int cmd_adopt(const char *distro)
 
     install_libdl_stub(R);
 
+    {   /* Put alr itself where a GUEST script can reach it.
+         *
+         * The acceptance suite is a bash script that invokes $ALR, and bash
+         * lives in the rootfs -- so to run the suite in this app's context the
+         * guest has to be able to exec alr. It can: the interposer passes
+         * through any binary whose PT_INTERP is outside the rootfs, which is
+         * exactly what an Android binary looks like from in there.
+         *
+         * Copied rather than symlinked: a symlink to /data/app/... would break
+         * the moment the app updates and the APK path changes. */
+        char dst[ALR_PBUF];
+        snprintf(dst, sizeof dst, "%s/usr/lib/alr/alr", R);
+        if (copy_file(g_self, dst) == 0) chmod(dst, 0755);
+    }
+
     {   char pl[ALR_PBUF];
         snprintf(pl, sizeof pl, "%s/usr/lib/alr/libalr_preload.so", R);
         if (!preload_deps_ok(R, pl))
@@ -2628,7 +2669,31 @@ static char **build_env(const struct launch *L, const char *guest_exe,
          * <R>/data/data/... and fails with a bare ENOENT that reads as a
          * corrupt rootfs. */
         if (klen ==  6 && !memcmp(environ[i], "OLDPWD", 6)) continue;
-        if (klen ==  8 && !memcmp(environ[i], "ALR_ROOT", 8)) continue;
+        /* Every ALR_ variable that describes THIS launch, dropped for the
+         * same reason as PATH above: envp allows duplicates and getenv(3)
+         * returns the first, so an inherited copy shadows the PUT() below.
+         * Only ALR_ROOT was listed here, and the rest went unnoticed until alr
+         * was run from inside a guest -- a nested `alr run /bin/readlink
+         * /proc/self/exe` answered "/usr/lib/alr/alr", because the child's
+         * environment carried ALR_GUEST_EXE twice and the stale one, naming
+         * the host binary its parent had exec'd, came first.
+         *
+         * ALR_LOG, ALR_DISTRO and ALR_ROOT_DIR are NOT here: alr never PUT()s
+         * them, so there is nothing to shadow, and inheriting them is how a
+         * nested alr finds the same rootfs and the same verbosity. */
+        {
+            static const char *const own[] = {
+                "ALR_ROOT=", "ALR_LDSO=", "ALR_LIBPATH=", "ALR_PRELOAD=",
+                "ALR_GUEST_EXE=", "ALR_GUEST_ARGV0=", "ALR_GUEST_PATH=",
+                "ALR_FAKEROOT=", "ALR_COUNT=", "ALR_LOG_FD=", NULL
+            };
+            int o, drop = 0;
+            for (o = 0; own[o]; o++) {
+                size_t ol = strlen(own[o]) - 1;      /* key without the '=' */
+                if (klen == ol && !memcmp(environ[i], own[o], ol)) { drop = 1; break; }
+            }
+            if (drop) continue;
+        }
         /* The guest rootfs has only C.UTF-8 generated; an inherited
          * LANG=en_US.UTF-8 makes every perl/dpkg invocation emit a locale
          * warning block that buries the real output. */
@@ -2816,6 +2881,24 @@ static int rd_pread(void *c, void *dst, size_t len, uint64_t off)
  * load-bearing, because passing NULL for the interp buffer makes it report
  * every ELF as static (the comment at its other call site records the day that
  * cost). */
+/* The PT_INTERP of an ELF, or "" if it has none. */
+static void exe_interp(const char *host, char *out, size_t outsz)
+{
+    unsigned char head[ALR_PROBE_BYTES];
+    struct alr_shebang sb;
+    struct rdctx ctx;
+    ssize_t n;
+    int fd;
+
+    out[0] = '\0';
+    if ((fd = open(host, O_RDONLY | O_CLOEXEC)) < 0) return;
+    n = read(fd, head, sizeof head);
+    ctx.fd = fd;
+    (void)alr_classify(head, n < 0 ? 0 : (size_t)n, rd_pread, &ctx, &sb,
+                       out, outsz);
+    close(fd);
+}
+
 static int exe_is_static(const char *host)
 {
     unsigned char head[ALR_PROBE_BYTES];
@@ -3076,6 +3159,45 @@ static int cmd_run(const char *distro, int argc, char **argv, int login_shell,
         }
     }
 
+    /* A HOST binary named as the target: run it, do not load it.
+     *
+     * PT_INTERP says whose loader a program wants. A guest program names the
+     * rootfs's ld-linux; an ANDROID binary names /system/bin/linker64, which is
+     * not under the rootfs at all. Handing the second kind to the guest's glibc
+     * loader cannot work -- it hunts for bionic's DT_NEEDED names and reports
+     *     alr: error while loading shared libraries: libdl.so
+     * naming a library that exists on both sides in incompatible forms.
+     *
+     * The interposer already does this for guest-initiated execs; the same rule
+     * has to hold when the host binary is what the user asked for, which is how
+     * `alr run /usr/lib/alr/alr version` (and the acceptance suite running
+     * inside the guest) reaches alr itself. */
+    {
+        char interp[ALR_PBUF];
+        exe_interp(host, interp, sizeof interp);
+        /* PT_INTERP is written in the TARGET's own namespace, so comparing it
+         * against the host root is meaningless -- a guest binary names
+         * /lib/ld-linux-aarch64.so.1, which of course does not start with
+         * <R>. The first version of this did exactly that and classified
+         * /bin/bash as a host binary.
+         *
+         * The question is whose loader it is: a guest binary's interp exists
+         * INSIDE the rootfs, a host binary's exists outside it and not in. */
+        char inroot[ALR_PBUF];
+        snprintf(inroot, sizeof inroot, "%s%s", L.root, interp);
+        if (interp[0] && access(inroot, F_OK) != 0 && access(interp, F_OK) == 0) {
+            if (g_log >= 1)
+                fprintf(stderr, "alr: %s is a host binary (interp %s); running "
+                                "it directly\n", host, interp);
+            av[n++] = host;
+            for (i = 1; i < argc && n < ALR_MAX_ARGV - 2; i++) av[n++] = argv[i];
+            av[n] = NULL;
+            alr_resolvd_stop();
+            execv(host, (char *const *)av);
+            die("boot-failed", "could not run the host binary");
+        }
+    }
+
     /* ADR 0002: the program argument MUST contain a '/' -- glibc's dl-load.c
      * treats a slash-free name as a LIBRARY name and searches the library path
      * for it, not $PATH.  We always pass an absolute host path. */
@@ -3150,8 +3272,24 @@ static int cmd_run(const char *distro, int argc, char **argv, int login_shell,
 
     /* Start the resolver bridge before the guest exists.  If it cannot start
      * we continue without it: the guest then uses glibc's own resolver, which
-     * is correct on devices that do not have Private DNS or a VPN. */
-    g_resolv_sock = alr_resolvd_start(getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+     * is correct on devices that do not have Private DNS or a VPN.
+     *
+     * TMPDIR is a hint, not an address.  A nested alr -- one launched from
+     * INSIDE a guest, which is how the acceptance suite runs in the Android
+     * app -- inherits the GUEST's TMPDIR ("/tmp"), and to this process, which
+     * is not interposed, that names Android's /tmp.  There isn't one, so the
+     * bridge failed on every nested run and every one of them printed the DNS
+     * warning.  The rootfs's own /tmp is a directory both views agree exists,
+     * so fall back to it rather than to nothing. */
+    {
+        const char *td = getenv("TMPDIR");
+        g_resolv_sock = alr_resolvd_start(td && *td ? td : "/tmp");
+        if (!g_resolv_sock) {
+            char rtmp[ALR_PBUF];
+            snprintf(rtmp, sizeof rtmp, "%s/tmp", L.root);
+            g_resolv_sock = alr_resolvd_start(rtmp);
+        }
+    }
     if (g_log >= 1 && !g_resolv_sock)
         fprintf(stderr, "alr: resolver bridge unavailable; guest DNS may fail "
                         "on devices with Private DNS or a VPN (RISKS R15)\n");

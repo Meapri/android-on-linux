@@ -140,6 +140,7 @@ tasks.register("buildAlrRuntime") {
     val jniOut = layout.buildDirectory.dir("generated/alr/jniLibs")
     val assetOut = layout.buildDirectory.dir("generated/alr/assets/alr")
     inputs.dir(alrDir.dir("src"))
+    inputs.dir(alrDir.dir("tests"))
     inputs.file(alrDir.file("Makefile"))
     outputs.dir(jniOut)
     outputs.dir(assetOut)
@@ -179,6 +180,30 @@ tasks.register("buildAlrRuntime") {
         val libdl = alrBuild.resolve("libdl.so.2")
         require(libdl.isFile) { "runtime/alr build produced no build/libdl.so.2" }
         libdl.copyTo(assets.resolve("libdl.so.2"), overwrite = true)
+
+        // 4. alr's own acceptance suite, shipped as assets.
+        //
+        // It runs INSIDE the guest, which is not a preference -- the suite is
+        // bash and calls awk, and Android has neither. What makes that valid is
+        // that a guest process forked from the app still carries the app's
+        // seccomp filter and uid, which is precisely what the suite's validity
+        // gate demands before it will report a single number. `run-as` does
+        // not: it lands in runas_app with Seccomp: 0, where every syscall would
+        // look ALLOWED and every PASS would be a lie.
+        //
+        // Copied from runtime/alr/tests rather than duplicated, so the suite in
+        // the APK is the suite in the repo. A forked copy would drift and then
+        // report green about code it no longer describes.
+        val testsOut = assetOut.get().asFile.resolve("tests")
+        testsOut.deleteRecursively()
+        listOf("device", "cases").forEach { sub ->
+            val src = alrDir.dir("tests/$sub").asFile
+            require(src.isDirectory) { "runtime/alr/tests/$sub missing" }
+            src.copyRecursively(testsOut.resolve(sub), overwrite = true)
+        }
+        require(testsOut.resolve("device/acceptance.sh").isFile) {
+            "acceptance.sh did not make it into the assets"
+        }
 
         logger.lifecycle("alr runtime packaged: libalr.so + libalr_preload.so")
     }
