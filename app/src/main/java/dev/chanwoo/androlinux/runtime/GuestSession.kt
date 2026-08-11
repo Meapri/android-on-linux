@@ -195,20 +195,37 @@ object GuestSession {
             // to it hangs instead of failing, which is worse.
             runCatching { busHost.delete() }
         }
-        val r = alr.run(
-            distro = distro,
-            program = "/usr/bin/dbus-daemon",
-            arguments = listOf(
-                "--session", "--fork", "--address=unix:path=$busGuest", "--print-address",
-            ),
-            timeoutSeconds = 60,
-        )
-        val addr = r.stdout.lineSequence().firstOrNull { it.startsWith("unix:") }?.trim()
-        if (addr == null) {
-            Log.w(TAG, "session: no dbus session bus (rc=${r.exitCode}) ${r.stderr.take(300)}")
+        // The address is DICTATED, not read back: we pass --address, so asking
+        // the daemon to print it would only be a second way to learn what we
+        // already decided -- and reading that would mean reading a pipe the
+        // daemon never closes.
+        //
+        // --nofork, and the call runs on its own thread. A daemon cannot
+        // daemonize THROUGH alr: the supervisor traces the whole process tree
+        // and waits for all of it, so `dbus-daemon --fork` returns to us only
+        // when the bus dies. The app sat at "launching guest" for the whole
+        // timeout and presented a black surface, with the bus itself perfectly
+        // healthy. So we do not wait for the process at all -- we wait for the
+        // SOCKET, which is the thing that has to exist before the app connects.
+        val addr = "unix:path=$busGuest"
+        Thread({
+            alr.runDaemon(
+                distro = distro,
+                program = "/usr/bin/dbus-daemon",
+                arguments = listOf("--session", "--nofork", "--address=$addr"),
+                logFile = File(rootfsDir, "tmp/alr-dbus.log"),
+                timeoutSeconds = 24L * 60 * 60,
+            )
+            Log.i(TAG, "session: dbus-daemon exited")
+        }, "alr-session-bus").apply { isDaemon = true }.start()
+
+        var waited = 0
+        while (waited < 8000 && !busHost.exists()) { Thread.sleep(100); waited += 100 }
+        if (!busHost.exists()) {
+            Log.w(TAG, "session: no dbus session bus (no socket after ${waited}ms)")
             return emptyMap()
         }
-        Log.i(TAG, "session: bus at $addr")
+        Log.i(TAG, "session: bus at $addr (ready in ${waited}ms)")
         return mapOf("DBUS_SESSION_BUS_ADDRESS" to addr)
     }
 }

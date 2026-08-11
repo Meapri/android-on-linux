@@ -1,0 +1,10 @@
+--------- beginning of main
+08-11 12:00:21.544 28963 29005 I alr_runtime: rootfs ready: ubuntu-26.04 at /data/user/0/dev.chanwoo.androlinux/files/rootfs/ubuntu-26.04 (bundled debian-arm64 extracted=true)
+08-11 12:00:21.548 28963 29005 I alr_runtime: discovered 1 installed app(s): gpicview
+08-11 12:00:35.751 28963 29145 I alr_runtime: [gpicview] backend=alr xdg=/data/user/0/dev.chanwoo.androlinux/files/rootfs/ubuntu-26.04/tmp/alr-rt
+08-11 12:00:35.768 28963 29145 I alr_runtime: [gpicview] compositor: ALR WAYLAND COMPOSITOR: started socket=/data/user/0/dev.chanwoo.androlinux/files/rootfs/ubuntu-26.04/tmp/alr-rt/alr-xdg/wayland-0 globals=wl_compositor,wl_shm,wl_seat,wl_output,xdg_wm_base,wl_subcompositor,wl_data_device_manager,zwp_text_input_manager_v3 content=1440x2947
+08-11 12:00:35.774 28963 29145 I alr_runtime: [gpicview] touch-dpi: density=523 env={GDK_DPI_SCALE=1.25, QT_FONT_DPI=601, QT_AUTO_SCREEN_SCALE_FACTOR=1, Xft.dpi=601}
+08-11 12:00:35.774 28963 29145 I alr_runtime: [gpicview] launching guest: /usr/bin/gpicview
+08-11 12:00:35.875 28963 29145 I alr_runtime: session: bus at unix:path=/tmp/alr-rt/alr-xdg/bus (ready in 100ms)
+08-11 12:00:35.944 28963 29145 I alr_runtime: [gpicview] 
+08-11 12:00:35.944 28963 29145 I alr_runtime: [gpicview] (gpicview:29161): dbind-WARNING **: 03:00:35.944: AT-SPI: Error retrieving accessibility bus address: org.freedesktop.DBus.Error.ServiceUnknown: The name org.a11y.Bus was not provided by any .service files

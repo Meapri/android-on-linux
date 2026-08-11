@@ -238,6 +238,50 @@ class AlrRuntime(
     fun installDistro(distro: String, timeoutSeconds: Long = 3600): AlrResult =
         exec(listOf("install", distro), timeoutSeconds)
 
+    /**
+     * Start a guest DAEMON: output to [logFile], return when the launcher
+     * process exits.
+     *
+     * A daemon that forks keeps the inherited stdout OPEN, so a caller reading
+     * that pipe to EOF waits for the daemon to die rather than for the launch
+     * to finish. dbus-daemon --fork did exactly that: the session bus came up
+     * correctly and the app then sat on the read for the full timeout before
+     * launching anything, which looked like the app hanging on a black screen.
+     * Redirecting to a file removes the pipe, so waitFor() sees the parent exit.
+     */
+    fun runDaemon(
+        distro: String,
+        program: String,
+        arguments: List<String> = emptyList(),
+        guestEnv: Map<String, String> = emptyMap(),
+        logFile: File,
+        timeoutSeconds: Long = 60,
+    ): Int {
+        ensureAdopted(distro)
+        if (!isAvailable()) return -1
+        val eArgs = guestEnv.entries
+            .filterNot { it.key.startsWith("PROOT_") || it.key in RESERVED }
+            .flatMap { listOf("-e", "${it.key}=${it.value}") }
+        val tmp = File(prefix, "tmp").apply { mkdirs() }
+        logFile.parentFile?.mkdirs()
+        val builder = ProcessBuilder(
+            listOf(binary.absolutePath, "-d", distro, "run") + eArgs + listOf(program) + arguments,
+        )
+        builder.redirectErrorStream(true)
+        builder.redirectOutput(logFile)
+        builder.environment().apply {
+            put("PREFIX", prefix.absolutePath)
+            put("ALR_ROOT_DIR", rootfsBase.absolutePath)
+            put("TMPDIR", tmp.absolutePath)
+            put("HOME", filesDir.absolutePath)
+        }
+        return runCatching {
+            val p = builder.start()
+            if (p.waitFor(timeoutSeconds, TimeUnit.SECONDS)) p.exitValue()
+            else { p.destroyForcibly(); -2 }
+        }.getOrDefault(-1)
+    }
+
     fun version(): AlrResult = exec(listOf("version"), 30)
 
     /**
