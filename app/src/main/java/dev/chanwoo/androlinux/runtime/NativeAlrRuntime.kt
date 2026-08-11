@@ -92,9 +92,26 @@ class NativeAlrRuntime(private val appContext: Context) : AlrRuntime {
                 // while the probe harness measured Ubuntu, so "it works in the
                 // app" and "it works in the report" were claims about two
                 // different filesystems.
-                val picked = dev.chanwoo.androlinux.GuestRootfs.pick(appContext.filesDir)
+                val picked = dev.chanwoo.androlinux.GuestRootfs.ensureProvisioned(
+                    dev.chanwoo.androlinux.AlrRuntime(
+                        java.io.File(nativeLibraryDir), java.io.File(filesDirPath),
+                    ),
+                    appContext.filesDir,
+                ) { s -> Log.i(TAG, "rootfs: $s") }
                 rootfsDirCached = picked?.first ?: status.rootfsDir
                 rootfsNameCached = picked?.second ?: status.manifestName
+                // The session, once the tree exists and BEFORE anything is
+                // installed into it: policy-rc.d has to be in place before the
+                // first maintainer script runs, or every package that ships a
+                // service tries to start one and fails the configure step.
+                if (picked != null) {
+                    GuestSession.provision(
+                        dev.chanwoo.androlinux.AlrRuntime(
+                            java.io.File(nativeLibraryDir), java.io.File(filesDirPath),
+                        ),
+                        picked.first, picked.second,
+                    )
+                }
                 Log.i(
                     TAG,
                     "rootfs ready: ${rootfsNameCached} at ${rootfsDirCached} " +
@@ -126,9 +143,30 @@ class NativeAlrRuntime(private val appContext: Context) : AlrRuntime {
             if (c.appId in scannedIds) null
             else if (overlayBinaryPresent(dir, c)) c.toInstalledOverlayApp() else null
         }
-        val apps = scanned + overlayInstalled
+        // Same reasoning, one step further: a catalog app whose EXEC binary is in
+        // the rootfs is installed, whether or not it left a .desktop behind.
+        //
+        // .desktop discovery cannot see every installed app, and not because
+        // anything failed. htop ships no desktop entry at all, and the entries
+        // that do exist for terminal programs carry Terminal=true, which the
+        // scanner drops on purpose (there is no TTY host yet). So `apt install
+        // htop` succeeded -- dpkg said `install ok installed`, the binary was
+        // there -- and the detail screen still offered to install it, because
+        // the only thing being asked was "is there a .desktop for this".
+        //
+        // The binary is the honest test, and it is the same one AptInstaller
+        // already reports as binaryPresent. .desktop entries still win on
+        // collision: they carry the resolved icon and the field-code-expanded
+        // argv, which a catalog entry does not.
+        val haveIds = scannedIds + overlayInstalled.map { it.appId }
+        val execInstalled = BundledCatalog.apps.mapNotNull { c ->
+            if (c.appId in haveIds) null
+            else if (execBinaryPresent(dir, c)) c.toInstalledOverlayApp() else null
+        }
+        val apps = scanned + overlayInstalled + execInstalled
         Log.i(TAG, "discovered ${apps.size} installed app(s): ${apps.joinToString { it.appId }}" +
-            if (overlayInstalled.isNotEmpty()) " (overlay: ${overlayInstalled.joinToString { it.appId }})" else "")
+            (if (overlayInstalled.isEmpty()) "" else " (overlay: ${overlayInstalled.joinToString { it.appId }})") +
+            (if (execInstalled.isEmpty()) "" else " (exec: ${execInstalled.joinToString { it.appId }})"))
         _installedApps.value = apps
     }
 
@@ -385,6 +423,20 @@ class NativeAlrRuntime(private val appContext: Context) : AlrRuntime {
             add("usr/lib/chromium/chromium-headless-shell")
         }.distinct()
         return candidates.any { File(rootfsDir, it).isFile }
+    }
+
+    /**
+     * Is [app]'s EXEC target present in the rootfs?
+     *
+     * Only for entries that name an absolute in-guest path: a DESKTOP entry has
+     * no binary to look for, and a relative target would be resolved against
+     * $PATH at launch, which is not a question a file test can answer.
+     */
+    internal fun execBinaryPresent(rootfsDir: File, app: CatalogApp): Boolean {
+        if (app.entry.kind != LaunchEntry.EntryKind.EXEC) return false
+        val target = app.entry.target
+        if (!target.startsWith("/")) return false
+        return File(rootfsDir, target.removePrefix("/")).isFile
     }
 
     /**

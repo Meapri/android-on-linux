@@ -1,0 +1,1649 @@
+build: 0.4.163-sd-v163
+execution summary
+ROOTFS EXECUTION: PASS
+rootfs fixtures tree=debian-arm64
+rootfs userland tree=debian-arm64
+SHELL SCRIPT EXECUTION: PASS
+SHELL -C EXECUTION: KNOWN_FAIL:static-shell (ADR 0008; a static /bin/sh resolves -c paths against Android)
+GLIBC DYNAMIC EXECUTION: PASS
+DISTRO USERLAND EXECUTION: FAIL
+CLEAN GUEST ENVIRONMENT: PASS
+IDENTITY NSS EXECUTION: FAIL
+DPKG VERSION EXECUTION: PASS
+DPKG ARCH EXECUTION: PASS
+DPKG QUERY EXECUTION: PASS
+DPKG SPLIT EXECUTION: PASS
+APT VERSION EXECUTION: FAIL
+APT-GET VERSION EXECUTION: FAIL
+APT-CACHE VERSION EXECUTION: FAIL
+APT-CONFIG VERSION EXECUTION: FAIL
+DPKG LOCAL INSTALL EXECUTION: FAIL
+INSTALLED PACKAGE EXECUTION: FAIL
+ALR PACKAGED TRAMPOLINE CONTINUE EXECUTION: PASS
+ALR PROCFS VIRTUALIZATION PLAN: PASS
+ALR WX-SAFE EXEC STRATEGY: PASS
+ALR PERF HARNESS: PASS
+ALR PERF PROOT VS ALR DEVICE COMPARISON: PENDING_DEVICE
+ALR PROCFS INTERPOSE MECHANISM: PASS
+ALR MEMFD W^X-SAFE NATIVE EXEC: KNOWN_FAIL:selinux-memfd-exec (EACCES; not on the product path at targetSdk 28)
+ALR EXECMEM ANON RX NATIVE EXEC: PASS
+ALR NATIVE LOADER MECHANISM (freestanding): PASS
+ALR NATIVE LOADER GUEST EXEC (glibc static): PASS
+ALR NATIVE LOADER GUEST EXEC (glibc threads+fork): PASS
+ALR SECCOMP PATH-MEDIATION (seccomp-trace rootfs path rewrite): VIABLE
+ALR WAYLAND SOCKET TRANSPORT (named AF_UNIX host↔guest): VIABLE
+ALR LOADER PATH-MEDIATION REAL FILE READ (glibc opens /etc via rootfs): PASS
+ALR NATIVE LOADER GUEST EXEC (glibc DYNAMIC via in-process ld.so): PASS
+ALR REAL DEBIAN PROGRAM (/usr/bin/env, dynamic coreutils): PASS
+ALR REAL DEBIAN PROGRAM (/usr/bin/id, libselinux+rootfs /etc): PASS
+ALR REAL SHELL COMMAND (/bin/dash -c 'echo …', argv passing): PASS
+ALR WRITE-PATH MEDIATION (dash writes+reads /tmp in rootfs): PASS
+ALR IN-PROCESS IMAGE DECODE (gdk-pixbuf PNG, GIMP prerequisite): PASS
+ALR GIMP 3.0 LOADS (gimp-console-3.0 --version, 112-lib closure in-process): PASS
+ALR CP-3 MICROBENCH compute (same binary via loader, ns_per_op in logcat alr-microbench): ABSENT
+ALR CP-3 MICROBENCH syscall (same binary via loader, ns_per_op in logcat alr-microbench): ABSENT
+ALR GPU PASSTHROUGH BOUNDARY: VIABLE (shmem-ring 161812 cmds/60fps-frame, inproc 925925)
+ALR GPU MARSHALLING HARDWARE RENDER: PASS
+ALR AHB ZEROCOPY HARDWARE SAMPLE: PASS
+ALR GPU DRAW HARDWARE RENDER (shader+VBO+texture+draw on Mali): PASS
+ALR GPU RING HARDWARE RENDER (op stream via SPSC ring -> Mali): PASS
+ALR GPU AHB RENDER (guest draw -> AHB render target, direct read): PASS
+ALR GPU LIVE INTEGRATION (guest -> ring -> host executor -> AHB present, 8 frames on Mali): PASS
+ALR GPU THROUGHPUT (same op-stream on Mali: ALR ring+executor vs direct, % of native): PASS
+ALR VK ENUM MARSHAL (guest Vulkan enumerate/props -> ring -> real Mali libvulkan): PASS
+ALR VK RENDER MARSHAL (guest Vulkan device+queue+cmdbuf+clear -> real Mali -> AHB readback): PASS
+ALR VK DRAW MARSHAL (guest Vulkan graphics-pipeline vkCmdDraw -> real Mali -> AHB readback): PASS
+ALR VK ICD SERVICE (guest libvulkan.so.1 ICD path: servicer drains ring -> real Mali enum -> reply ring): PASS
+ALR VK ICD PRESENT (guest-supplied SPIR-V over the wire + AHB swapchain -> real Mali draw -> present sink): PASS
+ALR JIT WX CYCLE (V8-style iterative RW<->RX exec memory; PASS => Chromium V8 needs no --jitless): PASS
+HOST GPU EGL/GLES EXECUTION: PASS
+ANDROID HOST VULKAN PROBE EXECUTION: PASS
+ANDROID HOST VULKAN SURFACE PROBE EXECUTION: PENDING_SURFACE_CALLBACK
+ANDROID HOST VULKAN SURFACE EXECUTION: PENDING_SURFACE_CALLBACK
+HOST GPU SURFACE EXECUTION: PENDING_SURFACE_CALLBACK
+GUEST GPU BRIDGE COMMAND EXECUTION: PASS
+GUEST GPU IPC BRIDGE EXECUTION: PASS
+GUEST GLES SHIM SMOKE EXECUTION: FAIL
+GUEST GPU MULTI-FRAME SURFACE EXECUTION: PENDING_SURFACE_CALLBACK
+GUEST WAYLAND GUI GPU BRIDGE EXECUTION: PASS
+GUEST X11 GUI GPU BRIDGE EXECUTION: PASS
+GUEST GUI GPU SURFACE EXECUTION: PENDING_SURFACE_CALLBACK
+ANDROID PERMISSION MODEL: PASS
+identity numeric root=false
+identity named root=false
+identity proot mode=raw -r
+guest env leaked android vars=false
+rootfs verified=true extracted=true
+rootfs /bin/hello exists=true executable=true bytes=537664
+rootfs /bin/sh exists=true executable=true bytes=1914704
+rootfs /bin/cat exists=true executable=true bytes=1914704
+rootfs /bin/script-hello exists=true executable=true bytes=46
+rootfs /bin/glibc-hello exists=true executable=true bytes=67496
+rootfs glibc loader exists=true executable=true bytes=203968
+rootfs libc exists=true executable=true bytes=1722920
+rootfs /bin/dash exists=true executable=true bytes=133608
+rootfs /usr/bin/env exists=true executable=true bytes=68368
+rootfs /etc/passwd exists=true bytes=187
+rootfs /etc/group exists=true bytes=60
+rootfs /etc/nsswitch.conf exists=true bytes=74
+rootfs /usr/bin/id exists=true executable=true bytes=67952
+rootfs libselinux exists=true executable=true bytes=198800
+rootfs libpcre2 exists=true executable=true bytes=592328
+rootfs libnss_files exists=true executable=true bytes=67440
+rootfs /usr/bin/dpkg exists=true executable=true bytes=330192
+rootfs libmd exists=true executable=true bytes=67584
+rootfs /etc/dpkg/dpkg.cfg exists=true bytes=446
+rootfs /etc/dpkg/dpkg.cfg.d exists=true
+rootfs stale needrestart dpkg cfg exists=false
+rootfs androlinux minimal dpkg cfg exists=true
+rootfs /usr/bin/dpkg-query exists=true executable=true bytes=199016
+rootfs /usr/share/dpkg/cputable exists=true bytes=2062
+rootfs /usr/share/dpkg/tupletable exists=true bytes=2729
+rootfs /usr/bin/apt exists=true executable=true bytes=67752
+rootfs /usr/bin/apt-get exists=true executable=true bytes=67840
+rootfs /usr/bin/apt-cache exists=true executable=true bytes=133440
+rootfs /usr/bin/apt-config exists=true executable=true bytes=67760
+rootfs libapt-pkg exists=true executable=true bytes=1905160
+rootfs libapt-private exists=true executable=true bytes=395440
+rootfs apt http method exists=true executable=true bytes=198912
+rootfs apt lists partial exists=true
+rootfs local deb exists=true bytes=832
+rootfs /usr/bin/dpkg-deb exists=true executable=true bytes=199104
+rootfs installed alr smoke exists=false executable=false bytes=0
+rootfs dpkg status exists=true bytes=0
+rootfs /dev/null placeholder exists=true bytes=0
+rootfs dpkg triggers File exists=true bytes=0
+rootfs dpkg triggers Unincorp exists=true bytes=0
+rootfs helper rm exists=true executable=true bytes=67944
+rootfs helper tar exists=true executable=true bytes=472584
+rootfs helper diff exists=true executable=true bytes=133424
+rootfs helper ldconfig exists=true executable=true bytes=148
+rootfs helper ldconfig.real exists=true executable=true bytes=865840
+rootfs helper start-stop-daemon exists=true executable=true bytes=68888
+rootfs /usr/bin/dpkg-split exists=true executable=true bytes=133416
+rootfs /usr/bin/alr-gpu-client exists=true executable=true bytes=537664
+rootfs /usr/bin/alr-gles-shim-smoke exists=true executable=true bytes=67496
+rootfs /usr/lib/androlinux/libalr_gles_shim.so exists=true executable=true bytes=67440
+rootfs /usr/bin/alr-wayland-gpu-client exists=true executable=true bytes=706896
+rootfs /usr/bin/alr-x11-gpu-client exists=true executable=true bytes=706896
+proot guest gpu client exit=0
+proot guest gpu client stdout=alr guest gpu client ok
+ALR_GPU_BRIDGE_PROTOCOL clear-color-v2
+ALR_GPU_FRAME_COUNT 3
+ALR_GPU_CLEAR 0.78 0.12 0.95 guest-frame-0001
+ALR_GPU_CLEAR 0.12 0.78 0.28 guest-frame-0002
+ALR_GPU_CLEAR 0.08 0.18 0.92 guest-frame-0003
+ALR_GPU_IPC_CLIENT skipped reason=no-port
+proot guest gpu client stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+alr: NOTE /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/usr/bin/alr-gpu-client is statically linked -- path virtualization does NOT
+     apply to it.  It runs, but its paths resolve against Android,
+     not the guest rootfs.
+     reason=unhooked-static-binary  (docs/adr/0008-static-guest-binaries-non-goal.md)
+guest gpu stdout commands parsed=3
+guest gpu ipc host=127.0.0.1
+guest gpu ipc port=37559
+guest gpu ipc expected frames=3
+guest gpu ipc received frames=3
+guest gpu ipc dropped frames=0
+guest gpu ipc lossless=true
+guest gpu ipc raw=ALR_GPU_IPC_HELLO clear-color-v2 frames=3|ALR_GPU_CLEAR 0.78 0.12 0.95 guest-frame-0001|ALR_GPU_CLEAR 0.12 0.78 0.28 guest-frame-0002|ALR_GPU_CLEAR 0.08 0.18 0.92 guest-frame-0003|ALR_GPU_IPC_END
+guest gpu ipc error=none
+proot guest gpu ipc client exit=0
+proot guest gpu ipc client stdout=alr guest gpu client ok
+ALR_GPU_BRIDGE_PROTOCOL clear-color-v2
+ALR_GPU_FRAME_COUNT 3
+ALR_GPU_CLEAR 0.78 0.12 0.95 guest-frame-0001
+ALR_GPU_CLEAR 0.12 0.78 0.28 guest-frame-0002
+ALR_GPU_CLEAR 0.08 0.18 0.92 guest-frame-0003
+ALR_GPU_IPC_CLIENT ok sent=3 transport=tcp-loopback
+proot guest gpu ipc client stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+alr: NOTE /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/usr/bin/alr-gpu-client is statically linked -- path virtualization does NOT
+     apply to it.  It runs, but its paths resolve against Android,
+     not the guest rootfs.
+     reason=unhooked-static-binary  (docs/adr/0008-static-guest-binaries-non-goal.md)
+proot guest gles shim smoke exit=1
+proot guest gles shim smoke stdout=ALR_GLES_SHIM_LOAD fail /usr/lib/androlinux/libalr_gles_shim.so: cannot open shared object file: No such file or directory
+proot guest gles shim smoke stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+guest gles shim command parsed=false
+proot guest wayland gui client exit=0
+proot guest wayland gui client stdout=alr-wayland-gpu-client ok
+ALR_GUI_PROTOCOL WAYLAND compositor-bridge-v1
+ALR_GUI_FRAME_COUNT 4
+ALR_GUI_FRAME WAYLAND seq=1 0.90 0.18 0.22 WAYLAND-window-0001
+ALR_GPU_CLEAR 0.90 0.18 0.22 WAYLAND-window-0001
+ALR_GUI_FRAME WAYLAND seq=2 0.12 0.72 0.36 WAYLAND-window-0002
+ALR_GPU_CLEAR 0.12 0.72 0.36 WAYLAND-window-0002
+ALR_GUI_FRAME WAYLAND seq=3 0.16 0.30 0.92 WAYLAND-window-0003
+ALR_GPU_CLEAR 0.16 0.30 0.92 WAYLAND-window-0003
+ALR_GUI_FRAME WAYLAND seq=4 0.94 0.72 0.16 WAYLAND-window-0004
+ALR_GPU_CLEAR 0.94 0.72 0.16 WAYLAND-window-0004
+ALR_GUI_IPC_CLIENT skipped reason=no-port
+proot guest x11 gui client exit=0
+proot guest x11 gui client stdout=alr-x11-gpu-client ok
+ALR_GUI_PROTOCOL X11 compositor-bridge-v1
+ALR_GUI_FRAME_COUNT 4
+ALR_GUI_FRAME X11 seq=1 0.90 0.18 0.22 X11-window-0001
+ALR_GPU_CLEAR 0.90 0.18 0.22 X11-window-0001
+ALR_GUI_FRAME X11 seq=2 0.12 0.72 0.36 X11-window-0002
+ALR_GPU_CLEAR 0.12 0.72 0.36 X11-window-0002
+ALR_GUI_FRAME X11 seq=3 0.16 0.30 0.92 X11-window-0003
+ALR_GPU_CLEAR 0.16 0.30 0.92 X11-window-0003
+ALR_GUI_FRAME X11 seq=4 0.94 0.72 0.16 X11-window-0004
+ALR_GPU_CLEAR 0.94 0.72 0.16 X11-window-0004
+ALR_GUI_IPC_CLIENT skipped reason=no-port
+guest wayland gui ipc expected frames=4
+guest wayland gui ipc received frames=4
+guest wayland gui ipc lossless=true
+guest wayland gui ipc seq gaps=0
+guest wayland gui ipc duplicate seq=0
+guest wayland gui ipc out of order=false
+guest wayland gui ipc raw=ALR_GUI_IPC_HELLO protocol=WAYLAND frames=4 client=alr-wayland-gpu-client|ALR_GUI_FRAME WAYLAND seq=1 0.90 0.18 0.22 WAYLAND-window-0001|ALR_GPU_CLEAR 0.90 0.18 0.22 WAYLAND-window-0001|ALR_GUI_FRAME WAYLAND seq=2 0.12 0.72 0.36 WAYLAND-window-0002|ALR_GPU_CLEAR 0.12 0.72 0.36 WAYLAND-window-0002|ALR_GUI_FRAME WAYLAND seq=3 0.16 0.30 0.92 WAYLAND-window-0003|ALR_GPU_CLEAR 0.16 0.30 0.92 WAYLAND-window-0003|ALR_GUI_FRAME WAYLAND seq=4 0.94 0.72 0.16 WAYLAND-window-0004
+guest wayland gui ipc error=none
+guest x11 gui ipc expected frames=4
+guest x11 gui ipc received frames=4
+guest x11 gui ipc lossless=true
+guest x11 gui ipc seq gaps=0
+guest x11 gui ipc duplicate seq=0
+guest x11 gui ipc out of order=false
+guest x11 gui ipc raw=ALR_GUI_IPC_HELLO protocol=X11 frames=4 client=alr-x11-gpu-client|ALR_GUI_FRAME X11 seq=1 0.90 0.18 0.22 X11-window-0001|ALR_GPU_CLEAR 0.90 0.18 0.22 X11-window-0001|ALR_GUI_FRAME X11 seq=2 0.12 0.72 0.36 X11-window-0002|ALR_GPU_CLEAR 0.12 0.72 0.36 X11-window-0002|ALR_GUI_FRAME X11 seq=3 0.16 0.30 0.92 X11-window-0003|ALR_GPU_CLEAR 0.16 0.30 0.92 X11-window-0003|ALR_GUI_FRAME X11 seq=4 0.94 0.72 0.16 X11-window-0004
+guest x11 gui ipc error=none
+surface gpu command source frames=8
+proot dpkg-split --version exit=0
+proot dpkg-split --version stdout=Debian 'dpkg-split' package split/join tool; version 1.22.6 (arm64).
+This is free software; see the GNU General Public License version 2 or
+later for copying conditions. There is NO warranty.
+proot dpkg-split --version stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+native smoke exit=0
+native smoke stdout=alr-test-command ok arg1=smoke
+alr packaged trampoline continue passed=true
+alr packaged trampoline continue summary=ALR PACKAGED TRAMPOLINE CONTINUE EXECUTION: PASS
+alr procfs virtualization passed=true
+alr procfs self exe guest view=/bin/hello
+alr procfs self exe host truth=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr_runtime_trampoline.so
+alr procfs mounts host leak tokens=0
+alr wx-safe exec passed=true
+alr wx-safe primary method=direct-rootfs-execve
+alr wx-safe entrypoint packaged=ALR WX-SAFE ENTRYPOINT IS PACKAGED: PASS
+alr wx-safe direct rootfs exec rejected=ALR WX-SAFE DIRECT ROOTFS EXEC REJECTED: N/A (this domain permits it)
+alr perf harness ran=true
+alr perf alr xlate ns/op=4065.967
+alr perf syscall getppid ns/op=257.183
+alr perf xlate cost in syscall units=15.810
+alr procfs interpose passed=true
+alr procfs interpose self exe target=/bin/hello
+alr procfs interpose mounts no host leak=ALR INTERPOSE MOUNTS NO HOST LEAK: PASS
+alr memfd w^x-safe native exec passed=false
+alr memfd create=ALR MEMFD CREATE: PASS
+alr memfd flag=MFD_EXEC
+alr memfd child exit=127
+alr memfd child stderr=EXECVEAT_ERRNO=13
+alr syscall sandbox blocked count=0
+alr syscall execveat=ALLOWED errno=9
+alr syscall symlink=
+alr syscall symlinkat=ALLOWED errno=2
+alr syscall mknodat=ALLOWED errno=2
+alr execmem anon rx native exec passed=true
+alr execmem mprotect rx=ALLOWED
+alr execmem child signal=0
+alr execmem diag=MPROTECT_OK calling;CALL_RET=42
+alr gpu boundary inproc ns/op=18
+alr gpu boundary socket ns/op=45498
+alr gpu boundary shmem-ring ns/op=103
+alr gpu passthrough boundary viable=true
+alr native loader guest exec passed=true
+alr native loader map=ALR NATIVE LOADER MAP: PASS
+alr native loader reached=jumped-to-entry
+alr native loader child=0 signal=0
+alr native loader diag=STATIC;PROG:IREL=0x0000000000000005 MAPPED;SIGRESET;E@0x0000000000400680 code=0xd280001dd503201f P@0x0000000000400040 p0=0x0000000500000001 sp@0x00000078edff3710 argc=0x0000000000000001 JUMPING;PFLT_OK;
+proot hello quiet exit=0
+proot hello quiet stdout=hello from static arm64 rootfs
+proot hello quiet stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+alr: NOTE /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/bin/hello is statically linked -- path virtualization does NOT
+     apply to it.  It runs, but its paths resolve against Android,
+     not the guest rootfs.
+     reason=unhooked-static-binary  (docs/adr/0008-static-guest-binaries-non-goal.md)
+proot script exit=0
+proot script stdout=hello from shell script rootfs
+proot script stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+proot shell -c exit=1
+proot shell -c stdout=shell-c ok
+proot shell -c stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+alr: NOTE /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/bin/sh is statically linked -- path virtualization does NOT
+     apply to it.  It runs, but its paths resolve against Android,
+     not the guest rootfs.
+     reason=unhooked-static-binary  (docs/adr/0008-static-guest-binaries-non-goal.md)
+/bin/sh: /bin/hello: not found
+cat: /etc/os-release: No such file or directory
+proot glibc exit=0
+proot glibc stdout=hello from dynamic glibc rootfs
+glibc version=2.39
+proot glibc stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+proot dash exit=0
+proot dash stdout=dash-c ok
+proot dash stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+/bin/dash: 1: /usr/bin/env: not found
+proot id exit=0
+proot id stdout=uid=10463 gid=10463 groups=10463,3003,9997,20463,50463
+proot id stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+proot dpkg --version exit=0
+proot dpkg --version stdout=Debian 'dpkg' package management program version 1.22.6 (arm64).
+This is free software; see the GNU General Public License version 2 or
+later for copying conditions. There is NO warranty.
+proot dpkg --version stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+proot dpkg --print-architecture exit=0
+proot dpkg --print-architecture stdout=arm64
+proot dpkg --print-architecture stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+proot dpkg-query --version exit=0
+proot dpkg-query --version stdout=Debian dpkg-query package management program query tool version 1.22.6 (arm64).
+This is free software; see the GNU General Public License version 2 or
+later for copying conditions. There is NO warranty.
+proot dpkg-query --version stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+proot apt --version exit=100
+proot apt --version stdout=apt 2.8.3 (arm64)
+proot apt --version stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+[1;33mW: [0mUnable to read /etc/apt/apt.conf.d/ - DirectoryExists (2: No such file or directory)[0m
+[1;31mE: [0mUnable to determine a suitable packaging system type[0m
+proot apt-get --version exit=100
+proot apt-get --version stdout=apt 2.8.3 (arm64)
+Supported modules:
+ Ver: Standard .deb
+ Pkg:  Debian APT solver interface (Priority -1000)
+ Pkg:  Debian APT planner interface (Priority -1000)
+ Pkg:  Debian dpkg interface (Priority 0)
+ S.L: 'deb' Debian binary tree
+ S.L: 'deb-src' Debian source tree
+ Idx: EDSP scenario file
+ Idx: EIPP scenario file
+ Idx: Debian Source Index
+ Idx: Debian Package Index
+ Idx: Debian Translation Index
+ Idx: Debian dpkg status file
+ Idx: Debian deb file
+ Idx: Debian dsc file
+ Idx: Debian control file
+proot apt-get --version stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+W: Unable to read /etc/apt/apt.conf.d/ - DirectoryExists (2: No such file or directory)
+E: Unable to determine a suitable packaging system type
+proot apt-cache --version exit=100
+proot apt-cache --version stdout=apt 2.8.3 (arm64)
+proot apt-cache --version stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+W: Unable to read /etc/apt/apt.conf.d/ - DirectoryExists (2: No such file or directory)
+E: Unable to determine a suitable packaging system type
+proot apt-config --version exit=100
+proot apt-config --version stdout=apt 2.8.3 (arm64)
+proot apt-config --version stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+W: Unable to read /etc/apt/apt.conf.d/ - DirectoryExists (2: No such file or directory)
+E: Unable to determine a suitable packaging system type
+proot dpkg -i local deb exit=2
+proot dpkg -i local deb stdout=
+proot dpkg -i local deb stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+dpkg: error: requested operation requires superuser privilege
+proot installed package smoke exit=125
+proot installed package smoke stdout=
+proot installed package smoke stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+alr: command not found in the guest
+  reason=boot-enoent
+probe dlopen talloc=dlopen libtalloc.so=fail: dlopen failed: library "/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libtalloc.so" not found
+probe dlopen proot=dlopen libalr_proot.so=fail: dlopen failed: library "/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr_proot.so" not found
+host gpu renderer=gl renderer=Adreno (TM) 830
+host gpu vendor=gl vendor=Qualcomm
+host gpu software renderer=host gpu software renderer=false
+host gpu hardware candidate=host gpu hardware candidate=true
+host vulkan device=host vulkan device=Adreno (TM) 830
+host vulkan device type=host vulkan device type=integrated-gpu
+host vulkan api version=host vulkan api version=1.3.284
+host vulkan android surface extension=host vulkan android surface extension=true
+host vulkan software renderer=host vulkan software renderer=false
+host vulkan hardware candidate=host vulkan hardware candidate=true
+permission INTERNET declared=true
+permission ACCESS_NETWORK_STATE declared=true
+permission broad storage declared=false
+permission runtime dangerous requested=false
+
+--- verbose report ---
+AndroLinux Runtime Lab
+
+package: dev.chanwoo.androlinux
+nativeLibraryDir: /data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64
+loader executable: /data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr-loader.so
+app files dir: /data/user/0/dev.chanwoo.androlinux/files
+rootfs dir: /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64
+program: /bin/hello
+execution backend: proot
+can execute: yes
+backend reason: packaged PRoot backend validated for static arm64 ELF smoke execution inside app-private rootfs
+ALR RUNTIME LAUNCHER AVAILABLE: (측정) ALR BACKEND AVAILABLE
+ALR RUNTIME CONFIG BUILD: PASS
+ALR RUNTIME DIRECT APP-DATA EXEC POLICY: (측정) ALR DIRECT APP-DATA EXECVE
+ALR HOOK LOAD: (집계) alr_hook smoke
+ALR HOOK CONFIG BUILD: (집계) alr_hook smoke
+ALR INTERPOSER LOAD: (집계) alr_interposer smoke
+ALR INTERPOSER CONFIG BUILD: (집계) alr_interposer smoke
+ALR CONFIG SERIALIZE: PASS
+ALR CONFIG PARSE: PASS
+ALR EXEC RESOLVE: PASS
+ALR EXEC CLASSIFY: PASS
+ALR EXEC STRATEGY: plan-only
+alr exec guest path=/bin/hello
+alr exec host path=/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/bin/hello
+alr exec kind=elf
+ALR LAUNCH ATTEMPT: SKIP
+ALR LAUNCH MODE: policy-preflight
+ALR LOW-OVERHEAD RUNTIME HELLO EXECUTION: SKIP
+ALR ELF LOAD PLAN: PASS
+ALR ELF STATIC HELLO CANDIDATE: PASS
+alr elf class=elf64
+alr elf machine=aarch64
+alr elf type=exec
+alr elf status=static-executable
+alr elf entry=0x400680
+alr elf min vaddr=0x400000
+alr elf max vaddr=0x496d70
+alr elf interp=none
+alr elf load segments=2
+ALR TRAMPOLINE AVAILABLE: PASS
+ALR TRAMPOLINE CONFIG HANDOFF: PASS
+ALR TRAMPOLINE POLICY PREFLIGHT: PASS
+ALR STATIC HELLO VIA TRAMPOLINE: SKIP
+alr trampoline path=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr_runtime_trampoline.so
+alr trampoline exit=not-run
+alr trampoline stdout=
+alr trampoline stderr=
+ALR EXEC CONTINUITY PLAN: PASS
+ALR EXECVE CHILD CONTINUITY PLAN: PASS
+ALR EXECVP PATH LOOKUP PLAN: SKIP
+ALR POSIX_SPAWN CHILD PLAN: SKIP
+ALR EXEC CONTINUITY TRAMPOLINE: PASS
+ALR EXEC CONTINUITY CONFIG HANDOFF: PASS
+alr exec continuation kind=execve
+alr exec continuation path lookup=false
+alr exec continuation target guest path=/bin/hello
+alr exec continuation host path diagnostic=/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/bin/hello
+alr exec continuation argv count=6
+alr exec continuation argv0=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr_runtime_trampoline.so
+alr exec continuation env overrides=6
+alr launch exit=-1
+alr launch stdout=
+alr launch stderr=
+alr launch error=direct rootfs host exec disabled by ALR policy
+alr runtime launcher path=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr_runtime_launcher.so
+alr runtime hook path=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr_runtime_hook.so
+alr runtime interposer path=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr_runtime_interposer.so
+alr runtime trampoline path=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr_runtime_trampoline.so
+alr runtime bridge path=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr_runtime_bridge.so
+alr runtime config source=env-skeleton
+alr runtime config format=alr-config-v1
+alr runtime config bytes=1618
+alr runtime config checksum=5f570e492695ff77
+alr runtime guest execution=not-claimed
+LOW-OVERHEAD BACKEND PROBE FRAMEWORK: PASS
+OPTIONAL RUNTIME BACKEND AVAILABLE: SKIP
+optional runtime backend source=none
+optional runtime backend name=none
+optional runtime backend path=none
+optional runtime backend executable=no
+optional runtime backend reason=no optional external runtime backend configured
+
+Runtime policy: rootfs files stay in app-private writable storage; execution enters through packaged native backends.
+
+loader argv:
+  /data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr-loader.so
+  --rootfs
+  /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64
+  --program
+  /bin/hello
+
+loader env:
+  ALR_ROOTFS=/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64
+  ALR_PROGRAM=/bin/hello
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+proot argv:
+  /data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr_proot.so
+  -R
+  /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64
+  -w
+  /
+  /bin/hello
+
+proot env:
+  ALR_ROOTFS=/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64
+  ALR_PROGRAM=/bin/hello
+  PROOT_LOADER=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libproot-loader.so
+  PROOT_TMP_DIR=/data/user/0/dev.chanwoo.androlinux/cache/proot-tmp
+  PROOT_NO_SECCOMP=1
+  PROOT_VERBOSE=-1
+  LD_LIBRARY_PATH=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+alr runtime argv:
+  /data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr_runtime_launcher.so
+  --rootfs
+  /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64
+  --cwd
+  /
+  --program
+  /bin/hello
+  --dry-run
+
+alr runtime env:
+  ALR_ROOTFS=/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64
+  ALR_PROGRAM=/bin/hello
+  ALR_BACKEND=alr-runtime
+  ALR_HOOK_PATH=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr_runtime_hook.so
+  ALR_INTERPOSER_PATH=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr_runtime_interposer.so
+  ALR_BRIDGE_PATH=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr_runtime_bridge.so
+  ALR_CONFIG_FORMAT=alr-config-v1
+  ALR_FAKE_ROOT=0
+  ALR_TRACE_PATH=0
+  ALR_TRACE_EXEC=0
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+rootfs install dir: /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64
+rootfs marker: /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/.alr-installed-bookworm-slim-2026-05-gui-gpu-v40
+rootfs status: debian-arm64/tiny-rootfs.tar verified=true extracted=true
+rootfs staged archive: /data/user/0/dev.chanwoo.androlinux/files/rootfs/.downloads/debian-arm64/bookworm-slim-2026-05-gui-gpu-v35/tiny-rootfs.tar
+rootfs extracted dir: /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64
+rootfs marker=/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/.alr-installed-bookworm-slim-2026-05-gui-gpu-v35
+
+next executable backend: android-native-test-command
+packaged command: /data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr_test_command.so
+native command exit=0
+native command stdout=alr-test-command ok arg1=smoke
+native command stderr=
+
+native library probe:
+
+dlopen libtalloc.so=fail: dlopen failed: library "/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libtalloc.so" not found
+dlopen libalr_proot.so=fail: dlopen failed: library "/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr_proot.so" not found
+dlopen libproot-loader.so=fail: dlopen failed: library "/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libproot-loader.so" not found
+dlopen libalr_runtime_launcher.so=ok
+dlopen libalr_runtime_hook.so=ok
+dlopen libalr_runtime_interposer.so=ok
+
+ALR packaged trampoline continue probe:
+ALR PACKAGED TRAMPOLINE CONTINUE PROBE: android-native-exec
+ALR EXEC CONTINUITY PLAN: PASS
+ALR EXECVE CHILD CONTINUITY PLAN: PASS
+ALR EXECVP PATH LOOKUP PLAN: SKIP
+ALR POSIX_SPAWN CHILD PLAN: SKIP
+ALR EXEC CONTINUITY TRAMPOLINE: PASS
+ALR EXEC CONTINUITY CONFIG HANDOFF: PASS
+alr exec continuation kind=execve
+alr exec continuation path lookup=false
+alr exec continuation target guest path=/bin/hello
+alr exec continuation host path diagnostic=/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/bin/hello
+alr exec continuation argv count=7
+alr exec continuation argv0=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr_runtime_trampoline.so
+alr exec continuation env overrides=6
+ALR PACKAGED TRAMPOLINE CONTINUE EXECUTION: PASS
+alr packaged trampoline continue exit=0
+alr packaged trampoline continue path=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr_runtime_trampoline.so
+alr packaged trampoline continue stdout=ALR TRAMPOLINE CONTINUE EXEC: PASS
+ALR TRAMPOLINE CONTINUE CONFIG: PASS
+ALR TRAMPOLINE CONTINUE CHECKSUM: PASS
+ALR TRAMPOLINE CONTINUE KIND: PASS
+alr trampoline continue mode=dry-run
+alr trampoline continue kind=execve
+alr trampoline continue target guest=/bin/hello
+alr trampoline continue argv target=/bin/hello
+alr trampoline continue extra argc=1
+alr trampoline continue rootfs=/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64
+alr packaged trampoline continue stderr=
+
+ALR procfs virtualization plan probe:
+ALR PROCFS VIRTUALIZATION PROBE: android-native-plan
+ALR PROCFS PLAN: PASS
+ALR PROCFS SELF EXE PLAN: PASS
+ALR PROCFS SELF STATUS FAKEROOT PLAN: PASS
+ALR PROCFS MOUNTS PLAN: PASS
+ALR PROCFS HOST LEAK GUARD: PASS
+alr procfs self exe guest view=/bin/hello
+alr procfs self exe host truth=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr_runtime_trampoline.so
+alr procfs self exe requires virtualization=true
+alr procfs self exe interpose paths=/proc/self/exe,/proc/<pid>/exe
+alr procfs self exe interpose syscalls=readlink,readlinkat,openat
+alr procfs self status name=hello
+alr procfs self status uid=10463
+alr procfs self status gid=10463
+alr procfs self status fakeroot=false
+alr procfs mounts entries=6
+alr procfs mounts has guest root=true
+alr procfs mounts has proc=true
+alr procfs mounts host leak tokens=0
+alr procfs mount[0]=alr_rootfs / overlay rw,relatime
+alr procfs mount[1]=proc /proc proc rw,nosuid,nodev,noexec,relatime
+alr procfs mount[2]=sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime
+alr procfs mount[3]=tmpfs /tmp tmpfs rw,nosuid,nodev,relatime
+alr procfs mount[4]=devpts /dev/pts devpts rw,nosuid,noexec,relatime
+alr procfs mount[5]=tmpfs /dev/shm tmpfs rw,nosuid,nodev,relatime
+
+ALR W^X-safe exec strategy probe:
+ALR WX-SAFE EXEC PROBE: android-native-plan
+ALR WX-SAFE EXEC STRATEGY: PASS
+ALR WX-SAFE ENTRYPOINT IS PACKAGED: PASS
+alr wx selinux domain=u:r:untrusted_app_27:s0:c207,c257,c512,c768
+alr wx app-data exec allowed=yes
+ALR WX-SAFE DIRECT ROOTFS EXEC REJECTED: N/A (this domain permits it)
+ALR WX-SAFE FILE-BACKED MMAP EXEC REJECTED: N/A (this domain permits file execute)
+ALR WX-SAFE PROOT BASELINE AVAILABLE: PASS
+alr wx entrypoint=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr_runtime_trampoline.so
+alr wx target rootfs host path diagnostic=/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/bin/hello
+alr wx primary method=direct-rootfs-execve
+alr wx fallback chain=direct-rootfs-execve,anon-mmap-loader,memfd-execveat,proot-baseline
+alr wx method[0]=direct-rootfs-execve device-selinux-check=true leans-on=app_data_file:file execute_no_trans for this domain
+alr wx method[1]=anon-mmap-loader device-selinux-check=true leans-on=execmem for the app domain
+alr wx method[2]=memfd-execveat device-selinux-check=true leans-on=execute on the anonymous memfd/tmpfs label for the app domain
+alr wx method[3]=proot-baseline device-selinux-check=false leans-on=none (ptrace-mediated, no native exec page is created)
+
+ALR PRoot-vs-ALR perf comparison probe:
+ALR PERF PROBE: android-native-measure
+ALR PERF HARNESS: PASS
+ALR PERF ALR PATH XLATE MEASURED: PASS
+ALR PERF SYSCALL ROUNDTRIP MEASURED: PASS
+ALR PERF PROOT PTRACE DEVICE BASELINE: PENDING_DEVICE
+ALR PERF PROOT VS ALR DEVICE COMPARISON: PENDING_DEVICE
+alr perf iterations=100000
+alr perf alr xlate total ns=406596667
+alr perf alr xlate ns/op=4065.967
+alr perf syscall getppid total ns=25718281
+alr perf syscall getppid ns/op=257.183
+alr perf xlate cost in syscall units=15.810
+alr perf interpretation=both PRoot and ALR pay the path-translation cost; ALR's win is avoiding PRoot's per-syscall ptrace stops, so the real delta is PENDING_DEVICE
+alr perf optimization target=reduce ALR path-translation allocations on the hot path
+alr perf note=PRoot ptrace per-syscall overhead is device/kernel specific and must be measured on-device
+
+ALR procfs interpose mechanism probe:
+ALR INTERPOSE PROBE: android-native-mechanism
+ALR INTERPOSE SELF EXE VIRTUALIZED: PASS
+ALR INTERPOSE MOUNTS VIRTUALIZED: PASS
+ALR INTERPOSE SELF EXE NO HOST PROC: PASS
+ALR INTERPOSE MOUNTS NO HOST LEAK: PASS
+alr interpose self exe target=/bin/hello
+alr interpose mounts bytes=291
+--- self exe ---
+ALR INTERPOSE RESOLVE: PASS
+ALR INTERPOSE KIND: proc-self-exe
+ALR INTERPOSE VIRTUALIZED: PASS
+alr interpose guest path=/proc/self/exe
+alr interpose host path=synthetic
+alr interpose synthetic link target=/bin/hello
+--- mounts ---
+ALR INTERPOSE RESOLVE: PASS
+ALR INTERPOSE KIND: proc-mounts
+ALR INTERPOSE VIRTUALIZED: PASS
+alr interpose guest path=/proc/mounts
+alr interpose host path=synthetic
+alr interpose synthetic content bytes=291
+
+ALR memfd W^X-safe native exec probe:
+ALR MEMFD EXEC PROBE: android-native-attempt
+alr memfd guest source=/bin/hello
+alr memfd bytes=537664
+ALR MEMFD CREATE: PASS
+alr memfd flag=MFD_EXEC
+ALR MEMFD EXECVEAT W^X-SAFE EXECUTION: KNOWN_FAIL:selinux-memfd-exec (EACCES; off the product path at targetSdk 28)
+alr memfd child exit=127
+alr memfd child stdout=
+alr memfd child stderr=EXECVEAT_ERRNO=13
+
+ALR ACCEPTANCE SUITE: SKIP  (touch files/run-acceptance to run it)
+
+ALR execution backend (alr) in this app's domain:
+ALR BACKEND PROBE: android-native-attempt
+alr binary=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr.so executable=true
+alr preload installed=true
+alr distro=debian-arm64
+ALR BACKEND AVAILABLE: PASS
+alr version=alr 0.5.0
+alr preload-host=preload (host)  /data/user/0/dev.chanwoo.androlinux/files/usr/share/alr/libalr_preload.so
+ALR ADOPT EXIT: 125
+INSTALL DOWNLOAD:        SKIP  the host app fetched and verified the archive
+INSTALL VERIFY SHA256:   SKIP  verified by the host app before extraction
+INSTALL EXTRACT:         SKIP  extracted by the host app; alr adopted the tree
+INSTALL REPAIR:          PASS
+INSTALL LDSO PRESENT:    PASS  /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/lib/ld-linux-aarch64.so.1
+INSTALL LDSO OPTIONS:    PASS  argv0=yes preload=yes library-path=yes inhibit-cache=yes
+INSTALL BOOT:            FAIL  (none) exit=-2 elapsed_ms=103 (exited 0 but wrote to stderr -- a multicall binary that could not resolve its own name)
+INSTALL BOOT STDOUT:     PASS  stdout="alr"
+INSTALL GLIBC VERSION:   2.39
+ALR GUEST BOOT: FAIL
+alr guest boot stdout= exit=125
+alr guest os=
+alr supervisor=
+ALR GUEST NET: 
+
+ALR direct app-data execve probe (does this SELinux domain allow it?):
+ALR DIRECT APP-DATA EXEC PROBE: android-native-attempt
+alr direct-exec target=/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/bin/hello
+alr direct-exec mode=700 size=537664
+alr direct-exec child_exit=-1 child_signal=31 child_out=(empty)
+alr direct-exec note=SIGSYS -- the program STARTED and then hit a syscall the zygote filter blocks; that is what alr's supervisor exists to rescue
+ALR DIRECT APP-DATA EXECVE: PASS
+alr direct-exec domain-note=verdict is about execve() only; child_exit is the program's own business
+alr direct-exec verdict=app-data execve is PERMITTED in this domain -- the alr native backend can run without a loader
+
+ALR syscall sandbox capability probe:
+ALR SYSCALL SANDBOX PROBE: per-syscall results follow (note: this list contains no blocked syscall, so it cannot detect the zygote filter)
+alr syscall execveat=ALLOWED errno=9
+alr syscall symlinkat=ALLOWED errno=2
+alr syscall linkat=ALLOWED errno=2
+alr syscall mknodat=ALLOWED errno=2
+alr syscall statx=ALLOWED errno=2
+alr syscall clone3=ALLOWED errno=22
+alr syscall unshare=ALLOWED errno=0
+alr syscall blocked count=0
+
+ALR seccomp path-mediation probe (rootfs path rewrite via seccomp-trace):
+ALR SECCOMP PATH-TRAP PROBE: the install/rewrite results follow
+alr sc real_path=/data/user/0/dev.chanwoo.androlinux/files/alr-sc-real.txt
+alr sc decoy_path=/data/user/0/dev.chanwoo.androlinux/files/alr-sc-decoy-DOES-NOT-EXIST.txt
+alr sc rewrite_fits=yes
+alr sc filter_install=OK
+alr sc seccomp_trace_events=1
+alr sc observed_guest_path=/data/user/0/dev.chanwoo.androlinux/files/alr-sc-decoy-DOES-NOT-EXIST.txt
+alr sc trapped_decoy_match=yes
+alr sc path_rewrites=1
+alr sc mem_diag=mem_rw=ok/2 mem_ro=ok/2 rd=255/2 wr=58/2 
+alr sc child_exit=0
+alr sc child_diag=FILTER_OK how=seccomp;OPEN_OK content=ALR_REWRITE_OK;
+alr sc PATH_MEDIATION_VIABLE=yes
+
+ALR Wayland unix-socket transport probe (named AF_UNIX host↔forked guest):
+ALR UNIX SOCKET TRANSPORT PROBE: the bind/connect/accept results follow
+alr us socket_path=/data/user/0/dev.chanwoo.androlinux/files/alr-wl-test.sock
+alr us bind=OK errno=0
+alr us listen=OK
+alr us accept=OK
+alr us byte_exchange=OK
+alr us guest_connect_exit=0
+alr us WAYLAND_TRANSPORT_VIABLE=yes
+
+ALR execmem anon RX native exec probe:
+ALR EXECMEM PROBE: android-native-attempt
+ALR EXECMEM ANON RX EXECUTION: PASS
+alr execmem mprotect rx=ALLOWED
+alr execmem child exit=0
+alr execmem child signal=0
+alr execmem diag=MPROTECT_OK calling;CALL_RET=42
+
+ALR native ELF loader self-test (freestanding mechanism proof):
+ALR NATIVE LOADER SELFTEST: android-native-attempt
+ALR NATIVE LOADER SELFTEST EXEC: PASS
+alr native loader selftest bytes=132
+alr native loader selftest child exit=42 signal=0
+alr native loader mt passed=true
+alr native loader mt threads=1
+alr native loader mt emulated=3 nums=99,99,99
+alr native loader mt stdout=main ok
+
+ALR native ELF loader multi-process (threads+fork) probe:
+ALR NATIVE LOADER PROBE: android-native-attempt
+alr native loader guest=/bin/mt-test
+alr native loader argc=1
+alr native loader pcgate=on interpose=on
+alr native loader gpu accel=off vk_icd=off angle=off
+alr native loader bytes=710032
+ALR NATIVE LOADER PARSE: PASS
+alr native loader elf type=ET_EXEC
+alr native loader entry=0x238a80
+alr native loader phnum=9
+ALR NATIVE LOADER MAP: PASS
+ALR NATIVE LOADER LINK MODE: STATIC
+ALR NATIVE LOADER INTERP MAP: SKIP
+ALR NATIVE LOADER GUEST EXEC: PASS
+alr native loader reached=jumped-to-entry
+alr native loader child exit=0 signal=0
+alr native loader fault signo=0 pc=0x0 addr=0x0 lr=0x0 x0=0x0 x8=0x0 x19=0x0 x20=0x0 x23=0x0 x24=0x0 sp=0x0 syscall=-1
+alr native loader guest threads spawned=1
+alr native loader path-mediation traps=1 rewrites=0 (pcgate=on interpose=on)
+alr exec traps=0 rewrites=0 exec_events=0 clone_events=1 vfork_stripped=0
+alr exec envp_injected=0 ld_preload_set=0
+alr exec reentry=off spliced=0 inproc=off inproc_redirected=0 inproc_skipped=0
+alr CR4 crashpad_blocked=0 argv_sandbox_injected=0
+alr CR4 self_exe_remaps=0 cap=12 cap_hit=no first_type=(none)
+alr native loader seccomp-emulated syscalls=3 nums=99,99,99
+alr sc trace_hist 78:1
+alr sc emul_hist 99:3
+alr sc stime_us=2150849 utime_us=559140 nonvol_ctxt=1014 traps=1 emul=3
+alr native loader diag=STATIC;PROG:IREL=0x0000000000000007 MAPPED;SIGRESET;E@0x0000000000238a80 code=0xd280001dd503201f P@0x0000000000200040 p0=0x0000000400000006 sp@0x00000078edff3710 argc=0x0000000000000001 JUMPING;PFLT_OK;
+alr native loader guest stdout=main ok
+thread ok
+child ok
+
+alr native loader fileio mediated=true
+
+ALR native ELF loader path-mediation real-file-read probe (fileio-test):
+ALR NATIVE LOADER PROBE: android-native-attempt
+alr native loader guest=/bin/fileio-test
+alr native loader argc=1
+alr native loader pcgate=on interpose=on
+alr native loader gpu accel=off vk_icd=off angle=off
+alr native loader bytes=645976
+ALR NATIVE LOADER PARSE: PASS
+alr native loader elf type=ET_EXEC
+alr native loader entry=0x236100
+alr native loader phnum=9
+ALR NATIVE LOADER MAP: PASS
+ALR NATIVE LOADER LINK MODE: STATIC
+ALR NATIVE LOADER INTERP MAP: SKIP
+ALR NATIVE LOADER GUEST EXEC: PASS
+alr native loader reached=jumped-to-entry
+alr native loader child exit=0 signal=0
+alr native loader fault signo=0 pc=0x0 addr=0x0 lr=0x0 x0=0x0 x8=0x0 x19=0x0 x20=0x0 x23=0x0 x24=0x0 sp=0x0 syscall=-1
+alr native loader guest threads spawned=0
+alr native loader path-mediation traps=4 rewrites=2 (pcgate=on interpose=on)
+alr native loader first path rewrite=/etc/alr-probe.txt=>/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/etc/alr-probe.txt
+alr exec traps=0 rewrites=0 exec_events=0 clone_events=0 vfork_stripped=0
+alr exec envp_injected=0 ld_preload_set=0
+alr exec reentry=off spliced=0 inproc=off inproc_redirected=0 inproc_skipped=0
+alr CR4 crashpad_blocked=0 argv_sandbox_injected=0
+alr CR4 self_exe_remaps=0 cap=12 cap_hit=no first_type=(none)
+alr native loader seccomp-emulated syscalls=1 nums=99
+alr sc trace_hist 56:2 79:1 78:1
+alr sc emul_hist 99:1
+alr sc stime_us=2164812 utime_us=559140 nonvol_ctxt=1015 traps=4 emul=1
+alr native loader diag=STATIC;PROG:IREL=0x0000000000000007 MAPPED;SIGRESET;E@0x0000000000236100 code=0xd280001dd503201f P@0x0000000000200040 p0=0x0000000400000006 sp@0x00000078edff3700 argc=0x0000000000000001 JUMPING;PFLT_OK;
+alr native loader guest stdout=fileio: alr-rootfs-ok
+
+dirent: apt
+dirent: nsswitch.conf
+dirent: group
+
+alr native loader dyn passed=true
+
+ALR native ELF loader DYNAMIC (in-process ld.so handoff) probe (dynhello):
+ALR NATIVE LOADER PROBE: android-native-attempt
+alr native loader guest=/bin/dynhello
+alr native loader argc=1
+alr native loader pcgate=on interpose=on
+alr native loader gpu accel=off vk_icd=off angle=off
+alr native loader bytes=6336
+ALR NATIVE LOADER PARSE: PASS
+alr native loader elf type=ET_DYN(static-PIE)
+alr native loader entry=0x10500
+alr native loader phnum=11
+ALR NATIVE LOADER MAP: PASS
+ALR NATIVE LOADER LINK MODE: DYNAMIC(interp-handoff)
+ALR NATIVE LOADER INTERP MAP: PASS
+ALR NATIVE LOADER GUEST EXEC: PASS
+alr native loader reached=jumped-to-entry
+alr native loader child exit=0 signal=0
+alr native loader fault signo=0 pc=0x0 addr=0x0 lr=0x0 x0=0x0 x8=0x0 x19=0x0 x20=0x0 x23=0x0 x24=0x0 sp=0x0 syscall=-1
+alr native loader guest threads spawned=0
+alr native loader path-mediation traps=0 rewrites=0 (pcgate=on interpose=on)
+alr exec traps=0 rewrites=0 exec_events=0 clone_events=0 vfork_stripped=0
+alr exec envp_injected=0 ld_preload_set=0
+alr exec reentry=off spliced=0 inproc=off inproc_redirected=0 inproc_skipped=0
+alr CR4 crashpad_blocked=0 argv_sandbox_injected=0
+alr CR4 self_exe_remaps=0 cap=12 cap_hit=no first_type=(none)
+alr native loader seccomp-emulated syscalls=1 nums=99
+alr sc trace_hist
+alr sc emul_hist 99:1
+alr sc stime_us=2177118 utime_us=559140 nonvol_ctxt=1016 traps=0 emul=1
+alr native loader diag=DYN;INTERP_READ=0x0000000000031cc0 PROG:IREL=0x0000000000000000 INTERP:IREL=0x0000000000000000 MAPPED;SIGRESET;E@0x00000078f2dd6a40 code=0xd280001dd503201f P@0x00000078f2dfe040 p0=0x0000000400000006 sp@0x00000078edff3700 argc=0x0000000000000001 BASE=0x00000078f2dbc000 PROGE=0x00000078f2e0e500 PROGB=0x00000078f2dfe000 INTRE@0x00000078f2dd6a40 JUMPING;XFLT_OK;
+alr native loader guest stdout=alr-dyn-ok
+
+
+ALR real Debian program probe (/usr/bin/env):
+ALR NATIVE LOADER PROBE: android-native-attempt
+alr native loader guest=/usr/bin/env
+alr native loader argc=1
+alr native loader pcgate=on interpose=on
+alr native loader gpu accel=off vk_icd=off angle=off
+alr native loader bytes=68368
+ALR NATIVE LOADER PARSE: PASS
+alr native loader elf type=ET_DYN(static-PIE)
+alr native loader entry=0x3080
+alr native loader phnum=9
+ALR NATIVE LOADER MAP: PASS
+ALR NATIVE LOADER LINK MODE: DYNAMIC(interp-handoff)
+ALR NATIVE LOADER INTERP MAP: PASS
+ALR NATIVE LOADER GUEST EXEC: PASS
+alr native loader reached=jumped-to-entry
+alr native loader child exit=0 signal=0
+alr native loader fault signo=0 pc=0x0 addr=0x0 lr=0x0 x0=0x0 x8=0x0 x19=0x0 x20=0x0 x23=0x0 x24=0x0 sp=0x0 syscall=-1
+alr native loader guest threads spawned=0
+alr native loader path-mediation traps=0 rewrites=0 (pcgate=on interpose=on)
+alr exec traps=0 rewrites=0 exec_events=0 clone_events=0 vfork_stripped=0
+alr exec envp_injected=0 ld_preload_set=0
+alr exec reentry=off spliced=0 inproc=off inproc_redirected=0 inproc_skipped=0
+alr CR4 crashpad_blocked=0 argv_sandbox_injected=0
+alr CR4 self_exe_remaps=0 cap=12 cap_hit=no first_type=(none)
+alr native loader seccomp-emulated syscalls=1 nums=99
+alr sc trace_hist
+alr sc emul_hist 99:1
+alr sc stime_us=2191631 utime_us=559140 nonvol_ctxt=1016 traps=0 emul=1
+alr native loader diag=DYN;INTERP_READ=0x0000000000031cc0 PROG:IREL=0x0000000000000000 INTERP:IREL=0x0000000000000000 MAPPED;SIGRESET;E@0x00000078f2e07a40 code=0xd280001dd503201f P@0x0000007bb80ab040 p0=0x0000000400000006 sp@0x00000078edff3710 argc=0x0000000000000001 BASE=0x00000078f2ded000 PROGE=0x0000007bb80ae080 PROGB=0x0000007bb80ab000 INTRE@0x00000078f2e07a40 JUMPING;XFLT_OK;
+alr native loader guest stdout=GLIBC_TUNABLES=glibc.pthread.rseq=0
+LD_LIBRARY_PATH=/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/lib/aarch64-linux-gnu:/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/lib:/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/usr/lib/aarch64-linux-gnu:/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/usr/lib
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+HOME=/root
+TERM=xterm-256color
+XDG_RUNTIME_DIR=/data/user/0/dev.chanwoo.androlinux/cache/alr-xdg
+WAYLAND_DISPLAY=wayland-0
+DISPLAY=:0
+PULSE_SERVER=unix:/data/user/0/dev.chanwoo.androlinux/cache/alr-xdg/pulse/native
+PULSE_CLIENTCONFIG=/etc/pulse/client.conf
+GDK_BACKEND=wayland
+SDL_VIDEODRIVER=wayland
+QT_QPA_PLATFORM=wayland
+QT_WAYLAND_DISABLE_WINDOWDECORATION=1
+QT_WAYLAND_DISABLE_HW_INTEGRATION=1
+GDK_RENDERING=cairo
+GSETTINGS_BACKEND=memory
+LC_ALL=C.UTF-8
+LANG=C.UTF-8
+XDG_DATA_DIRS=/usr/local/share:/usr/share
+XKB_CONFIG_ROOT=/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/usr/share/X11/xkb
+GDK_PIXBUF_MODULE_FILE=/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders.cache
+GDK_PIXBUF_MODULEDIR=/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders
+XDG_CONFIG_HOME=/root/.config
+XDG_CACHE_HOME=/root/.cache
+FONTCONFIG_PATH=/etc/fonts
+ALR_ROOTFS=/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64
+ALR_GUEST_EXE=/usr/bin/env
+ALR_USB_SOCK=/data/user/0/dev.chanwoo.androlinux/cache/alr-usb/usbd.sock
+LD_PRELOAD=/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/usr/lib/androlinux/libalr_interpose.so
+ALR_PCGATE=1
+
+
+ALR real Debian program probe (/usr/bin/id):
+ALR NATIVE LOADER PROBE: android-native-attempt
+alr native loader guest=/usr/bin/id
+alr native loader argc=1
+alr native loader pcgate=on interpose=on
+alr native loader gpu accel=off vk_icd=off angle=off
+alr native loader bytes=67952
+ALR NATIVE LOADER PARSE: PASS
+alr native loader elf type=ET_DYN(static-PIE)
+alr native loader entry=0x2680
+alr native loader phnum=9
+ALR NATIVE LOADER MAP: PASS
+ALR NATIVE LOADER LINK MODE: DYNAMIC(interp-handoff)
+ALR NATIVE LOADER INTERP MAP: PASS
+ALR NATIVE LOADER GUEST EXEC: PASS
+alr native loader reached=jumped-to-entry
+alr native loader child exit=0 signal=0
+alr native loader fault signo=0 pc=0x0 addr=0x0 lr=0x0 x0=0x0 x8=0x0 x19=0x0 x20=0x0 x23=0x0 x24=0x0 sp=0x0 syscall=-1
+alr native loader guest threads spawned=0
+alr native loader path-mediation traps=0 rewrites=0 (pcgate=on interpose=on)
+alr exec traps=0 rewrites=0 exec_events=0 clone_events=0 vfork_stripped=0
+alr exec envp_injected=0 ld_preload_set=0
+alr exec reentry=off spliced=0 inproc=off inproc_redirected=0 inproc_skipped=0
+alr CR4 crashpad_blocked=0 argv_sandbox_injected=0
+alr CR4 self_exe_remaps=0 cap=12 cap_hit=no first_type=(none)
+alr native loader seccomp-emulated syscalls=1 nums=99
+alr sc trace_hist
+alr sc emul_hist 99:1
+alr sc stime_us=2207017 utime_us=559140 nonvol_ctxt=1016 traps=0 emul=1
+alr native loader diag=DYN;INTERP_READ=0x0000000000031cc0 PROG:IREL=0x0000000000000000 INTERP:IREL=0x0000000000000000 MAPPED;SIGRESET;E@0x00000078f2e07a40 code=0xd280001dd503201f P@0x0000007bb80ab040 p0=0x0000000400000006 sp@0x00000078edff3710 argc=0x0000000000000001 BASE=0x00000078f2ded000 PROGE=0x0000007bb80ad680 PROGB=0x0000007bb80ab000 INTRE@0x00000078f2e07a40 JUMPING;XFLT_OK;
+alr native loader guest stdout=uid=10463 gid=10463 groups=10463,3003,9997,20463,50463
+
+
+ALR real shell command probe (/bin/dash -c 'echo alr-shell-ok'):
+ALR NATIVE LOADER PROBE: android-native-attempt
+alr native loader guest=/bin/dash
+alr native loader argc=3
+alr native loader pcgate=on interpose=on
+alr native loader gpu accel=off vk_icd=off angle=off
+alr native loader bytes=133608
+ALR NATIVE LOADER PARSE: PASS
+alr native loader elf type=ET_DYN(static-PIE)
+alr native loader entry=0x4480
+alr native loader phnum=9
+ALR NATIVE LOADER MAP: PASS
+ALR NATIVE LOADER LINK MODE: DYNAMIC(interp-handoff)
+ALR NATIVE LOADER INTERP MAP: PASS
+ALR NATIVE LOADER GUEST EXEC: PASS
+alr native loader reached=jumped-to-entry
+alr native loader child exit=0 signal=0
+alr native loader fault signo=0 pc=0x0 addr=0x0 lr=0x0 x0=0x0 x8=0x0 x19=0x0 x20=0x0 x23=0x0 x24=0x0 sp=0x0 syscall=-1
+alr native loader guest threads spawned=0
+alr native loader path-mediation traps=0 rewrites=0 (pcgate=on interpose=on)
+alr exec traps=0 rewrites=0 exec_events=0 clone_events=0 vfork_stripped=0
+alr exec envp_injected=0 ld_preload_set=0
+alr exec reentry=off spliced=0 inproc=off inproc_redirected=0 inproc_skipped=0
+alr CR4 crashpad_blocked=0 argv_sandbox_injected=0
+alr CR4 self_exe_remaps=0 cap=12 cap_hit=no first_type=(none)
+alr native loader seccomp-emulated syscalls=1 nums=99
+alr sc trace_hist
+alr sc emul_hist 99:1
+alr sc stime_us=2220734 utime_us=559140 nonvol_ctxt=1019 traps=0 emul=1
+alr native loader diag=DYN;INTERP_READ=0x0000000000031cc0 PROG:IREL=0x0000000000000000 INTERP:IREL=0x0000000000000000 MAPPED;SIGRESET;E@0x00000078f2d91a40 code=0xd280001dd503201f P@0x00000078f2db9040 p0=0x0000000400000006 sp@0x00000078edff36f0 argc=0x0000000000000003 BASE=0x00000078f2d77000 PROGE=0x00000078f2dbd480 PROGB=0x00000078f2db9000 INTRE@0x00000078f2d91a40 JUMPING;XFLT_OK;
+alr native loader guest stdout=alr-shell-ok
+
+
+ALR write-path mediation probe (dash writes+reads /tmp in rootfs):
+ALR NATIVE LOADER PROBE: android-native-attempt
+alr native loader guest=/bin/dash
+alr native loader argc=3
+alr native loader pcgate=on interpose=on
+alr native loader gpu accel=off vk_icd=off angle=off
+alr native loader bytes=133608
+ALR NATIVE LOADER PARSE: PASS
+alr native loader elf type=ET_DYN(static-PIE)
+alr native loader entry=0x4480
+alr native loader phnum=9
+ALR NATIVE LOADER MAP: PASS
+ALR NATIVE LOADER LINK MODE: DYNAMIC(interp-handoff)
+ALR NATIVE LOADER INTERP MAP: PASS
+ALR NATIVE LOADER GUEST EXEC: PASS
+alr native loader reached=jumped-to-entry
+alr native loader child exit=0 signal=0
+alr native loader fault signo=0 pc=0x0 addr=0x0 lr=0x0 x0=0x0 x8=0x0 x19=0x0 x20=0x0 x23=0x0 x24=0x0 sp=0x0 syscall=-1
+alr native loader guest threads spawned=0
+alr native loader path-mediation traps=0 rewrites=0 (pcgate=on interpose=on)
+alr exec traps=0 rewrites=0 exec_events=0 clone_events=0 vfork_stripped=0
+alr exec envp_injected=0 ld_preload_set=0
+alr exec reentry=off spliced=0 inproc=off inproc_redirected=0 inproc_skipped=0
+alr CR4 crashpad_blocked=0 argv_sandbox_injected=0
+alr CR4 self_exe_remaps=0 cap=12 cap_hit=no first_type=(none)
+alr native loader seccomp-emulated syscalls=1 nums=99
+alr sc trace_hist
+alr sc emul_hist 99:1
+alr sc stime_us=2237483 utime_us=559140 nonvol_ctxt=1020 traps=0 emul=1
+alr native loader diag=DYN;INTERP_READ=0x0000000000031cc0 PROG:IREL=0x0000000000000000 INTERP:IREL=0x0000000000000000 MAPPED;SIGRESET;E@0x00000078f2d91a40 code=0xd280001dd503201f P@0x00000078f2db9040 p0=0x0000000400000006 sp@0x00000078edff36c0 argc=0x0000000000000003 BASE=0x00000078f2d77000 PROGE=0x00000078f2dbd480 PROGB=0x00000078f2db9000 INTRE@0x00000078f2d91a40 JUMPING;XFLT_OK;
+alr native loader guest stdout=got:wp-ok
+
+
+ALR in-process image decode probe (gdk-pixbuf PNG):
+ALR NATIVE LOADER PROBE: android-native-attempt
+alr native loader guest=/bin/alr-png-test
+alr native loader argc=1
+alr native loader pcgate=on interpose=on
+alr native loader gpu accel=off vk_icd=off angle=off
+alr native loader bytes=27512
+ALR NATIVE LOADER PARSE: PASS
+alr native loader elf type=ET_DYN(static-PIE)
+alr native loader entry=0x117c0
+alr native loader phnum=10
+ALR NATIVE LOADER MAP: PASS
+ALR NATIVE LOADER LINK MODE: DYNAMIC(interp-handoff)
+ALR NATIVE LOADER INTERP MAP: PASS
+ALR NATIVE LOADER GUEST EXEC: PASS
+alr native loader reached=jumped-to-entry
+alr native loader child exit=0 signal=0
+alr native loader fault signo=0 pc=0x0 addr=0x0 lr=0x0 x0=0x0 x8=0x0 x19=0x0 x20=0x0 x23=0x0 x24=0x0 sp=0x0 syscall=-1
+alr native loader guest threads spawned=0
+alr native loader path-mediation traps=0 rewrites=0 (pcgate=on interpose=on)
+alr exec traps=0 rewrites=0 exec_events=0 clone_events=0 vfork_stripped=0
+alr exec envp_injected=0 ld_preload_set=0
+alr exec reentry=off spliced=0 inproc=off inproc_redirected=0 inproc_skipped=0
+alr CR4 crashpad_blocked=0 argv_sandbox_injected=0
+alr CR4 self_exe_remaps=0 cap=12 cap_hit=no first_type=(none)
+alr native loader seccomp-emulated syscalls=1 nums=99
+alr sc trace_hist
+alr sc emul_hist 99:1
+alr sc stime_us=2255106 utime_us=559140 nonvol_ctxt=1032 traps=0 emul=1
+alr native loader diag=DYN;INTERP_READ=0x0000000000031cc0 PROG:IREL=0x0000000000000000 INTERP:IREL=0x0000000000000000 MAPPED;SIGRESET;E@0x00000078f2e07a40 code=0xd280001dd503201f P@0x0000007bbaa85040 p0=0x0000000400000006 sp@0x00000078edff3700 argc=0x0000000000000001 BASE=0x00000078f2ded000 PROGE=0x0000007bbaa967c0 PROGB=0x0000007bbaa85000 INTRE@0x00000078f2e07a40 JUMPING;XFLT_OK;
+alr native loader guest stdout=alr-png: start (extended diagnostic)
+alr-png: env XDG_DATA_DIRS=/usr/local/share:/usr/share
+alr-png: env GDK_PIXBUF_MODULE_FILE=/data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders.cache
+alr-png: mime.cache present(/usr/share/mime/mime.cache)=YES
+alr-png: glib content-type guess of PNG bytes = (see below)
+alr-png: g_content_type_guess(PNG bytes) ctype=image/png mime=image/png uncertain=0
+alr-png: png decode OK WxH=2x2 nchan=4
+alr-png: jpeg decode OK WxH=2x2 nchan=3
+alr-png: bmp decode FAIL: Unable to load image-loading module: /usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader-bmp.so: /usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader-bmp.so: cannot open shared object file: No such file or directory
+alr-png: gif decode FAIL: Unable to load image-loading module: /usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader-gif.so: /usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader-gif.so: cannot open shared object file: No such file or directory
+alr-png: format png   disabled=no
+alr-png: format jpeg  disabled=no
+alr-png: format bmp   disabled=no
+alr-png: format gif   disabled=no
+alr-png: formats=png,jpeg,ani,bmp,gif,icns,ico,pnm,qtif,tga,xbm,xpm,svg
+alr-png: gdk_pixbuf_init_modules(/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders) = FAIL : Cannot open pixbuf loader module file '/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders/loaders.cache': No such file or directory
+
+This likely means that your installation is broken.
+Try running the command
+  gdk-pixbuf-query-loaders > /usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders/loaders.cache
+to make things work again for the time being.
+alr-png: png-after-init decode OK WxH=2x2 nchan=4
+alr-png: g_module_supported=1
+alr-png: g_module_open(/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader-bmp.so) FAIL: /usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader-bmp.so: cannot open shared object file: No such file or directory
+alr-png: done
+
+
+ALR GIMP 3.0 load probe (gimp-console-3.0 --version):
+ALR NATIVE LOADER PROBE: android-native-attempt
+alr native loader guest=/usr/bin/gimp-console-3.0
+alr native loader argc=2
+alr native loader pcgate=on interpose=on
+alr native loader gpu accel=off vk_icd=off angle=off
+alr native loader bytes=3804864
+ALR NATIVE LOADER PARSE: PASS
+alr native loader elf type=ET_DYN(static-PIE)
+alr native loader entry=0x63c00
+alr native loader phnum=12
+ALR NATIVE LOADER MAP: PASS
+ALR NATIVE LOADER LINK MODE: DYNAMIC(interp-handoff)
+ALR NATIVE LOADER INTERP MAP: PASS
+ALR NATIVE LOADER GUEST EXEC: PASS
+alr native loader reached=jumped-to-entry
+alr native loader child exit=0 signal=0
+alr native loader fault signo=0 pc=0x0 addr=0x0 lr=0x0 x0=0x0 x8=0x0 x19=0x0 x20=0x0 x23=0x0 x24=0x0 sp=0x0 syscall=-1
+alr native loader guest threads spawned=0
+alr native loader path-mediation traps=0 rewrites=0 (pcgate=on interpose=on)
+alr exec traps=0 rewrites=0 exec_events=0 clone_events=0 vfork_stripped=0
+alr exec envp_injected=0 ld_preload_set=0
+alr exec reentry=off spliced=0 inproc=off inproc_redirected=0 inproc_skipped=0
+alr CR4 crashpad_blocked=0 argv_sandbox_injected=0
+alr CR4 self_exe_remaps=0 cap=12 cap_hit=no first_type=(none)
+alr native loader seccomp-emulated syscalls=1 nums=99
+alr sc trace_hist
+alr sc emul_hist 99:1
+alr sc stime_us=2288401 utime_us=559140 nonvol_ctxt=1034 traps=0 emul=1
+alr native loader diag=DYN;INTERP_READ=0x0000000000031cc0 PROG:IREL=0x0000000000000000 INTERP:IREL=0x0000000000000000 MAPPED;SIGRESET;E@0x00000078f2e07a40 code=0xd280001dd503201f P@0x00000078ed646040 p0=0x0000000400000006 sp@0x00000078ebfb36e0 argc=0x0000000000000002 BASE=0x00000078f2ded000 PROGE=0x00000078ed6a9c00 PROGB=0x00000078ed646000 INTRE@0x00000078f2e07a40 JUMPING;XFLT_OK;
+alr native loader guest stdout=GNU Image Manipulation Program version 3.0.2
+
+
+ALR native ELF loader (anon-mmap-loader) probe:
+ALR NATIVE LOADER PROBE: android-native-attempt
+alr native loader guest=/bin/hello
+alr native loader argc=1
+alr native loader pcgate=on interpose=on
+alr native loader gpu accel=off vk_icd=off angle=off
+alr native loader bytes=537664
+ALR NATIVE LOADER PARSE: PASS
+alr native loader elf type=ET_EXEC
+alr native loader entry=0x400680
+alr native loader phnum=6
+ALR NATIVE LOADER MAP: PASS
+ALR NATIVE LOADER LINK MODE: STATIC
+ALR NATIVE LOADER INTERP MAP: SKIP
+ALR NATIVE LOADER GUEST EXEC: PASS
+alr native loader reached=jumped-to-entry
+alr native loader child exit=0 signal=0
+alr native loader fault signo=0 pc=0x0 addr=0x0 lr=0x0 x0=0x0 x8=0x0 x19=0x0 x20=0x0 x23=0x0 x24=0x0 sp=0x0 syscall=-1
+alr native loader guest threads spawned=0
+alr native loader path-mediation traps=1 rewrites=0 (pcgate=on interpose=on)
+alr exec traps=0 rewrites=0 exec_events=0 clone_events=0 vfork_stripped=0
+alr exec envp_injected=0 ld_preload_set=0
+alr exec reentry=off spliced=0 inproc=off inproc_redirected=0 inproc_skipped=0
+alr CR4 crashpad_blocked=0 argv_sandbox_injected=0
+alr CR4 self_exe_remaps=0 cap=12 cap_hit=no first_type=(none)
+alr native loader seccomp-emulated syscalls=1 nums=99
+alr sc trace_hist 78:1
+alr sc emul_hist 99:1
+alr sc stime_us=2124121 utime_us=559140 nonvol_ctxt=1009 traps=1 emul=1
+alr native loader diag=STATIC;PROG:IREL=0x0000000000000005 MAPPED;SIGRESET;E@0x0000000000400680 code=0xd280001dd503201f P@0x0000000000400040 p0=0x0000000500000001 sp@0x00000078edff3710 argc=0x0000000000000001 JUMPING;PFLT_OK;
+alr native loader guest stdout=hello from static arm64 rootfs
+
+
+ALR guest->host GPU boundary cost probe:
+ALR GPU BOUNDARY PROBE: the per-boundary results follow
+alr gpu boundary inproc dispatch ns/op=18
+alr gpu boundary inproc cmds per 60fps frame=925925
+alr gpu boundary socket per-cmd ns/op=45498
+alr gpu boundary socket cmds per 60fps frame=366
+alr gpu boundary shmem-ring ns/op=103
+alr gpu boundary shmem-ring cmds per 60fps frame=161812
+alr gpu boundary note=in-process and shared-ring per-cmd costs gate GPU passthrough feasibility; naive socket-per-cmd does not scale to draw-call-heavy frames
+
+ALR GPU command-marshalling probe (guest GLES stream -> host GPU):
+ALR GPU MARSHALLING PROBE: android-egl-gles
+ALR GPU MARSHALLING DECODE+EXECUTE: PASS
+ALR GPU MARSHALLING HARDWARE RENDER: PASS
+alr gpu marshalling stream bytes=73
+alr gpu marshalling commands decoded=8
+alr gpu marshalling renderer=Adreno (TM) 830
+alr gpu marshalling center pixel=229,77,26
+alr gpu marshalling corner pixel=26,51,178
+alr gpu marshalling gl error=0x0
+alr gpu marshalling software renderer=false
+
+ALR AHardwareBuffer zero-copy display probe (AHB -> EGLImage -> external-OES):
+alr ahb zerocopy probe=ahardwarebuffer-eglimage-external-oes
+alr ahb ext native_client_buffer=yes
+alr ahb ext egl_image_base=yes
+alr ahb ext gl_oes_egl_image_external=yes
+ALR AHB ZEROCOPY IMPORT: PASS
+ALR AHB ZEROCOPY HARDWARE SAMPLE: PASS
+alr ahb buffer=64x64 stride_px=64
+alr ahb center pixel=230,120,20
+alr ahb expected~=230,120,20 (orange)
+alr ahb renderer=Adreno (TM) 830
+alr ahb gl error=0x0
+alr ahb software renderer=false
+
+ALR GPU-native draw probe (shader+VBO+texture+draw decoded on Mali):
+alr gpu draw probe=marshalling-shader-vbo-texture-draw
+ALR GPU DRAW DECODE+EXECUTE: PASS
+ALR GPU DRAW HARDWARE RENDER: PASS
+alr gpu draw ops decoded=32
+alr gpu draw stream bytes=739
+alr gpu draw center pixel=0,220,0 (expect ~0,220,0 textured triangle)
+alr gpu draw corner pixel=26,26,102 (expect ~25,25,102 clear)
+alr gpu draw renderer=Adreno (TM) 830
+alr gpu draw gl error=0x0
+alr gpu draw software renderer=false
+
+ALR GPU-native ring probe (op stream via SPSC command ring -> Mali):
+alr gpu ring probe=spsc-ring-decode-draw
+ALR GPU RING TRANSPORT: PASS
+ALR GPU RING DECODE+EXECUTE: PASS
+ALR GPU RING HARDWARE RENDER: PASS
+alr gpu ring bytes pushed=739 drained=739
+alr gpu ring sync reply_seq>=req=no
+alr gpu ring ops decoded=32
+alr gpu ring center pixel=0,220,0
+alr gpu ring renderer=Adreno (TM) 830
+alr gpu ring software renderer=false
+
+ALR GPU-native AHB render-target probe (guest draw -> AHB-FBO -> external-OES sample):
+alr gpu fbo probe=ahb-fbo-rendertarget-then-external-oes-sample
+ALR GPU FBO RENDERTARGET: PASS
+ALR GPU AHB RENDER (guest draw landed in AHB, direct read): PASS
+alr gpu fbo external-oes resample: info-only (v114 proves external-OES display separately)
+alr gpu fbo ops decoded=32
+alr gpu fbo AHB-direct pixel=0,220,0 corner=26,26,102 (expect center ~0,220,0 triangle, corner ~25,25,102 clear)
+alr gpu fbo external-oes pixel=0,0,0
+alr gpu fbo renderer=Adreno (TM) 830
+alr gpu fbo render err=0x0 sample err=0x0
+alr gpu fbo software renderer=false
+
+Android host GPU probe:
+host gpu probe=android-egl-gles-pbuffer
+egl initialize=ok version=1.5
+egl choose config=ok count=1
+egl pbuffer surface=ok size=16x16
+egl context=ok api=gles2
+egl make current=ok
+gl vendor=Qualcomm
+gl renderer=Adreno (TM) 830
+gl version=OpenGL ES 3.2 V@0800.64.7 (GIT@f61dec9117, I68b0a64d7e, 1774510019) (Date:03/26/26)
+gl shading language=OpenGL ES GLSL ES 3.20
+gl clear error=0x0
+host gpu software renderer=false
+host gpu hardware candidate=true
+
+Android host Vulkan probe:
+host vulkan probe=android-vulkan-instance-device
+vulkan instance extensions count=14
+host vulkan surface extension=true
+host vulkan android surface extension=true
+vulkan create instance=ok
+vulkan physical devices count=1
+host vulkan device=Adreno (TM) 830
+host vulkan device type=integrated-gpu
+host vulkan api version=1.3.284
+host vulkan driver version=2150760512
+host vulkan vendor id=0x5143
+host vulkan device id=0x44050001
+host vulkan software renderer=false
+host vulkan hardware candidate=true
+
+proot backend candidate: packaged native executable
+proot actual env:
+
+diagnostic note: libproot-loader.so is a PRoot loader executable, not a dlopen-able shared library; libtalloc.so is a dependency, not a standalone command. Direct crash probes are skipped in the default success report.
+
+proot hello quiet command=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr.so
+proot hello quiet exit=0
+proot hello quiet stdout=hello from static arm64 rootfs
+proot hello quiet stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+alr: NOTE /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/bin/hello is statically linked -- path virtualization does NOT
+     apply to it.  It runs, but its paths resolve against Android,
+     not the guest rootfs.
+     reason=unhooked-static-binary  (docs/adr/0008-static-guest-binaries-non-goal.md)
+
+proot script command=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr.so
+proot script exit=0
+proot script stdout=hello from shell script rootfs
+proot script stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+
+proot shell -c command=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr.so
+proot shell -c exit=1
+proot shell -c stdout=shell-c ok
+proot shell -c stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+alr: NOTE /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/bin/sh is statically linked -- path virtualization does NOT
+     apply to it.  It runs, but its paths resolve against Android,
+     not the guest rootfs.
+     reason=unhooked-static-binary  (docs/adr/0008-static-guest-binaries-non-goal.md)
+/bin/sh: /bin/hello: not found
+cat: /etc/os-release: No such file or directory
+
+proot glibc command=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr.so
+proot glibc exit=0
+proot glibc stdout=hello from dynamic glibc rootfs
+glibc version=2.39
+proot glibc stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+
+proot dash command=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr.so
+proot dash exit=0
+proot dash stdout=dash-c ok
+proot dash stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+/bin/dash: 1: /usr/bin/env: not found
+
+proot id command=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr.so
+proot id exit=0
+proot id stdout=uid=10463 gid=10463 groups=10463,3003,9997,20463,50463
+proot id stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+
+proot dpkg --version command=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr.so
+proot dpkg --version exit=0
+proot dpkg --version stdout=Debian 'dpkg' package management program version 1.22.6 (arm64).
+This is free software; see the GNU General Public License version 2 or
+later for copying conditions. There is NO warranty.
+proot dpkg --version stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+
+proot dpkg --print-architecture command=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr.so
+proot dpkg --print-architecture exit=0
+proot dpkg --print-architecture stdout=arm64
+proot dpkg --print-architecture stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+
+proot dpkg-query --version command=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr.so
+proot dpkg-query --version exit=0
+proot dpkg-query --version stdout=Debian dpkg-query package management program query tool version 1.22.6 (arm64).
+This is free software; see the GNU General Public License version 2 or
+later for copying conditions. There is NO warranty.
+proot dpkg-query --version stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+
+proot dpkg-split --version command=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr.so
+proot dpkg-split --version exit=0
+proot dpkg-split --version stdout=Debian 'dpkg-split' package split/join tool; version 1.22.6 (arm64).
+This is free software; see the GNU General Public License version 2 or
+later for copying conditions. There is NO warranty.
+proot dpkg-split --version stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+
+proot apt --version command=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr.so
+proot apt --version exit=100
+proot apt --version stdout=apt 2.8.3 (arm64)
+proot apt --version stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+[1;33mW: [0mUnable to read /etc/apt/apt.conf.d/ - DirectoryExists (2: No such file or directory)[0m
+[1;31mE: [0mUnable to determine a suitable packaging system type[0m
+
+proot apt-get --version command=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr.so
+proot apt-get --version exit=100
+proot apt-get --version stdout=apt 2.8.3 (arm64)
+Supported modules:
+ Ver: Standard .deb
+ Pkg:  Debian APT solver interface (Priority -1000)
+ Pkg:  Debian APT planner interface (Priority -1000)
+ Pkg:  Debian dpkg interface (Priority 0)
+ S.L: 'deb' Debian binary tree
+ S.L: 'deb-src' Debian source tree
+ Idx: EDSP scenario file
+ Idx: EIPP scenario file
+ Idx: Debian Source Index
+ Idx: Debian Package Index
+ Idx: Debian Translation Index
+ Idx: Debian dpkg status file
+ Idx: Debian deb file
+ Idx: Debian dsc file
+ Idx: Debian control file
+proot apt-get --version stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+W: Unable to read /etc/apt/apt.conf.d/ - DirectoryExists (2: No such file or directory)
+E: Unable to determine a suitable packaging system type
+
+proot apt-cache --version command=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr.so
+proot apt-cache --version exit=100
+proot apt-cache --version stdout=apt 2.8.3 (arm64)
+proot apt-cache --version stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+W: Unable to read /etc/apt/apt.conf.d/ - DirectoryExists (2: No such file or directory)
+E: Unable to determine a suitable packaging system type
+
+proot apt-config --version command=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr.so
+proot apt-config --version exit=100
+proot apt-config --version stdout=apt 2.8.3 (arm64)
+proot apt-config --version stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+W: Unable to read /etc/apt/apt.conf.d/ - DirectoryExists (2: No such file or directory)
+E: Unable to determine a suitable packaging system type
+
+proot dpkg -i local deb command=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr.so
+proot dpkg -i local deb exit=2
+proot dpkg -i local deb stdout=
+proot dpkg -i local deb stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+dpkg: error: requested operation requires superuser privilege
+
+proot installed package smoke command=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr.so
+proot installed package smoke exit=125
+proot installed package smoke stdout=
+proot installed package smoke stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+alr: command not found in the guest
+  reason=boot-enoent
+
+proot guest gpu client command=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr.so
+proot guest gpu client exit=0
+proot guest gpu client stdout=alr guest gpu client ok
+ALR_GPU_BRIDGE_PROTOCOL clear-color-v2
+ALR_GPU_FRAME_COUNT 3
+ALR_GPU_CLEAR 0.78 0.12 0.95 guest-frame-0001
+ALR_GPU_CLEAR 0.12 0.78 0.28 guest-frame-0002
+ALR_GPU_CLEAR 0.08 0.18 0.92 guest-frame-0003
+ALR_GPU_IPC_CLIENT skipped reason=no-port
+proot guest gpu client stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+alr: NOTE /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/usr/bin/alr-gpu-client is statically linked -- path virtualization does NOT
+     apply to it.  It runs, but its paths resolve against Android,
+     not the guest rootfs.
+     reason=unhooked-static-binary  (docs/adr/0008-static-guest-binaries-non-goal.md)
+
+proot guest gpu ipc client command=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr.so
+proot guest gpu ipc client exit=0
+proot guest gpu ipc client stdout=alr guest gpu client ok
+ALR_GPU_BRIDGE_PROTOCOL clear-color-v2
+ALR_GPU_FRAME_COUNT 3
+ALR_GPU_CLEAR 0.78 0.12 0.95 guest-frame-0001
+ALR_GPU_CLEAR 0.12 0.78 0.28 guest-frame-0002
+ALR_GPU_CLEAR 0.08 0.18 0.92 guest-frame-0003
+ALR_GPU_IPC_CLIENT ok sent=3 transport=tcp-loopback
+proot guest gpu ipc client stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+alr: NOTE /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/usr/bin/alr-gpu-client is statically linked -- path virtualization does NOT
+     apply to it.  It runs, but its paths resolve against Android,
+     not the guest rootfs.
+     reason=unhooked-static-binary  (docs/adr/0008-static-guest-binaries-non-goal.md)
+
+proot guest gles shim smoke command=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr.so
+proot guest gles shim smoke exit=1
+proot guest gles shim smoke stdout=ALR_GLES_SHIM_LOAD fail /usr/lib/androlinux/libalr_gles_shim.so: cannot open shared object file: No such file or directory
+proot guest gles shim smoke stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+
+proot guest wayland gui client command=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr.so
+proot guest wayland gui client exit=0
+proot guest wayland gui client stdout=alr-wayland-gpu-client ok
+ALR_GUI_PROTOCOL WAYLAND compositor-bridge-v1
+ALR_GUI_FRAME_COUNT 4
+ALR_GUI_FRAME WAYLAND seq=1 0.90 0.18 0.22 WAYLAND-window-0001
+ALR_GPU_CLEAR 0.90 0.18 0.22 WAYLAND-window-0001
+ALR_GUI_FRAME WAYLAND seq=2 0.12 0.72 0.36 WAYLAND-window-0002
+ALR_GPU_CLEAR 0.12 0.72 0.36 WAYLAND-window-0002
+ALR_GUI_FRAME WAYLAND seq=3 0.16 0.30 0.92 WAYLAND-window-0003
+ALR_GPU_CLEAR 0.16 0.30 0.92 WAYLAND-window-0003
+ALR_GUI_FRAME WAYLAND seq=4 0.94 0.72 0.16 WAYLAND-window-0004
+ALR_GPU_CLEAR 0.94 0.72 0.16 WAYLAND-window-0004
+ALR_GUI_IPC_CLIENT skipped reason=no-port
+proot guest wayland gui client stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+alr: NOTE /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/usr/bin/alr-wayland-gpu-client is statically linked -- path virtualization does NOT
+     apply to it.  It runs, but its paths resolve against Android,
+     not the guest rootfs.
+     reason=unhooked-static-binary  (docs/adr/0008-static-guest-binaries-non-goal.md)
+
+proot guest x11 gui client command=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr.so
+proot guest x11 gui client exit=0
+proot guest x11 gui client stdout=alr-x11-gpu-client ok
+ALR_GUI_PROTOCOL X11 compositor-bridge-v1
+ALR_GUI_FRAME_COUNT 4
+ALR_GUI_FRAME X11 seq=1 0.90 0.18 0.22 X11-window-0001
+ALR_GPU_CLEAR 0.90 0.18 0.22 X11-window-0001
+ALR_GUI_FRAME X11 seq=2 0.12 0.72 0.36 X11-window-0002
+ALR_GPU_CLEAR 0.12 0.72 0.36 X11-window-0002
+ALR_GUI_FRAME X11 seq=3 0.16 0.30 0.92 X11-window-0003
+ALR_GPU_CLEAR 0.16 0.30 0.92 X11-window-0003
+ALR_GUI_FRAME X11 seq=4 0.94 0.72 0.16 X11-window-0004
+ALR_GPU_CLEAR 0.94 0.72 0.16 X11-window-0004
+ALR_GUI_IPC_CLIENT skipped reason=no-port
+proot guest x11 gui client stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+alr: NOTE /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/usr/bin/alr-x11-gpu-client is statically linked -- path virtualization does NOT
+     apply to it.  It runs, but its paths resolve against Android,
+     not the guest rootfs.
+     reason=unhooked-static-binary  (docs/adr/0008-static-guest-binaries-non-goal.md)
+
+proot guest wayland gui ipc client command=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr.so
+proot guest wayland gui ipc client exit=0
+proot guest wayland gui ipc client stdout=alr-wayland-gpu-client ok
+ALR_GUI_PROTOCOL WAYLAND compositor-bridge-v1
+ALR_GUI_FRAME_COUNT 4
+ALR_GUI_FRAME WAYLAND seq=1 0.90 0.18 0.22 WAYLAND-window-0001
+ALR_GPU_CLEAR 0.90 0.18 0.22 WAYLAND-window-0001
+ALR_GUI_FRAME WAYLAND seq=2 0.12 0.72 0.36 WAYLAND-window-0002
+ALR_GPU_CLEAR 0.12 0.72 0.36 WAYLAND-window-0002
+ALR_GUI_FRAME WAYLAND seq=3 0.16 0.30 0.92 WAYLAND-window-0003
+ALR_GPU_CLEAR 0.16 0.30 0.92 WAYLAND-window-0003
+ALR_GUI_FRAME WAYLAND seq=4 0.94 0.72 0.16 WAYLAND-window-0004
+ALR_GPU_CLEAR 0.94 0.72 0.16 WAYLAND-window-0004
+ALR_GUI_IPC_ACK ALR_GUI_IPC_ACK protocol=WAYLAND received=4 expected=4 lossless=true
+proot guest wayland gui ipc client stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+alr: NOTE /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/usr/bin/alr-wayland-gpu-client is statically linked -- path virtualization does NOT
+     apply to it.  It runs, but its paths resolve against Android,
+     not the guest rootfs.
+     reason=unhooked-static-binary  (docs/adr/0008-static-guest-binaries-non-goal.md)
+
+proot guest x11 gui ipc client command=/data/app/~~Hf4wq655_SKdofFkpRXUhg==/dev.chanwoo.androlinux-bsUyvg2a0A7LiiH5a66MEA==/lib/arm64/libalr.so
+proot guest x11 gui ipc client exit=0
+proot guest x11 gui ipc client stdout=alr-x11-gpu-client ok
+ALR_GUI_PROTOCOL X11 compositor-bridge-v1
+ALR_GUI_FRAME_COUNT 4
+ALR_GUI_FRAME X11 seq=1 0.90 0.18 0.22 X11-window-0001
+ALR_GPU_CLEAR 0.90 0.18 0.22 X11-window-0001
+ALR_GUI_FRAME X11 seq=2 0.12 0.72 0.36 X11-window-0002
+ALR_GPU_CLEAR 0.12 0.72 0.36 X11-window-0002
+ALR_GUI_FRAME X11 seq=3 0.16 0.30 0.92 X11-window-0003
+ALR_GPU_CLEAR 0.16 0.30 0.92 X11-window-0003
+ALR_GUI_FRAME X11 seq=4 0.94 0.72 0.16 X11-window-0004
+ALR_GPU_CLEAR 0.94 0.72 0.16 X11-window-0004
+ALR_GUI_IPC_ACK ALR_GUI_IPC_ACK protocol=X11 received=4 expected=4 lossless=true
+proot guest x11 gui ipc client stderr=alr: WARNING the guest preload is MISSING from this rootfs.
+     reason=preload-missing-in-rootfs
+     Nothing is path-virtualized: the guest sees the ANDROID
+     filesystem, not /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64.
+     Fix:  alr update-components
+alr: NOTE /data/user/0/dev.chanwoo.androlinux/files/rootfs/debian-arm64/usr/bin/alr-x11-gpu-client is statically linked -- path virtualization does NOT
+     apply to it.  It runs, but its paths resolve against Android,
+     not the guest rootfs.
+     reason=unhooked-static-binary  (docs/adr/0008-static-guest-binaries-non-goal.md)
+
+proot hello verbose on failure skipped=quiet rootfs execution passed

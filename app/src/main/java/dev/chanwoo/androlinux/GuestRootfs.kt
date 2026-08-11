@@ -41,6 +41,46 @@ object GuestRootfs {
         return null
     }
 
+    /**
+     * Provision the target release when no guest tree exists yet.
+     *
+     * A fresh device has none: the app bundles a PoC rootfs, and the Ubuntu
+     * trees were, until now, put there out of band. That made "install an app"
+     * work only on a machine somebody had already prepared by hand, which is
+     * not a product. alr can fetch and hash-verify an ubuntu-base image itself,
+     * so the app just has to ask.
+     *
+     * Blocking and slow (a base image plus its unpack); callers run it off the
+     * main thread. Returns the picked tree, or null if provisioning failed --
+     * the caller then falls back to whatever it had.
+     */
+    fun ensureProvisioned(
+        alr: dev.chanwoo.androlinux.AlrRuntime,
+        filesDir: File,
+        onStatus: (String) -> Unit = {},
+    ): Pair<File, String>? {
+        pick(filesDir)?.let { return it }
+        val target = PREFERENCE.first()
+        onStatus("provisioning $target")
+        val r = alr.installDistro(target)
+        // The whole transcript, not a tail: provisioning is a long chain
+        // (discover, verify, untar, hardlink repair, relativize, boot check)
+        // and the line that explains a failure is rarely the last one.
+        runCatching {
+            File(filesDir, "install-$target.txt")
+                .writeText("--- stdout ---\n${r.stdout}\n--- stderr ---\n${r.stderr}")
+        }
+        if (!r.ok) {
+            onStatus(
+                "provisioning $target failed (${r.exitCode}): " +
+                    (r.stderr + r.stdout).lineSequence()
+                        .filter { it.isNotBlank() }.toList().takeLast(24).joinToString("\n  "),
+            )
+            return null
+        }
+        return pick(filesDir)
+    }
+
     /** For the settings screen: the release actually running, not a constant. */
     fun describe(filesDir: File): String {
         val picked = pick(filesDir) ?: return "bundled tiny rootfs · arm64"

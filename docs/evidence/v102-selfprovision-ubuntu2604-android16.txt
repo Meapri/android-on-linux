@@ -1,0 +1,144 @@
+--- stdout ---
+Adding 'local diversion of /usr/sbin/ldconfig to /usr/sbin/ldconfig.distrib'
+alr: resolving the current ubuntu-base image for 26.04
+alr: https://cdimage.ubuntu.com/ubuntu-base/releases/26.04/release/ubuntu-base-26.04-base-arm64.tar.gz
+alr: sha256 ok
+alr: extracting into /data/user/0/dev.chanwoo.androlinux/files/rootfs/ubuntu-26.04.part
+alr: hardlink members: 0 linked, 115 copied, 0 failed
+alr: absolute symlinks: 20 relativized, 0 failed
+alr: repointed 104 coreutils tool(s) at their GNU binaries
+alr: preload installed from /data/user/0/dev.chanwoo.androlinux/files/usr/share/alr/libalr_preload.so
+alr: installed /data/user/0/dev.chanwoo.androlinux/files/rootfs/ubuntu-26.04
+
+INSTALL DOWNLOAD:        PASS  cache hit
+INSTALL VERIFY SHA256:   PASS
+INSTALL EXTRACT:         PASS  files=6564 skipped_special=0 setuid_masked=0
+INSTALL REPAIR:          PASS
+INSTALL LDSO PRESENT:    PASS  /data/user/0/dev.chanwoo.androlinux/files/rootfs/ubuntu-26.04/lib/ld-linux-aarch64.so.1
+INSTALL LDSO OPTIONS:    PASS  argv0=yes preload=yes library-path=yes inhibit-cache=yes
+INSTALL BOOT:            PASS  /bin/true exit=0 elapsed_ms=36
+INSTALL BOOT STDOUT:     PASS  stdout="alr"
+INSTALL GLIBC VERSION:   2.43
+
+--- stderr ---
+alr: this tar does not take --no-overwrite-dir; skipping it
+alr: this tar does not take --warning=no-unknown-keyword; skipping it
+tar: can't link 'usr/bin/perl5.40.1' -> 'usr/bin/perl': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/[' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/arch' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/b2sum' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/base32' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/base64' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/basename' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/basenc' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/cat' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/chcon' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/chgrp' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/chmod' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/chown' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/chroot' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/cksum' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/comm' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/cp' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/csplit' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/cut' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/date' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/dd' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/df' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/dir' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/dircolors' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/dirname' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/du' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/echo' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/env' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/expand' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/expr' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/factor' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/false' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/fmt' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/fold' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/groups' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/hashsum' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/head' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/hostid' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/id' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/install' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/join' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/link' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/ln' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/logname' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/ls' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/md5sum' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/mkdir' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/mkfifo' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/mknod' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/mktemp' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/mv' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/nice' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/nl' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/nohup' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/nproc' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/numfmt' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/od' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/paste' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/pathchk' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/pinky' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/pr' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/printenv' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/printf' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/ptx' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/pwd' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/readlink' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/realpath' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/relpath' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/rm' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/rmdir' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/runcon' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/seq' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/sha1sum' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/sha224sum' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/sha256sum' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/sha3-224sum' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/sha3-256sum' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/sha3-384sum' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/sha3-512sum' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/sha384sum' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/sha3sum' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/sha512sum' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/shake128sum' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/shake256sum' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/shred' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/shuf' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/sleep' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/sort' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/split' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/stat' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/stdbuf' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/stty' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/sum' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/sync' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/tac' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/tail' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/tee' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/test' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/timeout' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/touch' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/tr' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/true' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/truncate' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/tsort' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/tty' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/uname' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/unexpand' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/uniq' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/unlink' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/users' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/vdir' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/wc' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/who' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/whoami' -> 'usr/bin/coreutils': Permission denied
+tar: can't link 'usr/lib/cargo/bin/coreutils/yes' -> 'usr/bin/coreutils': Permission denied
+tar: had errors
+alr: tar exited 1 (continuing; some members are expected to be skipped)
+alr: uutils coreutils detected; repointing at the GNU binaries already in this image
+dpkg-divert: warning: diverting file '/usr/sbin/ldconfig' from an Essential package with rename is dangerous, use --no-rename

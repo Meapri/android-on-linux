@@ -522,7 +522,19 @@ static int fix_hardlinks(const char *tarball, const char *root,
          * from a second decompression pass. */
         if (line[0] == 'c' || line[0] == 'b' || line[0] == 'p') special++;
 
-        if (!sep || line[0] != 'h') continue;    /* 'h' = hardlink member */
+        /* A hardlink member, in either listing dialect.
+         *
+         * GNU tar marks one with 'h' in the mode column; toybox prints the
+         * ordinary file mode and only appends " link to <target>". Requiring
+         * 'h' therefore matched nothing at all on Android, so every hardlink
+         * in the image was silently left out -- and since Ubuntu 26.04's
+         * /usr/bin/env is a symlink INTO the uutils hardlink farm, install
+         * ended at "rootfs is missing usr/bin/env" and blamed the tarball.
+         *
+         * " link to " is the discriminator; a symlink line uses " -> ". The
+         * mode check stays as a cheap guard against a filename that happens to
+         * contain the phrase. */
+        if (!sep || (line[0] != 'h' && line[0] != '-')) continue;
         *sep = '\0';
         /* the member name is the last field before " link to " */
         name = sep;
@@ -1344,7 +1356,10 @@ static void install_libdl_stub(const char *R)
  *
  * Said once, at provisioning, because the alternative is the user discovering
  * it when `ls` fails with a message about a loader they never invoked. */
-static void warn_uutils_coreutils(const char *R)
+static int gnu_coreutils_repoint(const char *R);
+
+/* Detect a uutils coreutils tree. With `repair`, fix it; without, explain it. */
+static void warn_uutils_coreutils(const char *R, int repair)
 {
     char p[ALR_PBUF];
     struct stat st;
@@ -1355,6 +1370,19 @@ static void warn_uutils_coreutils(const char *R)
     snprintf(p, sizeof p, "%s/usr/lib/cargo/bin/coreutils", R);
     if (stat(p, &st) != 0 || !S_ISDIR(st.st_mode)) return;
 
+    if (repair) {
+        /* adopt REPAIRS rather than reports. Its job is to take an extracted
+         * tree and make it bootable, and a tree whose entire coreutils answers
+         *   coreutils: unknown program 'ld-linux-aarch64.so'
+         * is not bootable -- `alr adopt`'s own boot check fails on it. The
+         * repair needs no network: Ubuntu's coreutils-from-gnu package is
+         * nothing but symlinks, so the GNU binaries are already in the image
+         * under gnu* and this only repoints /usr/bin at them. */
+        fprintf(stderr, "alr: uutils coreutils detected; repointing at the "
+                        "GNU binaries already in this image\n");
+        gnu_coreutils_repoint(R);
+        return;
+    }
     fprintf(stderr,
         "alr: NOTE this rootfs uses uutils coreutils (Rust), not GNU.\n"
         "     ls, cat, echo, cp and the rest are ONE multicall binary that\n"
@@ -1832,6 +1860,36 @@ static void die_staged(const char *part, const char *reason, const char *msg)
     die(reason, msg);
 }
 
+/* Does the tar on THIS host accept `opt`?
+ *
+ * alr's extract argv was written for GNU tar, which is what Termux has. Android
+ * has toybox, and toybox 0.8.12 takes --no-same-owner and --no-same-permissions
+ * but not --no-overwrite-dir or --warning=. It rejects the whole command on the
+ * first unknown option, so ONE unsupported flag means nothing is extracted at
+ * all -- which is what happened: `alr install ubuntu-26.04` on Android 16
+ * downloaded and hash-verified the image, then reported
+ *     tar: Unknown option 'no-overwrite-dir'
+ *     alr: rootfs is missing lib/ld-linux-aarch64.so.1
+ * and blamed the tarball for an empty directory.
+ *
+ * Probed rather than keyed off a version or a platform #ifdef: the answer is a
+ * property of the tar that is actually on PATH, and vendors ship their own.
+ * The probe reads a zero-byte file, so it does no work beyond parsing argv. */
+static int tar_has_opt(const char *opt)
+{
+    char cmd[256], line[256];
+    FILE *fp;
+    int unknown = 0;
+
+    snprintf(cmd, sizeof cmd, "tar %s -tf /dev/null 2>&1", opt);
+    if (!(fp = popen(cmd, "r"))) return 0;
+    while (fgets(line, sizeof line, fp))
+        if (strstr(line, "nknown option") || strstr(line, "nrecognized option"))
+            unknown = 1;
+    pclose(fp);
+    return !unknown;
+}
+
 static int cmd_install(const char *distro, const char *url_override)
 {
     char R[ALR_PBUF], part[ALR_PBUF], tarball[ALR_PBUF], cache[ALR_PBUF];
@@ -1891,26 +1949,27 @@ static int cmd_install(const char *distro, const char *url_override)
             die("unsupported-distro",
                 "no discovery path for this distro yet; pass --url "
                 "(docs/05-provisioning-spec.md §1.1)");
-        /* v1 targets 24.04 only (docs/00-product.md §2).  26.04 installs and
-         * boots, but its coreutils is the uutils multicall binary, which
-         * resolves its own name in a way a correct argv[0] does not satisfy
-         * under an explicit loader (ADR 0002) -- every coreutils tool is
-         * unusable there.  Say so at install time rather than letting the
-         * rootfs look fine until the first `ls`. */
-        if (strcmp(distro, "ubuntu-24.04") != 0)
-            fprintf(stderr,
-                "alr: WARNING %s is not a v1 target.\n"
-                "     Ubuntu 26.04 replaced GNU coreutils with uutils, a Rust\n"
-                "     multicall binary that issues raw syscalls inline instead of\n"
-                "     calling libc.  LD_PRELOAD cannot see those, so ls/cat/echo\n"
-                "     and the rest of coreutils CANNOT work here -- this is the\n"
-                "     same limit documented for Go binaries, not a bug to fix.\n"
-                "     Everything else (bash, apt, dpkg, grep, sed, awk, tar) does\n"
-                "     work.  See docs/RISKS.md.\n", distro);
+        /* Any ubuntu-<release> is discoverable; the release is a path
+         * component on cdimage and SHA256SUMS is fetched alongside it.
+         *
+         * This used to warn that anything but 24.04 was unusable, because
+         * 26.04 replaced GNU coreutils with the uutils multicall binary, which
+         * resolves its own identity by a raw syscall no LD_PRELOAD can see.
+         * That is still true of uutils -- and it is no longer the whole story:
+         * the 26.04 image also carries the GNU binaries as gnu* (104 of them),
+         * and `use-gnu-coreutils` repoints /usr/bin at those. adopt runs it
+         * when it finds a uutils tree, so the warning described a state the
+         * installer no longer leaves behind. */
         printf("alr: resolving the current ubuntu-base image for %s\n", distro + 7);
         if (discover_ubuntu(distro + 7, durl, sizeof durl, dsha, sizeof dsha) != 0) {
             /* Offline / air-gapped fallback.  Say plainly that the download is
              * unverified rather than implying the pin is as good as a hash. */
+            /* The pinned name is a 24.04 image, so the fallback only makes
+             * sense for 24.04; for any other release an unverified download of
+             * the WRONG release is worse than failing. */
+            if (strcmp(distro, "ubuntu-24.04") != 0)
+                die("discovery-failed",
+                    "could not reach SHA256SUMS for this release; pass --url");
             snprintf(durl, sizeof durl, "%s/24.04/release/%s",
                      cfg()->has_mirror ? cfg()->mirror : ALR_UBUNTU_CDIMAGE,
                      ALR_UBUNTU_PIN);
@@ -1963,10 +2022,26 @@ static int cmd_install(const char *distro, const char *url_override)
      *   "'sh' not found in PATH or not executable"
      * for files that plainly exist and are executable by their owner.
      * We set umask 022 around the extraction instead (see below). */
-    ex[6]  = (char *)"--no-overwrite-dir";
-    ex[7]  = (char *)"--exclude=dev/*";
-    ex[8]  = (char *)"--warning=no-unknown-keyword";
-    ex[9]  = NULL;
+    {   /* The optional ones, in the order they were written, each included
+         * only if this tar takes it.
+         *
+         * Both are safe to lose here. --no-overwrite-dir protects the metadata
+         * of directories that already exist, and we extract into a FRESH .part
+         * directory; --warning= only silences a diagnostic. --exclude and
+         * --no-same-owner are not optional and are not in this list: without
+         * them the extract would try to create device nodes and chown to root,
+         * neither of which an app may do. */
+        static const char *const maybe[] = {
+            "--no-overwrite-dir", "--warning=no-unknown-keyword", NULL
+        };
+        int n = 6, i;
+        ex[n++] = (char *)"--exclude=dev/*";
+        for (i = 0; maybe[i]; i++)
+            if (tar_has_opt(maybe[i])) ex[n++] = (char *)maybe[i];
+            else fprintf(stderr, "alr: this tar does not take %s; skipping it\n",
+                         maybe[i]);
+        ex[n] = NULL;
+    }
     {
         mode_t old = umask(022);
         rc = run_cmd(ex);
@@ -2007,7 +2082,7 @@ static int cmd_install(const char *distro, const char *url_override)
 
     repair(part);
     rep.repaired = access_ok_all(part);
-    warn_uutils_coreutils(part);
+    warn_uutils_coreutils(part, 1);
     /* NOT ignorable.  This used to discard the return value, so a rootfs with
      * NO path virtualization was reported as a successful install: the warning
      * scrolled past, cmd_install returned 0, and `alr run` then booted it
@@ -2350,7 +2425,7 @@ static int cmd_adopt(const char *distro)
      * that fails verify_rootfs (its /usr/bin/env is a link into the multicall
      * tree), and a bare "missing usr/bin/env" tells the user nothing about
      * why. */
-    warn_uutils_coreutils(R);
+    warn_uutils_coreutils(R, 1);
     install_hostbin(distro, R);
 
     if (install_preload(R) != 0)
@@ -2415,16 +2490,22 @@ static int cmd_adopt(const char *distro)
  * this needs no download, no apt and no network: it repoints the symlinks that
  * are already there at the binaries that are already there.
  *
- * Not done automatically at adopt. Replacing a distribution's default userland
- * is the user's call, and `alr adopt` says so and names this command. */
-static int cmd_use_gnu_coreutils(const char *distro)
+ * Runs automatically from install and adopt when the tree is a uutils one.
+ * That used to be "the user's call", which is the right instinct about
+ * replacing a distribution's userland and the wrong conclusion here: under an
+ * explicit loader the uutils multicall binary cannot resolve its own name, so
+ * the alternative on offer is not "uutils" but "no coreutils at all", and
+ * adopt's own boot check fails on it. It stays a command so it can be re-run.
+ *
+ * Takes a ROOT PATH, not a distro name: install repairs the staging tree
+ * (<R>.part), which has no distro name to resolve. */
+static int gnu_coreutils_repoint(const char *R)
 {
-    char R[ALR_PBUF], bindir[ALR_PBUF];
+    char bindir[ALR_PBUF];
     DIR *d;
     struct dirent *e;
     int moved = 0, absent = 0;
 
-    distro_root(R, sizeof R, distro);
     if (!is_dir(R)) die("rootfs-missing", "no such rootfs");
     snprintf(bindir, sizeof bindir, "%s/usr/bin", R);
     if (!(d = opendir(bindir)))
@@ -2458,6 +2539,14 @@ static int cmd_use_gnu_coreutils(const char *distro)
             "this rootfs has no gnu* binaries in /usr/bin; it is probably not "
             "a uutils-based Ubuntu image");
     return 0;
+}
+
+/* `alr use-gnu-coreutils <distro>` -- the same repair, by distro name. */
+static int cmd_use_gnu_coreutils(const char *distro)
+{
+    char R[ALR_PBUF];
+    distro_root(R, sizeof R, distro);
+    return gnu_coreutils_repoint(R);
 }
 
 /* ── launch ──────────────────────────────────────────────────────────── */

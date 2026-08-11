@@ -40,6 +40,21 @@ data class AlrResult(
         (stdout + "\n" + stderr).lineSequence().firstOrNull { it.startsWith(prefix) }.orEmpty()
 }
 
+/**
+ * Variables alr owns and refuses via `-e`. Passing one fails the whole
+ * invocation with env-reserved, so they are filtered rather than forwarded.
+ *
+ * Only the names alr actually owns -- NOT the whole ALR_ prefix. This app's GPU
+ * bridge legitimately uses ALR_GPU_BRIDGE_*, and filtering the prefix made the
+ * guest client miss its host and port and write frames to stdout.
+ */
+private val RESERVED = setOf(
+    "LD_PRELOAD", "LD_LIBRARY_PATH", "LOCPATH", "GLIBC_TUNABLES",
+    "ALR_COUNT", "ALR_DISTRO", "ALR_FAKEROOT", "ALR_GUEST_ARGV0",
+    "ALR_GUEST_EXE", "ALR_GUEST_PATH", "ALR_LDSO", "ALR_LIBPATH",
+    "ALR_LOG", "ALR_LOG_FD", "ALR_PRELOAD", "ALR_ROOT", "ALR_ROOT_DIR",
+)
+
 class AlrRuntime(
     private val nativeLibraryDir: File,
     private val filesDir: File,
@@ -197,14 +212,8 @@ class AlrRuntime(
         // prefix -- this app's GPU bridge legitimately uses ALR_GPU_BRIDGE_*,
         // and filtering the prefix here made the guest client miss its host and
         // port and write frames to stdout instead of the socket.
-        val reserved = setOf(
-            "LD_PRELOAD", "LD_LIBRARY_PATH", "LOCPATH", "GLIBC_TUNABLES",
-            "ALR_COUNT", "ALR_DISTRO", "ALR_FAKEROOT", "ALR_GUEST_ARGV0",
-            "ALR_GUEST_EXE", "ALR_GUEST_PATH", "ALR_LDSO", "ALR_LIBPATH",
-            "ALR_LOG", "ALR_LOG_FD", "ALR_PRELOAD", "ALR_ROOT", "ALR_ROOT_DIR",
-        )
         val eArgs = guestEnv.entries
-            .filterNot { it.key.startsWith("PROOT_") || it.key in reserved }
+            .filterNot { it.key.startsWith("PROOT_") || it.key in RESERVED }
             .flatMap { listOf("-e", "${it.key}=${it.value}") }
         return exec(
         listOf("-d", distro, "run") + eArgs + listOf(program) + arguments,
@@ -216,7 +225,69 @@ class AlrRuntime(
         )
     }
 
+    /**
+     * `alr install <distro>` -- fetch, verify and unpack an Ubuntu base image.
+     *
+     * alr discovers the current image from cdimage's SHA256SUMS and checks the
+     * hash, so this is a real provisioning path and not a download-and-hope.
+     * It must run from the APP process: `run-as` has no network on Android 16
+     * (a bare-IP connect times out there while the same request from the shell
+     * uid returns 200), the same way it has no seccomp filter -- run-as is not
+     * the app, in one more respect.
+     */
+    fun installDistro(distro: String, timeoutSeconds: Long = 3600): AlrResult =
+        exec(listOf("install", distro), timeoutSeconds)
+
     fun version(): AlrResult = exec(listOf("version"), 30)
+
+    /**
+     * Like [run], but streams the guest's output to [onLine] as it arrives and
+     * blocks until the guest exits.
+     *
+     * [run] reads stdout to EOF, then stderr, then waits -- fine for a command
+     * that finishes, and wrong twice over for a GUI session that lives for
+     * minutes: nothing is visible until the app is closed, and a guest that
+     * writes more to stderr than the pipe buffer holds blocks forever, because
+     * nobody is draining it while stdout is being read. A GTK app that logs a
+     * warning per frame does exactly that.
+     */
+    fun runStreaming(
+        distro: String,
+        program: String,
+        arguments: List<String> = emptyList(),
+        guestEnv: Map<String, String> = emptyMap(),
+        onLine: (String) -> Unit,
+    ): AlrResult {
+        ensureAdopted(distro)
+        val eArgs = guestEnv.entries
+            .filterNot { it.key.startsWith("PROOT_") || it.key in RESERVED }
+            .flatMap { listOf("-e", "${it.key}=${it.value}") }
+        if (!isAvailable()) return AlrResult(-1, "", "alr binary not found at ${binary.absolutePath}")
+        rootfsBase.mkdirs()
+        val tmp = File(prefix, "tmp").apply { mkdirs() }
+        val builder = ProcessBuilder(
+            listOf(binary.absolutePath, "-d", distro, "run") + eArgs + listOf(program) + arguments,
+        )
+        builder.redirectErrorStream(true)
+        builder.environment().apply {
+            put("PREFIX", prefix.absolutePath)
+            put("ALR_ROOT_DIR", rootfsBase.absolutePath)
+            put("TMPDIR", tmp.absolutePath)
+            put("HOME", filesDir.absolutePath)
+        }
+        return runCatching {
+            val process = builder.start()
+            val tail = ArrayDeque<String>()
+            process.inputStream.bufferedReader().forEachLine { line ->
+                onLine(line)
+                // Keep only the tail: the caller classifies the exit from it, and
+                // a long-lived GUI app can log megabytes.
+                tail.addLast(line)
+                if (tail.size > 200) tail.removeFirst()
+            }
+            AlrResult(process.waitFor(), tail.joinToString("\n"), "")
+        }.getOrElse { AlrResult(-1, "", "alr exec failed: ${it.message}") }
+    }
 
     private fun exec(
         arguments: List<String>,

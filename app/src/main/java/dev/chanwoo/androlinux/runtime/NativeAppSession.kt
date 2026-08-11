@@ -100,8 +100,36 @@ class NativeAppSession internal constructor(
             val refresh = 60000
             surfaceW.set(outW); surfaceH.set(outH); refreshMhz.set(refresh)
 
+            // WHICH EXECUTION BACKEND, and where the wayland socket has to live.
+            //
+            // The legacy in-process loader mediates paths with
+            // usr/lib/androlinux/libalr_interpose.so. An alr-provisioned Ubuntu
+            // tree has no such file -- nothing installs it there -- so on 26.04
+            // the loader ran the guest with NO path mediation at all
+            // (path-mediation rewrites=0 in its own report) and every absolute
+            // path inside the guest resolved against Android. sakura got as far
+            // as GTK and died on "Cannot load default config file" from
+            // fontconfig and an icon it could not decode. So: alr when the tree
+            // is alr's, the legacy loader when the tree is the bundled one.
+            val alrBackend = File(rootfsDir, "usr/lib/alr/libalr_preload.so").isFile &&
+                !File(rootfsDir, "usr/lib/androlinux/libalr_interpose.so").isFile
+
+            // The compositor derives XDG_RUNTIME_DIR from this directory and binds
+            // wayland-0 under it. Under alr the guest is a separate process whose
+            // absolute paths are rewritten into the rootfs, so a socket in the
+            // app's cacheDir is unreachable from in there -- /data/user/0/<pkg>/
+            // cache/... would be looked up under <rootfs>/data/user/0/...
+            // Putting it INSIDE the rootfs gives it a name both sides can say:
+            // the host binds <R>/tmp/alr-rt/alr-xdg/wayland-0 and the guest opens
+            // /tmp/alr-rt/alr-xdg/wayland-0, which are the same socket.
+            val xdgHostBase = if (alrBackend) File(rootfsDir, "tmp/alr-rt").absolutePath
+                              else runtime.cacheDirPath
+            val guestXdgRuntimeDir = if (alrBackend) "/tmp/alr-rt/alr-xdg" else null
+            if (alrBackend) runCatching { File(xdgHostBase).mkdirs() }
+            Log.i(TAG, "[$appId] backend=${if (alrBackend) "alr" else "legacy-loader"} xdg=$xdgHostBase")
+
             val wlStart = AlrNative.nativeWaylandCompositorStart(
-                runtime.cacheDirPath, holder.surface, dm.densityDpi, dm.xdpi, dm.ydpi,
+                xdgHostBase, holder.surface, dm.densityDpi, dm.xdpi, dm.ydpi,
                 outW, outH, refresh,
             )
             compositorUp.set(true)
@@ -167,14 +195,18 @@ class NativeAppSession internal constructor(
             Log.i(TAG, "[$appId] launching guest: ${program.replace('\n', ' ')}")
 
             // BLOCKS for the whole guest lifetime.
-            val out = AlrNative.nativeAlrNativeLoaderProbe(
-                runtime.packageName,
-                runtime.nativeLibraryDir,
-                runtime.filesDirPath,
-                runtime.cacheDirPath,
-                rootfsName,
-                program,
-            )
+            val out = if (alrBackend) {
+                runGuestViaAlr(rootfsName, launch.first, launch.second, guestXdgRuntimeDir!!)
+            } else {
+                AlrNative.nativeAlrNativeLoaderProbe(
+                    runtime.packageName,
+                    runtime.nativeLibraryDir,
+                    runtime.filesDirPath,
+                    runtime.cacheDirPath,
+                    rootfsName,
+                    program,
+                )
+            }
             Log.i(TAG, "[$appId] guest exited:\n$out")
             // Exit classification from the loader report's authoritative status line
             // "alr native loader child exit=<code> signal=<sig>": a non-zero terminating
@@ -292,7 +324,103 @@ class NativeAppSession internal constructor(
     // Internals
     // ----------------------------------------------------------------------- //
 
+    /**
+     * Every key handed to [setEnv], kept so the alr backend can pass them on.
+     *
+     * The legacy loader is in-process, so Os.setenv reaches the guest by
+     * inheritance. alr builds a DELIBERATE environment and inherits nothing it
+     * was not given, so the same calls have to be replayed as `-e KEY=VAL`.
+     */
+    private val guestEnv = LinkedHashMap<String, String>()
+
+    /**
+     * Run the guest through alr and block until it exits.
+     *
+     * The environment is the same contract the legacy loader builds in
+     * runtime_report.cpp, with one difference that is the whole point: every
+     * path here is written in the GUEST's namespace. The loader had to spell
+     * XKB_CONFIG_ROOT and friends as `<rootfs>/usr/share/X11/xkb` because it
+     * mediated nothing for them; under alr `/usr/share/X11/xkb` IS that
+     * directory, and a host-form path would be rewritten a second time.
+     *
+     * The return string is shaped like the loader's report so [exitedCleanly]
+     * keeps working on it unchanged.
+     */
+    private fun runGuestViaAlr(
+        rootfsName: String,
+        program: String,
+        args: List<String>,
+        xdgRuntimeDir: String,
+    ): String {
+        val alr = dev.chanwoo.androlinux.AlrRuntime(
+            File(runtime.nativeLibraryDir), File(runtime.filesDirPath),
+        )
+        val env = LinkedHashMap<String, String>()
+        env["TERM"] = "xterm-256color"
+        // A terminal emulator asks the environment which shell to run, and alr
+        // builds a deliberate environment that does not include one. sakura's
+        // window opened to a blank black rectangle and the only trace was
+        //   VTE-CRITICAL: vte_pty_spawn_with_fds_async: assertion 'argv[0] !=
+        //   nullptr' failed
+        // -- it had nothing to spawn. USER/LOGNAME go with it: the guest runs
+        // as the app's Android uid, which has no /etc/passwd entry of its own.
+        env["SHELL"] = "/bin/bash"
+        env["USER"] = "root"
+        env["LOGNAME"] = "root"
+        env["XDG_RUNTIME_DIR"] = xdgRuntimeDir
+        env["WAYLAND_DISPLAY"] = "wayland-0"
+        env["XDG_SESSION_TYPE"] = "wayland"
+        env["GDK_BACKEND"] = "wayland"
+        env["SDL_VIDEODRIVER"] = "wayland"
+        env["QT_QPA_PLATFORM"] = "wayland"
+        env["QT_WAYLAND_DISABLE_WINDOWDECORATION"] = "1"
+        env["QT_WAYLAND_DISABLE_HW_INTEGRATION"] = "1"
+        // No GPU passthrough on this path yet: cairo software rendering is what
+        // the legacy loader also falls back to, and it is honest about it.
+        env["GDK_RENDERING"] = "cairo"
+        env["GSETTINGS_BACKEND"] = "memory"
+        env["XDG_DATA_DIRS"] = "/usr/local/share:/usr/share"
+        env["XDG_CONFIG_HOME"] = "/root/.config"
+        env["XDG_CACHE_HOME"] = "/root/.cache"
+        env["FONTCONFIG_PATH"] = "/etc/fonts"
+        env["XKB_CONFIG_ROOT"] = "/usr/share/X11/xkb"
+        env["PULSE_SERVER"] = "unix:$xdgRuntimeDir/pulse/native"
+        env["PULSE_CLIENTCONFIG"] = "/etc/pulse/client.conf"
+        // Our shim dir FIRST, so glycin's `bwrap` resolves to the passthrough
+        // rather than the distro's real bubblewrap, which Android blocks.
+        env["PATH"] = "${GuestShims.SHIM_DIR}:/usr/local/sbin:/usr/local/bin:" +
+            "/usr/sbin:/usr/bin:/sbin:/bin"
+        // Bring the session up before the app: the packages, caches and shims a
+        // desktop app needs are the SESSION's, not this app's, and provisioning
+        // them per app is what produced the per-app list this replaces. One apt
+        // transaction, once per rootfs.
+        val alrRoot = File(runtime.filesDirPath, "rootfs/$rootfsName")
+        if (!GuestSession.provision(alr, alrRoot, rootfsName)) {
+            Log.w(TAG, "[$appId] session provisioning incomplete; launching anyway")
+        }
+        env.putAll(GuestSession.startSessionBus(alr, alrRoot, rootfsName, xdgRuntimeDir))
+        // Everything the session already decided (touch DPI, request env, the
+        // X11/GNOME shims) wins over these defaults.
+        env.putAll(guestEnv)
+        // Streamed, not buffered: a GUI session lives as long as the user keeps
+        // it open, so buffering means no diagnostics until it closes -- and a
+        // guest that fills the stderr pipe while nobody drains it just stops.
+        val r = alr.runStreaming(
+            distro = rootfsName,
+            program = program,
+            arguments = args,
+            guestEnv = env,
+        ) { line -> Log.i(TAG, "[$appId] $line") }
+        // exitedCleanly() reads the loader's own status line; synthesize the same
+        // one so the CRASHED/STOPPED classification does not depend on which
+        // backend ran. A signal death shows up as 128+n from a shell-style exit.
+        val sig = if (r.exitCode > 128 && r.exitCode < 192) r.exitCode - 128 else 0
+        val code = if (sig != 0) -1 else r.exitCode
+        return "alr native loader child exit=$code signal=$sig\n" + r.stdout + "\n" + r.stderr
+    }
+
     private fun setEnv(key: String, value: String) {
+        guestEnv[key] = value
         try {
             android.system.Os.setenv(key, value, true)
         } catch (e: Throwable) {

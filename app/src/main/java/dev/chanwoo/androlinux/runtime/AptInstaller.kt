@@ -329,7 +329,7 @@ object AptInstaller {
             // STEP 1 — apt-get update: fetch the index from the pinned mirror.
             val upOut = host.loaderProbe(
                 rootfsName,
-                "/usr/bin/apt-get\n-o\nAcquire::ForceIPv4=true\nupdate",
+                "/usr/bin/apt-get\n-o\nAcquire::ForceIPv4=true\n-o\nAcquire::Retries=5\nupdate",
             )
             val idxOk = upOut.contains("Reading package lists") ||
                 upOut.contains("Packages") || upOut.contains("Get:")
@@ -342,7 +342,7 @@ object AptInstaller {
             // STEP 2 — apt-get install -y --no-install-recommends <pkg>.
             val out = host.loaderProbe(
                 rootfsName,
-                "/usr/bin/apt-get\n-o\nAcquire::ForceIPv4=true\n-o\n" +
+                "/usr/bin/apt-get\n-o\nAcquire::ForceIPv4=true\n-o\nAcquire::Retries=5\n-o\n" +
                     "APT::Sandbox::User=root\n-o\nAPT::Get::Fix-Broken=false\n-o\n" +
                     "pkgProblemResolver::FixByInstall=false\n" +
                     "install\n-y\n--no-install-recommends\n--no-fix-broken\n" + pkg,
