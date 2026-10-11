@@ -48,6 +48,7 @@
 #include <termios.h>
 #include <utime.h>
 #include <unistd.h>
+#include <sys/auxv.h>
 
 /* ── state ──────────────────────────────────────────────────────────── */
 
@@ -401,6 +402,33 @@ static void alr_init(void)
         memcpy(nm, b, n); nm[n] = '\0';
         (void)syscall(SYS_prctl, 15 /*PR_SET_NAME*/, (unsigned long)(uintptr_t)nm,
                       0UL, 0UL, 0UL);
+    }
+    /* Same cause, one more view: the kernel's AT_EXECFN names the loader.
+     * uutils' multicall dispatch takes its applet name from it, read with a
+     * raw prctl(PR_GET_AUXV) (or /proc/self/auxv) that nothing here can wrap,
+     * and failed with "unknown program 'ld-linux-aarch64.so'".  getauxval()
+     * is no help: on an explicit invocation ld.so repoints its OWN copy of
+     * AT_EXECFN at argv[0], while the kernel's copy still points at the
+     * loader path string on this process's stack.  Rewrite that string in
+     * place -- only when it is the loader's path, and only when the guest
+     * path fits in the bytes the kernel gave it. */
+    if (g_guest_exe && *g_guest_exe) {
+        const char *ld = getenv("ALR_LDSO");
+        unsigned long av[2 * 48];
+        long got = syscall(SYS_prctl, 0x41555856 /*PR_GET_AUXV*/,
+                           (unsigned long)(uintptr_t)av, sizeof av, 0UL, 0UL);
+        size_t k;
+        for (k = 0; got > 0 && ld && 2 * k + 1 < sizeof av / sizeof av[0]
+                    && av[2 * k] != AT_NULL; k++) {
+            char *fn;
+            if (av[2 * k] != AT_EXECFN) continue;
+            fn = (char *)(uintptr_t)av[2 * k + 1];
+            if (fn && strcmp(fn, ld) == 0) {
+                size_t n = strlen(g_guest_exe);
+                if (n <= strlen(fn)) memcpy(fn, g_guest_exe, n + 1);
+            }
+            break;
+        }
     }
     g_ldso      = getenv("ALR_LDSO");
     g_libpath   = getenv("ALR_LIBPATH");
@@ -1368,41 +1396,69 @@ static const char *relativize(const char *target, const char *linkguest,
     return buf;
 }
 
+/* The link's own path in GUEST namespace, for relativize().  The parent
+ * directory is resolved by the kernel -- opened O_PATH and read back through
+ * /proc/self/fd -- so a relative linkpath, a dirfd and ".." all come out
+ * right.  Only absolute linkpaths used to be relativized: `ln -s /etc/hostname
+ * l` (relative link, AT_FDCWD) stored "/etc/hostname" verbatim and the kernel
+ * then followed it into ANDROID's /etc.  NULL when the parent cannot be
+ * resolved; the caller then leaves the target alone. */
+static const char *link_guest_path(int dfd, const char *linkpath,
+                                   char *out, size_t outsz)
+{
+    char dir[ALR_PBUF], hb[ALR_PBUF], gb[ALR_PBUF], fdb[32];
+    const char *slash, *base, *c;
+    size_t dl, bl;
+    long fd, n;
+
+    if (!linkpath || !*linkpath || !g_root_len) return NULL;
+    slash = strrchr(linkpath, '/');
+    if (slash) {
+        dl = (size_t)(slash - linkpath);
+        if (dl == 0) dl = 1;                         /* "/name" -> "/" */
+        if (dl >= sizeof dir) return NULL;
+        memcpy(dir, linkpath, dl); dir[dl] = '\0';
+        base = slash + 1;
+    } else {
+        dir[0] = '.'; dir[1] = '\0';
+        base = linkpath;
+    }
+    if (!*base) return NULL;
+    /* through the syscall() wrapper, which maps a guest-absolute dir */
+    fd = syscall(SYS_openat, dir[0] == '/' ? AT_FDCWD : dfd, dir,
+                 O_PATH | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return NULL;
+    snprintf(fdb, sizeof fdb, "/proc/self/fd/%ld", fd);
+    n = syscall(SYS_readlinkat, AT_FDCWD, fdb, hb, sizeof hb - 1);
+    syscall(SYS_close, fd);
+    if (n <= 0) return NULL;
+    hb[n] = '\0';
+    c = alr_guest_canon(hb, g_root, g_root_len, gb, sizeof gb);
+    if (!c || c == hb) return NULL;                  /* not under the rootfs */
+    dl = strlen(c); bl = strlen(base);
+    if (dl + 1 + bl + 1 > outsz) return NULL;
+    memcpy(out, c, dl);
+    if (out[dl - 1] != '/') out[dl++] = '/';
+    memcpy(out + dl, base, bl + 1);
+    return out;
+}
+
 int symlink(const char *target, const char *linkpath)
 {
-    char rb[ALR_PBUF];
-    const char *t = relativize(target, linkpath, rb, sizeof rb);
+    char rb[ALR_PBUF], gb[ALR_PBUF];
+    const char *lg_path = target && target[0] == '/'
+                        ? link_guest_path(AT_FDCWD, linkpath, gb, sizeof gb) : NULL;
+    const char *t = relativize(target, lg_path, rb, sizeof rb);
     if (t != target) lg("alr symlink: %s -> %s (link %s)\n", target, t, linkpath);
     { P(linkpath); NEED(symlink); return real_symlink(t, _p); }
 }
 
 int symlinkat(const char *target, int dfd, const char *linkpath)
 {
-    char rb[ALR_PBUF], gb[ALR_PBUF], fdb[64], hb[ALR_PBUF];
-    const char *t = target, *lg_path = linkpath;
+    char rb[ALR_PBUF], gb[ALR_PBUF];
+    const char *t, *lg_path = target && target[0] == '/'
+                            ? link_guest_path(dfd, linkpath, gb, sizeof gb) : NULL;
 
-    /* Relative linkpath + a real dirfd: recover the guest path via
-     * /proc/self/fd/N so the depth is computable. If anything fails we leave
-     * the target untouched -- a wrong depth is worse than an absolute link. */
-    if (linkpath && linkpath[0] != '/' && dfd != AT_FDCWD) {
-        ssize_t r;
-        int k = snprintf(fdb, sizeof fdb, "/proc/self/fd/%d", dfd);
-        if (k > 0 && (size_t)k < sizeof fdb &&
-            (r = readlink(fdb, hb, sizeof hb - 1)) > 0) {
-            const char *c;
-            hb[r] = '\0';
-            c = alr_guest_canon(hb, g_root, g_root_len, gb, sizeof gb);
-            if (c && c[0] == '/') {
-                size_t dl = strlen(c);
-                if (dl + 1 + strlen(linkpath) + 1 <= sizeof gb) {
-                    if (c != gb) { memcpy(gb, c, dl + 1); }
-                    if (dl && gb[dl - 1] != '/') gb[dl++] = '/';
-                    memcpy(gb + dl, linkpath, strlen(linkpath) + 1);
-                    lg_path = gb;
-                }
-            }
-        }
-    }
     t = relativize(target, lg_path, rb, sizeof rb);
     if (t != target)
         lg("alr symlinkat: %s -> %s (link %s dfd=%d)\n", target, t, lg_path, dfd);
