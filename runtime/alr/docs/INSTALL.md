@@ -97,15 +97,27 @@ LICENSE
 README.md
 ```
 
-> ⚠️ **공개 릴리스와 이 문서의 차이.** GitHub의 공개 릴리스 [`v0.5.0`](https://github.com/Meapri/alr-termux/releases/tag/v0.5.0)은
-> 2026-08-03에 나온 것이다. 그 tarball에는 `libexec/alr/alr-lane`이 없고, 기본 게스트도 `ubuntu-24.04`다.
-> 그래서 정적·Go 바이너리(codex, Go 툴체인, busybox-static)는 경로 가상화 없이 돌고, 24.04는 지금 지원하지 않는다.
-> 이 문서가 설명하는 동작을 쓰려면 §3.1처럼 저장소에서 tarball을 직접 빌드한다.
-> 두 tarball은 `alr version`이 똑같이 `alr 0.5.0`을 출력하므로, `$PREFIX/libexec/alr/alr-lane`이 있는지로 구별한다.
+### 3.1 공개 릴리스 설치 (권장)
 
-### 3.1 저장소에서 빌드해서 설치 (현재 권장)
+Termux 안에서 실행한다. 인증 없이 받을 수 있다.
 
-빌드는 macOS 또는 Linux 호스트에서 한다. 필요한 도구는 다음과 같다.
+```bash
+pkg install -y curl tar
+V=1.0.0
+curl -fsSLO https://github.com/Meapri/alr-termux/releases/download/v$V/alr-$V-aarch64.tar.gz
+curl -fsSLO https://github.com/Meapri/alr-termux/releases/download/v$V/SHA256SUMS
+sha256sum -c SHA256SUMS                   # alr-1.0.0-aarch64.tar.gz: OK
+tar -C "$PREFIX" -xzf alr-$V-aarch64.tar.gz
+ls "$PREFIX/libexec/alr/alr-lane"         # 있어야 한다
+alr version
+```
+
+> v0.5.0 이하 릴리스에는 `libexec/alr/alr-lane`이 없고, 기본 게스트가 `ubuntu-24.04`다.
+> 그 버전에서는 정적·Go 바이너리(codex, Go 툴체인, busybox-static)가 경로 가상화 없이 돈다. v1.0.0으로 올린 뒤 §3.4를 따른다.
+
+### 3.2 저장소에서 직접 빌드
+
+릴리스에 아직 들어가지 않은 변경을 쓰려면 tarball을 직접 빌드한다. 빌드는 macOS 또는 Linux 호스트에서 한다. 필요한 도구는 다음과 같다.
 
 - Android NDK. `NDK` 환경 변수로 경로를 준다. r27.2(`27.2.12479018`)로 빌드를 확인했다.
 - zig **0.16.0**. 게스트 preload를 빌드한다. 다른 버전이면 `scripts/build-preload.sh`가 멈춘다.
@@ -114,36 +126,16 @@ README.md
 cd runtime/alr
 ZIG=/path/to/zig-0.16.0/zig scripts/build-preload.sh          # build/libalr_preload.so
 NDK=/path/to/android-ndk ZIG=/path/to/zig-0.16.0/zig scripts/make-release.sh
-# -> dist/alr-0.5.0-aarch64.tar.gz 와 dist/SHA256SUMS
+# -> dist/alr-<버전>-aarch64.tar.gz 와 dist/SHA256SUMS
 ```
 
-`make-release.sh`는 구성 요소가 하나라도 없으면 아무것도 쓰지 않고 멈춘다. 만든 tarball을 기기로 옮긴다.
+`make-release.sh`는 구성 요소가 하나라도 없으면 아무것도 쓰지 않고 멈춘다. 만든 tarball을 기기로 옮기고, Termux 안에서 `$PREFIX`에 푼다.
+`/sdcard`를 읽으려면 먼저 `termux-setup-storage`로 저장소 권한을 준다.
 
 ```bash
-adb push dist/alr-0.5.0-aarch64.tar.gz /sdcard/Download/
-```
-
-Termux 안에서 `$PREFIX`에 푼다. `/sdcard`를 읽으려면 먼저 `termux-setup-storage`로 저장소 권한을 준다.
-
-```bash
-termux-setup-storage                      # 처음 한 번, 권한 대화상자에서 허용
-tar -C "$PREFIX" -xzf ~/storage/downloads/alr-0.5.0-aarch64.tar.gz
-ls "$PREFIX/libexec/alr/alr-lane"         # 있어야 한다
-alr version
-```
-
-### 3.2 공개 릴리스 v0.5.0 설치
-
-위의 차이를 알고 쓰는 경우에만 고른다. 인증 없이 받을 수 있다.
-
-```bash
-pkg install -y curl tar
-V=0.5.0
-curl -fsSLO https://github.com/Meapri/alr-termux/releases/download/v$V/alr-$V-aarch64.tar.gz
-curl -fsSLO https://github.com/Meapri/alr-termux/releases/download/v$V/SHA256SUMS
-sha256sum -c SHA256SUMS
-tar -C "$PREFIX" -xzf alr-$V-aarch64.tar.gz
-alr version
+adb push dist/alr-1.0.0-aarch64.tar.gz /sdcard/Download/      # 호스트에서
+termux-setup-storage                                          # Termux에서, 처음 한 번
+tar -C "$PREFIX" -xzf ~/storage/downloads/alr-1.0.0-aarch64.tar.gz
 ```
 
 ### 3.3 tarball을 `$PREFIX`가 아닌 곳에 풀 때
@@ -154,7 +146,7 @@ alr version
 2. 바이너리 기준 `../share/alr/`, `../libexec/alr/`
 3. `$PREFIX/share/alr/`, `$PREFIX/libexec/alr/`
 
-그래서 `~/alr` 같은 곳에 풀어도 그 안의 `bin/alr`은 같은 tarball의 preload와 `alr-lane`을 쓴다. 이 조회는 2026-10-11 이후 빌드에 있다.
+그래서 `~/alr` 같은 곳에 풀어도 그 안의 `bin/alr`은 같은 tarball의 preload와 `alr-lane`을 쓴다. 이 조회는 v1.0.0부터 있다.
 preload를 찾지 못하면 `alr`은 경고를 내고 진행하지만, 그 게스트는 rootfs가 아니라 Android 파일시스템을 본다. 정상 동작이 아니다.
 
 ### 3.4 업그레이드 확인
@@ -228,10 +220,10 @@ alr install --with git,node       # node·npm까지
 `SHA256SUMS`에 닿지 못하면 `reason=discovery-failed`로 멈춘다. 해시 없이 받는 폴백은 없다.
 오프라인이나 미러 환경에서는 `--url <tarball>`로 tarball을 직접 준다.
 
-지원하는 게스트는 **Ubuntu 26.04 LTS 하나**다([ADR 0005](../../../docs/adr/0005-termux-first-goals.md)).
+지원하는 게스트는 **Ubuntu 26.04 LTS 하나**다([ADR 0005](https://github.com/Meapri/android-on-linux/blob/main/docs/adr/0005-termux-first-goals.md)).
 배포판을 지정하지 않은 명령은 항상 `ubuntu-26.04`를 쓴다. 이미 설치된 24.04 트리는 `-d ubuntu-24.04`로 이름을 주면 실행되지만 검증하지 않는다.
 
-`--with codex`는 codex의 Rust 바이너리 릴리스를 받는다. codex는 정적 바이너리라 레인(`alr-lane`)에서 rootfs를 본다(§3.1 tarball 필요).
+`--with codex`는 codex의 Rust 바이너리 릴리스를 받는다. codex는 정적 바이너리라 레인(`alr-lane`)에서 rootfs를 본다(v1.0.0 이상 필요).
 
 ## 7. 사용
 
@@ -281,7 +273,7 @@ ALR_LOG=1 alr run /bin/true
 | `alr-doctor` P3가 FATAL | Play Store판 Termux일 가능성이 높다. §2대로 F-Droid/GitHub판으로 바꾼다 |
 | `alr: WARNING libalr_preload.so not found` | tarball을 풀지 않았거나 일부만 풀었다. §3 |
 | 게스트가 Android 파일시스템을 본다 | 위와 같은 원인 |
-| `go build`가 `mkdir /tmp/go-build…: permission denied` | `alr-lane`이 없는 tarball(공개 v0.5.0)이다. §3.1 |
+| `go build`가 `mkdir /tmp/go-build…: permission denied` | `alr-lane`이 없는 tarball(v0.5.0 이하)이다. §3.1 |
 | codex가 `could not create PATH aliases: Read-only file system` | 위와 같은 원인 |
 | `alr version`이 `reason=preload-stale` | 업그레이드 뒤 rootfs 안 preload가 옛 것이다. `alr update-components` (§3.4) |
 | `alr-doctor`가 진단을 멈춘다 | `adb shell`이나 `run-as`에서 실행했다. Termux 터미널에서 직접 실행한다 (§4) |

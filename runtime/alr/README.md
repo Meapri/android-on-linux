@@ -1,9 +1,11 @@
 # alr — Termux-native Ubuntu ARM64 glibc runtime
 
-`alr`은 **루팅 없이, Termux 안에서, 스톡 Ubuntu 24.04 ARM64 glibc rootfs를 PRoot보다 낮은 오버헤드로 실행**하는
+`alr`은 **루팅 없이, Termux 안에서, 스톡 Ubuntu 26.04 LTS ARM64 glibc rootfs를 PRoot보다 낮은 오버헤드로 실행**하는
 독립형 런타임 + CLI다. 목표 워크로드는 `git`, `node`/`npm`, `make`, `apt` 같은 평범한 Linux CLI 프로그램을
 폰의 CPU 성능 그대로 돌리는 것이다.
 
+> **v1.0.0 (2026-10).** 기본 게스트는 Ubuntu 26.04 LTS이고, 정적·Go 바이너리는 tawcroot 레인에서 경로 가상화된다([ADR 0010](docs/adr/0010-tawcroot-lane.md)). Android 17은 Snapdragon 한 대에서 쟀다([T1 증거](docs/evidence/2026-10-11-t1-ubuntu-2604-android17.md)).
+>
 > **선행 릴리스 (v0.5.0).** 참조 디바이스는 **2대 — MediaTek(커널 6.1)과 Snapdragon 8 Elite(커널 6.6),
 > 둘 다 Android 16**. 두 기기의 zygote 차단 syscall **239개 집합이 완전히 동일하고**, 호환성 폭
 > 96/96 도 같다 ([M19](docs/evidence/2026-08-03-m19-snapdragon.md)). **SoC 벤더·커널 축은 닫혔다.**
@@ -27,7 +29,7 @@
    원리적으로 불가능하다([ADR 0005](docs/adr/0005-play-store-unsupported.md)). 설치 도중 Google Play Protect가
    차단 대화상자를 띄우는데, 거기서 **`확인`을 누르면 설치가 취소된다**. 전체 절차는
    [docs/INSTALL.md](docs/INSTALL.md).
-2. `alr` tarball을 `$PREFIX`에 풀고(공개 릴리스 v0.5.0에는 레인이 없으니 [INSTALL §3](docs/INSTALL.md)을 먼저 본다), Termux 터미널에서:
+2. 릴리스 tarball(v1.0.0)을 `$PREFIX`에 풀고([INSTALL §3](docs/INSTALL.md)), Termux 터미널에서:
 
 ```bash
 alr-doctor                  # 기기 능력 진단 (첫 실행에 한 번)
@@ -242,7 +244,7 @@ scripts/build-preload.sh        # 게스트 측 libalr_preload.so (zig 0.16.0 �
 1. Termux CLI: 이 문서가 설명하는 `alr install/run/shell`.
 2. APK 안의 실행 엔진: 상위 프로젝트의 `app/build.gradle.kts` `buildAlrRuntime` 작업이 이 디렉터리를 그대로 빌드해 `libalr.so`와 `libalr_preload.so`로 APK에 넣는다. APK는 `targetSdk 28`로 Termux와 같은 SELinux 도메인(`untrusted_app_27`)에서 실행된다.
 
-이 문서의 초판은 상위 프로젝트가 `targetSdk 35`에서 in-process ELF 리맵과 PC 조건부 seccomp, ptrace 경로 중재로 동작한다고 적었다. 그 경로는 지금 **레거시 로더**로 동결되어 있고, 제품 경로는 alr이다([상위 ADR 0004](../../docs/adr/0004-unified-direction.md)). 무엇을 가져오고 무엇을 버렸는지는 [docs/02-architecture.md §7](docs/02-architecture.md)에 파일 단위로 정리했다.
+이 문서의 초판은 상위 프로젝트가 `targetSdk 35`에서 in-process ELF 리맵과 PC 조건부 seccomp, ptrace 경로 중재로 동작한다고 적었다. 그 경로는 지금 **레거시 로더**로 동결되어 있고, 제품 경로는 alr이다([상위 ADR 0004](https://github.com/Meapri/android-on-linux/blob/main/docs/adr/0004-unified-direction.md)). 무엇을 가져오고 무엇을 버렸는지는 [docs/02-architecture.md §7](docs/02-architecture.md)에 파일 단위로 정리했다.
 
 상위 프로젝트에는 이 엔진이 다루지 않는 GUI(Wayland 컴포지터), GPU 가속, 오디오, 카탈로그 UI가 있다. 이 문서의 비목표 "GUI / GPU 가속"은 **이 CLI 단독 배포의 범위**를 뜻하며, 프로젝트 전체의 비목표가 아니다.
 

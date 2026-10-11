@@ -42,14 +42,14 @@ TERMUX_PKG_MAINTAINER="@Meapri"
 # Keep in lockstep with src/common/alr_version.h -- that header is the single
 # source of truth and scripts/make-release.sh REFUSES to cut a release when this
 # line disagrees with it.
-TERMUX_PKG_VERSION="0.5.0"
+TERMUX_PKG_VERSION="1.0.0"
 
 TERMUX_PKG_SRCURL=https://github.com/Meapri/alr-termux/archive/refs/tags/v${TERMUX_PKG_VERSION}.tar.gz
 # NOTE these two hashes are the only values in the release path with no
 # automated cross-check: their URLs interpolate TERMUX_PKG_VERSION, so a
 # version bump silently repoints them while the old hashes stay.  Bump them in
 # the same commit, or set them back to PLACEHOLDER so the guard below fires.
-TERMUX_PKG_SHA256=8dd67599bad98c60a8156d583fb162214b4eb8aa0fcfc871a3bbea0db947e623
+TERMUX_PKG_SHA256=PLACEHOLDER
 
 # Runtime dependencies, derived from what src/cli/alr.c actually execs or pipes
 # through popen() ON THE HOST.  These are not guesses:
@@ -103,7 +103,7 @@ _PRELOAD_TARBALL_URL="https://github.com/Meapri/alr-termux/releases/download/v${
 # Carrying the previous release's hashes over instead points both URLs at the
 # new version while the hashes still describe the old one, which fails as a
 # checksum mismatch nobody can interpret.
-_PRELOAD_TARBALL_SHA256="056754e882365e613be24a777bf41c62fea9f4b79cf21eb6503d6933a9669804"
+_PRELOAD_TARBALL_SHA256="PLACEHOLDER"
 
 # Fail at the top rather than 200 lines into a build with a confusing 404.
 _alr_refuse_placeholders() {
