@@ -256,7 +256,7 @@ alr update-components ubuntu-24.04   libalr_preload.so 만 갱신
 
 모든 실패는 안정적 `reason=` 코드를 갖는다. **이 목록은 코드가 실제로 방출하는 것과 정확히 일치해야 한다** — `scripts/check-reasons.sh` 가 양방향으로 검사하고 `make check` 에 걸려 있다.
 
-> **`discovery-failed`** — cdimage 의 `SHA256SUMS` 를 못 읽어서 설치할 이미지를 특정하지 못한 경우. 24.04 에는 핀 박힌 파일명으로의 무검증 폴백이 있지만, 그 이름은 24.04 이미지라서 **다른 릴리스에는 쓸 수 없다** — 틀린 릴리스를 검증 없이 내려받는 것이 실패보다 나쁘다. 그래서 24.04 가 아니면 폴백하지 않고 이 사유로 멈춘다.
+> **`discovery-failed`** — cdimage 의 `SHA256SUMS` 를 못 읽어서 설치할 이미지를 특정하지 못한 경우. 검증할 해시 없이 내려받는 것이 실패보다 나쁘므로 어떤 릴리스든 폴백 없이 이 사유로 멈춘다(24.04 의 핀 박힌 폴백은 2026-10-11 에 24.04 지원과 함께 지웠다).
 
 
 ```
@@ -273,10 +273,11 @@ preload-missing-in-rootfs  preload-stale              remove-failed
 rootfs-incomplete          rootfs-missing             rootfs-missing-interposer-deps
 rootfs-unbootable
 too-many-env               unhooked-static-binary     unsupported-distro
-uutils-coreutils
 with-failed                workdir-enoent
 ```
 
+> **`uutils-coreutils` 는 2026-10-11 에 어휘에서 빠졌다** — uutils 가 preload 아래에서 동작하게 되어([증거](evidence/2026-10-11-t5-uutils-preload.md)) 그 경고를 내던 코드가 없어졌다.
+>
 > **`already-installed` 는 2026-08-04 에 어휘에서 빠졌다** — 실패가 아니게 됐기 때문이다. 그 코드가 가리키던 상황은 *"이미 설치된 rootfs 에 `--with` 를 줬는데 무시했다"* 였는데, 이제 무시하지 않고 **실제로 설치한다**. 실패하면 `with-failed` 다.
 >
 > ⚠️ **이 목록은 2026-08-03 에 실측으로 다시 썼다.** 이전 판은 17개를 적어 두었는데 코드가 방출하는 것은 22개였고 **겹치는 것이 5개뿐**이었다(`download-network` `extract-permission` `ldso-missing` `boot-failed` `boot-enoent`). 목표 [G6](00-product.md) 은 "모든 실패가 안정적 `reason=` 코드로 분류된다" 이고 그 측정 수단이 이 어휘인데, **어느 쪽도 지키지 않는 어휘는 G6 을 참으로도 거짓으로도 만들 수 없다.** 그래서 G6 은 목표가 아니라 문장이었다.

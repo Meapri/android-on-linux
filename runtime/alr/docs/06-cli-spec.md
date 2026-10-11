@@ -54,7 +54,7 @@ alr config [get <key> | set <key> <value>]
 **우선순위**: 플래그 > 환경변수 > 사용자 설정 > 전역 설정 > 내장 기본값.
 
 ```toml
-default_distro = "ubuntu-24.04"
+default_distro = "ubuntu-26.04"
 
 [runtime]
 fakeroot = true          # apt/dpkg에 필요
@@ -69,7 +69,7 @@ mirror = ""              # 비우면 cdimage.ubuntu.com 사용 (권장)
 
 | 키 | 대응 환경변수 | 내장 기본값 |
 |---|---|---|
-| `default_distro` | `ALR_DISTRO` | `ubuntu-24.04` |
+| `default_distro` | `ALR_DISTRO` | `ubuntu-26.04` |
 | `runtime.fakeroot` | `ALR_FAKEROOT` | `false` |
 | `runtime.log` | `ALR_LOG` | `0` |
 | `paths.root` | `ALR_ROOT_DIR` | `$PREFIX/var/lib/alr/distros` |

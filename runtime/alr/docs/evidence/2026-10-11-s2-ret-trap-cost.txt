@@ -1,0 +1,103 @@
+date: 2026-10-11T06:56:05Z
+device: SM-S937N sun android=17 sdk=37 kernel=6.6.127-android15-8-p33f4ffe-abogkiS937NKSUADZIF-4k
+clang: clang version 21.1.8
+source sha256: 46748ccd5235ac80116c7c5ecca1c1ec3a458e3b8ac10e497349f74e682705a8
+== unpinned ==
+context: uid=10057 ctx=u:r:untrusted_app_27:s0:c57,c256,c512,c768 Seccomp=2 Seccomp_filters=1 cpu=any 
+  baseline                     254 ns/call  (median of 9; min 222, max 483)
+  + filter, tramp ALLOW        159 ns/call  (median of 9; min 116, max 334)
+  + TRAP, emulate              544 ns/call  (median of 9; min 538, max 591)
+  + TRAP, reissue              664 ns/call  (median of 9; min 658, max 723)
+
+  filter eval overhead    -95 ns
+  signal round trip       +290 ns  (emulate - baseline)
+  D6 round-trip cost      +410 ns  (reissue - baseline)
+  D6 verdict              PROCEED (<= 5 us)
+== cpu 0 run 1 ==
+context: uid=10057 ctx=u:r:untrusted_app_27:s0:c57,c256,c512,c768 Seccomp=2 Seccomp_filters=1 cpu=0 
+  baseline                     225 ns/call  (median of 9; min 223, max 396)
+  + filter, tramp ALLOW        262 ns/call  (median of 9; min 259, max 290)
+  + TRAP, emulate             1008 ns/call  (median of 9; min 1004, max 1031)
+  + TRAP, reissue             1098 ns/call  (median of 9; min 1089, max 1259)
+
+  filter eval overhead    +37 ns
+  signal round trip       +783 ns  (emulate - baseline)
+  D6 round-trip cost      +873 ns  (reissue - baseline)
+  D6 verdict              PROCEED (<= 5 us)
+== cpu 0 run 2 ==
+context: uid=10057 ctx=u:r:untrusted_app_27:s0:c57,c256,c512,c768 Seccomp=2 Seccomp_filters=1 cpu=0 
+  baseline                     173 ns/call  (median of 9; min 172, max 175)
+  + filter, tramp ALLOW        205 ns/call  (median of 9; min 204, max 207)
+  + TRAP, emulate              877 ns/call  (median of 9; min 874, max 882)
+  + TRAP, reissue             1094 ns/call  (median of 9; min 1089, max 1101)
+
+  filter eval overhead    +32 ns
+  signal round trip       +704 ns  (emulate - baseline)
+  D6 round-trip cost      +921 ns  (reissue - baseline)
+  D6 verdict              PROCEED (<= 5 us)
+== cpu 0 run 3 ==
+context: uid=10057 ctx=u:r:untrusted_app_27:s0:c57,c256,c512,c768 Seccomp=2 Seccomp_filters=1 cpu=0 
+  baseline                     173 ns/call  (median of 9; min 172, max 179)
+  + filter, tramp ALLOW        206 ns/call  (median of 9; min 203, max 214)
+  + TRAP, emulate              877 ns/call  (median of 9; min 872, max 883)
+  + TRAP, reissue             1098 ns/call  (median of 9; min 1094, max 1130)
+
+  filter eval overhead    +33 ns
+  signal round trip       +704 ns  (emulate - baseline)
+  D6 round-trip cost      +925 ns  (reissue - baseline)
+  D6 verdict              PROCEED (<= 5 us)
+== cpu 6 run 1 ==
+context: uid=10057 ctx=u:r:untrusted_app_27:s0:c57,c256,c512,c768 Seccomp=2 Seccomp_filters=1 cpu=6 
+  baseline                     142 ns/call  (median of 9; min 104, max 343)
+  + filter, tramp ALLOW        118 ns/call  (median of 9; min 116, max 122)
+  + TRAP, emulate              533 ns/call  (median of 9; min 526, max 540)
+  + TRAP, reissue              666 ns/call  (median of 9; min 662, max 676)
+
+  filter eval overhead    -24 ns
+  signal round trip       +391 ns  (emulate - baseline)
+  D6 round-trip cost      +524 ns  (reissue - baseline)
+  D6 verdict              PROCEED (<= 5 us)
+== cpu 6 run 2 ==
+context: uid=10057 ctx=u:r:untrusted_app_27:s0:c57,c256,c512,c768 Seccomp=2 Seccomp_filters=1 cpu=6 
+  baseline                     193 ns/call  (median of 9; min 142, max 279)
+  + filter, tramp ALLOW        118 ns/call  (median of 9; min 116, max 155)
+  + TRAP, emulate              541 ns/call  (median of 9; min 534, max 547)
+  + TRAP, reissue              676 ns/call  (median of 9; min 670, max 683)
+
+  filter eval overhead    -75 ns
+  signal round trip       +348 ns  (emulate - baseline)
+  D6 round-trip cost      +483 ns  (reissue - baseline)
+  D6 verdict              PROCEED (<= 5 us)
+== cpu 6 run 3 ==
+context: uid=10057 ctx=u:r:untrusted_app_27:s0:c57,c256,c512,c768 Seccomp=2 Seccomp_filters=1 cpu=6 
+  baseline                     144 ns/call  (median of 9; min 142, max 464)
+  + filter, tramp ALLOW        118 ns/call  (median of 9; min 116, max 120)
+  + TRAP, emulate              541 ns/call  (median of 9; min 528, max 546)
+  + TRAP, reissue              677 ns/call  (median of 9; min 672, max 686)
+
+  filter eval overhead    -26 ns
+  signal round trip       +397 ns  (emulate - baseline)
+  D6 round-trip cost      +533 ns  (reissue - baseline)
+  D6 verdict              PROCEED (<= 5 us)
+== unpinned run 2 ==
+context: uid=10057 ctx=u:r:untrusted_app_27:s0:c57,c256,c512,c768 Seccomp=2 Seccomp_filters=1 cpu=any 
+  baseline                     172 ns/call  (median of 9; min 104, max 255)
+  + filter, tramp ALLOW        117 ns/call  (median of 9; min 116, max 120)
+  + TRAP, emulate              542 ns/call  (median of 9; min 532, max 557)
+  + TRAP, reissue              677 ns/call  (median of 9; min 669, max 692)
+
+  filter eval overhead    -55 ns
+  signal round trip       +370 ns  (emulate - baseline)
+  D6 round-trip cost      +505 ns  (reissue - baseline)
+  D6 verdict              PROCEED (<= 5 us)
+== unpinned run 3 ==
+context: uid=10057 ctx=u:r:untrusted_app_27:s0:c57,c256,c512,c768 Seccomp=2 Seccomp_filters=1 cpu=any 
+  baseline                     172 ns/call  (median of 9; min 121, max 252)
+  + filter, tramp ALLOW        129 ns/call  (median of 9; min 127, max 141)
+  + TRAP, emulate              540 ns/call  (median of 9; min 529, max 575)
+  + TRAP, reissue              677 ns/call  (median of 9; min 675, max 682)
+
+  filter eval overhead    -43 ns
+  signal round trip       +368 ns  (emulate - baseline)
+  D6 round-trip cost      +505 ns  (reissue - baseline)
+  D6 verdict              PROCEED (<= 5 us)

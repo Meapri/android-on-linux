@@ -1,0 +1,21 @@
+── 호환성 폭 측정: 96 패키지, rootfs=/data/data/com.termux/files/usr/var/lib/alr/distros/ubuntu-26.04 ──
+  batch ok: gcc g++ make cmake ninja-build pkg-config autoconf automake
+  batch ok: libtool binutils gdb ccache bison flex m4 patch
+  batch ok: gettext clang cppcheck shellcheck doxygen python3 python3-pip python3-venv
+  batch ok: python3-dev ruby perl golang-go rustc cargo php-cli lua5.4
+  batch ok: tcl sqlite3 git subversion mercurial curl wget openssh-client
+  batch ok: netcat-openbsd socat bind9-dnsutils iproute2 rsync gnupg openssl ca-certificates
+  batch ok: jq ripgrep fd-find fzf tree htop tmux vim
+  batch ok: nano neovim less file unzip zip xz-utils zstd
+  batch ok: bzip2 7zip pandoc bc parallel moreutils procps psmisc
+  batch ok: lsof strace sysstat util-linux man-db locales coreutils findutils
+  batch ok: grep sed gawk diffutils time postgresql-client mariadb-client redis-tools
+  batch ok: imagemagick ffmpeg graphviz libxml2-utils libjson-perl python3-requests python3-yaml build-essential
+
+─────────────────────────────────────────────────────────────
+  설치 성공   96 / 96
+  실행 성공   96 / 96
+
+── 실패 상세 ──
+
+ALR BREADTH: install=96/96 run=96/96

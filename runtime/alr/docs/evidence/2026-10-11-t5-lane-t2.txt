@@ -1,0 +1,17 @@
+── T2 native comparison  (SM-S937N / Android 17, runs=15) ──
+native: git version 2.56.0, node v24.18.0, Python 3.14.6, npm 11.20.0
+guest : git version 2.53.0, node v24.21.0, Python 3.14.4
+git status 10k (top)         native     25.8 ms  alr     22.5 ms  x0.87  PASS 
+node -e 0 (top)              native     95.9 ms  alr     34.2 ms  x0.36  PASS 
+python3 -c pass (top)        native     22.6 ms  alr     20.9 ms  x0.93  PASS 
+node -e 0 x20 (guest)        native   1951.1 ms  alr    598.9 ms  x0.31  PASS 
+git status x20 (guest)       native    462.7 ms  alr    321.7 ms  x0.70  PASS 
+go    : native go1.27.1, guest go1.26.0
+go version (top, lane)       native     12.9 ms  alr     13.2 ms  x1.02  PASS 
+go build, cached (lane)      native    181.7 ms  alr    184.1 ms  x1.01  PASS 
+gofmt -l net (lane)          native    112.8 ms  alr     99.3 ms  x0.88  PASS 
+npm ci, 74 deps (top)        native    689.5 ms  alr    556.4 ms  x0.81  PASS 
+apt-get reinstall tree       native    278.6 ms  alr    963.2 ms  x3.46  INFO data-bound
+  apt data: lists native 1.9M guest 144M; dpkg info native 5.3M guest 31M
+
+ALR T2 NATIVE: PASS

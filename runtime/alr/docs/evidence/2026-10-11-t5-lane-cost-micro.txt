@@ -1,0 +1,90 @@
+== native (host paths)
+getppid                   315 ns
+lstat abs                1194 ns
+stat abs                  998 ns
+fstatat dirfd 1comp       347 ns
+fstatat dirfd follow      355 ns
+fstat                     147 ns
+lseek+getdents            764 ns
+open+close abs           2640 ns
+openat dirfd+close       1881 ns
+readlink abs              973 ns
+stat symlink abs         1173 ns
+lstat cwd 1comp           346 ns
+lstat cwd 3comp           435 ns
+open cwd 3comp+close     1994 ns
+== lane 8b3f604
+getppid                   326 ns
+lstat abs                1673 ns
+stat abs                 2199 ns
+fstatat dirfd 1comp      3919 ns
+fstatat dirfd follow     4449 ns
+fstat                     807 ns
+lseek+getdents           2576 ns
+open+close abs           3998 ns
+openat dirfd+close       6388 ns
+readlink abs             1627 ns
+stat symlink abs         2717 ns
+lstat cwd 1comp          2095 ns
+lstat cwd 3comp          2073 ns
+open cwd 3comp+close     4424 ns
+== lane now
+getppid                   358 ns
+lstat abs                1398 ns
+stat abs                 1406 ns
+fstatat dirfd 1comp      1228 ns
+fstatat dirfd follow     1234 ns
+fstat                     175 ns
+lseek+getdents            856 ns
+open+close abs           3177 ns
+openat dirfd+close       3319 ns
+readlink abs             1333 ns
+stat symlink abs         1846 ns
+lstat cwd 1comp          1040 ns
+lstat cwd 3comp          1426 ns
+open cwd 3comp+close     3185 ns
+== native (host paths)
+getppid                   325 ns
+lstat abs                1097 ns
+stat abs                 1073 ns
+fstatat dirfd 1comp       357 ns
+fstatat dirfd follow      356 ns
+fstat                     156 ns
+lseek+getdents            811 ns
+open+close abs           2792 ns
+openat dirfd+close       1975 ns
+readlink abs             1020 ns
+stat symlink abs         1264 ns
+lstat cwd 1comp           359 ns
+lstat cwd 3comp           453 ns
+open cwd 3comp+close     2077 ns
+== lane 8b3f604
+getppid                   369 ns
+lstat abs                1785 ns
+stat abs                 2340 ns
+fstatat dirfd 1comp      4238 ns
+fstatat dirfd follow     4770 ns
+fstat                     841 ns
+lseek+getdents           2738 ns
+open+close abs           4124 ns
+openat dirfd+close       6601 ns
+readlink abs             1693 ns
+stat symlink abs         2845 ns
+lstat cwd 1comp          2202 ns
+lstat cwd 3comp          2185 ns
+open cwd 3comp+close     4556 ns
+== lane now
+getppid                   397 ns
+lstat abs                1416 ns
+stat abs                 1409 ns
+fstatat dirfd 1comp      1232 ns
+fstatat dirfd follow     1234 ns
+fstat                     179 ns
+lseek+getdents            869 ns
+open+close abs           3163 ns
+openat dirfd+close       3319 ns
+readlink abs             1331 ns
+stat symlink abs         1876 ns
+lstat cwd 1comp          1050 ns
+lstat cwd 3comp          1440 ns
+open cwd 3comp+close     3187 ns

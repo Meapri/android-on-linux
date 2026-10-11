@@ -1,5 +1,7 @@
 # PoC Roadmap
 
+> **Status banner (2026-10-11).** The goals of PoC 1-6 (APK loader, rootfs manager, shell backend, GUI output, GLES acceleration, minimal Vulkan) have since been reached on a device; the per-PoC status lines below were not kept up to date. See [ADR 0004](adr/0004-unified-direction.md) for the current phase plan.
+
 ## PoC 0: Host-side policy model
 
 Status: started.

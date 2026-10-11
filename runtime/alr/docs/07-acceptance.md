@@ -297,6 +297,65 @@ CLI GUEST USERDB LS:              PASS   ← ls -ld /root → "alr alr" (이전:
 > **여전히 미측정**: 사람이 앉은 대화형 세션에서의 창 분할·리사이즈. 자동화가 판정할 수 있는
 > 부분은 판정했고, 남은 것에는 상태 토큰을 붙이지 않는다.
 
+#### 레인 (ADR 0010)
+
+정적 ELF와 Go 바이너리는 tawcroot 레인에서 돈다([ADR 0010](adr/0010-tawcroot-lane.md)). 검사는 `alr-lane`이 alr 옆에 있고 rootfs의 `/bin/busybox`가 정적일 때만 돈다. 아니면 모두 SKIP이다. `probe_lane.c`의 검사는 rootfs에 정적 libc(`libc6-dev`)가 없으면 `LANE PROBE` SKIP 하나로 나온다.
+
+```
+LANE STATIC SEES ROOTFS:        PASS   ← busybox cat /etc/os-release 가 Ubuntu
+LANE STATIC CWD:                PASS   ← -w /etc 에서 pwd 가 /etc
+LANE STATIC ARGV GUEST:         PASS   ← 인자는 게스트 경로 그대로
+LANE ENV CLEAN:                 PASS   ← LD_PRELOAD, LD_LIBRARY_PATH, ALR_* 가 레인에 없다
+LANE STATIC NO WARN:            PASS   ← 레인이 맡으면 unhooked-static-binary 경고가 없다
+LANE CHILD DETACHED:            PASS   ← preload 를 거쳐 레인에 든 자식을 슈퍼바이저가 떼어 낸다
+LANE CHILD SEES ROOTFS:         PASS
+LANE IDS MATCH PRELOAD:         PASS   ← 두 레인의 id -u 가 같다
+LANE FAKEROOT IDS:              PASS   ← ALR_FAKEROOT=1 이면 레인도 0
+LANE SYMLINK RELATIVIZED:       PASS   ← 레인의 ln -s /etc/os-release 가 ../../../etc/os-release
+LANE SYMLINK READ BY PRELOAD:   PASS
+LANE HARDLINK READ BY PRELOAD:  PASS   ← 레인의 ln 이 만든 이름을 preload 레인이 읽는다
+LANE NO LINK STORE:             PASS   ← distros/tawcroot 가 생기지 않는다
+LANE OFF SWITCH:                PASS   ← ALR_LANE=0 이면 가상화가 없다
+LANE GO BUILD AND RUN:          PASS   ← go build 와 빌드된 바이너리가 rootfs 를 본다
+LANE DIRFD ABS SYMLINK STAT:    PASS   ← 아래 34개는 tests/device/probe_lane.c (게스트 gcc 로 정적 빌드)
+LANE DIRFD ABS SYMLINK OPEN:    PASS   ← 호스트 쪽에서 만든 절대 심링크도 rootfs 기준으로 따라간다
+LANE DIRFD NOFOLLOW SYMLINK:    PASS
+LANE DIRFD LSTAT IS LINK:       PASS
+LANE CWD ABS SYMLINK STAT:      PASS
+LANE CWD ABS SYMLINK OPEN:      PASS
+LANE CWD CREATE:                PASS
+LANE CWD CREATE WHERE:          PASS
+LANE CWD AFTER VFORK CHDIR:     PASS   ← vfork 자식의 chdir 가 부모의 cwd 캐시에 남지 않는다
+LANE ROOT CWD BIND NAME:        PASS   ← 루트의 proc 는 바인드다
+LANE ROOT DIRFD BIND NAME:      PASS
+LANE ROOT DIRFD DOTDOT:         PASS
+LANE PROC DIRFD ROOT LINK:      PASS
+LANE PROC FD DIR LOWEST FD:     PASS   ← /proc/self/fd 디렉터리도 가장 낮은 빈 fd 를 받는다
+LANE DIR AT PROC FD DIR NUMBER: PASS
+LANE OWN FDS HIDDEN:            PASS   ← /proc/self/fd 에 alr-lane 의 fd 가 없다
+LANE OWN FDS EBADF:             PASS
+LANE FOLLOW STAT RETARGETED LINK: PASS ← 다른 프로세스가 바꾼 심링크의 새 대상
+LANE EFAULT STAT PATH:          PASS   ← 잘못된 포인터는 EFAULT (6개)
+LANE EFAULT STAT BUF:           PASS
+LANE EFAULT OPEN PATH:          PASS
+LANE EFAULT DIRFD PATH:         PASS
+LANE EFAULT READLINK BUF:       PASS
+LANE EFAULT PATH CROSSES PAGE:  PASS
+LANE SEGV HANDLER READBACK:     PASS   ← 게스트의 SIGSEGV 설정이 그대로 보인다 (ADR 0010 결정 7)
+LANE SEGV HANDLER RUNS:         PASS
+LANE SEGV SENT HANDLER RUNS:    PASS
+LANE SEGV HANDLER AFTER VFORK RESET: PASS
+LANE SEGV HANDLER AFTER FORK THEN VFORK RESET: PASS ← fork 자식의 첫 트랩이 vfork 자식의 것이어도
+LANE SEGV RESETHAND:            PASS
+LANE BUS HANDLER RUNS:          PASS
+LANE SEGV DEFAULT KILLS:        PASS
+LANE SEGV IGNORED STILL KILLS:  PASS
+LANE SEGV IGNORED SENT:         PASS
+CLI ROOT DIR CANONICALIZED:     PASS   ← ALR_ROOT_DIR 에 "." 가 있어도 getcwd 가 게스트 경로
+```
+
+`CLI STATIC BINARY WARNS`는 이제 `ALR_LANE=0`으로 잰다. 레인이 있으면 정적 바이너리도 가상화되므로 경고할 이유가 없다.
+
 ### M8 — 성능
 ```
 ALR BENCH GIT STATUS vs PROOT:    34.8x  MEASURED  native 42 / alr 49 / proot 1,704 ms
@@ -514,6 +573,8 @@ ALR BREADTH: install=96/96 run=96/96
 > coreutils 계열이 전부 깨진다** — 인라인 `svc` 74개짜리 raw-syscall 바이너리라 인터포저가 닿지 않고,
 > [ADR 0006](adr/0006-raw-syscall-binaries.md)이 이를 **비목표**로 확정했다
 > ([M15 §2](evidence/2026-08-03-m15-cmdline-2604.md)). 26.04 로 폭을 재면 다른 지표다.
+>
+> **갱신 (2026-10-11)**: 위 판단은 원인을 잘못 짚었다. uutils 는 이름만 잃었고, preload 가 `AT_EXECFN` 을 고친 뒤 26.04(uutils 그대로)에서 폭은 96/96, 수용은 171/0/0 이다([증거](evidence/2026-10-11-t5-uutils-preload.md)).
 
 ## 6. 숨은 비용 — 발표 전 반드시 측정
 

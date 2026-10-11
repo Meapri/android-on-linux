@@ -6,12 +6,13 @@
 
 ## 2. 타깃
 
-- **디바이스**: arm64, **Android 16 전용.** 벤더 2곳에서 검증됐고, 다른 릴리스는 **지원 범위 밖**이다([ADR 0007](adr/0007-android-16-only.md)).
+- **디바이스**: arm64, **Android 16과 17.** 벤더 2곳에서 검증됐고, Android 17은 Snapdragon 참조 기기에서만 쟀다. 다른 릴리스는 **지원 범위 밖**이다([ADR 0007](adr/0007-android-16-only.md) 과 그 보론).
 
 | | 상태 |
 |---|---|
 | MediaTek MT8775, Android 16 (커널 `6.1.145-android14`) | **검증됨** — 수용 164, 폭 96/96 |
 | Qualcomm Snapdragon 8 Elite SM8750, Android 16 (커널 `6.6.98-android15`) | **검증됨** — 폭 96/96, 차단 syscall 집합 동일 ([M19](evidence/2026-08-03-m19-snapdragon.md)) |
+| Qualcomm Snapdragon 8 Elite SM8750, **Android 17** (커널 `6.6.127-android15`) | **검증됨** — 차단 syscall 집합이 Android 16과 동일, 수용 테스트 ([2026-10-11 T1](evidence/2026-10-11-t1-ubuntu-2604-android17.md)) |
 | Android 12 / 13 / 14 / 15 (모든 기기) | **범위 밖 — 지원하지 않는다.** 검증 계획 없음 ([ADR 0007](adr/0007-android-16-only.md)) |
 | 다른 OEM 의 Android 16 | **미측정, 그리고 잴 수단이 없다.** 미지원이라는 뜻이 아니다 — 확인해 주지 못한다는 뜻이다 (아래) |
 
@@ -38,9 +39,9 @@
 >
 > **exec 는 Snapdragon 이 2배 빠르고**(proot 쪽도 함께 오르므로 기기 성능 차이다) **재작성 per-op 은 MediaTek 이 빠르다.** 배수가 MediaTek 에서 더 큰 것은 alr 이 빨라서가 아니라 **proot 가 더 느려서**다. 배수를 인용할 때는 기기를 함께 쓴다.
 - **호스트**: Termux **F-Droid / GitHub 빌드** (`targetSdkVersion=28`). Play Store 빌드는 **v1 미지원** (ADR 0005).
-- **게스트**: Ubuntu 24.04 (noble) arm64, glibc 2.39, `ports.ubuntu.com` 아카이브. Debian bookworm/trixie는 v1.1 목표.
+- **게스트**: **Ubuntu 26.04 LTS** (resolute, glibc 2.43) arm64 하나만 지원한다. `alr install` 과 모든 명령의 기본값이다. 24.04 (noble) 는 2026-10-11 부로 지원하지 않는다([ADR 0005](../../../docs/adr/0005-termux-first-goals.md)). coreutils 는 Ubuntu 기본값인 uutils 를 그대로 쓴다. GNU 로 바꾸고 싶으면 `alr use-gnu-coreutils` 를 쓴다([ADR 0006 보론 2](adr/0006-raw-syscall-binaries.md), [증거](evidence/2026-10-11-t5-uutils-preload.md)). Debian bookworm/trixie는 v1.1 목표.
 - **워크로드**: `git`, `node`(및 npm/npx), `bash`, `apt`/`dpkg`, 일반 coreutils/빌드 툴체인.
-  `codex` 는 **비목표**다 — 정적 링크라 경로 가상화가 원리적으로 닿지 않는다([ADR 0008](adr/0008-static-guest-binaries-non-goal.md)).
+  `codex`, Go 툴체인, busybox-static 같은 정적·Go 바이너리는 tawcroot 레인(`alr-lane`)에서 경로 가상화된다([ADR 0010](adr/0010-tawcroot-lane.md), [증거](evidence/2026-10-11-t5-lane.md)).
 
 ## 3. 목표 (Goals)
 
@@ -61,10 +62,12 @@
 | G2 | **MEASURED 달성** | 아무것도 없는 상태에서 `alr install --with git` **2분 27초**, `git version 2.43.0`. `openssh-client` 포함 전 패키지 `ii` ([M10](evidence/2026-08-02-m10-apt-install-git.md)) |
 | G3 | **MEASURED 달성** | 수용 테스트가 매 실행 `path_traps=0 syscall_stops=0` 보고 |
 | G4 | **MEASURED 달성** | proot-distro 대비 `git status` **25.8×** (양쪽 git 2.53.0 동일, 워밍업 후 — [M19 §6.1](evidence/2026-08-03-m19-snapdragon.md)). 34.8× 는 git 빌드가 셋 다 달랐던 M8 수치라 인용하지 않는다 |
-| G5 | **MEASURED 달성** | `node`/`npm` 은 동적 링크라 경로 가상화가 적용된다 — `npm ci` 실측 proot-distro 대비 **3.12×** ([M12](evidence/2026-08-03-m12-spawn-resolver.md)). codex 는 [ADR 0008](adr/0008-static-guest-binaries-non-goal.md) 로 G5 에서 뺐다(정적 링크, 원리적으로 후킹 불가) |
+| G5 | **MEASURED 달성** | `node`/`npm` 은 동적 링크라 경로 가상화가 적용된다 — `npm ci` 실측 proot-distro 대비 **3.12×** ([M12](evidence/2026-08-03-m12-spawn-resolver.md)). codex 는 한때 [ADR 0008](adr/0008-static-guest-binaries-non-goal.md) 로 G5 에서 뺐지만, 2026-10-11 부터 tawcroot 레인에서 rootfs 를 본다([ADR 0010](adr/0010-tawcroot-lane.md)) |
 | G6 | **부분 달성** | 어휘가 이제 **강제된다** — `scripts/check-reasons.sh` 가 방출 코드와 [05 §7](05-provisioning-spec.md) 목록을 **양방향**으로 검사하고 `make check`·CI 에 걸려 있다(현재 32/32 일치). **남은 것**: `alr.c` 의 일부 stderr 실패 경로에 아직 코드가 없다 — 어휘는 지켜지지만 전수는 아니다 |
 
-> ⚠️ **codex 는 비목표다**([ADR 0008](adr/0008-static-guest-binaries-non-goal.md)). `--with codex` 로 설치·실행은 되지만 **경로 가상화 없이 돈다.** 아래는 그 근거이며, `alr` 은 정적 ELF 를 실행할 때 한 줄로 경고한다.
+> **2026-10-11 정정**: 아래 인용은 레인 이전의 상태다. 지금 codex 는 tawcroot 레인([ADR 0010](adr/0010-tawcroot-lane.md))에서 rootfs 를 `/` 로 보고, `codex doctor` 는 rootfs 안의 git 과 rg 를 찾는다([증거](evidence/2026-10-11-t5-lane.md)). `ALR_LANE=0` 일 때만 아래처럼 가상화 없이 돌고 경고가 나온다.
+>
+> ⚠️ **(레인 이전) codex 는 비목표다**([ADR 0008](adr/0008-static-guest-binaries-non-goal.md)). `--with codex` 로 설치·실행은 되지만 **경로 가상화 없이 돈다.** 아래는 그 근거이며, `alr` 은 정적 ELF 를 실행할 때 한 줄로 경고한다.
 >
 > **`codex --version` 이 통과한다는 것을 "codex 가 게스트 안에서 동작한다" 로 읽지 말 것.** 배포되는 codex 바이너리는 `INTERP` 프로그램 헤더도 `NEEDED` 항목도 없는 **정적 링크**(269 MB, ET_EXEC)다. `LD_PRELOAD` 는 원리적으로 닿지 않으므로 codex 의 모든 경로 연산은 rootfs 가 아니라 Android 파일시스템으로 간다. 실제로 시작할 때마다 `could not create PATH aliases: Read-only file system` 을 낸다 — 그 경로가 Android 의 읽기 전용 루트로 샌 증거다. codex 는 그 실패를 치명적으로 다루지 않아 계속 진행할 뿐이다.
 >
@@ -125,13 +128,12 @@
 
 - **GUI / X11 / Wayland / GPU 가속.** 상위 프로젝트(android-on-linux)의 영역. `alr`은 CLI 전용이다.
 - **Play Store Termux 지원** (ADR 0005).
-- **정적 링크 게스트 바이너리** ([ADR 0008](adr/0008-static-guest-binaries-non-goal.md)). `LD_PRELOAD` 가 닿을 동적 심볼이 없다 — codex 가 대표 사례다. 실행은 막지 않되 경로 가상화는 붙지 않는다.
 - **Android 12~15 지원** ([ADR 0007](adr/0007-android-16-only.md)). 검증하지 않는다 — bionic allowlist 는 릴리스마다 커지므로 Android 16 실측을 구버전으로 외삽할 수 없고, 외삽하지 않기로 했다.
 - **보안 격리.** `alr`은 샌드박스가 **아니다**. 경로 재작성은 방어 경계가 아니다.
 - **x86 에뮬레이션** (box64/FEX). 네이티브 arm64만.
 - **systemd / init / 서비스 관리.**
 - **setuid 의미론.** `/data`는 `nosuid`이며 setuid/setgid는 seccomp로 막혀 있다. `sudo`류는 동작하지 않는다.
-- **libc를 우회해 raw `svc`를 발행하는 게스트 바이너리.** Go가 대표적이고, **Ubuntu 26.04가 기본 coreutils로 채택한 uutils(Rust)도 여기 해당한다**(74개 inline `svc` 확인). `LD_PRELOAD`는 libc를 거치는 호출만 보므로 닿지 않는다.
+- **경로 syscall을 libc 없이 직접 발행하는 게스트 바이너리.** Go가 대표적이다. `LD_PRELOAD`는 libc를 거치는 호출만 보므로 닿지 않는다. Ubuntu 26.04의 uutils(Rust)는 inline `svc`가 74개 있지만 모두 fd 계열이고, 자기 이름을 raw `PR_GET_AUXV`로 읽는 문제만 있었다. 이 문제는 preload가 `AT_EXECFN`을 고쳐서 해결했다([증거](evidence/2026-10-11-t5-uutils-preload.md)). Go 바이너리와 정적 바이너리는 tawcroot 레인에서 가상화된다([ADR 0010](adr/0010-tawcroot-lane.md)). 그래서 이 항목은 더 이상 비목표가 아니다. 비용도 T2 예산 안이다. 경로 syscall만 반복하는 busybox `find`와 `ls -lR`이 레인에서 `ALR_LANE=0` 대비 1.08배와 1.09배다([증거](evidence/2026-10-11-t5-lane-cost.md)).
 
   > **정정.** 이전에 "가로챌 방법이 원리적으로 없다"고 적었는데 틀렸다. seccomp user notification은 **동작한다** — 스택된 필터에서 `USER_NOTIF`(0x7fc00000)가 `ALLOW`(0x7fff0000)보다 우선하고, 앞서 본 `EPERM`은 정책이 아니라 `no_new_privs`가 0이어서였다. 비목표인 진짜 이유는 **비용**이다: 알림 왕복 실측 **154 µs/syscall**(베이스라인의 352배, 그것도 하한). 값싼 대안인 `PR_SET_SYSCALL_USER_DISPATCH`는 이 커널(arm64 6.1)에 없다. 근거와 남은 선택지는 [ADR 0006](adr/0006-raw-syscall-binaries.md).
 

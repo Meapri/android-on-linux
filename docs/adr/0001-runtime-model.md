@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted.
+Accepted. The backend order below is **superseded by [ADR 0004](0004-unified-direction.md)** (2026-10-11): PRoot was removed ([THIRD-PARTY](../THIRD-PARTY.md)), and the product engine is now alr (`runtime/alr`), which executes the guest through kernel `execve` at `targetSdk 28`. The no-root, no-VM decision and the packaged-native-entrypoint rule remain in force. The text below is kept as the historical record.
 
 ## Decision
 

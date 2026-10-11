@@ -7,13 +7,15 @@
 #   make preload     guest-side libalr_preload.so under the pinned zig
 #   make alr         cross-build the alr binary with the NDK
 #   make doctor      cross-build alr-doctor with the NDK
+#   make lane        cross-build alr-lane (vendored tawcroot, ADR 0010)
 #   make check       test + the device-free preload release gates
 #   make install     lay the release layout down under $(DESTDIR)$(PREFIX)
 #   make release     build the release tarball (scripts/make-release.sh)
 #   make device-test push + build + run the host tests ON the device
 #
 # Two ABI sides (docs/01-platform-facts.md §F1/§F2):
-#   host  (bionic) -> NDK 29, --target=aarch64-linux-android24
+#   host  (bionic) -> NDK 29, --target=aarch64-linux-android24 (alr: android29,
+#                     static; see ALR_API below)
 #   guest (glibc)  -> zig cc, --target=aarch64-linux-gnu.2.17
 # Termux's own clang is an on-device inner loop only, never a release path.
 
@@ -92,6 +94,30 @@ ifeq "$(origin CFLAGS)" "command line"
 HOST_CFLAGS := $(CFLAGS) -D_GNU_SOURCE $(ALR_INC)
 endif
 
+# alr itself is linked STATIC.  Every dynamic bionic program pays the linker
+# (and Termux's LD_PRELOADed libtermux-exec) before main -- 8-10 ms on the
+# reference device, where `true` alone takes 10 ms -- and `alr run` used to
+# pay it on top of the guest's own start.  Static, `alr run python3 -c pass`
+# went from 27 to 16.5 ms against Termux's 22.7 (docs/evidence/
+# 2026-10-11-t5-lane.md).  API 29, not 24: bionic's libc.a below 29 leaves the
+# TLS segment 8-aligned and a static arm64 executable then aborts at start
+# ("TLS segment is underaligned").  alr-doctor stays dynamic at 24 -- it is the
+# tool that has to run on whatever device it is asked about.
+#
+# An explicit HOST_CC/CC (the on-device Termux loop) builds dynamic: Termux
+# ships no libc.a.
+ALR_API    := 29
+ALR_CC     := $(NDK_CLANG) --target=aarch64-linux-android$(ALR_API)
+ALR_STATIC := -static
+ifeq "$(origin HOST_CC)" "command line"
+ALR_CC     := $(HOST_CC)
+ALR_STATIC :=
+endif
+ifeq "$(origin CC)" "command line"
+ALR_CC     := $(CC)
+ALR_STATIC :=
+endif
+
 # `doctor` has always refused to run with an empty $(NDK) rather than let the
 # glob expand to a bare path and report "clang: not found" three screens later.
 # Skipped when HOST_CC has been pointed elsewhere -- that is the on-device loop.
@@ -101,7 +127,7 @@ NDK_ERR := set NDK=/path/to/android-ndk (r29+), or build on-device with HOST_CC=
 endif
 endif
 
-.PHONY: all test doctor alr preload check check-docs install release clean dist-clean \
+.PHONY: all test doctor alr lane preload check check-docs install release clean dist-clean \
         device-test check-zig
 
 all: test
@@ -125,7 +151,27 @@ alr: $(BUILD)
 ifdef NDK_ERR
 	$(error $(NDK_ERR))
 endif
-	$(HOST_CC) $(HOST_CFLAGS) $(HOST_LDFLAGS) -o $(BUILD)/alr $(ALR_SRC)
+	$(ALR_CC) $(HOST_CFLAGS) $(HOST_LDFLAGS) $(ALR_STATIC) -o $(BUILD)/alr $(ALR_SRC)
+
+# --- alr-lane (docs/adr/0010-tawcroot-lane.md) -----------------------------
+# third_party/tawcroot as a separate binary, never linked into alr.  Freestanding
+# static non-PIE, as upstream builds it; -mno-outline-atomics because a
+# -nostdlib link has no compiler-rt for __aarch64_cas*; -DTAWCROOT_ALR selects
+# the local changes listed in third_party/tawcroot/VENDORING.md.  The flags are
+# the lane's own, not $(HOST_CFLAGS): -std=c11, PIE and the stack protector are
+# all wrong for a binary with no libc.  The frame cap is upstream's: the SIGSYS
+# handler runs on the guest thread's stack (include/stack_budget.h).
+LANE_DIR     := third_party/tawcroot
+LANE_CFLAGS  := -O2 -Wall -Wframe-larger-than=1024 -Werror=frame-larger-than -ffreestanding -fno-stack-protector -fno-pie \
+                -mno-outline-atomics -D_GNU_SOURCE -DTAWCROOT_ALR -I$(LANE_DIR)/include
+LANE_LDFLAGS := -static -nostdlib -nostartfiles -Wl,--image-base=0x10000000 \
+                -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384
+lane: $(BUILD)
+ifdef NDK_ERR
+	$(error $(NDK_ERR))
+endif
+	$(HOST_CC) $(LANE_CFLAGS) $(LANE_LDFLAGS) -o $(BUILD)/alr-lane \
+	    $(LANE_DIR)/src/*.c $(LANE_DIR)/src/arch/aarch64_*.S
 
 # --- alr-doctor ------------------------------------------------------------
 # Cross-built for release; see scripts/dev-bootstrap.md for the on-device path.
@@ -179,14 +225,18 @@ check: test
 # and `alr version` recomputes that sha256 from the installed file -- the two
 # must agree or the manifest is worse than absent.
 install:
-	@for f in $(BUILD)/alr $(BUILD)/alr-doctor $(BUILD)/libalr_preload.so \
-	          $(BUILD)/libalr_preload.manifest.json; do \
-	    [ -f "$$f" ] || { echo "missing $$f -- run 'make alr doctor preload' first" >&2; \
+	@for f in $(BUILD)/alr $(BUILD)/alr-doctor $(BUILD)/alr-lane \
+	          $(BUILD)/libalr_preload.so $(BUILD)/libalr_preload.manifest.json; do \
+	    [ -f "$$f" ] || { echo "missing $$f -- run 'make alr doctor lane preload' first" >&2; \
 	                      exit 1; }; \
 	done
-	install -d $(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/share/alr
+	install -d $(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/share/alr \
+	           $(DESTDIR)$(PREFIX)/libexec/alr
 	install -m 755 $(BUILD)/alr        $(DESTDIR)$(PREFIX)/bin/alr
 	install -m 755 $(BUILD)/alr-doctor $(DESTDIR)$(PREFIX)/bin/alr-doctor
+	install -m 755 $(BUILD)/alr-lane   $(DESTDIR)$(PREFIX)/libexec/alr/alr-lane
+	install -m 644 $(LANE_DIR)/LICENSE.MIT \
+	    $(DESTDIR)$(PREFIX)/share/alr/LICENSE.tawcroot
 	install -m 755 $(BUILD)/libalr_preload.so \
 	    $(DESTDIR)$(PREFIX)/share/alr/libalr_preload.so
 	install -m 644 $(BUILD)/libalr_preload.manifest.json \

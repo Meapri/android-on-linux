@@ -28,6 +28,14 @@ handler that returns `ENOSYS`, so `execve("/bin/hello")` failed with "Function
 not implemented". A fallback that cannot run anything is worse than no
 fallback: it invites a silent downgrade to a path nobody tests.
 
+## Vendored, not shipped
+
+| Component | Origin | Licence | Status |
+|---|---|---|---|
+| `runtime/alr/third_party/tawcroot` | [wmww/tawc](https://github.com/wmww/tawc) `tawcroot/` at `d9efb4a` | MIT (Sophie Winter) | Reference input for ADR 0004 spike S2. Not built, not packaged. Provenance and rules: [VENDORING.md](../runtime/alr/third_party/tawcroot/VENDORING.md) |
+
+If tawcroot code ever enters a shipped artifact, the MIT notice must travel with it, and a new ADR must say so first.
+
 ## Downloaded at runtime, never linked
 
 The guest rootfs is a stock distribution image (Ubuntu 24.04 / 26.04

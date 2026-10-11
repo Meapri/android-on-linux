@@ -48,6 +48,7 @@
 #include <termios.h>
 #include <utime.h>
 #include <unistd.h>
+#include <sys/auxv.h>
 
 /* ── state ──────────────────────────────────────────────────────────── */
 
@@ -57,6 +58,8 @@ static const char *g_guest_exe;
 static const char *g_ldso;
 static const char *g_libpath;
 static const char *g_preload;
+/* Host path of alr-lane (ADR 0010), or NULL when the lane is off. */
+static const char *g_lane;
 static const char *g_resolv_sock;
 static int g_fakeroot;
 static int g_count;
@@ -289,6 +292,31 @@ static void alr_dtor(void)
     if (n > 0) { ssize_t w = write(g_log_fd, b, (size_t)n); (void)w; }
 }
 
+/* The variables alr_init() reads, kept as "NAME=value" so the exec path can
+ * put back any the guest removed (env_set_exe).  Static storage: R1. */
+#define ALR_NCARRY 10
+static char   g_carry[ALR_NCARRY][ALR_PBUF];
+static size_t g_carry_len[ALR_NCARRY];      /* length of "NAME=" */
+static int    g_ncarry;
+
+static void carry_capture(void)
+{
+    static const char *const names[ALR_NCARRY] = {
+        "ALR_ROOT", "ALR_LDSO", "ALR_LIBPATH", "ALR_PRELOAD", "ALR_FAKEROOT",
+        "ALR_COUNT", "ALR_LOG", "ALR_LOG_FD", ALR_RESOLV_ENV, "ALR_LANE",
+    };
+    int k;
+    for (k = 0; k < ALR_NCARRY; k++) {
+        const char *v = getenv(names[k]);
+        int w;
+        if (!v) continue;
+        w = snprintf(g_carry[g_ncarry], ALR_PBUF, "%s=%s", names[k], v);
+        if (w < 0 || w >= ALR_PBUF) continue;
+        g_carry_len[g_ncarry] = strlen(names[k]) + 1;
+        g_ncarry++;
+    }
+}
+
 static void alr_init(void)
 {
     g_in_init = 1;
@@ -377,12 +405,42 @@ static void alr_init(void)
         (void)syscall(SYS_prctl, 15 /*PR_SET_NAME*/, (unsigned long)(uintptr_t)nm,
                       0UL, 0UL, 0UL);
     }
+    /* Same cause, one more view: the kernel's AT_EXECFN names the loader.
+     * uutils' multicall dispatch takes its applet name from it, read with a
+     * raw prctl(PR_GET_AUXV) (or /proc/self/auxv) that nothing here can wrap,
+     * and failed with "unknown program 'ld-linux-aarch64.so'".  getauxval()
+     * is no help: on an explicit invocation ld.so repoints its OWN copy of
+     * AT_EXECFN at argv[0], while the kernel's copy still points at the
+     * loader path string on this process's stack.  Rewrite that string in
+     * place -- only when it is the loader's path, and only when the guest
+     * path fits in the bytes the kernel gave it. */
+    if (g_guest_exe && *g_guest_exe) {
+        const char *ld = getenv("ALR_LDSO");
+        unsigned long av[2 * 48];
+        long got = syscall(SYS_prctl, 0x41555856 /*PR_GET_AUXV*/,
+                           (unsigned long)(uintptr_t)av, sizeof av, 0UL, 0UL);
+        size_t k;
+        for (k = 0; got > 0 && ld && 2 * k + 1 < sizeof av / sizeof av[0]
+                    && av[2 * k] != AT_NULL; k++) {
+            char *fn;
+            if (av[2 * k] != AT_EXECFN) continue;
+            fn = (char *)(uintptr_t)av[2 * k + 1];
+            if (fn && strcmp(fn, ld) == 0) {
+                size_t n = strlen(g_guest_exe);
+                if (n <= strlen(fn)) memcpy(fn, g_guest_exe, n + 1);
+            }
+            break;
+        }
+    }
     g_ldso      = getenv("ALR_LDSO");
     g_libpath   = getenv("ALR_LIBPATH");
     g_preload   = getenv("ALR_PRELOAD");
     g_resolv_sock = getenv(ALR_RESOLV_ENV);
+    { const char *l = getenv("ALR_LANE");
+      g_lane = (l && *l && strcmp(l, "0") != 0) ? l : NULL; }
     { const char *f = getenv("ALR_FAKEROOT"); g_fakeroot = f && *f == '1'; }
     { const char *c = getenv("ALR_COUNT");    g_count    = c && *c == '1'; }
+    carry_capture();
 
     if (r && r[0] == '/') {
         size_t n = strlen(r);
@@ -1342,41 +1400,69 @@ static const char *relativize(const char *target, const char *linkguest,
     return buf;
 }
 
+/* The link's own path in GUEST namespace, for relativize().  The parent
+ * directory is resolved by the kernel -- opened O_PATH and read back through
+ * /proc/self/fd -- so a relative linkpath, a dirfd and ".." all come out
+ * right.  Only absolute linkpaths used to be relativized: `ln -s /etc/hostname
+ * l` (relative link, AT_FDCWD) stored "/etc/hostname" verbatim and the kernel
+ * then followed it into ANDROID's /etc.  NULL when the parent cannot be
+ * resolved; the caller then leaves the target alone. */
+static const char *link_guest_path(int dfd, const char *linkpath,
+                                   char *out, size_t outsz)
+{
+    char dir[ALR_PBUF], hb[ALR_PBUF], gb[ALR_PBUF], fdb[32];
+    const char *slash, *base, *c;
+    size_t dl, bl;
+    long fd, n;
+
+    if (!linkpath || !*linkpath || !g_root_len) return NULL;
+    slash = strrchr(linkpath, '/');
+    if (slash) {
+        dl = (size_t)(slash - linkpath);
+        if (dl == 0) dl = 1;                         /* "/name" -> "/" */
+        if (dl >= sizeof dir) return NULL;
+        memcpy(dir, linkpath, dl); dir[dl] = '\0';
+        base = slash + 1;
+    } else {
+        dir[0] = '.'; dir[1] = '\0';
+        base = linkpath;
+    }
+    if (!*base) return NULL;
+    /* through the syscall() wrapper, which maps a guest-absolute dir */
+    fd = syscall(SYS_openat, dir[0] == '/' ? AT_FDCWD : dfd, dir,
+                 O_PATH | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return NULL;
+    snprintf(fdb, sizeof fdb, "/proc/self/fd/%ld", fd);
+    n = syscall(SYS_readlinkat, AT_FDCWD, fdb, hb, sizeof hb - 1);
+    syscall(SYS_close, fd);
+    if (n <= 0) return NULL;
+    hb[n] = '\0';
+    c = alr_guest_canon(hb, g_root, g_root_len, gb, sizeof gb);
+    if (!c || c == hb) return NULL;                  /* not under the rootfs */
+    dl = strlen(c); bl = strlen(base);
+    if (dl + 1 + bl + 1 > outsz) return NULL;
+    memcpy(out, c, dl);
+    if (out[dl - 1] != '/') out[dl++] = '/';
+    memcpy(out + dl, base, bl + 1);
+    return out;
+}
+
 int symlink(const char *target, const char *linkpath)
 {
-    char rb[ALR_PBUF];
-    const char *t = relativize(target, linkpath, rb, sizeof rb);
+    char rb[ALR_PBUF], gb[ALR_PBUF];
+    const char *lg_path = target && target[0] == '/'
+                        ? link_guest_path(AT_FDCWD, linkpath, gb, sizeof gb) : NULL;
+    const char *t = relativize(target, lg_path, rb, sizeof rb);
     if (t != target) lg("alr symlink: %s -> %s (link %s)\n", target, t, linkpath);
     { P(linkpath); NEED(symlink); return real_symlink(t, _p); }
 }
 
 int symlinkat(const char *target, int dfd, const char *linkpath)
 {
-    char rb[ALR_PBUF], gb[ALR_PBUF], fdb[64], hb[ALR_PBUF];
-    const char *t = target, *lg_path = linkpath;
+    char rb[ALR_PBUF], gb[ALR_PBUF];
+    const char *t, *lg_path = target && target[0] == '/'
+                            ? link_guest_path(dfd, linkpath, gb, sizeof gb) : NULL;
 
-    /* Relative linkpath + a real dirfd: recover the guest path via
-     * /proc/self/fd/N so the depth is computable. If anything fails we leave
-     * the target untouched -- a wrong depth is worse than an absolute link. */
-    if (linkpath && linkpath[0] != '/' && dfd != AT_FDCWD) {
-        ssize_t r;
-        int k = snprintf(fdb, sizeof fdb, "/proc/self/fd/%d", dfd);
-        if (k > 0 && (size_t)k < sizeof fdb &&
-            (r = readlink(fdb, hb, sizeof hb - 1)) > 0) {
-            const char *c;
-            hb[r] = '\0';
-            c = alr_guest_canon(hb, g_root, g_root_len, gb, sizeof gb);
-            if (c && c[0] == '/') {
-                size_t dl = strlen(c);
-                if (dl + 1 + strlen(linkpath) + 1 <= sizeof gb) {
-                    if (c != gb) { memcpy(gb, c, dl + 1); }
-                    if (dl && gb[dl - 1] != '/') gb[dl++] = '/';
-                    memcpy(gb + dl, linkpath, strlen(linkpath) + 1);
-                    lg_path = gb;
-                }
-            }
-        }
-    }
     t = relativize(target, lg_path, rb, sizeof rb);
     if (t != target)
         lg("alr symlinkat: %s -> %s (link %s dfd=%d)\n", target, t, lg_path, dfd);
@@ -1603,17 +1689,32 @@ static char *const *env_set_exe(char *const envp[], const char *guest,
                                 char *kv, size_t kvsz, const char **out)
 {
     size_t n = 0;
-    int i, seen = 0;
+    int i, k, seen = 0;
 
     if (!envp) return envp;
     if ((size_t)snprintf(kv, kvsz, "ALR_GUEST_EXE=%s", guest) >= kvsz) return envp;
     for (i = 0; envp[i]; i++) {
-        if (n >= ALR_ENV_MAX - 2) { lg("alr exec: env > %d, exe identity stale\n",
-                                       ALR_ENV_MAX); return envp; }
+        if (n >= ALR_ENV_MAX - 2 - ALR_NCARRY) {
+            lg("alr exec: env > %d, exe identity stale\n", ALR_ENV_MAX);
+            return envp;
+        }
         if (strncmp(envp[i], "ALR_GUEST_EXE=", 14) == 0) { out[n++] = kv; seen = 1; }
         else out[n++] = envp[i];
     }
     if (!seen) out[n++] = kv;
+    /* Runtime state the guest scrubbed from its own environment.  ucf (26.04)
+     * unsets every variable outside a short allowlist before it runs id, md5sum
+     * and cp; those children then started with no ALR_ROOT and no ALR_FAKEROOT,
+     * so they ran unvirtualized and as the real uid -- php8.5-common, mercurial,
+     * sysstat and parallel all failed to configure.  These are not the user's
+     * environment but the runtime's, and a guest process cannot opt out of it. */
+    for (k = 0; k < g_ncarry; k++) {
+        size_t nl = g_carry_len[k];
+        int j, have = 0;
+        for (j = 0; envp[j]; j++)
+            if (strncmp(envp[j], g_carry[k], nl) == 0) { have = 1; break; }
+        if (!have) out[n++] = g_carry[k];
+    }
     out[n] = NULL;
     return (char *const *)out;
 }
@@ -1653,7 +1754,7 @@ static int exec_build(const char *guest, char *const argv[],
     struct pctx ctx;
     enum alr_exe_kind kind = ALR_EXE_UNSUPPORTED;
     const char *cur = guest, *host = NULL;
-    int nl = 0, argc = 0, i, j;
+    int nl = 0, argc = 0, i, j, is_go = 0;
 
     ensure_init();
     if (!real_open) { errno = ENOSYS; return -1; }
@@ -1670,6 +1771,8 @@ static int exec_build(const char *guest, char *const argv[],
         ctx.fd = fd;
         kind = alr_classify(head, (size_t)n, pctx_read, &ctx,
                             &sb, ibuf[nl], ALR_SHEBANG_IBUF);
+        is_go = kind == ALR_EXE_ELF_DYNAMIC && g_lane
+                && alr_elf_is_go(head, (size_t)n, pctx_read, &ctx);
         close(fd);
         if (kind != ALR_EXE_SHEBANG) break;
         if (nl >= maxdepth - 1) { errno = ELOOP; return -1; }
@@ -1730,6 +1833,34 @@ static int exec_build(const char *guest, char *const argv[],
             av[argc] = NULL;
             return 1;
         }
+    }
+
+    /* ADR 0010: a program that makes its own path syscalls -- every static
+     * ELF, and Go even when dynamically linked -- runs under alr-lane, which
+     * traps those syscalls in-process and translates them against the root.
+     * It gets GUEST paths, unchanged: the lane does the mapping.  The caller
+     * strips this runtime's loader environment (host_out == 2), and the
+     * supervisor detaches when it sees the exec land on alr-lane, because a
+     * traced process pays a tracer round trip for every one of those traps. */
+    if (g_lane && (kind == ALR_EXE_ELF_STATIC || is_go)) {
+        lg("alr exec: lane %s%s\n", cur, is_go ? " (go)" : "");
+        if (host_out) *host_out = 2;
+        *file_out = g_lane;
+        av[argc++] = g_lane;
+        av[argc++] = "-r"; av[argc++] = g_root;
+        av[argc++] = "-b"; av[argc++] = "/proc:/proc";
+        av[argc++] = "-b"; av[argc++] = "/dev:/dev";
+        av[argc++] = "-b"; av[argc++] = "/sys:/sys";
+        if (g_fakeroot) av[argc++] = "--fakeroot";  /* same ids as here */
+        av[argc++] = "--";
+        av[argc++] = cur;
+        for (j = nl - 1; j >= 0 && argc < avmax - 2; j--) {
+            if (lvl[j].arg) av[argc++] = lvl[j].arg;
+            av[argc++] = lvl[j].file;
+        }
+        for (i = 1; argv[i] && argc < avmax - 2; i++) av[argc++] = (char *)argv[i];
+        av[argc] = NULL;
+        return 1;
     }
 
     if (kind == ALR_EXE_ELF_STATIC || !g_ldso) {
@@ -1800,6 +1931,32 @@ static int exec_build(const char *guest, char *const argv[],
     return 1;
 }
 
+/* The environment for a child this runtime does not interpose.
+ *
+ * A host binary must not inherit the GUEST's loader environment:
+ * LD_LIBRARY_PATH and LD_PRELOAD point into the rootfs at glibc objects, and
+ * an Android binary asks bionic to load them and gets
+ *     alr: error while loading shared libraries: libdl.so
+ * naming a library that exists on both sides in incompatible forms.
+ *
+ * A lane child (ADR 0010) drops this runtime's ALR_* variables as well: inside
+ * the lane every path is the guest's, and a dynamic program the lane loads
+ * must not find our host-path preload settings. */
+static char *const *env_strip(char *const *ep, int lane)
+{
+    static const char *out[ALR_ENV_MAX + 1];
+    int n = 0, k;
+    for (k = 0; ep[k] && n < ALR_ENV_MAX; k++) {
+        if (!strncmp(ep[k], "LD_PRELOAD=", 11))      continue;
+        if (!strncmp(ep[k], "LD_LIBRARY_PATH=", 16)) continue;
+        if (!strncmp(ep[k], "LOCPATH=", 8))          continue;
+        if (lane && !strncmp(ep[k], "ALR_", 4))       continue;
+        out[n++] = ep[k];
+    }
+    out[n] = NULL;
+    return (char *const *)out;
+}
+
 static int exec_dispatch(const char *guest, char *const argv[],
                          char *const envp[], int depth)
 {
@@ -1817,26 +1974,7 @@ static int exec_dispatch(const char *guest, char *const argv[],
                    ibuf, ALR_SHEBANG_MAX_DEPTH, &file, &ident, &is_host) < 0)
         return -1;
     ep = env_set_exe(envp, ident, kv, sizeof kv, ne);
-    if (is_host) {
-        /* A host binary must not inherit the GUEST's loader environment.
-         *
-         * LD_LIBRARY_PATH and LD_PRELOAD point into the rootfs at glibc
-         * objects; an Android binary asks bionic to load them and gets
-         *     alr: error while loading shared libraries: libdl.so
-         * naming a library that exists on both sides in incompatible forms.
-         * Same rule as everywhere else in this runtime: host paths and a host
-         * environment for something we are not virtualizing. */
-        static const char *hostenv[ALR_ENV_MAX + 1];
-        int hn = 0, k;
-        for (k = 0; ep[k] && hn < ALR_ENV_MAX; k++) {
-            if (!strncmp(ep[k], "LD_PRELOAD=", 11))      continue;
-            if (!strncmp(ep[k], "LD_LIBRARY_PATH=", 16)) continue;
-            if (!strncmp(ep[k], "LOCPATH=", 8))          continue;
-            hostenv[hn++] = ep[k];
-        }
-        hostenv[hn] = NULL;
-        return real_execve(file, (char *const *)av, (char *const *)hostenv);
-    }
+    if (is_host) ep = env_strip(ep, is_host == 2);
     return real_execve(file, (char *const *)av, ep);
 }
 
@@ -1956,19 +2094,7 @@ static int spawn_common(pid_t *pid, const char *path,
                        ibuf, ALR_SHEBANG_MAX_DEPTH, &file, &ident, &is_host) < 0)
             return errno ? errno : ENOEXEC;
         ep = env_set_exe(envp, ident, kv, sizeof kv, ne);
-        if (is_host) {
-            /* Same host-binary rule as execve: no guest loader environment. */
-            static const char *hostenv[ALR_ENV_MAX + 1];
-            int hn = 0, k;
-            for (k = 0; ep[k] && hn < ALR_ENV_MAX; k++) {
-                if (!strncmp(ep[k], "LD_PRELOAD=", 11))      continue;
-                if (!strncmp(ep[k], "LD_LIBRARY_PATH=", 16)) continue;
-                if (!strncmp(ep[k], "LOCPATH=", 8))          continue;
-                hostenv[hn++] = ep[k];
-            }
-            hostenv[hn] = NULL;
-            ep = (char *const *)hostenv;
-        }
+        if (is_host) ep = env_strip(ep, is_host == 2);
         return real_posix_spawn(pid, file, fa, attr, (char *const *)av, ep);
     }
 }
@@ -3515,15 +3641,33 @@ char *ttyname(int fd)
     if (ttyname_r(fd, g_tty, sizeof g_tty) != 0) return NULL;
     return g_tty;
 }
+static int alr_tc_get(int fd, struct termios *out);
+static int alr_speed_is_baud(void);
+
 int ttyname_r(int fd, char *buf, size_t buflen)
 {
     char host[ALR_PBUF], g[ALR_PBUF];
     const char *c;
     int r;
     ensure_init();
-    if (!real_ttyname_r) { errno = ENOSYS; return ENOSYS; }
-    r = real_ttyname_r(fd, host, sizeof host);
-    if (r != 0) return r;
+    if (alr_speed_is_baud()) {
+        /* glibc >= 2.42's ttyname_r checks the fd with its internal
+         * tcgetattr, i.e. TCGETS2, which Android denies -- every terminal
+         * came back EACCES and `tty` said "not a tty".  Do the check on the
+         * allowed TCGETS and take the name from /proc/self/fd, which is
+         * where glibc reads it too. */
+        char link[32];
+        long n;
+        if (alr_tc_get(fd, NULL) != 0) return errno == EBADF ? EBADF : ENOTTY;
+        snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+        n = syscall(SYS_readlinkat, AT_FDCWD, link, host, sizeof host - 1);
+        if (n < 0) return errno;
+        host[n] = '\0';
+    } else {
+        if (!real_ttyname_r) { errno = ENOSYS; return ENOSYS; }
+        r = real_ttyname_r(fd, host, sizeof host);
+        if (r != 0) return r;
+    }
     c = alr_guest_canon(host, g_root, g_root_len, g, sizeof g);
     { size_t n = strlen(c);
       if (n + 1 > buflen) return ERANGE;
@@ -3734,4 +3878,150 @@ int ioctl(int fd, unsigned long req, ...)
     default:
         return real_ioctl(fd, req, arg);
     }
+}
+
+/* ---- termios entry points that bypass the ioctl wrapper -------------------
+ *
+ * glibc >= 2.42 implements tcgetattr/tcsetattr with the TCGETS2/TCSETS2
+ * ioctls (and isatty() on top of tcgetattr).  Inside libc those are internal
+ * calls, so the PLT-level `ioctl` wrapper above never sees them and the kernel
+ * answers EACCES (Android's ioctlcmd filter, see the table above).  Measured on
+ * ubuntu-26.04 (glibc 2.43): raw TCGETS2 on a pty slave -> EACCES, tcgetattr ->
+ * EACCES, isatty -> 0.  tmux 3.6 does `tcgetattr(STDIN_FILENO)` in the pane
+ * child and `_exit(1)`s when it fails, so every pane died before exec.  glibc
+ * 2.39 (ubuntu-24.04) still uses TCGETS and never hit this.
+ *
+ * Re-implement the three libc entry points on the allowed TCGETS/TCSETS* ioctls,
+ * converting between the kernel layout (NCCS=19) and glibc's struct termios.
+ *
+ * The speed fields need the RUNNING glibc's convention, not the one this .so
+ * was built against (2.17).  Up to 2.41 speed_t is the CBAUD code (B38400 ==
+ * 017) and c_ispeed/c_ospeed hold that code.  From 2.42 speed_t is the baud
+ * rate itself (B38400 == 38400U in ubuntu-26.04's bits/termios-baud.h) and
+ * cfgetospeed() reads c_ospeed as such -- copying the code there made `stty`
+ * report a nonsense speed. */
+#define ALR_CBAUD   0010017u
+#define ALR_IBSHIFT 16
+static const unsigned alr_baud_tab[][2] = {     /* { CBAUD code, baud } */
+    {0, 0}, {01, 50}, {02, 75}, {03, 110}, {04, 134}, {05, 150}, {06, 200},
+    {07, 300}, {010, 600}, {011, 1200}, {012, 1800}, {013, 2400},
+    {014, 4800}, {015, 9600}, {016, 19200}, {017, 38400},
+    {0010001, 57600}, {0010002, 115200}, {0010003, 230400},
+    {0010004, 460800}, {0010005, 500000}, {0010006, 576000},
+    {0010007, 921600}, {0010010, 1000000}, {0010011, 1152000},
+    {0010012, 1500000}, {0010013, 2000000}, {0010014, 2500000},
+    {0010015, 3000000}, {0010016, 3500000}, {0010017, 4000000},
+};
+#define ALR_NBAUD (sizeof alr_baud_tab / sizeof alr_baud_tab[0])
+
+extern const char *gnu_get_libc_version(void);
+
+/* 1 when the guest glibc stores baud rates (>= 2.42) in c_[io]speed. */
+static int alr_speed_is_baud(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *s = gnu_get_libc_version();
+        unsigned maj = 0, min = 0;
+        if (s) sscanf(s, "%u.%u", &maj, &min);
+        v = maj > 2 || (maj == 2 && min >= 42);
+    }
+    return v;
+}
+
+static unsigned alr_code_to_baud(unsigned code)
+{
+    size_t i;
+    for (i = 0; i < ALR_NBAUD; i++)
+        if (alr_baud_tab[i][0] == code) return alr_baud_tab[i][1];
+    return 0;
+}
+
+/* -1 when the rate has no CBAUD code (it would need BOTHER + TCSETS2). */
+static long alr_baud_to_code(unsigned baud)
+{
+    size_t i;
+    for (i = 0; i < ALR_NBAUD; i++)
+        if (alr_baud_tab[i][1] == baud) return (long)alr_baud_tab[i][0];
+    return -1;
+}
+
+static int alr_tc_get(int fd, struct termios *out)
+{
+    struct alr_ktermios k;
+
+    if (!real_ioctl) real_ioctl = dlsym(RTLD_NEXT, "ioctl");
+    if (!real_ioctl) { errno = ENOSYS; return -1; }
+    if (real_ioctl(fd, TCGETS, &k) != 0) return -1;
+    if (out) {
+        unsigned ocode = k.c_cflag & ALR_CBAUD;
+        unsigned icode = (k.c_cflag >> ALR_IBSHIFT) & ALR_CBAUD;
+
+        memset(out, 0, sizeof *out);
+        out->c_iflag = k.c_iflag;
+        out->c_oflag = k.c_oflag;
+        out->c_cflag = k.c_cflag;
+        out->c_lflag = k.c_lflag;
+        out->c_line  = k.c_line;
+        memcpy(out->c_cc, k.c_cc, ALR_KNCCS);
+        if (alr_speed_is_baud()) {
+            out->c_ospeed = alr_code_to_baud(ocode);
+            out->c_ispeed = icode ? alr_code_to_baud(icode) : out->c_ospeed;
+        } else {
+            /* what glibc <= 2.41's own tcgetattr stores */
+            out->c_ispeed = out->c_ospeed = ocode;
+        }
+    }
+    return 0;
+}
+
+int tcgetattr(int fd, struct termios *t)
+{
+    ensure_init();
+    if (!t) { errno = EFAULT; return -1; }
+    return alr_tc_get(fd, t);
+}
+
+int tcsetattr(int fd, int act, const struct termios *t)
+{
+    struct alr_ktermios k;
+    unsigned long cmd;
+
+    ensure_init();
+    if (!t) { errno = EFAULT; return -1; }
+    switch (act) {
+    case TCSANOW:   cmd = TCSETS;  break;
+    case TCSADRAIN: cmd = TCSETSW; break;
+    case TCSAFLUSH: cmd = TCSETSF; break;
+    default: errno = EINVAL; return -1;
+    }
+    if (!real_ioctl) real_ioctl = dlsym(RTLD_NEXT, "ioctl");
+    if (!real_ioctl) { errno = ENOSYS; return -1; }
+    memset(&k, 0, sizeof k);
+    k.c_iflag = t->c_iflag;
+    k.c_oflag = t->c_oflag;
+    k.c_cflag = t->c_cflag;
+    k.c_lflag = t->c_lflag;
+    k.c_line  = t->c_line;
+    memcpy(k.c_cc, t->c_cc, ALR_KNCCS);
+    if (alr_speed_is_baud()) {
+        /* glibc >= 2.42's cfset*speed write c_[io]speed only; the kernel reads
+         * the speed from the CBAUD/CIBAUD bits of c_cflag. */
+        long oc = alr_baud_to_code(t->c_ospeed);
+        long ic = (t->c_ispeed == 0 || t->c_ispeed == t->c_ospeed)
+                  ? 0 : alr_baud_to_code(t->c_ispeed);
+        if (oc < 0 || ic < 0) { errno = EINVAL; return -1; }
+        k.c_cflag &= ~(ALR_CBAUD | (ALR_CBAUD << ALR_IBSHIFT));
+        k.c_cflag |= (unsigned)oc | ((unsigned)ic << ALR_IBSHIFT);
+    }
+    return real_ioctl(fd, cmd, &k);
+}
+
+int isatty(int fd)
+{
+    int saved = errno;
+    ensure_init();
+    if (alr_tc_get(fd, NULL) == 0) { errno = saved; return 1; }
+    if (errno != EBADF) errno = ENOTTY;      /* glibc contract */
+    return 0;
 }

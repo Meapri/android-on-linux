@@ -53,8 +53,8 @@ if [ -n "${ALR_ROOT:-}" ]; then
     : "${ALR_DISTRO:=$(basename "$ALR_ROOT")}"
 fi
 export ALR_ROOT_DIR=${ALR_ROOT_DIR:-$HOME/alr-distros}
-R="$ALR_ROOT_DIR/${ALR_DISTRO:-ubuntu-24.04}"
-ALR_DISTRO_NAME="${ALR_DISTRO:-ubuntu-24.04}"
+R="$ALR_ROOT_DIR/${ALR_DISTRO:-ubuntu-26.04}"
+ALR_DISTRO_NAME="${ALR_DISTRO:-ubuntu-26.04}"
 # `set -u` is on and PREFIX is a Termux variable: unset it aborts the run at
 # the first mention rather than skipping the check that mentions it.
 : "${PREFIX:=/nonexistent}"
@@ -217,6 +217,11 @@ ck  "CLI EXEC DDASH"             exec-ok        $ALR exec -- /bin/echo exec-ok
 # skipped the ".."-pops-at-root clamp and `-w /../..` chdir'd ABOVE the rootfs.
 ck  "CLI WORKDIR CLAMPS DOTDOT"  /              $ALR run -w /../.. /bin/pwd
 ck  "CLI WORKDIR NORMALIZES"     /etc           $ALR run -w /root/../etc /bin/pwd
+# The kernel reports cwd and /proc/self/fd targets canonically; a root dir
+# spelled with "." or ".." never prefix-matched them, so getcwd() returned the
+# host path and the uutils name fix missed ld.so (seen with
+# ALR_ROOT_DIR=$HOME/../usr/var/lib/alr/distros).
+ck  "CLI ROOT DIR CANONICALIZED" /etc           env ALR_ROOT_DIR="$ALR_ROOT_DIR/." $ALR run -w /etc /bin/pwd
 ck  "CLI WORKDIR PWD CANONICAL"  /etc           $ALR run -w /root/../etc /bin/sh -c 'echo $PWD'
 ck  "CLI WORKDIR SYSDIR PASS"    /proc          $ALR run -w /proc /bin/pwd
 # A -e must REPLACE alr's own value, not sit beside it: envp allows duplicate
@@ -254,19 +259,21 @@ fi
 # here must not leave the rootfs running a stale preload for every later check.
 ckc "CLI VERSION SHOWS GUEST PRELOAD" "preload (guest)" $ALR version
 _gp="$R/usr/lib/alr/libalr_preload.so"
-if [ -r "$_gp" ] && [ -r "$PREFIX/share/alr/libalr_preload.so" ] \
-   && ! cmp -s "$_gp" "$PREFIX/share/alr/libalr_preload.so"; then
+# `alr version` only hashes the two files, so any different bytes stand in for
+# an older build.  A packaged install has a second .so in $PREFIX/share/alr; a
+# dev push does not, and this check used to SKIP there.
+if [ -r "$_gp" ]; then
     cp "$_gp" "$R/tmp/.alr-preload-save" 2>/dev/null
-    cp "$PREFIX/share/alr/libalr_preload.so" "$_gp" 2>/dev/null
+    printf 'stale' >> "$_gp"
     "$ALR" version >/dev/null 2>&1; _rc=$?
     cp "$R/tmp/.alr-preload-save" "$_gp" 2>/dev/null; rm -f "$R/tmp/.alr-preload-save"
     [ "$_rc" = 1 ] && emit "CLI VERSION DETECTS STALE PRELOAD" PASS \
                    || emit "CLI VERSION DETECTS STALE PRELOAD" FAIL "rc=$_rc want=1"
-    cmp -s "$_gp" "$PREFIX/share/alr/libalr_preload.so" \
-        && emit "CLI VERSION TEST RESTORED" FAIL "rootfs left with the wrong .so" \
-        || emit "CLI VERSION TEST RESTORED" PASS
+    "$ALR" version >/dev/null 2>&1 \
+        && emit "CLI VERSION TEST RESTORED" PASS \
+        || emit "CLI VERSION TEST RESTORED" FAIL "rootfs left with the wrong .so"
 else
-    emit "CLI VERSION DETECTS STALE PRELOAD" SKIP "no second .so to swap in"
+    emit "CLI VERSION DETECTS STALE PRELOAD" FAIL "no guest preload at $_gp"
 fi
 ckrc "CLI UPDATE COMPONENTS"     0  $ALR update-components
 ckc  "CLI LIST"                  "$(basename "$R")"  $ALR list
@@ -354,19 +361,98 @@ if [ -r "$_pl" ]; then
 else
     emit "CLI WARNS UNVIRTUALIZED BOOT" SKIP "no preload in the rootfs to move"
 fi
-# A static guest binary runs but its paths resolve against ANDROID, not the
-# rootfs (ADR 0008).  alr knew and said nothing at every verbosity; the first
-# attempt at this warning fired on /usr/bin/git, because alr_classify only
-# walks PT_INTERP when given an interp buffer and the caller passed NULL.
+# Without the lane (ALR_LANE=0) a static guest binary runs but its paths
+# resolve against ANDROID, not the rootfs (ADR 0008).  alr knew and said
+# nothing at every verbosity; the first attempt at this warning fired on
+# /usr/bin/git, because alr_classify only walks PT_INTERP when given an interp
+# buffer and the caller passed NULL.
 if [ -x "$R/usr/local/bin/codex" ]; then
     ckc "CLI STATIC BINARY WARNS"  "reason=unhooked-static-binary" \
-        $ALR run /usr/local/bin/codex --version
+        env ALR_LANE=0 $ALR run /usr/local/bin/codex --version
 else
     emit "CLI STATIC BINARY WARNS" SKIP "codex not installed"
 fi
 n=$($ALR run /usr/bin/git --version 2>&1 | grep -c 'unhooked-static-binary')
 [ "${n:-1}" -eq 0 ] && emit "CLI DYNAMIC NO FALSE WARN" PASS \
                     || emit "CLI DYNAMIC NO FALSE WARN" FAIL "warned on a dynamic binary"
+
+echo "── 레인: 정적·Go 바이너리 (ADR 0010) ──"
+# busybox in Ubuntu is static: the preload never loads into it, so only the
+# lane can show it the rootfs.  Android has no /etc/os-release.
+_lane=$($ALR run /bin/busybox true 2>&1; ALR_LOG=1 $ALR run /bin/busybox true 2>&1)
+if [ -x "$R/bin/busybox" ] && printf '%s' "$_lane" | grep -q 'in the lane'; then
+    ckc "LANE STATIC SEES ROOTFS"   "ID=ubuntu" $ALR run /bin/busybox cat /etc/os-release
+    ck  "LANE STATIC CWD"           "/etc"      $ALR run -w /etc /bin/busybox pwd
+    ck  "LANE STATIC ARGV GUEST"    "/etc/hostname" $ALR run /bin/busybox realpath /etc/hostname
+    n=$($ALR run /bin/busybox env 2>&1 | grep -cE '^(LD_PRELOAD|LD_LIBRARY_PATH|ALR_)')
+    [ "${n:-1}" -eq 0 ] && emit "LANE ENV CLEAN" PASS \
+                        || emit "LANE ENV CLEAN" FAIL "$n loader variable(s) reached the lane"
+    n=$(printf '%s' "$_lane" | grep -c 'unhooked-static-binary')
+    [ "${n:-1}" -eq 0 ] && emit "LANE STATIC NO WARN" PASS \
+                        || emit "LANE STATIC NO WARN" FAIL "warned although the lane runs it"
+    # Reached through the preload (a guest exec), the lane process must leave
+    # the supervisor: a traced lane pays ~60 us per trap instead of 0.5.
+    ckc "LANE CHILD DETACHED"       "entered the lane; detaching" \
+        env ALR_LOG=1 $ALR run /bin/sh -c '/bin/busybox true'
+    ckc "LANE CHILD SEES ROOTFS"    "ID=ubuntu" $ALR run /bin/sh -c '/bin/busybox cat /etc/os-release'
+    # Inside -c, not as an argument: without the lane alr still rewrites a
+    # static program's absolute ARGUMENTS to host paths (ADR 0008 addendum).
+    # One rootfs, two lanes: what one lane writes the other must read, and a
+    # process must not change identity by crossing over.
+    ck  "LANE IDS MATCH PRELOAD"    "$($ALR run /usr/bin/id -u 2>/dev/null)" \
+        $ALR run /bin/busybox id -u
+    ck  "LANE FAKEROOT IDS"         0           env ALR_FAKEROOT=1 $ALR run /bin/busybox id -u
+    $ALR run /bin/busybox sh -c 'rm -rf /tmp/alrln && mkdir -p /tmp/alrln/d &&
+        cd /tmp/alrln/d && ln -s /etc/os-release abs && echo hl > h1 && ln h1 h2' >/dev/null 2>&1
+    ck  "LANE SYMLINK RELATIVIZED"  "../../../etc/os-release" $ALR run /usr/bin/readlink /tmp/alrln/d/abs
+    ckc "LANE SYMLINK READ BY PRELOAD" "Ubuntu" $ALR run /usr/bin/head -1 /tmp/alrln/d/abs
+    ck  "LANE HARDLINK READ BY PRELOAD" "hl"     $ALR run /usr/bin/cat /tmp/alrln/d/h2
+    [ ! -e "$ALR_ROOT_DIR/tawcroot" ] && emit "LANE NO LINK STORE" PASS \
+        || emit "LANE NO LINK STORE" FAIL "$ALR_ROOT_DIR/tawcroot exists (token symlinks are unreadable from the preload lane)"
+    _off=$(ALR_LANE=0 $ALR run /bin/busybox sh -c 'cat /etc/os-release' 2>/dev/null)
+    case "$_off" in *ID=ubuntu*) emit "LANE OFF SWITCH" FAIL "ALR_LANE=0 still virtualized";;
+                    *)           emit "LANE OFF SWITCH" PASS;; esac
+    if [ -x "$R/usr/bin/go" ]; then
+        # Go makes its file syscalls itself; before the lane `go build` failed
+        # on mkdir /tmp/go-build... (permission denied, Android's /tmp).
+        ckc "LANE GO BUILD AND RUN" "go-ok /etc/os-release" \
+            $ALR run /bin/bash -c 'rm -rf /tmp/alrgo && mkdir -p /tmp/alrgo && cd /tmp/alrgo &&
+                printf "package main\nimport (\"fmt\";\"os\")\nfunc main(){_,e:=os.Stat(\"/etc/os-release\");if e==nil{fmt.Println(\"go-ok /etc/os-release\")}}\n" > m.go &&
+                printf "module alrgo\n" > go.mod && go build -o m . && ./m'
+    else
+        emit "LANE GO BUILD AND RUN" SKIP "golang-go not installed"
+    fi
+    # The lane's fast paths and its own fault handling, checked from inside
+    # a static guest program (probe_lane.c).  `abs` is made from the host so
+    # no lane relativized it: followed by the kernel it names Android's
+    # /etc/hostname.
+    rm -rf "$R/tmp/alrlp" && mkdir -p "$R/tmp/alrlp" && ln -s /etc/hostname "$R/tmp/alrlp/abs"
+    cp tests/device/probe_lane.c "$R/tmp/probe_lane.c" 2>/dev/null
+    if $ALR run /usr/bin/gcc -O1 -static -o /tmp/probe_lane /tmp/probe_lane.c >/dev/null 2>&1; then
+        _plr=$($ALR run /tmp/probe_lane /tmp/alrlp 2>&1)
+        _cnt=0
+        while IFS= read -r _line; do
+            case "$_line" in
+                "LANE "*" PASS")   emit "${_line% PASS}" PASS; _cnt=$((_cnt + 1));;
+                "LANE "*" FAIL "*) emit "${_line%% FAIL *}" FAIL "${_line#* FAIL }"; _cnt=$((_cnt + 1));;
+            esac
+        done <<EOF_PL
+$_plr
+EOF_PL
+        [ "$_cnt" -gt 0 ] || emit "LANE PROBE" FAIL "probe printed no results: $(printf '%s' "$_plr" | head -3)"
+    else
+        emit "LANE PROBE" SKIP "no static libc (libc6-dev) in the rootfs"
+    fi
+else
+    for _c in "LANE STATIC SEES ROOTFS" "LANE STATIC CWD" "LANE STATIC ARGV GUEST" \
+              "LANE ENV CLEAN" "LANE STATIC NO WARN" "LANE CHILD DETACHED" \
+              "LANE CHILD SEES ROOTFS" "LANE IDS MATCH PRELOAD" "LANE FAKEROOT IDS" \
+              "LANE SYMLINK RELATIVIZED" "LANE SYMLINK READ BY PRELOAD" \
+              "LANE HARDLINK READ BY PRELOAD" "LANE NO LINK STORE" \
+              "LANE OFF SWITCH" "LANE GO BUILD AND RUN" "LANE PROBE"; do
+        emit "$_c" SKIP "no alr-lane beside alr, or no static /bin/busybox"
+    done
+fi
 
 echo "── 워크로드 (docs/07 §2 이름들, 지금까지 러너가 없던 것) ──"
 # These names carried PASS in docs/07 §2 with nothing behind them.  Measuring
@@ -378,6 +464,9 @@ echo "── 워크로드 (docs/07 §2 이름들, 지금까지 러너가 없던 
 ckc "ALR LDSO INVOKE"    "Ubuntu GLIBC"  $ALR run /usr/bin/ldd --version
 ck  "ALR PIPELINE"       ok       $ALR run /bin/bash -c 'echo ok | /bin/cat | /usr/bin/head -1'
 ckc "ALR FAKEROOT IDENTITY" "uid=0" env ALR_FAKEROOT=1 $ALR run /usr/bin/id
+# ucf (26.04) re-execs with a scrubbed environment.  The runtime's own ALR_*
+# state must survive that, or the child runs unvirtualized as the real uid.
+ck  "ALR ENV SCRUB KEEPS RUNTIME" 0 env ALR_FAKEROOT=1 $ALR run /usr/bin/env -i /usr/bin/id -u
 # NOT -qq: that is quiet by design and prints none of the lines this asserts.
 # Was: matched "ports.ubuntu.com", which apt also prints in EVERY failure
 # message ("Failed to fetch http://ports.ubuntu.com/..."). Assert the outcome
@@ -586,6 +675,13 @@ if [ -d "$_hb" ]; then
     else
     ckc "CLI HOSTBIN RUNS GUEST TOOL" "git version 2." "$_hb/git" --version
     fi
+    # codex's other tool.  Its doctor no longer runs either one, so execution
+    # is asserted here.
+    if [ -x "$R/usr/bin/rg" ]; then
+        ckc "CLI HOSTBIN RUNS GUEST RG" "ripgrep " "$_hb/rg" --version
+    else
+        emit "CLI HOSTBIN RUNS GUEST RG" SKIP "rg not installed in this rootfs"
+    fi
     # And it must work with NOTHING inherited -- every child of a static binary
     # starts from that binary's environment, not the harness's.  The first
     # version read ALR_ROOT_DIR from the environment and silently resolved
@@ -599,6 +695,7 @@ if [ -d "$_hb" ]; then
 else
     emit "CLI HOSTBIN PRESENT" FAIL "no $_hb; run alr update-components"
     emit "CLI HOSTBIN RUNS GUEST TOOL" SKIP "no hostbin"
+    emit "CLI HOSTBIN RUNS GUEST RG" SKIP "no hostbin"
     emit "CLI HOSTBIN SELF CONTAINED" SKIP "no hostbin"
 fi
 
@@ -608,10 +705,14 @@ fi
 # `alr run` to reach them, which only works because an inner alr detects it is
 # already traced and inherits the outer supervisor instead of failing to start
 # a second one (MEASURED before that: pids=0, rc=126).
+#
+# codex 0.162 stopped executing the tools in `doctor` ("found; execution not
+# verified"), so these assert discovery only.  Execution of the same hostbin
+# tools is asserted by CLI HOSTBIN RUNS GUEST TOOL and CLI HOSTBIN RUNS GUEST RG.
 if [ -x "$R/usr/local/bin/codex" ]; then
-    ckc "ALR CODEX FINDS GUEST GIT"  "git version 2."  \
+    ckc "ALR CODEX FINDS GUEST GIT"  "git executable found"  \
         $ALR run /usr/local/bin/codex doctor
-    ckc "ALR CODEX FINDS GUEST RG"   "ripgrep "        \
+    ckc "ALR CODEX FINDS GUEST RG"   '(system, `rg`)'        \
         $ALR run /usr/local/bin/codex doctor
     # Its config/state land in the rootfs, which only happens when HOME is
     # host-form.  With the guest form codex wrote to ANDROID's /root and
@@ -632,21 +733,26 @@ fi
 # shown to distinguish anything.
 #
 # Three deterministic targets, all always present, one per branch:
-#   /bin/true    dynamic C, calls libc for everything            -> 0, PASS
+#   /bin/bash    dynamic C, calls libc for everything            -> 0, PASS
+#                (not /bin/true: on 26.04 that is the uutils multicall
+#                binary, which carries its own svc instructions)
 #   ld.so        has no PT_INTERP, so it reads as STATIC, and a
 #                loader necessarily issues its own syscalls      -> STATIC
 #   libc.so.6    the note in the output exists because of this one
-if [ -x ./alr-doctor ]; then
+# alr-doctor sits beside alr: ./alr-doctor in a dev push, bin/alr-doctor in
+# an unpacked release.
+DOCTOR="$(dirname "$ALR")/alr-doctor"
+if [ -x "$DOCTOR" ]; then
     ckc "DOCTOR P11 DYNAMIC CLEAN" '0 `svc #0` -> PASS' \
-        ./alr-doctor --scan "$R/bin/true"
+        "$DOCTOR" --scan "$R/bin/bash"
     ckc "DOCTOR P11 STATIC FLAGGED" "STATIC (no PT_INTERP)" \
-        ./alr-doctor --scan "$R/lib/ld-linux-aarch64.so.1"
+        "$DOCTOR" --scan "$R/lib/ld-linux-aarch64.so.1"
     # The scan must READ the file, not merely accept the argument: a stub that
     # printed PASS for everything would pass the first check above.
     ckc "DOCTOR P11 COUNTS NONZERO" "-> WARN" \
-        ./alr-doctor --scan "$R/lib/ld-linux-aarch64.so.1"
+        "$DOCTOR" --scan "$R/lib/ld-linux-aarch64.so.1"
     ckc "DOCTOR P11 REJECTS NON ELF" "not a 64-bit ELF" \
-        ./alr-doctor --scan "$R/etc/os-release"
+        "$DOCTOR" --scan "$R/etc/os-release"
     # A DIRECTORY sweeps -- docs/06 §3.1's shape, and the one that answers the
     # question a user has ("which of my binaries will not be virtualized?").
     # Scoped to /usr/lib/go-1.22 when present because the Go toolchain is the
@@ -654,18 +760,18 @@ if [ -x ./alr-doctor ]; then
     # syscalls.  Sweeping the whole rootfs takes ~18 s and belongs in doctor,
     # not in a suite that runs on every change.
     if [ -d "$R/usr/lib/go-1.22/bin" ]; then
-        ckc "DOCTOR P11 SWEEPS DIR" "STATIC," ./alr-doctor --scan "$R/usr/lib/go-1.22/bin"
+        ckc "DOCTOR P11 SWEEPS DIR" "STATIC," "$DOCTOR" --scan "$R/usr/lib/go-1.22/bin"
     else
         # /usr/bin always exists; assert the sweep RAN and counted, which is
         # the part a stub could not fake.
-        ckc "DOCTOR P11 SWEEPS DIR" "executables scanned" ./alr-doctor --scan "$R/usr/bin"
+        ckc "DOCTOR P11 SWEEPS DIR" "executables scanned" "$DOCTOR" --scan "$R/usr/bin"
     fi
     # Shared libraries must stay OUT of a sweep: /usr/lib/aarch64-linux-gnu is
     # nothing but libc and friends, each stuffed with svc, and a sweep that
     # counted them would report every rootfs as broken.
     ckc "DOCTOR P11 SKIPS LIBS" "0 issue their own syscalls or are static" \
-        ./alr-doctor --scan "$R/usr/lib/aarch64-linux-gnu"
-    ckc "DOCTOR P12 PHANTOM" "live descendants" ./alr-doctor
+        "$DOCTOR" --scan "$R/usr/lib/aarch64-linux-gnu"
+    ckc "DOCTOR P12 PHANTOM" "live descendants" "$DOCTOR"
 else
     for n in "DOCTOR P11 DYNAMIC CLEAN" "DOCTOR P11 STATIC FLAGGED" \
              "DOCTOR P11 COUNTS NONZERO" "DOCTOR P11 REJECTS NON ELF" \
@@ -740,6 +846,25 @@ if [ -x "$R/usr/bin/tmux" ]; then
 else
     emit "ALR PTY TMUX" SKIP "tmux not installed"
 fi
+# glibc >= 2.42 (ubuntu-26.04) reaches tcgetattr/tcsetattr/isatty/ttyname
+# through its INTERNAL ioctl with TCGETS2, which Android denies -- the ioctl
+# wrapper only sees PLT calls, so every terminal looked like EACCES / "not a
+# tty" and tmux panes _exit(1)ed before exec.  script(1) gives the command a
+# fresh pty slave on stdin, which is the case that broke.  The speed check
+# catches the other half: 2.42 also changed speed_t from the CBAUD code to the
+# baud rate, and a wrapper that copies the code reports "speed 15".
+if [ -x "$R/usr/bin/script" ]; then
+    ckc "ALR PTY TERMIOS" "PTY_TC_OK" $ALR run /bin/bash -c \
+        'script -qc "test -t 0 && stty -g >/dev/null && echo PTY_TC_OK" /dev/null'
+    ckc "ALR PTY TTYNAME" "/dev/pts/" $ALR run /bin/bash -c \
+        'script -qc tty /dev/null'
+    # GNU stty: this checks the interposer's glibc speed_t conversion, and
+    # uutils' stty takes no `speed` operand at all.
+    ckc "ALR PTY SPEED" "38400" $ALR run /bin/bash -c \
+        'S=$(command -v gnustty || echo stty); script -qc "$S speed" /dev/null'
+else
+    emit "ALR PTY TERMIOS" SKIP "script(1) not in this rootfs"
+fi
 
 echo "── M4 경로 가상화 ──"
 # ID=ubuntu, not a release string: what this proves is that /etc/os-release came
@@ -794,7 +919,14 @@ ck  "PRELOAD SYMLINK DEPTH"        ../../../etc/os-release \
 # absolute -- relativizing those would break them.
 ck  "PRELOAD SYMLINK SYSDIR ABS"   /proc/self/exe \
     $ALR run /bin/bash -c 'ln -sf /proc/self/exe /tmp/alrsy && readlink /tmp/alrsy'
-$ALR run /bin/bash -c 'rm -f /tmp/alrsl /tmp/alrsy /usr/local/bin/alrsl' >/dev/null 2>&1
+# The same with a RELATIVE link path, which is how `ln -s TARGET NAME` calls
+# it.  Only absolute link paths used to be relativized, so this stored
+# "/etc/os-release" verbatim and reading through the link hit Android's /etc.
+ckc "PRELOAD SYMLINK RELATIVE LINKPATH" "Ubuntu" \
+    $ALR run /bin/bash -c 'cd /tmp && ln -sf /etc/os-release alrslr && head -1 alrslr'
+ckc "PRELOAD SYMLINK DOTDOT LINKPATH" "Ubuntu" \
+    $ALR run /bin/bash -c 'mkdir -p /tmp/alrsd/b && cd /tmp/alrsd/b && ln -sf /etc/os-release ../l && head -1 /tmp/alrsd/l'
+$ALR run /bin/bash -c 'rm -rf /tmp/alrsl /tmp/alrsy /usr/local/bin/alrsl /tmp/alrslr /tmp/alrsd' >/dev/null 2>&1
 
 # The image itself ships absolute symlinks, created by tar and so never seen by
 # the preload.  ubuntu-base has 20; /usr/bin/awk -> /etc/alternatives/awk was
@@ -903,7 +1035,9 @@ echo
 # ── M6: package manager (needs fakeroot) ────────────────────────────────
 echo "── M6 패키지 매니저 ──"
 if $ALR run /usr/bin/git --version >/dev/null 2>&1; then
-    ck  "ALR GIT VERSION"  "git version 2.43.0" $ALR run /usr/bin/git --version
+    # Any release, as for node below: 24.04 ships 2.43, 26.04 ships 2.53, and
+    # the claim is that the guest's own git runs, not which one it is.
+    ckre "ALR GIT VERSION"  '^git version [0-9]+\.[0-9]+' $ALR run /usr/bin/git --version
     ckc "ALR APT INSTALLED git" "git is already" \
         env ALR_FAKEROOT=1 $ALR run /usr/bin/apt-get install -y --no-install-recommends git
     ckc "ALR PERL DLOPEN"  "OK" $ALR run /usr/bin/perl -e 'use Cwd; print "OK\n"'

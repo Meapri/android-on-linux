@@ -10,7 +10,9 @@
 #
 # Two ABI sides land in one tarball (docs/01-platform-facts.md §F1/§F2):
 #
-#   bin/alr, bin/alr-doctor      HOST  (bionic)  NDK clang, aarch64-linux-android24
+#   bin/alr                      HOST  (bionic)  NDK clang, aarch64-linux-android29, static
+#   bin/alr-doctor               HOST  (bionic)  NDK clang, aarch64-linux-android24
+#   libexec/alr/alr-lane         HOST  (no libc) NDK clang, freestanding (ADR 0010)
 #   share/alr/libalr_preload.so  GUEST (glibc)   zig cc,    aarch64-linux-gnu.2.17
 #
 # The guest .so is an INPUT here, produced by scripts/build-preload.sh.  Building
@@ -56,6 +58,11 @@ src/supervisor/alr_supervisor.c"
 
 DOCTOR_SOURCES="src/cli/doctor.c"
 
+# alr-lane: vendored tawcroot, its own binary (docs/adr/0010-tawcroot-lane.md).
+# Same flags as the Makefile's `lane` target; see the comment there.
+LANE_DIR=third_party/tawcroot
+LANE_CFLAGS="-O2 -Wall -Wframe-larger-than=1024 -Werror=frame-larger-than -ffreestanding -fno-stack-protector -fno-pie -mno-outline-atomics -D_GNU_SOURCE -DTAWCROOT_ALR -I$LANE_DIR/include"
+
 # -O1, not -O2: the only alr binaries ever exercised on a real device were built
 # at -O1 by scripts/dev-push.sh.  A release is the wrong place to introduce a
 # codegen change nobody has run under the zygote seccomp filter.
@@ -69,8 +76,11 @@ HOST_CFLAGS="-O1 -Wall -Wextra -std=c11 -D_GNU_SOURCE -Isrc/common -Isrc/supervi
 # Android 15 ships 16 KiB pages.  Without these the binary loads on today's
 # devices and fails on tomorrow's, which is the worst possible failure shape.
 HOST_LDFLAGS="-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384"
+LANE_LDFLAGS="-static -nostdlib -nostartfiles -Wl,--image-base=0x10000000 $HOST_LDFLAGS"
 
 NDK_TRIPLE=aarch64-linux-android24
+# alr is static at API 29; the Makefile's ALR_API comment says why.
+ALR_TRIPLE=aarch64-linux-android29
 
 # ── small helpers ────────────────────────────────────────────────────────────
 
@@ -176,7 +186,7 @@ done
 [ -f "$PRELOAD_MANIFEST" ] || missing "$PRELOAD_MANIFEST" \
     "emitted next to the .so by scripts/build-preload.sh"
 
-for f in $ALR_SOURCES $DOCTOR_SOURCES; do
+for f in $ALR_SOURCES $DOCTOR_SOURCES $LANE_DIR/LICENSE.MIT; do
     [ -f "$f" ] || missing "$f" "source file listed in this script is not in the tree"
 done
 
@@ -362,18 +372,23 @@ elf_gates_preload
 say "host cc:    $NDK_CLANG"
 mkdir -p "$OUT_DIR"
 rm -rf "$STAGE"
-mkdir -p "$STAGE/bin" "$STAGE/share/alr"
+mkdir -p "$STAGE/bin" "$STAGE/share/alr" "$STAGE/libexec/alr"
 
 # shellcheck disable=SC2086  # word splitting of the flag/source lists is intended
-"$NDK_CLANG" --target="$NDK_TRIPLE" $HOST_CFLAGS $HOST_LDFLAGS \
+"$NDK_CLANG" --target="$ALR_TRIPLE" $HOST_CFLAGS $HOST_LDFLAGS -static \
     -o "$STAGE/bin/alr" $ALR_SOURCES
 
 # shellcheck disable=SC2086
 "$NDK_CLANG" --target="$NDK_TRIPLE" $HOST_CFLAGS $HOST_LDFLAGS \
     -o "$STAGE/bin/alr-doctor" $DOCTOR_SOURCES
 
+# shellcheck disable=SC2086
+"$NDK_CLANG" --target="$NDK_TRIPLE" $LANE_CFLAGS $LANE_LDFLAGS \
+    -o "$STAGE/libexec/alr/alr-lane" $LANE_DIR/src/*.c $LANE_DIR/src/arch/aarch64_*.S
+
 elf_gate_pagesize "$STAGE/bin/alr"
 elf_gate_pagesize "$STAGE/bin/alr-doctor"
+elf_gate_pagesize "$STAGE/libexec/alr/alr-lane"
 
 # ── stage ────────────────────────────────────────────────────────────────────
 #
@@ -387,14 +402,20 @@ elf_gate_pagesize "$STAGE/bin/alr-doctor"
 cp "$PRELOAD_SO"       "$STAGE/share/alr/libalr_preload.so"
 cp "$PRELOAD_MANIFEST" "$STAGE/share/alr/manifest.json"
 cp LICENSE README.md   "$STAGE/"
+# MIT asks for the notice with every copy (VENDORING.md rule 1).
+cp "$LANE_DIR/LICENSE.MIT" "$STAGE/share/alr/LICENSE.tawcroot"
 
-chmod 0755 "$STAGE/bin/alr" "$STAGE/bin/alr-doctor" "$STAGE/share/alr/libalr_preload.so"
-chmod 0644 "$STAGE/share/alr/manifest.json" "$STAGE/LICENSE" "$STAGE/README.md"
+chmod 0755 "$STAGE/bin/alr" "$STAGE/bin/alr-doctor" "$STAGE/share/alr/libalr_preload.so" \
+           "$STAGE/libexec/alr/alr-lane"
+chmod 0644 "$STAGE/share/alr/manifest.json" "$STAGE/share/alr/LICENSE.tawcroot" \
+           "$STAGE/LICENSE" "$STAGE/README.md"
 
 MEMBERS="bin/alr
 bin/alr-doctor
+libexec/alr/alr-lane
 share/alr/libalr_preload.so
 share/alr/manifest.json
+share/alr/LICENSE.tawcroot
 LICENSE
 README.md"
 
@@ -408,7 +429,10 @@ done
 # cannot --sort, so the archive is byte-reproducible only under GNU tar.  Say
 # which one happened instead of claiming reproducibility either way.
 
-TAR_REPRO=""
+# bsdtar on macOS also stores extended attributes (com.apple.provenance) as
+# ._<name> AppleDouble members, which GNU and busybox tar extract as files:
+# a tarball unpacked in Termux got bin/._alr beside bin/alr.
+TAR_REPRO="--no-xattrs --no-mac-metadata"
 REPRO_NOTE="NOT byte-reproducible (bsdtar: no --sort/--mtime; mtimes vary)"
 if tar --version 2>/dev/null | head -1 | grep -q 'GNU tar'; then
     TAR_REPRO="--sort=name --owner=0 --group=0 --numeric-owner --mtime=@$SOURCE_DATE_EPOCH"
@@ -419,7 +443,7 @@ rm -f "$TARBALL"
 # gzip -n, not `tar czf`: the gzip header otherwise carries a timestamp and two
 # identical trees produce two different files.
 # shellcheck disable=SC2086
-(cd "$STAGE" && tar $TAR_REPRO -cf - $MEMBERS) | gzip -n -9 > "$TARBALL"
+(cd "$STAGE" && COPYFILE_DISABLE=1 tar $TAR_REPRO -cf - $MEMBERS) | gzip -n -9 > "$TARBALL"
 
 rm -rf "$STAGE"
 

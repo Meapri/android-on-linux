@@ -97,6 +97,61 @@ static void build_elf(int etype, int with_interp)
     fake_ph.p_filesz = strlen(fake_interp) + 1;
 }
 
+/* A PT_NOTE segment at 0x2000 holding one note with the given owner. */
+static unsigned char note_buf[64];
+static size_t note_len;
+static struct alr_phdr64 note_ph;
+
+static int note_pread(void *ctx, void *dst, size_t len, uint64_t off)
+{
+    (void)ctx;
+    if (off == 0x40 && len == sizeof note_ph) { memcpy(dst, &note_ph, len); return 1; }
+    if (off == 0x2000 && len <= note_len) { memcpy(dst, note_buf, len); return 1; }
+    return 0;
+}
+
+/* namesz 0 means strlen(owner) + 1.  cmd/link writes the Go note's name
+ * padded, "Go\0\0" with namesz 4 (measured on a go1.26 cgo binary). */
+static void build_note(const char *owner, uint32_t namesz, uint32_t type, int as_note)
+{
+    uint32_t descsz = 4;
+    if (!namesz) namesz = (uint32_t)strlen(owner) + 1;
+    size_t o = 0;
+    memset(note_buf, 0, sizeof note_buf);
+    memcpy(note_buf + o, &namesz, 4); o += 4;
+    memcpy(note_buf + o, &descsz, 4); o += 4;
+    memcpy(note_buf + o, &type, 4);   o += 4;
+    memcpy(note_buf + o, owner, strlen(owner) + 1); o += (namesz + 3) & ~3u;
+    o += 4;                                          /* desc */
+    note_len = o;
+    build_elf(ALR_ET_EXEC, 0);
+    memset(&note_ph, 0, sizeof note_ph);
+    note_ph.p_type = as_note ? ALR_PT_NOTE : ALR_PT_LOAD;
+    note_ph.p_offset = 0x2000;
+    note_ph.p_filesz = note_len;
+}
+
+static void t_go(void)
+{
+    build_note("Go", 0, 4, 1);
+    ck(alr_elf_is_go(elf_hdr, sizeof elf_hdr, note_pread, NULL) == 1,
+       "Go build-id note detected", "", "1");
+    build_note("Go", 4, 4, 1);
+    ck(alr_elf_is_go(elf_hdr, sizeof elf_hdr, note_pread, NULL) == 1,
+       "Go note as cmd/link writes it (namesz 4)", "", "1");
+    build_note("Gox", 0, 4, 1);
+    ck(alr_elf_is_go(elf_hdr, sizeof elf_hdr, note_pread, NULL) == 0,
+       "owner Gox is not Go", "", "0");
+    build_note("GNU", 0, 3, 1);
+    ck(alr_elf_is_go(elf_hdr, sizeof elf_hdr, note_pread, NULL) == 0,
+       "GNU build-id note is not Go", "", "0");
+    build_note("Go", 0, 4, 0);
+    ck(alr_elf_is_go(elf_hdr, sizeof elf_hdr, note_pread, NULL) == 0,
+       "no PT_NOTE segment, not Go", "", "0");
+    ck(alr_elf_is_go((const unsigned char *)"#!/bin/sh\n", 10, note_pread, NULL) == 0,
+       "a script is not Go", "", "0");
+}
+
 static void t_elf(void)
 {
     struct alr_shebang sb;
@@ -248,6 +303,7 @@ int main(void)
 {
     t_shebang();
     t_elf();
+    t_go();
     printf("ALR ELF CLASSIFY: %s\n", fail ? "FAIL" : "PASS");
     {
         int before = fail;

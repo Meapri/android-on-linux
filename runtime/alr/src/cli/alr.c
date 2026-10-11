@@ -248,11 +248,17 @@ static const struct alr_config *cfg(void)
  * does not have. */
 static char g_root_dir_for_shims[ALR_PBUF];
 
+/* The distro every command uses when none is named, and the only release
+ * supported: the latest Ubuntu LTS (docs/adr/0005-termux-first-goals.md in the
+ * parent project).  A tree of an older release still runs when named with -d,
+ * but nothing picks it implicitly. */
+#define ALR_DEFAULT_DISTRO "ubuntu-26.04"
+
 static void distro_root(char *out, size_t n, const char *distro)
 {
     const char *root = getenv("ALR_ROOT_DIR");
     if (!root || !*root) root = cfg()->has_root ? cfg()->root : NULL;
-    if (!distro || !*distro) distro = "ubuntu-24.04";
+    if (!distro || !*distro) distro = ALR_DEFAULT_DISTRO;
     if (!distro_name_ok(distro))
         die("bad-distro-name",
             "distro names may contain only [A-Za-z0-9._-] and may not start "
@@ -930,8 +936,9 @@ static int with_codex(const char *R, const char *cache)
  * /etc/apt/apt.conf.d, env searching PATH for node) resolves against the
  * ANDROID host and fails in ways that look like a broken rootfs.
  *
- * Searched next to the alr binary first, then $PREFIX/share/alr -- the release
- * layout.  Returns 0 if installed, -1 if the .so could not be found. */
+ * Searched next to the alr binary first, then in the release layout around it
+ * (<bin>/../share/alr, so a tarball unpacked anywhere finds its own .so), then
+ * $PREFIX/share/alr.  Returns 0 if installed, -1 if the .so could not be found. */
 /* Rewriting the shim after each `alr` operation is not enough: a libc-bin
  * upgrade restores the genuine wrapper, which runs the static ldconfig.real,
  * which fails -- and that leaves libc-bin half-configured so every LATER apt
@@ -959,7 +966,7 @@ static void divert_ldconfig(const char *distro, const char *R)
 static int install_preload(const char *R)
 {
     char src[ALR_PBUF], dst[ALR_PBUF], dir[ALR_PBUF];
-    const char *cands[3];
+    const char *cands[4];
     char selfdir[ALR_PBUF];
     char *slash;
     int i;
@@ -971,11 +978,14 @@ static int install_preload(const char *R)
     snprintf(src, sizeof src, "%s/libalr_preload.so", selfdir);
     cands[0] = src;
     { static char c1[ALR_PBUF];
-      snprintf(c1, sizeof c1, "%s/share/alr/libalr_preload.so", prefix());
+      snprintf(c1, sizeof c1, "%s/../share/alr/libalr_preload.so", selfdir);
       cands[1] = c1; }
     { static char c2[ALR_PBUF];
-      snprintf(c2, sizeof c2, "%s/build/libalr_preload.so", selfdir);
+      snprintf(c2, sizeof c2, "%s/share/alr/libalr_preload.so", prefix());
       cands[2] = c2; }
+    { static char c3[ALR_PBUF];
+      snprintf(c3, sizeof c3, "%s/build/libalr_preload.so", selfdir);
+      cands[3] = c3; }
 
     /* Ship the manifest beside the .so (docs/05-provisioning-spec.md §3.4).
      * Three separate incidents in this project's evidence were "the deployed
@@ -986,7 +996,7 @@ static int install_preload(const char *R)
       run_cmd(mk); }
     snprintf(dst, sizeof dst, "%s/usr/lib/alr/libalr_preload.so", R);
 
-    for (i = 0; i < 3; i++) {
+    for (i = 0; i < 4; i++) {
         if (access(cands[i], R_OK) != 0) continue;
         if (copy_file(cands[i], dst) == 0) {
             char msrc[ALR_PBUF], mdst[ALR_PBUF];
@@ -1022,8 +1032,9 @@ static int install_preload(const char *R)
         }
     }
     fprintf(stderr,
-        "alr: WARNING libalr_preload.so not found next to the binary or in\n"
-        "     %s/share/alr/.  The guest will run WITHOUT path virtualization:\n"
+        "alr: WARNING libalr_preload.so not found next to the binary, in its\n"
+        "     ../share/alr/ or in %s/share/alr/.  The guest will run WITHOUT path\n"
+        "     virtualization:\n"
         "     it will see the Android filesystem, not the rootfs.\n", prefix());
     return -1;
 }
@@ -1037,7 +1048,6 @@ static int install_preload(const char *R)
  * optional in SHA256SUMS and silently ending up with "*ubuntu-base-..." in the
  * URL would 404 in a way that reads like a network problem. */
 #define ALR_UBUNTU_CDIMAGE "https://cdimage.ubuntu.com/ubuntu-base/releases"
-#define ALR_UBUNTU_PIN     "ubuntu-base-24.04.4-base-arm64.tar.gz"
 #define ALR_SUFFIX         "-base-arm64.tar.gz"
 
 /* `rel` is the release as it appears in the URL and the file names: "24.04",
@@ -1135,7 +1145,7 @@ static int cmd_version(const char *distro)
     FILE *fp;
 
     char selfdir[ALR_PBUF], *slash;
-    const char *cands[3];
+    const char *cands[4];
     int i;
 
     printf("alr %s\n", ALR_VERSION);
@@ -1143,14 +1153,15 @@ static int cmd_version(const char *distro)
     snprintf(selfdir, sizeof selfdir, "%s", g_self);
     slash = strrchr(selfdir, '/');
     if (slash) *slash = '\0'; else snprintf(selfdir, sizeof selfdir, ".");
-    { static char c0[ALR_PBUF], c1[ALR_PBUF], c2[ALR_PBUF];
+    { static char c0[ALR_PBUF], c1[ALR_PBUF], c2[ALR_PBUF], c3[ALR_PBUF];
       snprintf(c0, sizeof c0, "%s/libalr_preload.so", selfdir);
-      snprintf(c1, sizeof c1, "%s/share/alr/libalr_preload.so", prefix());
-      snprintf(c2, sizeof c2, "%s/build/libalr_preload.so", selfdir);
-      cands[0] = c0; cands[1] = c1; cands[2] = c2; }
+      snprintf(c1, sizeof c1, "%s/../share/alr/libalr_preload.so", selfdir);
+      snprintf(c2, sizeof c2, "%s/share/alr/libalr_preload.so", prefix());
+      snprintf(c3, sizeof c3, "%s/build/libalr_preload.so", selfdir);
+      cands[0] = c0; cands[1] = c1; cands[2] = c2; cands[3] = c3; }
 
     path[0] = '\0';
-    for (i = 0; i < 3; i++)
+    for (i = 0; i < 4; i++)
         if (access(cands[i], R_OK) == 0) { snprintf(path, sizeof path, "%s", cands[i]); break; }
 
     if (*path) {
@@ -1256,7 +1267,7 @@ static int install_hostbin(const char *distro, const char *R)
     /* distro is NULL for `alr update-components` with no argument, and the
      * name is BAKED INTO every wrapper -- writing "(null)" there would produce
      * 28 files that all fail at the first use. */
-    if (!distro || !*distro) distro = "ubuntu-24.04";
+    if (!distro || !*distro) distro = ALR_DEFAULT_DISTRO;
 
     /* mkdir -p: on a tree alr did not extract itself, usr/lib/alr may not
      * exist yet, and a single mkdir then fails with ENOENT on the PARENT --
@@ -1313,14 +1324,15 @@ static void install_libdl_stub(const char *R)
     if ((slash = strrchr(selfdir, '/'))) *slash = '\0';
     else snprintf(selfdir, sizeof selfdir, ".");
 
-    {   const char *cands[3];
-        static char c0[ALR_PBUF], c1[ALR_PBUF], c2[ALR_PBUF];
+    {   const char *cands[4];
+        static char c0[ALR_PBUF], c1[ALR_PBUF], c2[ALR_PBUF], c3[ALR_PBUF];
         snprintf(c0, sizeof c0, "%s/libdl.so.2", selfdir);
-        snprintf(c1, sizeof c1, "%s/share/alr/libdl.so.2", prefix());
-        snprintf(c2, sizeof c2, "%s/build/libdl.so.2", selfdir);
-        cands[0] = c0; cands[1] = c1; cands[2] = c2;
+        snprintf(c1, sizeof c1, "%s/../share/alr/libdl.so.2", selfdir);
+        snprintf(c2, sizeof c2, "%s/share/alr/libdl.so.2", prefix());
+        snprintf(c3, sizeof c3, "%s/build/libdl.so.2", selfdir);
+        cands[0] = c0; cands[1] = c1; cands[2] = c2; cands[3] = c3;
         src[0] = '\0';
-        for (i = 0; i < 3; i++)
+        for (i = 0; i < 4; i++)
             if (access(cands[i], R_OK) == 0) { snprintf(src, sizeof src, "%s", cands[i]); break; }
     }
     if (!*src) return;                              /* nothing to install */
@@ -1336,66 +1348,6 @@ static void install_libdl_stub(const char *R)
                    "interposer's DT_NEEDED requires it)\n", R);
         }
     }
-}
-
-/* Is this rootfs's coreutils the uutils multicall binary?
- *
- * If it is, every one of ls/cat/echo/cp is one Rust binary that decides which
- * applet to be from its OWN identity -- and it reads that identity with a raw
- * `svc`, not through libc, so neither the interposer's synthetic /proc/self/exe
- * nor --argv0 reaches it. Under the explicit loader (ADR 0002) it therefore
- * sees the LOADER:
- *
- *     coreutils: unknown program 'ld-linux-aarch64.so'
- *
- * There is nothing to fix in alr -- catching those syscalls means ptrace per
- * syscall, which is what this project exists not to do (ADR 0001). But Ubuntu
- * ships the way out: coreutils-from-gnu is a first-class selector in the same
- * archive, and MEASURED 2026-08-11, gnu-coreutils 9.7 runs under alr with path
- * virtualization fully applied.
- *
- * Said once, at provisioning, because the alternative is the user discovering
- * it when `ls` fails with a message about a loader they never invoked. */
-static int gnu_coreutils_repoint(const char *R);
-
-/* Detect a uutils coreutils tree. With `repair`, fix it; without, explain it. */
-static void warn_uutils_coreutils(const char *R, int repair)
-{
-    char p[ALR_PBUF];
-    struct stat st;
-
-    /* The tell: /usr/bin/coreutils is a large multicall binary, and the tools
-     * are symlinks into /usr/lib/cargo/bin/coreutils/. GNU coreutils has no
-     * such file at all. */
-    snprintf(p, sizeof p, "%s/usr/lib/cargo/bin/coreutils", R);
-    if (stat(p, &st) != 0 || !S_ISDIR(st.st_mode)) return;
-
-    if (repair) {
-        /* adopt REPAIRS rather than reports. Its job is to take an extracted
-         * tree and make it bootable, and a tree whose entire coreutils answers
-         *   coreutils: unknown program 'ld-linux-aarch64.so'
-         * is not bootable -- `alr adopt`'s own boot check fails on it. The
-         * repair needs no network: Ubuntu's coreutils-from-gnu package is
-         * nothing but symlinks, so the GNU binaries are already in the image
-         * under gnu* and this only repoints /usr/bin at them. */
-        fprintf(stderr, "alr: uutils coreutils detected; repointing at the "
-                        "GNU binaries already in this image\n");
-        gnu_coreutils_repoint(R);
-        return;
-    }
-    fprintf(stderr,
-        "alr: NOTE this rootfs uses uutils coreutils (Rust), not GNU.\n"
-        "     ls, cat, echo, cp and the rest are ONE multicall binary that\n"
-        "     reads its own identity with a raw syscall, which no LD_PRELOAD\n"
-        "     can see.  Under an explicit loader they report\n"
-        "       coreutils: unknown program 'ld-linux-aarch64.so'\n"
-        "     Everything else in the image (bash, dash, apt, dpkg, grep, sed,\n"
-        "     awk, tar) is unaffected.\n"
-        "     FIX, and it needs no network: the GNU binaries are ALREADY in\n"
-        "     this image (Ubuntu's own coreutils-from-gnu package turns out to\n"
-        "     be nothing but symlinks), so this only repoints them --\n"
-        "       alr use-gnu-coreutils <distro>\n"
-        "     reason=uutils-coreutils  (docs/adr/0006-raw-syscall-binaries.md)\n");
 }
 
 /* `alr update-components [<distro>]` -- docs/05-provisioning-spec.md.
@@ -1950,34 +1902,15 @@ static int cmd_install(const char *distro, const char *url_override)
                 "no discovery path for this distro yet; pass --url "
                 "(docs/05-provisioning-spec.md §1.1)");
         /* Any ubuntu-<release> is discoverable; the release is a path
-         * component on cdimage and SHA256SUMS is fetched alongside it.
-         *
-         * This used to warn that anything but 24.04 was unusable, because
-         * 26.04 replaced GNU coreutils with the uutils multicall binary, which
-         * resolves its own identity by a raw syscall no LD_PRELOAD can see.
-         * That is still true of uutils -- and it is no longer the whole story:
-         * the 26.04 image also carries the GNU binaries as gnu* (104 of them),
-         * and `use-gnu-coreutils` repoints /usr/bin at those. adopt runs it
-         * when it finds a uutils tree, so the warning described a state the
-         * installer no longer leaves behind. */
+         * component on cdimage and SHA256SUMS is fetched alongside it. */
         printf("alr: resolving the current ubuntu-base image for %s\n", distro + 7);
-        if (discover_ubuntu(distro + 7, durl, sizeof durl, dsha, sizeof dsha) != 0) {
-            /* Offline / air-gapped fallback.  Say plainly that the download is
-             * unverified rather than implying the pin is as good as a hash. */
-            /* The pinned name is a 24.04 image, so the fallback only makes
-             * sense for 24.04; for any other release an unverified download of
-             * the WRONG release is worse than failing. */
-            if (strcmp(distro, "ubuntu-24.04") != 0)
-                die("discovery-failed",
-                    "could not reach SHA256SUMS for this release; pass --url");
-            snprintf(durl, sizeof durl, "%s/24.04/release/%s",
-                     cfg()->has_mirror ? cfg()->mirror : ALR_UBUNTU_CDIMAGE,
-                     ALR_UBUNTU_PIN);
-            dsha[0] = '\0';
-            fprintf(stderr, "alr: WARNING SHA256SUMS unreachable; falling back to "
-                            "the pinned %s WITHOUT hash verification\n",
-                    ALR_UBUNTU_PIN);
-        }
+        /* No unverified fallback.  There used to be a pinned 24.04 image for
+         * offline installs; 24.04 is no longer supported, and fetching a
+         * release without its hash is worse than failing.  Offline installs
+         * pass --url. */
+        if (discover_ubuntu(distro + 7, durl, sizeof durl, dsha, sizeof dsha) != 0)
+            die("discovery-failed",
+                "could not reach SHA256SUMS for this release; pass --url");
         url = durl;
         printf("alr: %s\n", url);
     }
@@ -2082,7 +2015,6 @@ static int cmd_install(const char *distro, const char *url_override)
 
     repair(part);
     rep.repaired = access_ok_all(part);
-    warn_uutils_coreutils(part, 1);
     /* NOT ignorable.  This used to discard the return value, so a rootfs with
      * NO path virtualization was reported as a successful install: the warning
      * scrolled past, cmd_install returned 0, and `alr run` then booted it
@@ -2154,7 +2086,7 @@ static void cfg_effective(const char *key, char *val, size_t vn,
     if (!strcmp(key, "default_distro")) {
         if ((e = getenv("ALR_DISTRO")) && *e) { snprintf(val, vn, "%s", e); *src = "env ALR_DISTRO"; return; }
         if (c->has_distro) { snprintf(val, vn, "%s", c->distro); *src = "config"; return; }
-        snprintf(val, vn, "ubuntu-24.04"); return;
+        snprintf(val, vn, "%s", ALR_DEFAULT_DISTRO); return;
     }
     if (!strcmp(key, "runtime.fakeroot")) {
         if ((e = getenv("ALR_FAKEROOT")) && *e) { snprintf(val, vn, "%s", *e == '1' ? "true" : "false"); *src = "env ALR_FAKEROOT"; return; }
@@ -2421,11 +2353,6 @@ static int cmd_adopt(const char *distro)
 
     repair(R);
     rep.repaired = access_ok_all(R);
-    /* Before any verification can abort: a uutils rootfs is exactly the kind
-     * that fails verify_rootfs (its /usr/bin/env is a link into the multicall
-     * tree), and a bare "missing usr/bin/env" tells the user nothing about
-     * why. */
-    warn_uutils_coreutils(R, 1);
     install_hostbin(distro, R);
 
     if (install_preload(R) != 0)
@@ -2472,33 +2399,20 @@ static int cmd_adopt(const char *distro)
 
 /* `alr use-gnu-coreutils <distro>` -- repoint coreutils at the GNU binaries.
  *
- * Ubuntu 26.04 ships uutils as the default coreutils, and every tool in it is
- * ONE multicall binary that resolves its own identity with a raw syscall. Under
- * an explicit loader (ADR 0002) that resolves to the LOADER:
- *
- *     $ alr run /bin/echo hi
+ * Optional.  Ubuntu 26.04's default coreutils is uutils, one Rust multicall
+ * binary that takes its applet name from the kernel's AT_EXECFN.  Under the
+ * explicit loader (ADR 0002) that named the loader and every tool failed with
  *     coreutils: unknown program 'ld-linux-aarch64.so'
+ * so install used to run this automatically.  The interposer now rewrites the
+ * AT_EXECFN string to the guest path at startup, uutils runs as shipped, and
+ * this stays for anyone who prefers GNU.
  *
- * LD_PRELOAD cannot see a raw syscall and the supervisor is signal-only
- * (ADR 0001), so there is nothing to interpose. Everything else in the image is
- * unaffected -- MEASURED on 26.04: bash and dpkg 1.23.7 both fine.
+ * Ubuntu's own `coreutils-from-gnu` package is nothing but symlinks
+ * (/usr/bin/ls -> gnuls) and the GNU binaries are already in the base image
+ * (104 of them), so this needs no download: it repoints the symlinks that are
+ * already there at the binaries that are already there.
  *
- * The fix is Ubuntu's own. The archive ships `coreutils-from-gnu` as a
- * first-class alternative to `coreutils-from-uutils`, and that package turns
- * out to be nothing but symlinks: /usr/bin/ls -> gnuls, /usr/bin/cat -> gnucat.
- * The GNU binaries are ALREADY IN THE BASE IMAGE -- 104 of them, measured. So
- * this needs no download, no apt and no network: it repoints the symlinks that
- * are already there at the binaries that are already there.
- *
- * Runs automatically from install and adopt when the tree is a uutils one.
- * That used to be "the user's call", which is the right instinct about
- * replacing a distribution's userland and the wrong conclusion here: under an
- * explicit loader the uutils multicall binary cannot resolve its own name, so
- * the alternative on offer is not "uutils" but "no coreutils at all", and
- * adopt's own boot check fails on it. It stays a command so it can be re-run.
- *
- * Takes a ROOT PATH, not a distro name: install repairs the staging tree
- * (<R>.part), which has no distro name to resolve. */
+ * Takes a ROOT PATH, not a distro name, so it can run on any tree. */
 static int gnu_coreutils_repoint(const char *R)
 {
     char bindir[ALR_PBUF];
@@ -2572,6 +2486,16 @@ static int prepare(struct launch *L, const char *distro)
     distro_root(L->root, sizeof L->root, distro);
     L->root_len = alr_trim_root(L->root);
     if (!is_dir(L->root)) { errno = ENOENT; return -1; }
+    /* Canonical, because everything the kernel reports back -- getcwd,
+     * /proc/self/fd, AT_EXECFN -- is.  A root spelled $HOME/../usr/... never
+     * prefix-matched those, and the guest saw host paths. */
+    {
+        char canon[PATH_MAX];
+        if (realpath(L->root, canon) && strlen(canon) < sizeof L->root) {
+            snprintf(L->root, sizeof L->root, "%s", canon);
+            L->root_len = alr_trim_root(L->root);
+        }
+    }
 
     snprintf(L->ldso, sizeof L->ldso, "%s/lib/ld-linux-aarch64.so.1", L->root);
     if (access(L->ldso, X_OK) != 0) return -2;
@@ -2664,8 +2588,8 @@ static int env_is_reserved(const char *kv)
     static const char *const own[] = {
         "ALR_COUNT=", "ALR_DISTRO=", "ALR_FAKEROOT=", "ALR_GUEST_ARGV0=",
         "ALR_GUEST_EXE=", "ALR_GUEST_PATH=", "ALR_LDSO=", "ALR_LIBPATH=",
-        "ALR_LOG=", "ALR_LOG_FD=", "ALR_PRELOAD=", "ALR_ROOT=", "ALR_ROOT_DIR=",
-        NULL
+        "ALR_LANE=", "ALR_LOG=", "ALR_LOG_FD=", "ALR_PRELOAD=", "ALR_ROOT=",
+        "ALR_ROOT_DIR=", NULL
     };
     int i;
     for (i = 0; own[i]; i++)
@@ -2715,13 +2639,40 @@ static int parse_runopts(int argc, char **argv, struct runopts *ro,
     return i;
 }
 
+/* Host path of alr-lane (ADR 0010), or NULL when there is none or the user
+ * turned it off with ALR_LANE=0.  Beside the alr binary in a dev tree,
+ * <bin>/../libexec/alr/ in an unpacked release, $PREFIX/libexec/alr/ in a
+ * package. */
+static const char *lane_path(void)
+{
+    static char path[ALR_PBUF];
+    static int done;
+    const char *e = getenv("ALR_LANE");
+    char cand[3][ALR_PBUF], selfdir[ALR_PBUF], *slash;
+    int i;
+
+    if (e && !strcmp(e, "0")) return NULL;
+    if (done) return path[0] ? path : NULL;
+    done = 1;
+    snprintf(selfdir, sizeof selfdir, "%s", g_self);
+    slash = strrchr(selfdir, '/');
+    if (slash) *slash = '\0'; else snprintf(selfdir, sizeof selfdir, ".");
+    snprintf(cand[0], ALR_PBUF, "%s/alr-lane", selfdir);
+    snprintf(cand[1], ALR_PBUF, "%s/../libexec/alr/alr-lane", selfdir);
+    snprintf(cand[2], ALR_PBUF, "%s/libexec/alr/alr-lane", prefix());
+    for (i = 0; i < 3; i++)
+        if (access(cand[i], X_OK) == 0 && realpath(cand[i], path)) return path;
+    path[0] = '\0';
+    return NULL;
+}
+
 static char **build_env(const struct launch *L, const char *guest_exe,
                         int target_static,
                         const char *guest_argv0, const struct runopts *ro,
                         const char *guest_cwd)
 {
     static char *env[ALR_MAX_ENVP];
-    static char bufs[24][ALR_PBUF];
+    static char bufs[32][ALR_PBUF];
     int n = 0, b = 0, i;
     extern char **environ;
 
@@ -2849,6 +2800,9 @@ static char **build_env(const struct launch *L, const char *guest_exe,
      * through the same loader invocation we used for the first program. */
     PUT("ALR_LDSO=%s", L->ldso);
     PUT("ALR_LIBPATH=%s", L->libpath);
+    /* Where the interposer sends programs that make their own path syscalls
+     * (ADR 0010). */
+    if (lane_path()) PUT("ALR_LANE=%s", lane_path());
     /* IN ADDITION to --library-path, not instead of it.  --library-path
      * populates the loader's search list for the INITIAL link; glibc's NSS
      * loads libnss_dns.so.2 later via __libc_dlopen_mode, and without
@@ -3019,6 +2973,23 @@ static int exe_is_static(const char *host)
     return k == ALR_EXE_ELF_STATIC;
 }
 
+/* A dynamic Go program (cgo) still makes its own file syscalls: ADR 0010
+ * sends it to the lane like a static one. */
+static int exe_is_go(const char *host)
+{
+    unsigned char head[ALR_PROBE_BYTES];
+    struct rdctx ctx;
+    ssize_t n;
+    int fd, go;
+
+    if ((fd = open(host, O_RDONLY | O_CLOEXEC)) < 0) return 0;
+    n = read(fd, head, sizeof head);
+    ctx.fd = fd;
+    go = alr_elf_is_go(head, n < 0 ? 0 : (size_t)n, rd_pread, &ctx);
+    close(fd);
+    return go;
+}
+
 /* Append the target's own DT_RUNPATH/DT_RPATH to the loader search path,
  * rewritten into host form.
  *
@@ -3113,7 +3084,7 @@ static int shebang_resolve(const struct launch *L, char *host, size_t hostsz,
      * Only for the top-level target (depth 0): a shebang interpreter that is
      * static is a different and much rarer thing, and warning inside the chain
      * would fire on every script. */
-    if (k == ALR_EXE_ELF_STATIC && depth == 0)
+    if (k == ALR_EXE_ELF_STATIC && depth == 0 && !lane_path())
         fprintf(stderr,
             "alr: NOTE %s is statically linked -- path virtualization does NOT\n"
             "     apply to it.  It runs, but its paths resolve against Android,\n"
@@ -3355,6 +3326,43 @@ static int cmd_run(const char *distro, int argc, char **argv, int login_shell,
         }
     }
 
+    /* ADR 0010: a static target runs under alr-lane, which translates its
+     * path syscalls in-process -- no loader, no supervisor (the lane rescues
+     * the zygote filter's traps itself, and a traced lane pays a tracer round
+     * trip per trap).  It gets the GUEST command line and a guest-form
+     * environment without this runtime's loader variables; the lane maps the
+     * paths.  ALR_LANE=0 keeps the old unvirtualized launch. */
+    if ((target_static || exe_is_go(host)) && lane_path()
+        && !(ro && ro->no_supervisor)) {
+        char **ge = build_env(&L, guest_cmd, 0, argv[0], ro, g_guest_cwd);
+        static char *le[ALR_MAX_ENVP];
+        int k, m = 0, fake = 0;
+        for (k = 0; ge[k] && m < ALR_MAX_ENVP - 1; k++) {
+            if (!strcmp(ge[k], "ALR_FAKEROOT=1")) fake = 1;
+            if (!strncmp(ge[k], "LD_", 3) || !strncmp(ge[k], "ALR_", 4)
+                || !strncmp(ge[k], "LOCPATH=", 8))
+                continue;
+            le[m++] = ge[k];
+        }
+        le[m] = NULL;
+        av[n++] = (char *)lane_path();
+        av[n++] = (char *)"-r";  av[n++] = L.root;
+        av[n++] = (char *)"-b";  av[n++] = (char *)"/proc:/proc";
+        av[n++] = (char *)"-b";  av[n++] = (char *)"/dev:/dev";
+        av[n++] = (char *)"-b";  av[n++] = (char *)"/sys:/sys";
+        /* the lane's ids follow the preload's: real unless fakeroot */
+        if (fake) av[n++] = (char *)"--fakeroot";
+        av[n++] = (char *)"--";
+        av[n++] = (char *)guest_cmd;
+        for (i = 1; i < argc && n < ALR_MAX_ARGV - 2; i++) av[n++] = argv[i];
+        av[n] = NULL;
+        if (g_log >= 1) fprintf(stderr, "alr: running %s in the lane\n", guest_cmd);
+        alr_resolvd_stop();
+        umask(022);
+        execve(lane_path(), (char *const *)av, le);
+        die("boot-failed", "could not run alr-lane");
+    }
+
     /* ADR 0002: the program argument MUST contain a '/' -- glibc's dl-load.c
      * treats a slash-free name as a LIBRARY name and searches the library path
      * for it, not $PATH.  We always pass an absolute host path. */
@@ -3378,8 +3386,8 @@ static int cmd_run(const char *distro, int argc, char **argv, int login_shell,
      *                                              an applet named after
      *                                              the script
      *
-     * The same mechanism is why a uutils-based coreutils cannot work under an
-     * explicit loader: every tool in it is one binary dispatching on argv[0].
+     * uutils is multicall too but names itself from AT_EXECFN, not argv[0];
+     * the interposer rewrites that at startup (alr_init in alr_preload.c).
      * npre > 0 means shebang_resolve replaced `host` with the interpreter, so
      * that is what the program must see. */
     av[n++] = (char *)(login_shell ? "-bash" : (npre > 0 ? host : argv[0]));
@@ -3457,6 +3465,7 @@ static int cmd_run(const char *distro, int argc, char **argv, int login_shell,
     o.envp = build_env(&L, guest_cmd, target_static, av[5], ro, g_guest_cwd);
     o.log_level = g_log;
     o.log_fd = -1;
+    o.lane_path = lane_path();
 
     /* Ubuntu's default umask, not Termux's.
      *
@@ -3562,7 +3571,7 @@ int main(int argc, char **argv)
         if (n > 0) g_self[n] = '\0';
         else snprintf(g_self, sizeof g_self, "%s", argv[0]);
     }
-    if (!distro || !*distro) distro = cfg()->has_distro ? cfg()->distro : "ubuntu-24.04";
+    if (!distro || !*distro) distro = cfg()->has_distro ? cfg()->distro : ALR_DEFAULT_DISTRO;
     if (getenv("ALR_LOG")) g_log = atoi(getenv("ALR_LOG"));
     else if (cfg()->has_log) g_log = cfg()->log;
 

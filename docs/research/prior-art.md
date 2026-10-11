@@ -1,5 +1,7 @@
 # Prior Art Research
 
+> **Revised 2026-10-11** ([ADR 0004](../adr/0004-unified-direction.md)). Added tawc, Termux glibc-runner, and the alr engine as comparison points, and updated the conclusions that depended on PRoot being a fallback. The original matrix rows and source notes are kept.
+
 This document records the projects that shape Android on Linux Runtime. The product target is not to clone every feature from these systems. The target is a stock Android APK that runs ARM64 glibc Linux apps through a low-overhead runtime and presents GUI/GPU output through Android public graphics APIs.
 
 ## Decision Summary
@@ -7,7 +9,8 @@ This document records the projects that shape Android on Linux Runtime. The prod
 - Use Plib as the owned upstream baseline for code, tests, ALR planning, rootfs safety, PRoot fallback, and Android graphics bridge scaffolding.
 - Use Termux and Termux packages as Android userland packaging references, not as the final execution model.
 - Use Termux:X11, Local Desktop, and FluxLinux as GUI/graphics prior art, but keep this project app-window-first rather than full-desktop-first.
-- Use PRoot/proot-distro/UserLAnd/Andronix as compatibility baselines and smoke-test comparisons, not as the long-term hot path.
+- Use proot-distro/UserLAnd/Andronix as comparison baselines only. PRoot itself is no longer shipped; proot-distro is the external oracle in alr benchmarks (`git status` on 10k files: proot-distro 930 ms, alr 36 ms, native 33 ms).
+- Study tawc (wmww/tawc) for three things: the in-process `SECCOMP_RET_TRAP` approach of `tawcroot` (an unevaluated option for raw-syscall binaries, ADR 0004 D6), one Android Task per window for multi-window, and its Smithay compositor structure. Do not adopt its libhybris vendor-driver path, which conflicts with ADR 0002.
 - Treat AVF/gfxstream as a separate VM-class track. It is useful for understanding Android-backed GPU virtualization, but it does not satisfy the v1 no-VM native APK goal.
 - Lock GPU work to Android public APIs first: `ANativeWindow`, `AHardwareBuffer`, `EGL/GLES`, ANGLE where available, and Vulkan. This keeps the success path close to normal Android game rendering instead of Linux desktop driver probing.
 
@@ -23,6 +26,9 @@ This document records the projects that shape Android on Linux Runtime. The prod
 | Andronix | Termux/proot distro installer workflow | Usually desktop environments through VNC/Termux:X11-like paths | Useful setup flow and user education model | Prior art; not native enough |
 | Local Desktop | Android-hosted Linux desktop direction | Wayland/desktop-oriented bridge ideas | Relevant for compositor and desktop integration research | Reference for GUI architecture |
 | FluxLinux | Linux-on-Android GUI/runtime exploration | Focus on integrated GUI experience | Useful for app UX and bridge investigation | Reference only until evidence is local |
+| tawc (wmww/tawc) | `tawcroot`: seccomp `RET_TRAP` with an in-process `SIGSYS` handler, single process; Smithay Wayland compositor; libhybris loads vendor GPU drivers into glibc processes; gfxstream backend experimental; one Android Task per window | Not a shippable reference for this project's GPU rule (vendor drivers). Valuable for the `RET_TRAP` raw-syscall lane and the window model. Sources are MIT (`LICENSE.MIT`); only the distributed APK is GPLv3, because of termux-app's extra-keys code (upstream `notes/licensing.md`). `tawcroot/` is vendored for spike S2 under `runtime/alr/third_party/tawcroot` | Reference and spike input; `tawcroot/` vendored (MIT), not built into the product |
+| Termux glibc-runner (grun) | Forked glibc plus a forked package set, run through Termux | Native speed, but not the stock Ubuntu archive. alr keeps stock Ubuntu at near-native speed | Comparison baseline |
+| alr engine (`runtime/alr`) | Kernel `execve` of the guest `ld.so`, `LD_PRELOAD` path rewrite, signal-only ptrace supervisor; needs `targetSdk 28` | The Termux-style design this project adopted as its product engine | Product engine |
 | AVF/gfxstream | Android Virtualization Framework VM path | gfxstream-style GPU virtualization | Useful if unmodified distro compatibility becomes more important than native APK execution | Separate future track |
 
 ## Source Notes
@@ -47,7 +53,7 @@ Source links:
 
 proot-distro runs full Linux userlands on top of Termux or regular Linux without root, kernel modules, or Docker. It is valuable as a compatibility reference and as a baseline for rootfs layout, distro image handling, and command smoke tests.
 
-It is not the desired hot path because ptrace-style mediation is expensive for filesystem-heavy and process-heavy workloads. ALR should keep PRoot as a fallback and A/B oracle while moving common path/process/procfs operations into lower-overhead runtime layers.
+It is not the desired hot path because ptrace-style mediation is expensive for filesystem-heavy and process-heavy workloads. That expectation was confirmed by measurement (25.8x slower than alr on `git status` over 10k files with the same git version), and ALR no longer ships PRoot. proot-distro remains the external A/B oracle.
 
 Source link:
 
@@ -57,7 +63,9 @@ Source link:
 
 Termux:X11 is a fully fledged X server add-on app built with Android NDK and optimized for Termux. It proves that an Android-side display server can serve Linux GUI workloads, and its proot/chroot notes are useful for TMPDIR, SELinux, and namespace edge cases.
 
-It is not the v1 UX target because this project should avoid making a whole desktop session the default. The product should map Linux app surfaces to Android-owned app windows first, then use X11/Xwayland as a compatibility layer.
+It is not the v1 UX target because this project should avoid making a whole desktop session the default. The product should map Linux app surfaces to Android-owned app windows first, then use X11/Xwayland as a compatibility layer (done: rootful Xwayland as a client of the in-app compositor).
+
+Its structure is also the precedent for surface S3 in ADR 0004: a companion APK supplies server code that runs in the Termux process through `app_process`, and only the `Surface` and input cross the app boundary through Binder. Whether the same pattern works for the ALR compositor is unverified.
 
 Source link:
 
@@ -107,15 +115,33 @@ Source links:
 - <https://developer.android.com/ndk/reference/group/a-hardware-buffer>
 - <https://developer.android.com/games/develop/vulkan/overview>
 
+### tawc
+
+tawc (wmww/tawc) runs glibc Linux apps in a single process through `tawcroot`, which installs a seccomp `RET_TRAP` filter and handles `SIGSYS` in-process. Its compositor is written with Smithay, one Android Task is created per window, and GPU access goes through a libhybris fork that loads the vendor driver into the glibc process, with buffers shared as `AHardwareBuffer`. A gfxstream backend exists but is experimental.
+
+Relevance: the `RET_TRAP` mechanism is the one syscall-interception option that [alr ADR 0006](../../runtime/alr/docs/adr/0006-raw-syscall-binaries.md) did not evaluate (it measured `USER_NOTIF` at 154 µs per syscall and found `PR_SET_SYSCALL_USER_DISPATCH` absent). ADR 0004 D6 defines a microbenchmark and a decision table. The libhybris path is not adopted. Findings here come from reading the public repository, not from running it.
+
+Source link:
+
+- <https://github.com/wmww/tawc>
+
 ## Architecture Consequences
 
 - The first executable boundary must be packaged Android-native code from `nativeLibraryDir`, not a writable app-data binary.
-- Rootfs data can be mutable, but executable launch plans must be deterministic and report whether they use PRoot, ALR, or an optional external backend.
+- Rootfs data can be mutable, but executable launch plans must be deterministic and report which engine ran (alr or the frozen legacy loader) and which features were skipped.
 - GPU support must be Android-public-API-first: `Surface`, `ANativeWindow`, `EGL/GLES`, and later Vulkan. `/dev/dri`, KMS, GBM, KGSL, Turnip, or other vendor/private paths are not the default route.
 - The UI should feel like Android is hosting Linux apps one by one. Full desktop mode can exist later as an advanced compatibility path, but it is not the v1 product shape.
 - A GPU acceleration claim requires real device evidence from at least Adreno, Mali/Immortalis, and Tensor-class hardware using the same APK and no vendor-specific driver bundle.
 
 ## Open Research Questions
+
+Resolved since the first draft: ALR launches dynamic glibc programs with the stock guest loader (explicit `ld.so` invocation); GTK, Qt, and SDL smoke apps are useful; the GLES shim moved to a shared-memory ring and then to `AHardwareBuffer` zero-copy present; the Vulkan path followed a custom ICD with generated marshalling. Still open:
+
+- Does the GPU stack hold when the guest is launched by the alr engine (ring fd handoff, shim placement)? ADR 0004, P1.
+- Is the in-process `RET_TRAP` lane cheap enough to give static and Go binaries path virtualization? ADR 0004, S2.
+- Can the companion-app pattern host the ALR compositor in the Termux process? ADR 0004, S1.
+
+Original list, kept for history:
 
 - Whether ALR can reliably launch dynamic glibc programs without a custom linker beyond guest loader orchestration.
 - Which subset of Wayland semantics is needed before GTK/Qt smoke apps become useful.

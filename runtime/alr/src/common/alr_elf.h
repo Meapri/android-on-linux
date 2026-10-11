@@ -44,6 +44,7 @@ struct alr_shebang {
 #define ALR_PT_LOAD    1
 #define ALR_PT_DYNAMIC 2
 #define ALR_PT_INTERP  3
+#define ALR_PT_NOTE    4
 #define ALR_DT_NULL     0
 #define ALR_DT_STRTAB   5
 #define ALR_DT_RPATH   15
@@ -106,5 +107,15 @@ int alr_parse_shebang(const char *line, size_t len, struct alr_shebang *sb);
  * caller decides what to do with them. */
 int alr_rpath(alr_pread_fn pread, void *ctx, const unsigned char *head,
               size_t n, char *out, size_t outsz);
+
+/* 1 when the ELF carries a note owned by "Go" (the toolchain's build-id
+ * note, in a PT_NOTE segment), else 0.
+ *
+ * Go issues its file syscalls itself, not through libc, so the interposer
+ * never sees them even in a dynamically linked (cgo) Go binary: PT_INTERP
+ * alone cannot tell such a program apart.  ADR 0010 sends these to the
+ * in-process tawcroot lane along with every static ELF. */
+int alr_elf_is_go(const unsigned char *head, size_t n,
+                  alr_pread_fn pread, void *ctx);
 
 #endif /* ALR_ELF_H */

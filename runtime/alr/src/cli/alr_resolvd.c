@@ -14,6 +14,7 @@
 
 #include "alr_resolv_proto.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -68,6 +69,112 @@ static int32_t map_eai(int rc)
     }
 }
 
+/* netd's DNS proxy, spoken directly.
+ *
+ * bionic's getaddrinfo() reaches netd through libnetd_client.so, which libc
+ * dlopen()s at start-up.  alr is linked static (Makefile, ALR_API) -- a
+ * dynamic alr paid the bionic linker plus that dlopen chain on every
+ * `alr run`, ~9 ms on the reference device -- and a static libc cannot
+ * dlopen, so its getaddrinfo() falls back to /etc/resolv.conf, which Android
+ * does not have: every lookup failed.  This is the request bionic's
+ * android_getaddrinfo_proxy() sends (FrameworkListener text command, NUL
+ * terminated) and the reply it parses: a 4-byte ASCII code, 222 on success,
+ * then per address a big-endian "more" word, flags, family, socktype,
+ * protocol, address length, the address, and a canonical-name length plus
+ * name.  Going through netd keeps Private DNS, VPNs and per-network
+ * resolvers, the reason resolvd exists (docs/RISKS.md R15).
+ *
+ * Returns a bionic EAI_* code, or -1 when the proxy could not be used (the
+ * caller then asks libc). */
+#define DNSPROXY_SOCK       "/dev/socket/dnsproxyd"
+#define DNSPROXY_RESULT_OK  222
+
+static int read_be32(int fd, int32_t *out)
+{
+    uint32_t v;
+    if (read_full(fd, &v, sizeof v) != 0) return -1;
+    *out = (int32_t)ntohl(v);
+    return 0;
+}
+
+static int proxy_getaddrinfo(const char *node, const char *serv,
+                             const struct addrinfo *h,
+                             struct alr_resolv_ent *ents, uint32_t *n_out)
+{
+    struct sockaddr_un sa;
+    char cmd[64 + ALR_RESOLV_MAXNAME + ALR_RESOLV_MAXSERV];
+    char code[4];
+    const char *c;
+    int fd, len, ret = -1;
+    uint32_t n = 0;
+
+    /* the command is space-separated: such a name cannot be sent */
+    for (c = node; *c; c++) if (*c == ' ') return EAI_NONAME;
+    for (c = serv ? serv : ""; *c; c++) if (*c == ' ') return EAI_SERVICE;
+
+    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    memset(&sa, 0, sizeof sa);
+    sa.sun_family = AF_UNIX;
+    memcpy(sa.sun_path, DNSPROXY_SOCK, sizeof DNSPROXY_SOCK);
+    if (connect(fd, (struct sockaddr *)&sa, sizeof sa) != 0) goto out;
+
+    /* netid 0 = NETID_UNSET: netd picks this uid's default network. */
+    len = snprintf(cmd, sizeof cmd, "getaddrinfo %s %s %d %d %d %d %u",
+                   node, serv && *serv ? serv : "^", h->ai_flags, h->ai_family,
+                   h->ai_socktype, h->ai_protocol, 0u);
+    if (len < 0 || (size_t)len >= sizeof cmd) goto out;
+    if (write_full(fd, cmd, (size_t)len + 1) != 0) goto out;   /* with the NUL */
+    if (read_full(fd, code, sizeof code) != 0) goto out;
+    code[3] = '\0';
+    if (atoi(code) != DNSPROXY_RESULT_OK) {
+        int32_t e = 0;
+        ret = read_full(fd, &e, sizeof e) == 0 && e != 0 ? (int)e : EAI_FAIL;
+        goto out;
+    }
+    for (;;) {
+        int32_t more, flags, fam, st, proto, alen, nlen;
+        unsigned char addr[128];
+        char skip[256];
+        if (read_be32(fd, &more) != 0) goto out;
+        if (!more) break;
+        if (read_be32(fd, &flags) || read_be32(fd, &fam) || read_be32(fd, &st)
+            || read_be32(fd, &proto) || read_be32(fd, &alen))
+            goto out;
+        if (alen < 0 || alen > (int32_t)sizeof addr) goto out;
+        if (read_full(fd, addr, (size_t)alen) != 0) goto out;
+        if (read_be32(fd, &nlen) != 0 || nlen < 0) goto out;
+        while (nlen > 0) {                       /* canonical name: unused */
+            int k = nlen > (int32_t)sizeof skip ? (int)sizeof skip : nlen;
+            if (read_full(fd, skip, (size_t)k) != 0) goto out;
+            nlen -= k;
+        }
+        (void)flags;
+        if (n < ALR_RESOLV_MAXRES && alen <= ALR_RESOLV_MAXADDR) {
+            memset(&ents[n], 0, sizeof ents[n]);
+            ents[n].family   = fam;
+            ents[n].socktype = st;
+            ents[n].protocol = proto;
+            ents[n].addrlen  = (uint32_t)alen;
+            memcpy(ents[n].addr, addr, (size_t)alen);
+            n++;
+        }
+    }
+    *n_out = n;
+    ret = 0;
+out:
+    close(fd);
+    return ret;
+}
+
+/* Names that need no DNS: libc answers these itself, static or not. */
+static int needs_dns(const char *node, int flags)
+{
+    unsigned char b[16];
+    if (!node || !*node || (flags & AI_NUMERICHOST)) return 0;
+    return inet_pton(AF_INET, node, b) != 1 && inet_pton(AF_INET6, node, b) != 1;
+}
+
 static void serve_one(int fd)
 {
     struct alr_resolv_req rq;
@@ -96,8 +203,14 @@ static void serve_one(int fd)
     hints.ai_protocol = rq.protocol;
     hints.ai_flags    = rq.flags;
 
-    rc = getaddrinfo(rq.has_node ? node : NULL,
-                     rq.has_serv ? serv : NULL, &hints, &res);
+    rc = -1;
+    if (rq.has_node && needs_dns(node, hints.ai_flags))
+        rc = proxy_getaddrinfo(node, rq.has_serv ? serv : NULL, &hints, ents, &n);
+    if (rc < 0) {
+        n = 0;
+        rc = getaddrinfo(rq.has_node ? node : NULL,
+                         rq.has_serv ? serv : NULL, &hints, &res);
+    }
 
     for (ai = res; ai && n < ALR_RESOLV_MAXRES; ai = ai->ai_next) {
         if (!ai->ai_addr || ai->ai_addrlen > ALR_RESOLV_MAXADDR) continue;

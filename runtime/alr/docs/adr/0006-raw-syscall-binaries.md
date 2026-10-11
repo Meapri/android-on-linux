@@ -1,6 +1,6 @@
 # ADR 0006 — raw-syscall 바이너리를 어떻게 할 것인가
 
-- **상태**: 채택 (2026-08-03)
+- **상태**: 채택 (2026-08-03). **대체됨 (2026-10-11)**: raw-syscall 바이너리는 이제 비목표가 아니다. 정적 ELF와 Go 바이너리는 tawcroot 레인으로 실행한다([ADR 0010](0010-tawcroot-lane.md)). uutils는 preload 레인에서 동작한다([T5 uutils 증거](../evidence/2026-10-11-t5-uutils-preload.md)).
 - **관련**: [ADR 0001](0001-signal-only-ptrace-supervisor.md), [00-product.md §5](../00-product.md), [M15](../evidence/2026-08-03-m15-cmdline-2604.md)
 
 ## 배경
@@ -158,3 +158,24 @@ PRETTY_NAME="Ubuntu 26.04 LTS"
 **그러므로 26.04 대응의 비용은 런타임 변경 0 이다.** 프로비저닝 시점에 `coreutils-from-gnu` 를 선택하면 된다. 반대로 uutils 를 그대로 두고 후킹하려는 길(seccomp user notification, 154 µs/syscall)은 여전히 [ADR 0001](0001-signal-only-ptrace-supervisor.md) 을 무너뜨리므로 택하지 않는다.
 
 **남은 정직한 한계**: 이것은 "26.04 를 스톡 그대로 쓴다" 가 아니라 "26.04 를 GNU coreutils 로 쓴다" 이다. 그리고 우분투가 러스트로 옮긴 것이 coreutils 만은 아닐 수 있으므로(예: `sudo-rs`), 같은 부류가 다른 패키지에서 또 나올 수 있다 — 그건 나올 때 재서 판단한다.
+
+
+## 보론 (2026-10-11) — 평가하지 않은 선택지가 하나 있다
+
+위의 분석은 `USER_NOTIF`(프로세스 밖 supervisor, 154 µs)와 SUD(커널에 없음)만 비교했다. 세 번째 선택지인 **프로세스 내부 `SECCOMP_RET_TRAP` + `SIGSYS` 핸들러**는 평가하지 않았다. 허용된 트램폴린 PC 밖에서 발행된 경로 syscall만 같은 스레드의 시그널로 받아 재작성한 뒤 트램폴린에서 다시 발행하는 방식이며, 별도 프로세스와 컨텍스트 스위치가 없다. 공개된 tawc의 `tawcroot`가 이 방식을 쓴다(저장소를 읽은 것이며 직접 실행해 보지 않았다).
+
+이 ADR의 결정(기본 경로 유지, raw-syscall 바이너리는 비목표)은 **바뀌지 않는다.** 바뀌는 것은 "비용 때문에 불가능하다"는 결론의 근거 범위다. `RET_TRAP` 왕복 비용이 측정되기 전까지는 `USER_NOTIF`와 SUD에 대해서만 닫힌 결정이다.
+
+측정 계획과 판정 기준은 상위 [ADR 0004 D6](../../../../docs/adr/0004-unified-direction.md)에 있다. 요약하면 `getppid` 기준 왕복 5 µs 이하이면 로더 프로토타입, 31 µs 초과이면 폐기한다. 정적 바이너리는 `execve`가 핸들러를 초기화하므로 핸들러를 먼저 설치하는 사용자 영역 로더가 필요하다는 점이 구현상 가장 큰 미지수다.
+
+**측정 결과(2026-10-11)**: Snapdragon 참조 기기(Android 17, `untrusted_app_27`)에서 `getppid` 기준 `RET_TRAP` 재발행 왕복은 +410~+925 ns였다. `USER_NOTIF`(154 µs)보다 170배 이상 싸고, D6 판정은 `PROCEED`다. 이 ADR의 결정(raw-syscall 바이너리는 비목표)은 로더 프로토타입과 새 ADR이 나올 때까지 유지한다([증거](../evidence/2026-10-11-s2-ret-trap-cost.md)).
+
+tawcroot 소스는 MIT라서 `third_party/tawcroot/`에 반입했다(수정 없음, 빌드 미연결). 출처와 규칙은 [VENDORING.md](../../third_party/tawcroot/VENDORING.md)에 있다.
+
+## 보론 2 (2026-10-11) — uutils 는 이 ADR 의 대상이 아니었다
+
+uutils 가 `unknown program 'ld-linux-aarch64.so'` 로 실패한 원인은 raw syscall 의 경로가 아니라 **이름**이었다. uutils 는 applet 이름을 커널 auxv 의 `AT_EXECFN` 에서 얻는데, 그 값을 raw `prctl(PR_GET_AUXV)` 로 읽는다. 명시적 로더 실행(ADR 0002)에서 그 값은 ld.so 의 경로다. glibc ld.so 는 자기 사본만 `argv[0]` 으로 고치므로 `getauxval` 트레이스에는 이 호출이 나타나지 않았다. inline `svc` 74개는 `ioctl`·`fstat`·`fcntl`·`read`·`lseek` 같은 fd 계열이라 경로를 싣지 않는다.
+
+preload 가 시작할 때 커널 auxv 의 `AT_EXECFN` 문자열을 게스트 경로로 덮어쓰니 uutils 가 그대로 동작했다. 26.04(uutils 그대로)에서 수용은 171/0/0, 폭은 96/96 이다([증거](../evidence/2026-10-11-t5-uutils-preload.md)). install 과 adopt 는 더 이상 GNU 로 재지정하지 않는다.
+
+이 ADR 의 결정은 이제 **경로 syscall 을 libc 없이 내는 바이너리**(Go 가 대표적)에만 해당한다. 그 범주는 [ADR 0005](../../../../docs/adr/0005-termux-first-goals.md) T5 가 tawcroot 레인으로 다룬다. tawcroot 의 로컬 수정은 [VENDORING.md](../../third_party/tawcroot/VENDORING.md) 에 있다.
