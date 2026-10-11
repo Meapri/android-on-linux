@@ -218,6 +218,23 @@ int main(int argc, char **argv)
 	if (sigsetjmp(jb, 1) == 0) *(volatile int *)16 = 1;
 	res("LANE SEGV HANDLER AFTER VFORK RESET", caught_sig == SIGSEGV, "sig %d", caught_sig);
 
+	/* The same from a fork child whose first trapped call is its vfork
+	 * child's: the vfork child must still be told apart from the memory's
+	 * owner. */
+	pid_t fc = fork();
+	if (fc == 0) {
+		pid_t v = vfork();
+		if (v == 0) { signal(SIGSEGV, SIG_DFL); _exit(0); }
+		int vs;
+		waitpid(v, &vs, 0);
+		caught_sig = 0;
+		if (sigsetjmp(jb, 1) == 0) *(volatile int *)16 = 1;
+		_exit(caught_sig == SIGSEGV ? 0 : 1);
+	}
+	waitpid(fc, &ws, 0);
+	res("LANE SEGV HANDLER AFTER FORK THEN VFORK RESET",
+	    WIFEXITED(ws) && WEXITSTATUS(ws) == 0, "child status 0x%x", ws);
+
 	install(SIGSEGV, SA_RESETHAND);
 	caught_sig = 0;
 	if (sigsetjmp(jb, 1) == 0) *(volatile int *)16 = 1;

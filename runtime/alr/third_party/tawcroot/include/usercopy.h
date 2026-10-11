@@ -42,6 +42,8 @@ long tawc_usercopy_init(void);
 /* This process's tgid from the fork-wiped cache (usercopy.c).  A CLONE_VM
  * child sees its parent's until it forks or execs. */
 long tawc_self_tgid(void);
+/* In the child of a fork-type clone: cache the child's own tgid. */
+void tawc_self_tgid_forked(void);
 #endif
 
 extern int tawc_usercopy_works;

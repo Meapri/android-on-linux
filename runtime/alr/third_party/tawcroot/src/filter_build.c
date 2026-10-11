@@ -115,6 +115,23 @@ long tawcroot_build_filter(struct sock_filter *prog, size_t prog_cap,
 			continue;
 		}
 #endif
+#ifdef TAWCROOT_ALR
+		/* clone only without CLONE_VM (syscalls_control.c
+		 * handle_clone_fork).  Threads and vfork never trap: a
+		 * CLONE_VM child started from the handler would share its
+		 * stack. */
+		if (trap_nrs[t] == TAWC_SYS_clone) {
+			EMIT_OR_FAIL(TAWC_BPF_J(BPF_JMP | BPF_JEQ | BPF_K,
+					(uint32_t)trap_nrs[t], 0, 4));
+			EMIT_OR_FAIL(TAWC_BPF_S(BPF_LD | BPF_W | BPF_ABS, 16));
+			EMIT_OR_FAIL(TAWC_BPF_J(BPF_JMP | BPF_JSET | BPF_K,
+					0x00000100u /* CLONE_VM */, 1, 0));
+			EMIT_OR_FAIL(TAWC_BPF_S(BPF_RET | BPF_K, SECCOMP_RET_TRAP | TAWCROOT_TRAP_DATA));
+			EMIT_OR_FAIL(TAWC_BPF_S(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+			EMIT_OR_FAIL(TAWC_BPF_S(BPF_LD | BPF_W | BPF_ABS, 0));
+			continue;
+		}
+#endif
 		if (floor_only && reserved_fd_floor > 0) {
 			/* not-close jf skips: LD args, JGE, RET TRAP,
 			 * RET ALLOW = 4, landing on the LD-nr reload. */

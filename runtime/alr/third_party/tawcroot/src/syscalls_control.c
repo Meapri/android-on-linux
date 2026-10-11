@@ -501,6 +501,34 @@ static long handle_alarm(const tawcroot_syscall_args *args, ucontext_t *uc)
 }
 #endif
 
+#ifdef TAWCROOT_ALR
+/* clone without CLONE_VM, i.e. fork: the filter traps only these
+ * (filter_build.c), so the child can record its tgid before any guest
+ * code runs in it (usercopy.c).  The child resumes from this handler
+ * through sigreturn like any trapped call; a new stack is applied to its
+ * context rather than to the clone, which would move the handler's own
+ * stack. */
+#define TAWC_CLONE_VM 0x00000100UL
+static long handle_clone_fork(const tawcroot_syscall_args *args,
+			      ucontext_t *uc)
+{
+	if ((unsigned long)args->a & TAWC_CLONE_VM) return TAWC_ENOSYS;
+	long r = TAWC_RAW(TAWC_SYS_clone, args->a, 0, args->c, args->d,
+			  args->e, 0);
+	if (r == 0) {
+		tawc_self_tgid_forked();
+		if (args->b) {
+#if defined(__aarch64__)
+			uc->uc_mcontext.sp = (unsigned long)args->b;
+#elif defined(__x86_64__)
+			uc->uc_mcontext.gregs[REG_RSP] = (long long)args->b;
+#endif
+		}
+	}
+	return r;
+}
+#endif
+
 void tawcroot_control_register(void)
 {
 	tawcroot_dispatch_install(TAWC_SYS_seccomp,         handle_seccomp);
@@ -538,6 +566,9 @@ void tawcroot_control_register(void)
 	 * causes glibc to set its "clone3 missing" flag and use clone()
 	 * going forward, keeping the guest off the risky syscall entirely. */
 	tawcroot_dispatch_install(TAWC_SYS_clone3,          tawcroot_deny_enosys);
+#ifdef TAWCROOT_ALR
+	tawcroot_dispatch_install(TAWC_SYS_clone,           handle_clone_fork);
+#endif
 
 	tawcroot_dispatch_install(TAWC_SYS_exit,            handle_exit);
 

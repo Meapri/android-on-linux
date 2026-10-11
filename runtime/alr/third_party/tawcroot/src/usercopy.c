@@ -27,9 +27,10 @@ int tawc_usercopy_works = 0;
  * which is exactly the event that invalidates it.  A CLONE_VM child (vfork,
  * posix_spawn) keeps the page and so its parent's tgid; comparing that
  * with getpid() is how alr_fast.c and alr_fault.c tell such a child from
- * the memory's owner.  supervisor.c fills it at image start; after a
- * fork(2) the first trap refills it.  (A fork child whose very first trap
- * comes from a vfork child of its own would cache that child's pid.) */
+ * the memory's owner.  supervisor.c fills it at image start, and the
+ * child of a fork-type clone (trapped for this, syscalls_control.c) fills
+ * it before it runs guest code.  Filling it lazily instead could let a
+ * vfork child of that child, trapping first, cache its own pid. */
 static long *g_tgid_cache;
 
 static long cached_task_id(void)
@@ -45,6 +46,13 @@ static long cached_task_id(void)
 long tawc_self_tgid(void)
 {
 	return cached_task_id();
+}
+
+void tawc_self_tgid_forked(void)
+{
+	long t = TAWC_RAW(TAWC_SYS_getpid, 0, 0, 0, 0, 0, 0);
+	if (t > 0 && g_tgid_cache)
+		__atomic_store_n(g_tgid_cache, t, __ATOMIC_RELAXED);
 }
 #endif
 
