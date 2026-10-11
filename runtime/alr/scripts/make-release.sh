@@ -429,7 +429,10 @@ done
 # cannot --sort, so the archive is byte-reproducible only under GNU tar.  Say
 # which one happened instead of claiming reproducibility either way.
 
-TAR_REPRO=""
+# bsdtar on macOS also stores extended attributes (com.apple.provenance) as
+# ._<name> AppleDouble members, which GNU and busybox tar extract as files:
+# a tarball unpacked in Termux got bin/._alr beside bin/alr.
+TAR_REPRO="--no-xattrs --no-mac-metadata"
 REPRO_NOTE="NOT byte-reproducible (bsdtar: no --sort/--mtime; mtimes vary)"
 if tar --version 2>/dev/null | head -1 | grep -q 'GNU tar'; then
     TAR_REPRO="--sort=name --owner=0 --group=0 --numeric-owner --mtime=@$SOURCE_DATE_EPOCH"
@@ -440,7 +443,7 @@ rm -f "$TARBALL"
 # gzip -n, not `tar czf`: the gzip header otherwise carries a timestamp and two
 # identical trees produce two different files.
 # shellcheck disable=SC2086
-(cd "$STAGE" && tar $TAR_REPRO -cf - $MEMBERS) | gzip -n -9 > "$TARBALL"
+(cd "$STAGE" && COPYFILE_DISABLE=1 tar $TAR_REPRO -cf - $MEMBERS) | gzip -n -9 > "$TARBALL"
 
 rm -rf "$STAGE"
 

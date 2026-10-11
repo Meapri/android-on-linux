@@ -936,8 +936,9 @@ static int with_codex(const char *R, const char *cache)
  * /etc/apt/apt.conf.d, env searching PATH for node) resolves against the
  * ANDROID host and fails in ways that look like a broken rootfs.
  *
- * Searched next to the alr binary first, then $PREFIX/share/alr -- the release
- * layout.  Returns 0 if installed, -1 if the .so could not be found. */
+ * Searched next to the alr binary first, then in the release layout around it
+ * (<bin>/../share/alr, so a tarball unpacked anywhere finds its own .so), then
+ * $PREFIX/share/alr.  Returns 0 if installed, -1 if the .so could not be found. */
 /* Rewriting the shim after each `alr` operation is not enough: a libc-bin
  * upgrade restores the genuine wrapper, which runs the static ldconfig.real,
  * which fails -- and that leaves libc-bin half-configured so every LATER apt
@@ -965,7 +966,7 @@ static void divert_ldconfig(const char *distro, const char *R)
 static int install_preload(const char *R)
 {
     char src[ALR_PBUF], dst[ALR_PBUF], dir[ALR_PBUF];
-    const char *cands[3];
+    const char *cands[4];
     char selfdir[ALR_PBUF];
     char *slash;
     int i;
@@ -977,11 +978,14 @@ static int install_preload(const char *R)
     snprintf(src, sizeof src, "%s/libalr_preload.so", selfdir);
     cands[0] = src;
     { static char c1[ALR_PBUF];
-      snprintf(c1, sizeof c1, "%s/share/alr/libalr_preload.so", prefix());
+      snprintf(c1, sizeof c1, "%s/../share/alr/libalr_preload.so", selfdir);
       cands[1] = c1; }
     { static char c2[ALR_PBUF];
-      snprintf(c2, sizeof c2, "%s/build/libalr_preload.so", selfdir);
+      snprintf(c2, sizeof c2, "%s/share/alr/libalr_preload.so", prefix());
       cands[2] = c2; }
+    { static char c3[ALR_PBUF];
+      snprintf(c3, sizeof c3, "%s/build/libalr_preload.so", selfdir);
+      cands[3] = c3; }
 
     /* Ship the manifest beside the .so (docs/05-provisioning-spec.md §3.4).
      * Three separate incidents in this project's evidence were "the deployed
@@ -992,7 +996,7 @@ static int install_preload(const char *R)
       run_cmd(mk); }
     snprintf(dst, sizeof dst, "%s/usr/lib/alr/libalr_preload.so", R);
 
-    for (i = 0; i < 3; i++) {
+    for (i = 0; i < 4; i++) {
         if (access(cands[i], R_OK) != 0) continue;
         if (copy_file(cands[i], dst) == 0) {
             char msrc[ALR_PBUF], mdst[ALR_PBUF];
@@ -1028,8 +1032,9 @@ static int install_preload(const char *R)
         }
     }
     fprintf(stderr,
-        "alr: WARNING libalr_preload.so not found next to the binary or in\n"
-        "     %s/share/alr/.  The guest will run WITHOUT path virtualization:\n"
+        "alr: WARNING libalr_preload.so not found next to the binary, in its\n"
+        "     ../share/alr/ or in %s/share/alr/.  The guest will run WITHOUT path\n"
+        "     virtualization:\n"
         "     it will see the Android filesystem, not the rootfs.\n", prefix());
     return -1;
 }
@@ -1140,7 +1145,7 @@ static int cmd_version(const char *distro)
     FILE *fp;
 
     char selfdir[ALR_PBUF], *slash;
-    const char *cands[3];
+    const char *cands[4];
     int i;
 
     printf("alr %s\n", ALR_VERSION);
@@ -1148,14 +1153,15 @@ static int cmd_version(const char *distro)
     snprintf(selfdir, sizeof selfdir, "%s", g_self);
     slash = strrchr(selfdir, '/');
     if (slash) *slash = '\0'; else snprintf(selfdir, sizeof selfdir, ".");
-    { static char c0[ALR_PBUF], c1[ALR_PBUF], c2[ALR_PBUF];
+    { static char c0[ALR_PBUF], c1[ALR_PBUF], c2[ALR_PBUF], c3[ALR_PBUF];
       snprintf(c0, sizeof c0, "%s/libalr_preload.so", selfdir);
-      snprintf(c1, sizeof c1, "%s/share/alr/libalr_preload.so", prefix());
-      snprintf(c2, sizeof c2, "%s/build/libalr_preload.so", selfdir);
-      cands[0] = c0; cands[1] = c1; cands[2] = c2; }
+      snprintf(c1, sizeof c1, "%s/../share/alr/libalr_preload.so", selfdir);
+      snprintf(c2, sizeof c2, "%s/share/alr/libalr_preload.so", prefix());
+      snprintf(c3, sizeof c3, "%s/build/libalr_preload.so", selfdir);
+      cands[0] = c0; cands[1] = c1; cands[2] = c2; cands[3] = c3; }
 
     path[0] = '\0';
-    for (i = 0; i < 3; i++)
+    for (i = 0; i < 4; i++)
         if (access(cands[i], R_OK) == 0) { snprintf(path, sizeof path, "%s", cands[i]); break; }
 
     if (*path) {
@@ -1318,14 +1324,15 @@ static void install_libdl_stub(const char *R)
     if ((slash = strrchr(selfdir, '/'))) *slash = '\0';
     else snprintf(selfdir, sizeof selfdir, ".");
 
-    {   const char *cands[3];
-        static char c0[ALR_PBUF], c1[ALR_PBUF], c2[ALR_PBUF];
+    {   const char *cands[4];
+        static char c0[ALR_PBUF], c1[ALR_PBUF], c2[ALR_PBUF], c3[ALR_PBUF];
         snprintf(c0, sizeof c0, "%s/libdl.so.2", selfdir);
-        snprintf(c1, sizeof c1, "%s/share/alr/libdl.so.2", prefix());
-        snprintf(c2, sizeof c2, "%s/build/libdl.so.2", selfdir);
-        cands[0] = c0; cands[1] = c1; cands[2] = c2;
+        snprintf(c1, sizeof c1, "%s/../share/alr/libdl.so.2", selfdir);
+        snprintf(c2, sizeof c2, "%s/share/alr/libdl.so.2", prefix());
+        snprintf(c3, sizeof c3, "%s/build/libdl.so.2", selfdir);
+        cands[0] = c0; cands[1] = c1; cands[2] = c2; cands[3] = c3;
         src[0] = '\0';
-        for (i = 0; i < 3; i++)
+        for (i = 0; i < 4; i++)
             if (access(cands[i], R_OK) == 0) { snprintf(src, sizeof src, "%s", cands[i]); break; }
     }
     if (!*src) return;                              /* nothing to install */
@@ -2634,13 +2641,14 @@ static int parse_runopts(int argc, char **argv, struct runopts *ro,
 
 /* Host path of alr-lane (ADR 0010), or NULL when there is none or the user
  * turned it off with ALR_LANE=0.  Beside the alr binary in a dev tree,
- * $PREFIX/libexec/alr/ in a package. */
+ * <bin>/../libexec/alr/ in an unpacked release, $PREFIX/libexec/alr/ in a
+ * package. */
 static const char *lane_path(void)
 {
     static char path[ALR_PBUF];
     static int done;
     const char *e = getenv("ALR_LANE");
-    char cand[2][ALR_PBUF], selfdir[ALR_PBUF], *slash;
+    char cand[3][ALR_PBUF], selfdir[ALR_PBUF], *slash;
     int i;
 
     if (e && !strcmp(e, "0")) return NULL;
@@ -2650,8 +2658,9 @@ static const char *lane_path(void)
     slash = strrchr(selfdir, '/');
     if (slash) *slash = '\0'; else snprintf(selfdir, sizeof selfdir, ".");
     snprintf(cand[0], ALR_PBUF, "%s/alr-lane", selfdir);
-    snprintf(cand[1], ALR_PBUF, "%s/libexec/alr/alr-lane", prefix());
-    for (i = 0; i < 2; i++)
+    snprintf(cand[1], ALR_PBUF, "%s/../libexec/alr/alr-lane", selfdir);
+    snprintf(cand[2], ALR_PBUF, "%s/libexec/alr/alr-lane", prefix());
+    for (i = 0; i < 3; i++)
         if (access(cand[i], X_OK) == 0 && realpath(cand[i], path)) return path;
     path[0] = '\0';
     return NULL;

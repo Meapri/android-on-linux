@@ -739,17 +739,20 @@ fi
 #   ld.so        has no PT_INTERP, so it reads as STATIC, and a
 #                loader necessarily issues its own syscalls      -> STATIC
 #   libc.so.6    the note in the output exists because of this one
-if [ -x ./alr-doctor ]; then
+# alr-doctor sits beside alr: ./alr-doctor in a dev push, bin/alr-doctor in
+# an unpacked release.
+DOCTOR="$(dirname "$ALR")/alr-doctor"
+if [ -x "$DOCTOR" ]; then
     ckc "DOCTOR P11 DYNAMIC CLEAN" '0 `svc #0` -> PASS' \
-        ./alr-doctor --scan "$R/bin/bash"
+        "$DOCTOR" --scan "$R/bin/bash"
     ckc "DOCTOR P11 STATIC FLAGGED" "STATIC (no PT_INTERP)" \
-        ./alr-doctor --scan "$R/lib/ld-linux-aarch64.so.1"
+        "$DOCTOR" --scan "$R/lib/ld-linux-aarch64.so.1"
     # The scan must READ the file, not merely accept the argument: a stub that
     # printed PASS for everything would pass the first check above.
     ckc "DOCTOR P11 COUNTS NONZERO" "-> WARN" \
-        ./alr-doctor --scan "$R/lib/ld-linux-aarch64.so.1"
+        "$DOCTOR" --scan "$R/lib/ld-linux-aarch64.so.1"
     ckc "DOCTOR P11 REJECTS NON ELF" "not a 64-bit ELF" \
-        ./alr-doctor --scan "$R/etc/os-release"
+        "$DOCTOR" --scan "$R/etc/os-release"
     # A DIRECTORY sweeps -- docs/06 §3.1's shape, and the one that answers the
     # question a user has ("which of my binaries will not be virtualized?").
     # Scoped to /usr/lib/go-1.22 when present because the Go toolchain is the
@@ -757,18 +760,18 @@ if [ -x ./alr-doctor ]; then
     # syscalls.  Sweeping the whole rootfs takes ~18 s and belongs in doctor,
     # not in a suite that runs on every change.
     if [ -d "$R/usr/lib/go-1.22/bin" ]; then
-        ckc "DOCTOR P11 SWEEPS DIR" "STATIC," ./alr-doctor --scan "$R/usr/lib/go-1.22/bin"
+        ckc "DOCTOR P11 SWEEPS DIR" "STATIC," "$DOCTOR" --scan "$R/usr/lib/go-1.22/bin"
     else
         # /usr/bin always exists; assert the sweep RAN and counted, which is
         # the part a stub could not fake.
-        ckc "DOCTOR P11 SWEEPS DIR" "executables scanned" ./alr-doctor --scan "$R/usr/bin"
+        ckc "DOCTOR P11 SWEEPS DIR" "executables scanned" "$DOCTOR" --scan "$R/usr/bin"
     fi
     # Shared libraries must stay OUT of a sweep: /usr/lib/aarch64-linux-gnu is
     # nothing but libc and friends, each stuffed with svc, and a sweep that
     # counted them would report every rootfs as broken.
     ckc "DOCTOR P11 SKIPS LIBS" "0 issue their own syscalls or are static" \
-        ./alr-doctor --scan "$R/usr/lib/aarch64-linux-gnu"
-    ckc "DOCTOR P12 PHANTOM" "live descendants" ./alr-doctor
+        "$DOCTOR" --scan "$R/usr/lib/aarch64-linux-gnu"
+    ckc "DOCTOR P12 PHANTOM" "live descendants" "$DOCTOR"
 else
     for n in "DOCTOR P11 DYNAMIC CLEAN" "DOCTOR P11 STATIC FLAGGED" \
              "DOCTOR P11 COUNTS NONZERO" "DOCTOR P11 REJECTS NON ELF" \

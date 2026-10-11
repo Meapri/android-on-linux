@@ -113,8 +113,9 @@ LICENSE
 README.md
 ```
 
-`libalr_preload.so`는 **게스트가 경로 가상화를 받는 유일한 수단**이다. `alr`은 이것을 바이너리 옆에서 먼저 찾고
-없으면 `$PREFIX/share/alr/`에서 찾는다. 둘 다 없으면 경고를 내고 계속 진행하지만, 그 게스트는 rootfs가 아니라
+`libalr_preload.so`는 **게스트가 경로 가상화를 받는 유일한 수단**이다. `alr`은 이것을 바이너리 옆에서 먼저 찾고,
+다음으로 바이너리 기준 `../share/alr/`, 마지막으로 `$PREFIX/share/alr/`에서 찾는다. 그래서 tarball을 `$PREFIX`가 아닌
+곳에 풀어도 그 안의 `bin/alr`은 같은 tarball의 preload와 `libexec/alr/alr-lane`을 쓴다. 모두 없으면 경고를 내고 계속 진행하지만, 그 게스트는 rootfs가 아니라
 Android 파일시스템을 보게 된다 — 즉 정상 동작이 아니다.
 
 `alr version`은 버전, preload 경로, preload의 `sha256`, rootfs 경로를 출력한다.
