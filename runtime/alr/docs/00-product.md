@@ -39,7 +39,7 @@
 >
 > **exec 는 Snapdragon 이 2배 빠르고**(proot 쪽도 함께 오르므로 기기 성능 차이다) **재작성 per-op 은 MediaTek 이 빠르다.** 배수가 MediaTek 에서 더 큰 것은 alr 이 빨라서가 아니라 **proot 가 더 느려서**다. 배수를 인용할 때는 기기를 함께 쓴다.
 - **호스트**: Termux **F-Droid / GitHub 빌드** (`targetSdkVersion=28`). Play Store 빌드는 **v1 미지원** (ADR 0005).
-- **게스트**: **Ubuntu 26.04 LTS** (resolute, glibc 2.43) arm64 하나만 지원한다. `alr install` 과 모든 명령의 기본값이다. 24.04 (noble) 는 2026-10-11 부로 지원하지 않는다([ADR 0005](../../../docs/adr/0005-termux-first-goals.md)). coreutils 는 Ubuntu 기본값인 uutils 를 그대로 쓴다. GNU 로 바꾸고 싶으면 `alr use-gnu-coreutils` 를 쓴다([ADR 0006 보론 2](adr/0006-raw-syscall-binaries.md), [증거](evidence/2026-10-11-t5-uutils-preload.md)). Debian bookworm/trixie는 v1.1 목표.
+- **게스트**: **Ubuntu 26.04 LTS** (resolute, glibc 2.43) arm64 하나만 지원한다. `alr install` 과 모든 명령의 기본값이다. 24.04 (noble) 는 2026-10-11 부로 지원하지 않는다([ADR 0005](https://github.com/Meapri/android-on-linux/blob/main/docs/adr/0005-termux-first-goals.md)). coreutils 는 Ubuntu 기본값인 uutils 를 그대로 쓴다. GNU 로 바꾸고 싶으면 `alr use-gnu-coreutils` 를 쓴다([ADR 0006 보론 2](adr/0006-raw-syscall-binaries.md), [증거](evidence/2026-10-11-t5-uutils-preload.md)). Debian bookworm/trixie는 v1.1 목표.
 - **워크로드**: `git`, `node`(및 npm/npx), `bash`, `apt`/`dpkg`, 일반 coreutils/빌드 툴체인.
   `codex`, Go 툴체인, busybox-static 같은 정적·Go 바이너리는 tawcroot 레인(`alr-lane`)에서 경로 가상화된다([ADR 0010](adr/0010-tawcroot-lane.md), [증거](evidence/2026-10-11-t5-lane.md)).
 

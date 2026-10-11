@@ -1,6 +1,6 @@
 # Vendored: tawcroot (shipped as `alr-lane`)
 
-Status: **built as the separate binary `alr-lane` and shipped beside `alr`** ([alr ADR 0010](../../docs/adr/0010-tawcroot-lane.md), which is the "new ADR" rule 2 below asked for). It is never linked into `alr`. Make target `lane`, `scripts/make-release.sh` (`libexec/alr/alr-lane`), the Termux recipe and `scripts/dev-push.sh` all build it with `-DTAWCROOT_ALR`. That flag selects local changes 3 to 9 below. It started as the reference input for spike S2 ([ADR 0004 D6](../../../../docs/adr/0004-unified-direction.md), [alr ADR 0006 addendum](../../docs/adr/0006-raw-syscall-binaries.md)).
+Status: **built as the separate binary `alr-lane` and shipped beside `alr`** ([alr ADR 0010](../../docs/adr/0010-tawcroot-lane.md), which is the "new ADR" rule 2 below asked for). It is never linked into `alr`. Make target `lane`, `scripts/make-release.sh` (`libexec/alr/alr-lane`), the Termux recipe and `scripts/dev-push.sh` all build it with `-DTAWCROOT_ALR`. That flag selects local changes 3 to 9 below. It started as the reference input for spike S2 ([ADR 0004 D6](https://github.com/Meapri/android-on-linux/blob/main/docs/adr/0004-unified-direction.md), [alr ADR 0006 addendum](../../docs/adr/0006-raw-syscall-binaries.md)).
 
 ## Provenance
 

@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (2026-10-11). [ADR 0006](0006-raw-syscall-binaries.md)의 결정(raw-syscall 바이너리는 비목표)과 [ADR 0008](0008-static-guest-binaries-non-goal.md)의 결정(정적 바이너리는 경로 가상화 없이 실행)을 대체한다. 상위 결정은 [ADR 0005](../../../../docs/adr/0005-termux-first-goals.md) T5다. [VENDORING.md](../../third_party/tawcroot/VENDORING.md) 규칙 2가 요구하는 "새 ADR"이 이 문서다.
+Accepted (2026-10-11). [ADR 0006](0006-raw-syscall-binaries.md)의 결정(raw-syscall 바이너리는 비목표)과 [ADR 0008](0008-static-guest-binaries-non-goal.md)의 결정(정적 바이너리는 경로 가상화 없이 실행)을 대체한다. 상위 결정은 [ADR 0005](https://github.com/Meapri/android-on-linux/blob/main/docs/adr/0005-termux-first-goals.md) T5다. [VENDORING.md](../../third_party/tawcroot/VENDORING.md) 규칙 2가 요구하는 "새 ADR"이 이 문서다.
 
 ## Context
 
