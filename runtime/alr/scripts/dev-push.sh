@@ -150,6 +150,16 @@ alr)
               src/cli/alr.c src/cli/alr_resolvd.c src/common/alr_exec_rule.c src/common/alr_elf.c src/supervisor/alr_supervisor.c && \
         echo built"
     ;;
+trap-cost)
+    # ADR 0004 D6 / spike S2: in-process SECCOMP_RET_TRAP round trip.  Run once
+    # unpinned and once per CPU given in ALR_TRAP_CPUS (e.g. "0 7" for a LITTLE
+    # and a big core); the D6 verdict is printed per run.
+    assert_context
+    sync_tree
+    "${SSH[@]}" "cd ~/$REMOTE && \
+        clang $CFLAGS_DEV -o trap_cost bench/microbench/trap_cost.c && \
+        ./trap_cost && for c in ${ALR_TRAP_CPUS:-}; do echo; ./trap_cost \$c; done"
+    ;;
 supervisor)
     assert_context
     sync_tree
@@ -173,5 +183,5 @@ shell)
     exec "${SSH[@]}" "$*"
     ;;
 *)
-    echo "usage: $0 {test|supervisor|preload|alr|accept|bench|doctor|shell}" >&2; exit 1;;
+    echo "usage: $0 {test|supervisor|preload|alr|accept|bench|trap-cost|doctor|shell}" >&2; exit 1;;
 esac

@@ -121,7 +121,11 @@ S3가 실패하면 대안은 "Termux에서 `alr run --gui`가 APK 서비스에 �
 
 31 µs는 proot-distro 930 ms를 경로 syscall 3만 회로 나눈 값이다. 이 비용 이하여야 PRoot보다 의미 있게 빠르다.
 
-반입한 `tawcroot`는 호스트(x86_64)에서 전체가 컴파일, 링크되고, 정적 glibc 바이너리가 rootfs 안의 `/etc/hostname`을 읽는 것까지 확인했다. 같은 VM에서 `stat()`는 네이티브 약 0.45 µs, 트랩 경로 약 4.6 µs였고, 업스트림이 기록한 AMD 노트북 수치는 2.3 µs다. 둘 다 Android 기기 값이 아니므로 판정표에는 쓰지 않는다(`PENDING_DEVICE`). 기기 측정은 `tawcroot`를 NDK로 빌드해 같은 마이크로벤치를 `untrusted_app_27`에서 돌리는 일이고, 이것이 S2의 첫 작업이다.
+반입한 `tawcroot`는 호스트(x86_64)에서 전체가 컴파일, 링크되고, 정적 glibc 바이너리가 rootfs 안의 `/etc/hostname`을 읽는 것까지 확인했다. 같은 VM에서 `stat()`는 네이티브 약 0.45 µs, 트랩 경로 약 4.6 µs였고, 업스트림이 기록한 AMD 노트북 수치는 2.3 µs다. 둘 다 Android 기기 값이 아니므로 판정표에는 쓰지 않는다(`PENDING_DEVICE`).
+
+판정표의 수치는 [`runtime/alr/bench/microbench/trap_cost.c`](../../runtime/alr/bench/microbench/trap_cost.c)로 잰다. 이 벤치는 `tawcroot`의 필터 모양(트램폴린 복귀 PC만 `ALLOW`, 나머지는 `TRAP`)을 경로 변환 없이 재현하고, ADR 0006의 `notif_cost.c`와 같은 syscall(`getppid`)과 같은 반복 수를 쓴다. `tawcroot` 본체는 `getppid`를 트랩하지 않으므로 본체로는 이 수치를 얻을 수 없다. 출력은 기준선, 필터 평가, 시그널 왕복(핸들러가 결과를 직접 씀), 재발행 왕복(핸들러가 트램폴린에서 다시 발행함)의 네 값이며, 판정표에는 `재발행 왕복 - 기준선`을 적용한다. 실행 명령은 `scripts/dev-push.sh trap-cost`이고, Termux에서 fork된 프로세스(`untrusted_app_27`, `Seccomp: 2`)가 아니면 판정을 출력하지 않는다. 호스트에서는 aarch64와 x86_64로 컴파일만 확인했고 기기 실행 결과는 없다(`PENDING_DEVICE`).
+
+`tawcroot` 본체의 `stat` 경로 비용(경로 변환 포함)은 판정에 쓰지 않는 보조 수치다. 본체의 aarch64 빌드는 bionic 헤더를 전제하므로 NDK나 Termux의 clang이 필요하다([VENDORING.md](../../runtime/alr/third_party/tawcroot/VENDORING.md)).
 
 미검증 위험: Go 런타임이 `SIGSYS` 핸들러를 직접 등록하므로 `rt_sigaction`을 가상화해야 한다. 스레드 전체에 필터를 적용하는 `TSYNC` 동작도 확인해야 한다.
 

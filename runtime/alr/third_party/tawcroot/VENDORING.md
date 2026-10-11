@@ -33,6 +33,8 @@ A freestanding static non-PIE binary installs a seccomp filter that returns `SEC
 
 All of `src/*.c` and the `x86_64` stubs compile with upstream's flags (`-O2 -ffreestanding -fno-stack-protector -D_GNU_SOURCE -Iinclude`) and link with GNU ld using `-static -nostdlib -nostartfiles -Wl,-Ttext-segment=0x10000000`. Upstream uses `--image-base` (lld). Verified 2026-10-11 on an x86_64 Linux VM (kernel 6.18).
 
+aarch64 has not been built yet. A cross-compile against musl headers (`zig cc -target aarch64-linux-musl`, 2026-10-11) fails in `include/arch/aarch64.h` because musl declares `mcontext_t.regs` as `unsigned long[31]`, not `__u64[31]`, and in `linux/stat.h` (`statx_timestamp` redefined). Upstream builds against the NDK's bionic sysroot; use the NDK or Termux's clang, not musl.
+
 Host smoke, same VM: a static glibc binary run under `tawcroot -r ROOT -- /bin/h` opened `/etc/hostname` and read the file inside `ROOT`, not the host's. That is the case `LD_PRELOAD` cannot reach.
 
 ## Reference numbers (not evidence for Android)
