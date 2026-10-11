@@ -167,3 +167,5 @@ PRETTY_NAME="Ubuntu 26.04 LTS"
 이 ADR의 결정(기본 경로 유지, raw-syscall 바이너리는 비목표)은 **바뀌지 않는다.** 바뀌는 것은 "비용 때문에 불가능하다"는 결론의 근거 범위다. `RET_TRAP` 왕복 비용이 측정되기 전까지는 `USER_NOTIF`와 SUD에 대해서만 닫힌 결정이다.
 
 측정 계획과 판정 기준은 상위 [ADR 0004 D6](../../../../docs/adr/0004-unified-direction.md)에 있다. 요약하면 `getppid` 기준 왕복 5 µs 이하이면 로더 프로토타입, 31 µs 초과이면 폐기한다. 정적 바이너리는 `execve`가 핸들러를 초기화하므로 핸들러를 먼저 설치하는 사용자 영역 로더가 필요하다는 점이 구현상 가장 큰 미지수다.
+
+tawcroot 소스는 MIT라서 `third_party/tawcroot/`에 반입했다(수정 없음, 빌드 미연결). 출처와 규칙은 [VENDORING.md](../../third_party/tawcroot/VENDORING.md)에 있다.

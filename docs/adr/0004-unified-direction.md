@@ -51,7 +51,7 @@ GPU 링, glmark2(Score 1074), Vulkan ICD, zero-copy present, Chromium CR-1 증�
 | tawc (wmww/tawc) | `tawcroot`(seccomp `RET_TRAP` + 프로세스 내부 `SIGSYS` 처리), libhybris로 벤더 GPU 드라이버 적재, 창당 Android Task | `RET_TRAP` 방식은 [runtime/alr ADR 0006](../../runtime/alr/docs/adr/0006-raw-syscall-binaries.md)이 평가하지 않은 선택지다. libhybris는 ADR 0002와 충돌한다. 창당 Task는 멀티윈도우의 참고가 된다 |
 | AVF/gfxstream | VM 경로 | 별도 트랙(변경 없음) |
 
-tawc 코드를 반입하지는 않는다. 파일 단위 라이선스를 직접 확인하기 전에는 구조와 방법만 참고하고, 반입이 필요해지면 [clean-room-protocol](../clean-room-protocol.md)을 따른다.
+tawc의 소스는 MIT이고(`LICENSE.MIT`), 배포되는 tawc APK만 termux-app의 extra-keys 코드 때문에 GPLv3다(tawc `notes/licensing.md`). 그래서 `tawcroot/`는 라이선스 조건을 지키면 반입할 수 있고, [clean-room-protocol](../clean-room-protocol.md) Category B 규칙대로 라이선스를 기록한 뒤 `runtime/alr/third_party/tawcroot`에 반입했다(소스만, 수정 없음, 빌드와 배포에는 연결하지 않음). 출처와 규칙은 [VENDORING.md](../../runtime/alr/third_party/tawcroot/VENDORING.md)에 있다. libhybris와 tawc의 컴포지터는 반입하지 않는다.
 
 ## Decision
 
@@ -120,6 +120,8 @@ S3가 실패하면 대안은 "Termux에서 `alr run --gui`가 APK 서비스에 �
 | 31 µs 초과 | 폐기한다. ADR 0006의 비목표를 유지하고 이 결과를 보론으로 기록한다 |
 
 31 µs는 proot-distro 930 ms를 경로 syscall 3만 회로 나눈 값이다. 이 비용 이하여야 PRoot보다 의미 있게 빠르다.
+
+반입한 `tawcroot`는 호스트(x86_64)에서 전체가 컴파일, 링크되고, 정적 glibc 바이너리가 rootfs 안의 `/etc/hostname`을 읽는 것까지 확인했다. 같은 VM에서 `stat()`는 네이티브 약 0.45 µs, 트랩 경로 약 4.6 µs였고, 업스트림이 기록한 AMD 노트북 수치는 2.3 µs다. 둘 다 Android 기기 값이 아니므로 판정표에는 쓰지 않는다(`PENDING_DEVICE`). 기기 측정은 `tawcroot`를 NDK로 빌드해 같은 마이크로벤치를 `untrusted_app_27`에서 돌리는 일이고, 이것이 S2의 첫 작업이다.
 
 미검증 위험: Go 런타임이 `SIGSYS` 핸들러를 직접 등록하므로 `rt_sigaction`을 가상화해야 한다. 스레드 전체에 필터를 적용하는 `TSYNC` 동작도 확인해야 한다.
 
