@@ -121,7 +121,7 @@ breadth)
 preload)
     assert_context
     ./scripts/build-preload.sh
-    R="${ALR_DISTROS_DIR:-alr-distros}/${ALR_DISTRO:-ubuntu-24.04}"
+    R="${ALR_DISTROS_DIR:-alr-distros}/${ALR_DISTRO:-ubuntu-26.04}"
     "${SSH[@]}" "mkdir -p ~/$R/usr/lib/alr"
     "${SCP[@]}" build/libalr_preload.so build/libalr_preload.manifest.json \
                 "$HOST:$R/usr/lib/alr/"

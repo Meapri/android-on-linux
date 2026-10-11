@@ -248,11 +248,23 @@ static const struct alr_config *cfg(void)
  * does not have. */
 static char g_root_dir_for_shims[ALR_PBUF];
 
+/* The release `alr install` provisions when none is named: the newest Ubuntu
+ * with a final (non-beta) ubuntu-base image on cdimage. */
+#define ALR_DEFAULT_DISTRO "ubuntu-26.04"
+
+/* Where every other command looks when no distro is named, newest first.  A
+ * device provisioned before the default moved still has only the older tree,
+ * and `alr run` must keep finding it rather than failing rootfs-missing.  The
+ * app resolves its guest the same way (GuestRootfs.PREFERENCE). */
+static const char *const g_distro_preference[] = {
+    ALR_DEFAULT_DISTRO, "ubuntu-24.04", NULL
+};
+
 static void distro_root(char *out, size_t n, const char *distro)
 {
     const char *root = getenv("ALR_ROOT_DIR");
     if (!root || !*root) root = cfg()->has_root ? cfg()->root : NULL;
-    if (!distro || !*distro) distro = "ubuntu-24.04";
+    if (!distro || !*distro) distro = ALR_DEFAULT_DISTRO;
     if (!distro_name_ok(distro))
         die("bad-distro-name",
             "distro names may contain only [A-Za-z0-9._-] and may not start "
@@ -271,6 +283,19 @@ static int is_dir(const char *p)
 {
     struct stat st;
     return stat(p, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+/* The first installed tree in g_distro_preference, or ALR_DEFAULT_DISTRO when
+ * none is installed (so the error names the release `alr install` would get). */
+static const char *installed_default_distro(void)
+{
+    char r[ALR_PBUF];
+    int k;
+    for (k = 0; g_distro_preference[k]; k++) {
+        distro_root(r, sizeof r, g_distro_preference[k]);
+        if (is_dir(r)) return g_distro_preference[k];
+    }
+    return ALR_DEFAULT_DISTRO;
 }
 
 static int run_cmd(char *const argv[])
@@ -1256,7 +1281,7 @@ static int install_hostbin(const char *distro, const char *R)
     /* distro is NULL for `alr update-components` with no argument, and the
      * name is BAKED INTO every wrapper -- writing "(null)" there would produce
      * 28 files that all fail at the first use. */
-    if (!distro || !*distro) distro = "ubuntu-24.04";
+    if (!distro || !*distro) distro = ALR_DEFAULT_DISTRO;
 
     /* mkdir -p: on a tree alr did not extract itself, usr/lib/alr may not
      * exist yet, and a single mkdir then fails with ENOENT on the PARENT --
@@ -2154,7 +2179,7 @@ static void cfg_effective(const char *key, char *val, size_t vn,
     if (!strcmp(key, "default_distro")) {
         if ((e = getenv("ALR_DISTRO")) && *e) { snprintf(val, vn, "%s", e); *src = "env ALR_DISTRO"; return; }
         if (c->has_distro) { snprintf(val, vn, "%s", c->distro); *src = "config"; return; }
-        snprintf(val, vn, "ubuntu-24.04"); return;
+        snprintf(val, vn, "%s", installed_default_distro()); return;
     }
     if (!strcmp(key, "runtime.fakeroot")) {
         if ((e = getenv("ALR_FAKEROOT")) && *e) { snprintf(val, vn, "%s", *e == '1' ? "true" : "false"); *src = "env ALR_FAKEROOT"; return; }
@@ -3555,19 +3580,20 @@ int main(int argc, char **argv)
 {
     const char *distro = getenv("ALR_DISTRO");
     const char *url = NULL;
-    int i = 1;
+    int i = 1, distro_defaulted = 0;
 
     {   /* Must happen before any fork: see g_self. */
         ssize_t n = readlink("/proc/self/exe", g_self, sizeof g_self - 1);
         if (n > 0) g_self[n] = '\0';
         else snprintf(g_self, sizeof g_self, "%s", argv[0]);
     }
-    if (!distro || !*distro) distro = cfg()->has_distro ? cfg()->distro : "ubuntu-24.04";
+    if ((!distro || !*distro) && cfg()->has_distro) distro = cfg()->distro;
+    if (!distro || !*distro) { distro = installed_default_distro(); distro_defaulted = 1; }
     if (getenv("ALR_LOG")) g_log = atoi(getenv("ALR_LOG"));
     else if (cfg()->has_log) g_log = cfg()->log;
 
     while (i < argc && argv[i][0] == '-' && argv[i][1] != '\0') {
-        if (!strcmp(argv[i], "-d") && i + 1 < argc) { distro = argv[++i]; i++; }
+        if (!strcmp(argv[i], "-d") && i + 1 < argc) { distro = argv[++i]; distro_defaulted = 0; i++; }
         else if (!strcmp(argv[i], "-v")) { g_log++; i++; }
         else if (!strcmp(argv[i], "--url") && i + 1 < argc) { url = argv[++i]; i++; }
         else break;
@@ -3597,7 +3623,9 @@ int main(int argc, char **argv)
             else die("install-unknown-option",
                      "more than one distro named for `alr install`");
         }
-        return cmd_install(d ? d : distro, url);
+        /* An unnamed install provisions the newest release even when an
+         * older tree is what the other commands would pick. */
+        return cmd_install(d ? d : distro_defaulted ? ALR_DEFAULT_DISTRO : distro, url);
     }
     if (!strcmp(argv[i], "run") || !strcmp(argv[i], "exec")) {
         /* `exec` is `run` with -- ending option parsing unambiguously (§1). */

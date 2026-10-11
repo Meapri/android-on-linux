@@ -53,8 +53,8 @@ if [ -n "${ALR_ROOT:-}" ]; then
     : "${ALR_DISTRO:=$(basename "$ALR_ROOT")}"
 fi
 export ALR_ROOT_DIR=${ALR_ROOT_DIR:-$HOME/alr-distros}
-R="$ALR_ROOT_DIR/${ALR_DISTRO:-ubuntu-24.04}"
-ALR_DISTRO_NAME="${ALR_DISTRO:-ubuntu-24.04}"
+R="$ALR_ROOT_DIR/${ALR_DISTRO:-ubuntu-26.04}"
+ALR_DISTRO_NAME="${ALR_DISTRO:-ubuntu-26.04}"
 # `set -u` is on and PREFIX is a Termux variable: unset it aborts the run at
 # the first mention rather than skipping the check that mentions it.
 : "${PREFIX:=/nonexistent}"
@@ -920,7 +920,9 @@ echo
 # ── M6: package manager (needs fakeroot) ────────────────────────────────
 echo "── M6 패키지 매니저 ──"
 if $ALR run /usr/bin/git --version >/dev/null 2>&1; then
-    ck  "ALR GIT VERSION"  "git version 2.43.0" $ALR run /usr/bin/git --version
+    # Any release, as for node below: 24.04 ships 2.43, 26.04 ships 2.53, and
+    # the claim is that the guest's own git runs, not which one it is.
+    ckre "ALR GIT VERSION"  '^git version [0-9]+\.[0-9]+' $ALR run /usr/bin/git --version
     ckc "ALR APT INSTALLED git" "git is already" \
         env ALR_FAKEROOT=1 $ALR run /usr/bin/apt-get install -y --no-install-recommends git
     ckc "ALR PERL DLOPEN"  "OK" $ALR run /usr/bin/perl -e 'use Cwd; print "OK\n"'

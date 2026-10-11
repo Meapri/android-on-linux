@@ -29,7 +29,7 @@ set -u
 cd "$(dirname "$0")/../.." 2>/dev/null || true
 ALR=${ALR:-./alr}
 export ALR_ROOT_DIR=${ALR_ROOT_DIR:-$HOME/alr-distros}
-DISTRO=${ALR_DISTRO:-ubuntu-24.04}
+DISTRO=${ALR_DISTRO:-ubuntu-26.04}
 R="$ALR_ROOT_DIR/$DISTRO"
 REPO_IN_GUEST=/tmp/bigrepo
 NFILES=${NFILES:-10000}

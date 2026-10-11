@@ -3,8 +3,8 @@
 `alr`을 폰이나 태블릿에 올려서 Ubuntu 24.04 arm64 게스트를 띄우기까지의 절차다.
 개발자용 온디바이스 루프는 [scripts/dev-bootstrap.md](../scripts/dev-bootstrap.md)에 따로 있다.
 
-> **`alr` 은 Android 16 전용이다.** 다른 릴리스는 **지원 범위 밖**이며, 검증하지 않고 동작을 주장하지 않는다
-> ([ADR 0007](adr/0007-android-16-only.md)).
+> **`alr` 은 Android 16과 17을 지원한다.** 다른 릴리스는 **지원 범위 밖**이며, 검증하지 않고 동작을 주장하지 않는다
+> ([ADR 0007](adr/0007-android-16-only.md) 과 그 보론). Android 17은 Snapdragon 참조 기기 한 대에서만 쟀다.
 > 참조 디바이스는 **2대 — MediaTek(커널 6.1)과 Snapdragon 8 Elite(커널 6.6), 둘 다 Android 16.**
 > 두 기기의 zygote 차단 syscall 239개 집합이 완전히 동일해 **SoC 벤더·커널 축은 실측으로 닫혔다**(단 두 기기 다 Samsung 이라 **OEM 축은 미측정이고 잴 수단이 없다** — 다른 OEM 이 안 된다는 뜻이 아니라 확인해 주지 못한다는 뜻이다)
 > ([M19](evidence/2026-08-03-m19-snapdragon.md)).
@@ -14,7 +14,7 @@
 | 항목 | 요구 | 확인 방법 |
 |---|---|---|
 | CPU | **arm64 (aarch64)** 전용 | `uname -m` 이 `aarch64` |
-| Android | **16 전용.** 12~15 는 **지원하지 않는다** — 미검증이 아니라 범위 밖이다 ([ADR 0007](adr/0007-android-16-only.md)) | 설정 → 휴대전화 정보 |
+| Android | **16, 17.** 12~15 는 **지원하지 않는다** — 미검증이 아니라 범위 밖이다 ([ADR 0007](adr/0007-android-16-only.md)) | 설정 → 휴대전화 정보 |
 | Termux | **F-Droid 또는 GitHub 릴리스 빌드** (`targetSdkVersion=28`) | §2 |
 | 루팅 | 불필요. **루팅했다면 오히려 검증 대상이 아니다** | §5 |
 | 저장 공간 | ubuntu-base tarball 약 30 MB + 추출 후 rootfs. `git`까지 넣으면 수백 MB | |
@@ -183,7 +183,7 @@ grep Seccomp /proc/self/status    # Seccomp: 2 이어야 한다
 ## 6. 게스트 프로비저닝
 
 ```bash
-alr install                       # 기본값: ubuntu-24.04
+alr install                       # 기본값: 최신 LTS (현재 ubuntu-26.04)
 alr install --with git,node       # 설치 직후 패키지까지
 ```
 
@@ -192,7 +192,12 @@ alr install --with git,node       # 설치 직후 패키지까지
 내려받은 tarball을 **검증한다.** 해시가 맞지 않으면(캐시된 옛 tarball이 흔한 경우다) 다시 받는다.
 오프라인·미러 환경을 위해 `--url <tarball>`은 그대로 남아 있다.
 
-`SHA256SUMS`에 닿지 못하면 경고를 내고 고정된 폴백 이름으로 진행한다 — 조용히 넘어가지 않는다.
+`SHA256SUMS`에 닿지 못하면 `ubuntu-24.04`만 경고를 내고 고정된 폴백 이름으로 진행한다 — 조용히 넘어가지 않는다.
+기본값인 `ubuntu-26.04`를 포함한 다른 릴리스는 `reason=discovery-failed`로 멈추고 `--url`을 요구한다.
+검증할 해시 없이 다른 릴리스를 받는 것보다 실패하는 쪽이 낫기 때문이다.
+
+배포판을 지정하지 않은 `alr run`/`alr shell`은 설치된 트리 중 가장 새 LTS(26.04, 없으면 24.04)를 쓴다.
+26.04 이전에 설치한 기기는 `alr install`로 26.04를 새로 받기 전까지 24.04를 계속 쓴다.
 
 ## 7. 사용
 
