@@ -1,0 +1,72 @@
+# T2 on the release build of this change (make-release.sh, flat layout: alr and alr-lane side by side)
+# ALR_ROOT_DIR=$PREFIX/var/lib/alr/distros ALR=~/alrrel3/alr bash tests/device/t2_native.sh
+
+## run A (final tree)
+guest : git version 2.53.0, node v24.21.0, Python 3.14.4
+git status 10k (top)         native     27.1 ms  alr     19.2 ms  x0.71  PASS 
+node -e 0 (top)              native     95.9 ms  alr     33.9 ms  x0.35  PASS 
+python3 -c pass (top)        native     22.4 ms  alr     18.4 ms  x0.82  PASS 
+node -e 0 x20 (guest)        native   2000.1 ms  alr    570.4 ms  x0.29  PASS 
+git status x20 (guest)       native    451.8 ms  alr    331.1 ms  x0.73  PASS 
+go    : native go1.27.1, guest go1.26.0
+go version (top, lane)       native     10.9 ms  alr     11.3 ms  x1.04  PASS 
+go build, cached (lane)      native    172.5 ms  alr    169.0 ms  x0.98  PASS 
+gofmt -l net (lane)          native    112.0 ms  alr     87.5 ms  x0.78  PASS 
+npm ci, 74 deps (top)        native    802.2 ms  alr    583.3 ms  x0.73  PASS 
+apt-get reinstall tree       native    288.0 ms  alr    977.0 ms  x3.39  INFO data-bound
+  apt data: lists native 1.9M guest 144M; dpkg info native 5.3M guest 31M
+
+ALR T2 NATIVE: PASS
+
+## run B (same lane source, alr from the earlier tarball; alr.c is unchanged by this work)
+git status 10k (top)         native     17.6 ms  alr     19.5 ms  x1.10  PASS 
+node -e 0 (top)              native     84.1 ms  alr     31.6 ms  x0.38  PASS 
+python3 -c pass (top)        native     24.0 ms  alr     16.4 ms  x0.68  PASS 
+node -e 0 x20 (guest)        native   1936.3 ms  alr    582.6 ms  x0.30  PASS 
+git status x20 (guest)       native    409.0 ms  alr    336.7 ms  x0.82  PASS 
+go    : native go1.27.1, guest go1.26.0
+go version (top, lane)       native     12.9 ms  alr     10.9 ms  x0.84  PASS 
+go build, cached (lane)      native    169.9 ms  alr    166.9 ms  x0.98  PASS 
+gofmt -l net (lane)          native    112.7 ms  alr     92.7 ms  x0.82  PASS 
+npm ci, 74 deps (top)        native    703.1 ms  alr    574.3 ms  x0.82  PASS 
+apt-get reinstall tree       native    293.3 ms  alr    934.8 ms  x3.19  INFO data-bound
+  apt data: lists native 1.9M guest 144M; dpkg info native 5.3M guest 31M
+
+ALR T2 NATIVE: PASS
+
+## run C (intermediate lane: direct copies, before the getdents band and the leaf cache)
+guest : git version 2.53.0, node v24.21.0, Python 3.14.4
+git status 10k (top)         native     21.5 ms  alr     18.6 ms  x0.86  PASS 
+node -e 0 (top)              native     95.5 ms  alr     32.4 ms  x0.34  PASS 
+python3 -c pass (top)        native     24.4 ms  alr     16.2 ms  x0.66  PASS 
+node -e 0 x20 (guest)        native   1955.3 ms  alr    615.4 ms  x0.31  PASS 
+git status x20 (guest)       native    468.0 ms  alr    181.3 ms  x0.39  PASS 
+go    : native go1.27.1, guest go1.26.0
+go version (top, lane)       native      5.1 ms  alr      7.4 ms  x1.45  OVER 
+go build, cached (lane)      native    184.4 ms  alr    173.9 ms  x0.94  PASS 
+gofmt -l net (lane)          native    114.9 ms  alr    101.1 ms  x0.88  PASS 
+npm ci, 74 deps (top)        native    804.5 ms  alr    560.6 ms  x0.70  PASS 
+apt-get reinstall tree       native    295.5 ms  alr    981.4 ms  x3.32  INFO data-bound
+  apt data: lists native 1.9M guest 144M; dpkg info native 5.3M guest 31M
+
+ALR T2 NATIVE: OVER (1 workload(s) above x1.2)
+## run D (same build as C)
+guest : git version 2.53.0, node v24.21.0, Python 3.14.4
+git status 10k (top)         native     16.6 ms  alr     17.3 ms  x1.04  PASS 
+node -e 0 (top)              native     97.2 ms  alr     60.8 ms  x0.63  PASS 
+python3 -c pass (top)        native     23.6 ms  alr     16.7 ms  x0.71  PASS 
+node -e 0 x20 (guest)        native   1999.2 ms  alr    612.1 ms  x0.31  PASS 
+git status x20 (guest)       native    465.2 ms  alr    321.3 ms  x0.69  PASS 
+go    : native go1.27.1, guest go1.26.0
+go version (top, lane)       native     13.6 ms  alr      9.8 ms  x0.72  PASS 
+go build, cached (lane)      native    187.4 ms  alr    178.9 ms  x0.95  PASS 
+gofmt -l net (lane)          native    113.5 ms  alr     98.8 ms  x0.87  PASS 
+npm ci, 74 deps (top)        native    717.0 ms  alr    562.3 ms  x0.78  PASS 
+apt-get reinstall tree       native    299.9 ms  alr    947.2 ms  x3.16  INFO data-bound
+  apt data: lists native 1.9M guest 144M; dpkg info native 5.3M guest 31M
+
+ALR T2 NATIVE: PASS
+
+## breadth and supervisor suite (dev build of the final tree)
+
+ALR BREADTH: install=96/96 run=96/96

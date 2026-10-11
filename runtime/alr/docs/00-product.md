@@ -133,7 +133,7 @@
 - **x86 에뮬레이션** (box64/FEX). 네이티브 arm64만.
 - **systemd / init / 서비스 관리.**
 - **setuid 의미론.** `/data`는 `nosuid`이며 setuid/setgid는 seccomp로 막혀 있다. `sudo`류는 동작하지 않는다.
-- **경로 syscall을 libc 없이 직접 발행하는 게스트 바이너리.** Go가 대표적이다. `LD_PRELOAD`는 libc를 거치는 호출만 보므로 닿지 않는다. Ubuntu 26.04의 uutils(Rust)는 inline `svc`가 74개 있지만 모두 fd 계열이고, 자기 이름을 raw `PR_GET_AUXV`로 읽는 문제만 있었다. 이 문제는 preload가 `AT_EXECFN`을 고쳐서 해결했다([증거](evidence/2026-10-11-t5-uutils-preload.md)). Go 바이너리와 정적 바이너리는 tawcroot 레인에서 가상화된다([ADR 0010](adr/0010-tawcroot-lane.md)). 그래서 이 항목은 더 이상 비목표가 아니다. 남은 것은 비용이다. 경로 syscall만 반복하는 워크로드는 레인에서 1.3~1.7배다([증거](evidence/2026-10-11-t5-lane.md) §5).
+- **경로 syscall을 libc 없이 직접 발행하는 게스트 바이너리.** Go가 대표적이다. `LD_PRELOAD`는 libc를 거치는 호출만 보므로 닿지 않는다. Ubuntu 26.04의 uutils(Rust)는 inline `svc`가 74개 있지만 모두 fd 계열이고, 자기 이름을 raw `PR_GET_AUXV`로 읽는 문제만 있었다. 이 문제는 preload가 `AT_EXECFN`을 고쳐서 해결했다([증거](evidence/2026-10-11-t5-uutils-preload.md)). Go 바이너리와 정적 바이너리는 tawcroot 레인에서 가상화된다([ADR 0010](adr/0010-tawcroot-lane.md)). 그래서 이 항목은 더 이상 비목표가 아니다. 비용도 T2 예산 안이다. 경로 syscall만 반복하는 busybox `find`와 `ls -lR`이 레인에서 `ALR_LANE=0` 대비 1.08배와 1.09배다([증거](evidence/2026-10-11-t5-lane-cost.md)).
 
   > **정정.** 이전에 "가로챌 방법이 원리적으로 없다"고 적었는데 틀렸다. seccomp user notification은 **동작한다** — 스택된 필터에서 `USER_NOTIF`(0x7fc00000)가 `ALLOW`(0x7fff0000)보다 우선하고, 앞서 본 `EPERM`은 정책이 아니라 `no_new_privs`가 0이어서였다. 비목표인 진짜 이유는 **비용**이다: 알림 왕복 실측 **154 µs/syscall**(베이스라인의 352배, 그것도 하한). 값싼 대안인 `PR_SET_SYSCALL_USER_DISPATCH`는 이 커널(arm64 6.1)에 없다. 근거와 남은 선택지는 [ADR 0006](adr/0006-raw-syscall-binaries.md).
 

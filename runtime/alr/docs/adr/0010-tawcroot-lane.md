@@ -34,16 +34,20 @@ preload(`LD_PRELOAD`)는 libc를 거치는 호출만 본다. 두 부류의 게�
    - 신원은 실제 uid/gid이고 stat을 root 소유로 꾸미지 않는다. `ALR_FAKEROOT=1`이면 alr이 `--fakeroot`를 넘겨 upstream의 fake root로 돌아간다.
    - 절대 심링크 대상은 링크의 부모 깊이로 상대화해서 저장한다.
    - 하드링크가 거부되면 복사한다. upstream의 link store(`tawcroot:link:<token>` 심링크)는 쓰지 않는다. preload 레인에서는 그 심링크를 읽을 수 없기 때문이다.
+7. **SIGSEGV와 SIGBUS는 alr-lane이 갖는다**: alr-lane은 게스트의 경로와 stat 버퍼를 `process_vm_readv` 없이 직접 읽고 쓴다. 잘못된 포인터가 낸 fault는 alr-lane이 받아 EFAULT로 바꾼다. 그래서 커널에는 두 시그널에 alr-lane의 진입점을 걸어 두고, 게스트의 `rt_sigaction`에는 게스트가 설정한 값을 그대로 보여 준다([VENDORING.md](../../third_party/tawcroot/VENDORING.md) 10).
+   - 게스트 코드의 fault는 게스트 핸들러에 커널이 부른 것과 같은 인자, 스택, 마스크로 전달한다. `SIG_DFL`이면 프로세스가 원래처럼 그 시그널로 죽고, `SIG_IGN`이 exec를 넘어 상속되는 것도 같다. Go의 nil 역참조 `recover`와 `SetPanicOnFault`가 이 경로를 쓴다.
+   - 게스트가 볼 수 있는 차이는 두 가지다. `/proc/<pid>/status`의 `SigCgt`에 두 시그널이 잡혀 있다. `/proc/<pid>/fd` 디렉터리를 열면 fd가 900번대다(목록에서 alr-lane의 fd를 숨기는 `getdents64`만 트랩하기 위해서다).
 
 ## 결과
 
 - codex, Go 툴체인, busybox-static이 rootfs를 `/`로 본다.
-- Go 워크로드는 레인에서 네이티브 대비 1.01~1.02배다. 경로 syscall만 반복하는 워크로드는 더 비싸다. 같은 busybox로 비교하면 `find`는 1.34배, `ls -lR`은 1.65배다([증거](../evidence/2026-10-11-t5-lane.md) §5). 남은 비용은 트랩마다 드는 시그널 왕복과 게스트 경로 복사 한 번이다. 레인의 자식(예: codex가 띄운 git)도 레인에 남는다. 그 git의 `git status`(1만 파일)는 preload 레인 대비 1.07배였다. preload 레인으로 돌려보내는 브로커는 이 ADR의 범위 밖이며, 필요하면 따로 결정한다.
+- T2 워크로드는 레인에서 모두 1.2배 이내다(`go version` 1.04배, `go build` 0.98배). 경로 syscall만 반복하는 워크로드는 같은 busybox로 `ALR_LANE=0`과 비교해 `find`가 1.08배, `ls -lR`이 1.09배다([비용 증거](../evidence/2026-10-11-t5-lane-cost.md)). 통합 직후에는 1.34배와 1.65배였다([통합 증거](../evidence/2026-10-11-t5-lane.md) §5). 남은 비용은 트랩마다 드는 시그널 왕복(0.5~0.65 µs)이다. 레인의 자식(예: codex가 띄운 git)도 레인에 남는다. 그 git의 `git status`(1만 파일)는 preload 레인 대비 1.07배였다. preload 레인으로 돌려보내는 브로커는 이 ADR의 범위 밖이며, 필요하면 따로 결정한다.
 - 레인 안의 신원은 preload 레인과 같다(결정 6).
 - 레인의 정확성은 tawcroot에 달려 있다. tawcroot를 로컬에서 고치면 VENDORING.md에 기록한다.
 
 ## 다시 볼 조건
 
-- 경로가 많은 실사용 워크로드가 레인에서 T2 예산(1.2배)을 넘을 때. 다음 단계는 게스트 경로를 `process_vm_readv` 없이 읽는 것이다(SIGSEGV 가로채기가 필요하다).
+- 경로가 많은 실사용 워크로드가 레인에서 T2 예산(1.2배)을 넘을 때. 게스트 경로를 직접 읽는 단계(결정 7)는 끝났다. 남은 것은 시그널 왕복 자체이고, 그것을 없애려면 게스트의 `svc`를 바꿔 써야 한다.
+- 게스트가 SIGSEGV 처리의 차이(결정 7)에 걸릴 때. 예를 들어 `SigCgt`를 검사하거나, alr-lane이 아직 시작 중일 때 비동기 SIGSEGV를 받는 프로그램이다.
 - 레인 자식의 비용이 실사용에서 문제가 될 때. 그때는 자식을 preload 레인으로 돌려보내는 브로커를 검토한다.
 - Android가 zygote 필터를 바꿔 tawcroot의 트랩 방식이 막힐 때.

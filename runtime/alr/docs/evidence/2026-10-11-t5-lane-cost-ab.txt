@@ -1,0 +1,18 @@
+# Interleaved rounds (scratch ab.py): every round runs each command once in rotating order; medians of 15 rounds (11 for TZ unset).
+# base = env ALR_LANE=0 alr run (static busybox, no virtualization, host-form argument paths)
+# old lane = release of 8b3f604; band = this change without the leaf cache; + leaf cache = this change
+
+== find /usr/share -type f
+base                               median   276.2 ms  x1.00  (paired x1.00)
+old lane                           median   353.1 ms  x1.28  (paired x1.34)
+band                               median   312.3 ms  x1.13  (paired x1.17)
++ leaf cache                       median   297.0 ms  x1.08  (paired x1.11)
+== ls -lR /usr/share
+base                               median   279.9 ms  x1.00  (paired x1.00)
+old lane                           median   372.7 ms  x1.33  (paired x1.37)
+band                               median   310.2 ms  x1.11  (paired x1.15)
++ leaf cache                       median   306.0 ms  x1.09  (paired x1.14)
+== ls -lR /usr/share TZ unset
+base                               median   389.5 ms  x1.00  (paired x1.00)
+old lane                           median   694.2 ms  x1.78  (paired x1.80)
+new lane                           median   523.5 ms  x1.34  (paired x1.35)

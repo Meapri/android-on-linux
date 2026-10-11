@@ -299,7 +299,7 @@ CLI GUEST USERDB LS:              PASS   ← ls -ld /root → "alr alr" (이전:
 
 #### 레인 (ADR 0010)
 
-정적 ELF와 Go 바이너리는 tawcroot 레인에서 돈다([ADR 0010](adr/0010-tawcroot-lane.md)). 검사는 `alr-lane`이 alr 옆에 있고 rootfs의 `/bin/busybox`가 정적일 때만 돈다. 아니면 모두 SKIP이다.
+정적 ELF와 Go 바이너리는 tawcroot 레인에서 돈다([ADR 0010](adr/0010-tawcroot-lane.md)). 검사는 `alr-lane`이 alr 옆에 있고 rootfs의 `/bin/busybox`가 정적일 때만 돈다. 아니면 모두 SKIP이다. `probe_lane.c`의 검사는 rootfs에 정적 libc(`libc6-dev`)가 없으면 `LANE PROBE` SKIP 하나로 나온다.
 
 ```
 LANE STATIC SEES ROOTFS:        PASS   ← busybox cat /etc/os-release 가 Ubuntu
@@ -317,6 +317,37 @@ LANE HARDLINK READ BY PRELOAD:  PASS   ← 레인의 ln 이 만든 이름을 pre
 LANE NO LINK STORE:             PASS   ← distros/tawcroot 가 생기지 않는다
 LANE OFF SWITCH:                PASS   ← ALR_LANE=0 이면 가상화가 없다
 LANE GO BUILD AND RUN:          PASS   ← go build 와 빌드된 바이너리가 rootfs 를 본다
+LANE DIRFD ABS SYMLINK STAT:    PASS   ← 아래 31개는 tests/device/probe_lane.c (게스트 gcc 로 정적 빌드)
+LANE DIRFD ABS SYMLINK OPEN:    PASS   ← 호스트 쪽에서 만든 절대 심링크도 rootfs 기준으로 따라간다
+LANE DIRFD NOFOLLOW SYMLINK:    PASS
+LANE DIRFD LSTAT IS LINK:       PASS
+LANE CWD ABS SYMLINK STAT:      PASS
+LANE CWD ABS SYMLINK OPEN:      PASS
+LANE CWD CREATE:                PASS
+LANE CWD CREATE WHERE:          PASS
+LANE CWD AFTER VFORK CHDIR:     PASS   ← vfork 자식의 chdir 가 부모의 cwd 캐시에 남지 않는다
+LANE ROOT CWD BIND NAME:        PASS   ← 루트의 proc 는 바인드다
+LANE ROOT DIRFD BIND NAME:      PASS
+LANE ROOT DIRFD DOTDOT:         PASS
+LANE PROC DIRFD ROOT LINK:      PASS
+LANE OWN FDS HIDDEN:            PASS   ← /proc/self/fd 에 alr-lane 의 fd 가 없다
+LANE OWN FDS EBADF:             PASS
+LANE FOLLOW STAT RETARGETED LINK: PASS ← 다른 프로세스가 바꾼 심링크의 새 대상
+LANE EFAULT STAT PATH:          PASS   ← 잘못된 포인터는 EFAULT (6개)
+LANE EFAULT STAT BUF:           PASS
+LANE EFAULT OPEN PATH:          PASS
+LANE EFAULT DIRFD PATH:         PASS
+LANE EFAULT READLINK BUF:       PASS
+LANE EFAULT PATH CROSSES PAGE:  PASS
+LANE SEGV HANDLER READBACK:     PASS   ← 게스트의 SIGSEGV 설정이 그대로 보인다 (ADR 0010 결정 7)
+LANE SEGV HANDLER RUNS:         PASS
+LANE SEGV SENT HANDLER RUNS:    PASS
+LANE SEGV HANDLER AFTER VFORK RESET: PASS
+LANE SEGV RESETHAND:            PASS
+LANE BUS HANDLER RUNS:          PASS
+LANE SEGV DEFAULT KILLS:        PASS
+LANE SEGV IGNORED STILL KILLS:  PASS
+LANE SEGV IGNORED SENT:         PASS
 CLI ROOT DIR CANONICALIZED:     PASS   ← ALR_ROOT_DIR 에 "." 가 있어도 getcwd 가 게스트 경로
 ```
 
