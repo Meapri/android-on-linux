@@ -378,6 +378,9 @@ echo "── 워크로드 (docs/07 §2 이름들, 지금까지 러너가 없던 
 ckc "ALR LDSO INVOKE"    "Ubuntu GLIBC"  $ALR run /usr/bin/ldd --version
 ck  "ALR PIPELINE"       ok       $ALR run /bin/bash -c 'echo ok | /bin/cat | /usr/bin/head -1'
 ckc "ALR FAKEROOT IDENTITY" "uid=0" env ALR_FAKEROOT=1 $ALR run /usr/bin/id
+# ucf (26.04) re-execs with a scrubbed environment.  The runtime's own ALR_*
+# state must survive that, or the child runs unvirtualized as the real uid.
+ck  "ALR ENV SCRUB KEEPS RUNTIME" 0 env ALR_FAKEROOT=1 $ALR run /usr/bin/env -i /usr/bin/id -u
 # NOT -qq: that is quiet by design and prints none of the lines this asserts.
 # Was: matched "ports.ubuntu.com", which apt also prints in EVERY failure
 # message ("Failed to fetch http://ports.ubuntu.com/..."). Assert the outcome

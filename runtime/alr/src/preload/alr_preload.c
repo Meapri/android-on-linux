@@ -289,6 +289,31 @@ static void alr_dtor(void)
     if (n > 0) { ssize_t w = write(g_log_fd, b, (size_t)n); (void)w; }
 }
 
+/* The variables alr_init() reads, kept as "NAME=value" so the exec path can
+ * put back any the guest removed (env_set_exe).  Static storage: R1. */
+#define ALR_NCARRY 9
+static char   g_carry[ALR_NCARRY][ALR_PBUF];
+static size_t g_carry_len[ALR_NCARRY];      /* length of "NAME=" */
+static int    g_ncarry;
+
+static void carry_capture(void)
+{
+    static const char *const names[ALR_NCARRY] = {
+        "ALR_ROOT", "ALR_LDSO", "ALR_LIBPATH", "ALR_PRELOAD", "ALR_FAKEROOT",
+        "ALR_COUNT", "ALR_LOG", "ALR_LOG_FD", ALR_RESOLV_ENV,
+    };
+    int k;
+    for (k = 0; k < ALR_NCARRY; k++) {
+        const char *v = getenv(names[k]);
+        int w;
+        if (!v) continue;
+        w = snprintf(g_carry[g_ncarry], ALR_PBUF, "%s=%s", names[k], v);
+        if (w < 0 || w >= ALR_PBUF) continue;
+        g_carry_len[g_ncarry] = strlen(names[k]) + 1;
+        g_ncarry++;
+    }
+}
+
 static void alr_init(void)
 {
     g_in_init = 1;
@@ -383,6 +408,7 @@ static void alr_init(void)
     g_resolv_sock = getenv(ALR_RESOLV_ENV);
     { const char *f = getenv("ALR_FAKEROOT"); g_fakeroot = f && *f == '1'; }
     { const char *c = getenv("ALR_COUNT");    g_count    = c && *c == '1'; }
+    carry_capture();
 
     if (r && r[0] == '/') {
         size_t n = strlen(r);
@@ -1603,17 +1629,32 @@ static char *const *env_set_exe(char *const envp[], const char *guest,
                                 char *kv, size_t kvsz, const char **out)
 {
     size_t n = 0;
-    int i, seen = 0;
+    int i, k, seen = 0;
 
     if (!envp) return envp;
     if ((size_t)snprintf(kv, kvsz, "ALR_GUEST_EXE=%s", guest) >= kvsz) return envp;
     for (i = 0; envp[i]; i++) {
-        if (n >= ALR_ENV_MAX - 2) { lg("alr exec: env > %d, exe identity stale\n",
-                                       ALR_ENV_MAX); return envp; }
+        if (n >= ALR_ENV_MAX - 2 - ALR_NCARRY) {
+            lg("alr exec: env > %d, exe identity stale\n", ALR_ENV_MAX);
+            return envp;
+        }
         if (strncmp(envp[i], "ALR_GUEST_EXE=", 14) == 0) { out[n++] = kv; seen = 1; }
         else out[n++] = envp[i];
     }
     if (!seen) out[n++] = kv;
+    /* Runtime state the guest scrubbed from its own environment.  ucf (26.04)
+     * unsets every variable outside a short allowlist before it runs id, md5sum
+     * and cp; those children then started with no ALR_ROOT and no ALR_FAKEROOT,
+     * so they ran unvirtualized and as the real uid -- php8.5-common, mercurial,
+     * sysstat and parallel all failed to configure.  These are not the user's
+     * environment but the runtime's, and a guest process cannot opt out of it. */
+    for (k = 0; k < g_ncarry; k++) {
+        size_t nl = g_carry_len[k];
+        int j, have = 0;
+        for (j = 0; envp[j]; j++)
+            if (strncmp(envp[j], g_carry[k], nl) == 0) { have = 1; break; }
+        if (!have) out[n++] = g_carry[k];
+    }
     out[n] = NULL;
     return (char *const *)out;
 }
