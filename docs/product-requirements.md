@@ -68,7 +68,7 @@ Android public APIs
 
 - `node`/`npm`-based CLIs run with path virtualization (met, goal G5 of the alr engine).
 - Static binaries such as the Rust-built `codex` run without path virtualization when given a host-form environment ([alr ADR 0008](../runtime/alr/docs/adr/0008-static-guest-binaries-non-goal.md)).
-- Open: Go and uutils-class raw-syscall binaries (ADR 0004 D6 spike), and long-running PTY sessions.
+- Open: binaries that issue path syscalls without libc, such as Go (ADR 0005 T5, tawcroot lane), and long-running PTY sessions. uutils coreutils runs as shipped since 2026-10-11.
 
 ### Packaging and UX
 

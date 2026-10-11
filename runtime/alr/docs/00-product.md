@@ -39,7 +39,7 @@
 >
 > **exec 는 Snapdragon 이 2배 빠르고**(proot 쪽도 함께 오르므로 기기 성능 차이다) **재작성 per-op 은 MediaTek 이 빠르다.** 배수가 MediaTek 에서 더 큰 것은 alr 이 빨라서가 아니라 **proot 가 더 느려서**다. 배수를 인용할 때는 기기를 함께 쓴다.
 - **호스트**: Termux **F-Droid / GitHub 빌드** (`targetSdkVersion=28`). Play Store 빌드는 **v1 미지원** (ADR 0005).
-- **게스트**: **Ubuntu 26.04 LTS** (resolute, glibc 2.43) arm64 하나만 지원한다. `alr install` 과 모든 명령의 기본값이다. 24.04 (noble) 는 2026-10-11 부로 지원하지 않는다([ADR 0005](../../../docs/adr/0005-termux-first-goals.md)). 26.04 의 uutils coreutils 는 설치할 때 이미지에 들어 있는 GNU coreutils 로 재지정한다([ADR 0006](adr/0006-raw-syscall-binaries.md)). Debian bookworm/trixie는 v1.1 목표.
+- **게스트**: **Ubuntu 26.04 LTS** (resolute, glibc 2.43) arm64 하나만 지원한다. `alr install` 과 모든 명령의 기본값이다. 24.04 (noble) 는 2026-10-11 부로 지원하지 않는다([ADR 0005](../../../docs/adr/0005-termux-first-goals.md)). coreutils 는 Ubuntu 기본값인 uutils 를 그대로 쓴다. GNU 로 바꾸고 싶으면 `alr use-gnu-coreutils` 를 쓴다([ADR 0006 보론 2](adr/0006-raw-syscall-binaries.md), [증거](evidence/2026-10-11-t5-uutils-preload.md)). Debian bookworm/trixie는 v1.1 목표.
 - **워크로드**: `git`, `node`(및 npm/npx), `bash`, `apt`/`dpkg`, 일반 coreutils/빌드 툴체인.
   `codex` 는 **비목표**다 — 정적 링크라 경로 가상화가 원리적으로 닿지 않는다([ADR 0008](adr/0008-static-guest-binaries-non-goal.md)).
 
@@ -132,7 +132,7 @@
 - **x86 에뮬레이션** (box64/FEX). 네이티브 arm64만.
 - **systemd / init / 서비스 관리.**
 - **setuid 의미론.** `/data`는 `nosuid`이며 setuid/setgid는 seccomp로 막혀 있다. `sudo`류는 동작하지 않는다.
-- **libc를 우회해 raw `svc`를 발행하는 게스트 바이너리.** Go가 대표적이고, **Ubuntu 26.04가 기본 coreutils로 채택한 uutils(Rust)도 여기 해당한다**(74개 inline `svc` 확인). `LD_PRELOAD`는 libc를 거치는 호출만 보므로 닿지 않는다.
+- **경로 syscall을 libc 없이 직접 발행하는 게스트 바이너리.** Go가 대표적이다. `LD_PRELOAD`는 libc를 거치는 호출만 보므로 닿지 않는다. Ubuntu 26.04의 uutils(Rust)는 inline `svc`가 74개 있지만 모두 fd 계열이고, 자기 이름을 raw `PR_GET_AUXV`로 읽는 문제만 있었다. 이 문제는 preload가 `AT_EXECFN`을 고쳐서 해결했다([증거](evidence/2026-10-11-t5-uutils-preload.md)). Go 바이너리는 [ADR 0005](../../../docs/adr/0005-termux-first-goals.md) T5의 tawcroot 레인으로 다룬다.
 
   > **정정.** 이전에 "가로챌 방법이 원리적으로 없다"고 적었는데 틀렸다. seccomp user notification은 **동작한다** — 스택된 필터에서 `USER_NOTIF`(0x7fc00000)가 `ALLOW`(0x7fff0000)보다 우선하고, 앞서 본 `EPERM`은 정책이 아니라 `no_new_privs`가 0이어서였다. 비목표인 진짜 이유는 **비용**이다: 알림 왕복 실측 **154 µs/syscall**(베이스라인의 352배, 그것도 하한). 값싼 대안인 `PR_SET_SYSCALL_USER_DISPATCH`는 이 커널(arm64 6.1)에 없다. 근거와 남은 선택지는 [ADR 0006](adr/0006-raw-syscall-binaries.md).
 

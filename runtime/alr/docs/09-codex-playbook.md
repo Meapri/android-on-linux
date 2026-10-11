@@ -211,7 +211,7 @@ ssh -p 8022 localhost
 | "Play Store Termux도 지원하자" | glibc를 로드할 로더가 없다 ([ADR 0005](adr/0005-play-store-unsupported.md)) |
 | "`/dev/full`을 `/dev/null`로 심링크하자" | ENOSPC 테스트가 조용히 통과해 버린다 |
 | "정적 바이너리도 후킹하자" | LD_PRELOAD가 원리적으로 닿지 않는다 — codex 실측 확인(정적 musl, `alr preload:` 로그 0줄, [M12 §8](evidence/2026-08-03-m12-spawn-resolver.md)). `KNOWN_FAIL`로 분류하고 문서화한다. **단, 근거를 잘못 인용하지 말 것**: 가로채기 자체는 가능하다(seccomp USER_NOTIF). 비용이 154 µs/call 이라 안 하는 것이다 ([ADR 0006](adr/0006-raw-syscall-binaries.md)) |
-| "Go 바이너리도 지원하자" | raw `svc`라 인터포즈 불가. `alr doctor` P11이 경고하는 것으로 충분하다. 26.04 의 uutils coreutils 도 같은 부류다(inline `svc` 74개 실측, [M15](evidence/2026-08-03-m15-cmdline-2604.md)) — 그래서 26.04 는 v1 대상이 아니다 |
+| "Go 바이너리도 지원하자" | preload 로는 인터포즈할 수 없다. [ADR 0005](../../../docs/adr/0005-termux-first-goals.md) T5 가 tawcroot 레인으로 다룬다. 26.04 의 uutils 는 같은 부류가 아니었다. 이름만 잃었고 preload 에서 고쳤다([증거](evidence/2026-10-11-t5-uutils-preload.md)) |
 | "acceptance를 SKIP으로 바꿔 넘어가자" | `SKIP`은 "이 환경에 해당 없음"이지 "아직 못 고침"이 아니다. 후자는 `KNOWN_FAIL:<reason>` |
 
 ## 8. 상위 프로젝트 참조 규칙

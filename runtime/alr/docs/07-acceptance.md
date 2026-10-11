@@ -514,6 +514,8 @@ ALR BREADTH: install=96/96 run=96/96
 > coreutils 계열이 전부 깨진다** — 인라인 `svc` 74개짜리 raw-syscall 바이너리라 인터포저가 닿지 않고,
 > [ADR 0006](adr/0006-raw-syscall-binaries.md)이 이를 **비목표**로 확정했다
 > ([M15 §2](evidence/2026-08-03-m15-cmdline-2604.md)). 26.04 로 폭을 재면 다른 지표다.
+>
+> **갱신 (2026-10-11)**: 위 판단은 원인을 잘못 짚었다. uutils 는 이름만 잃었고, preload 가 `AT_EXECFN` 을 고친 뒤 26.04(uutils 그대로)에서 폭은 96/96, 수용은 171/0/0 이다([증거](evidence/2026-10-11-t5-uutils-preload.md)).
 
 ## 6. 숨은 비용 — 발표 전 반드시 측정
 

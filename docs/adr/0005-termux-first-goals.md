@@ -27,7 +27,7 @@ Accepted (2026-10-11). 목표와 우선순위는 이 문서로 정하고, 각 �
 |---|---|---|
 | zygote 차단 syscall 집합 | Android 16과 동일(239 = 239) | `alr doctor` 스윕, `scripts/diff-sweep.sh` |
 | Ubuntu 24.04.4 수용 테스트(지원 중단 전 마지막 실행) | PASS 163, FAIL 2(codex 출력 형식), KNOWN_FAIL 1, SKIP 1 | [T1 증거](../../runtime/alr/docs/evidence/2026-10-11-t1-ubuntu-2604-android17.md) |
-| Ubuntu 26.04.1 LTS 설치 | 다운로드, SHA256, 추출, uutils를 GNU coreutils로 재지정, 부팅 모두 PASS (glibc 2.43) | `alr install ubuntu-26.04` |
+| Ubuntu 26.04.1 LTS 설치 | 다운로드, SHA256, 추출, 부팅 모두 PASS (glibc 2.43). 처음에는 uutils를 GNU coreutils로 재지정했으나, 2026-10-11부터 uutils를 그대로 둔다 | `alr install ubuntu-26.04` |
 | Ubuntu 26.04.1 수용 테스트 | PASS 169, FAIL 0, KNOWN_FAIL 1(`/dev/full`, 비목표), SKIP 0. glibc 2.42의 termios 변경과 ucf의 환경 정리로 생긴 문제는 preload에서 고쳤다. 호환성 폭 96/96 | 같은 증거 |
 | `RET_TRAP` 왕복 비용 | +410~+925 ns, D6 판정 `PROCEED` | [S2 증거](../../runtime/alr/docs/evidence/2026-10-11-s2-ret-trap-cost.md) |
 | `git status` 10k 파일 | alr 36 ms, 네이티브 33 ms(Termux의 다른 git 빌드라 근사치) | [M19 §6](../../runtime/alr/docs/evidence/2026-08-03-m19-snapdragon.md) (Android 16 시점) |
@@ -41,10 +41,10 @@ GUI와 GPU에 대해서는 Termux 경로의 증거가 없다. 지금까지의 GP
 | | 목표 | 완료 기준 | 현재 |
 |---|---|---|---|
 | **T1** | 최신 Ubuntu LTS가 무패치로 부팅하고 apt가 동작한다 | `alr install`의 기본값이 최신 LTS이고, 그 rootfs에서 수용 테스트가 `FAIL=0`, `SKIP`은 비목표 항목만 남는다 | 달성(2026-10-11). 26.04.1에서 `FAIL=0 SKIP=0` |
-| **T2** | CLI가 네이티브 대비 1.2배 이내로 동작한다 | 아래 워크로드 각각에서 `alr 시간 / 네이티브 시간 <= 1.2`, 같은 기기, 워밍업 후 중앙값 | `git status`만 근사치 1.09배. 나머지는 네이티브 측정 없음 |
+| **T2** | CLI가 네이티브 대비 1.2배 이내로 동작한다 | 아래 워크로드 각각에서 `alr 시간 / 네이티브 시간 <= 1.2`, 같은 기기, 워밍업 후 중앙값 | 측정한 워크로드 모두 1.2배 이내([증거](../../runtime/alr/docs/evidence/2026-10-11-t2-native.md)): `git status` 1.08, `python3` 1.11, `node -e 0` 0.41, `npm ci` 0.79. apt는 데이터 크기가 달라 비율로 판정할 수 없다 |
 | **T3** | Termux에서 띄운 GUI 앱이 자체 확장 APK 화면에 표시된다 | Termux의 게스트가 만든 `wl_shm` 프레임이 확장 APK의 Surface에 표시되고, GTK 앱 하나가 입력을 받아 동작한다 | 없음 |
 | **T4** | GUI 가속이 네이티브 대비 1.2배 이내로 동작한다 | 같은 GL 워크로드를 Android 네이티브 앱으로 돌린 값 대비 1.2배 이내 | 없음. Adreno 미측정 |
-| **T5** | raw-syscall 바이너리도 경로 가상화된다 | 26.04의 uutils coreutils가 GNU 재지정 없이 동작하고, Go 바이너리 하나와 codex가 rootfs를 `/`로 본다. 경로 syscall당 추가 비용이 T2 예산 안에 든다 | 공존 스파이크 완료([증거](../../runtime/alr/docs/evidence/2026-10-11-t5-coexistence-spike.md)): uutils, codex, bash가 tawcroot 레인에서 동작한다. 단독 실행은 `find`에서 네이티브 대비 2.2배, ptrace 아래에서는 40배다 |
+| **T5** | raw-syscall 바이너리도 경로 가상화된다 | 26.04의 uutils coreutils가 GNU 재지정 없이 동작하고, Go 바이너리 하나와 codex가 rootfs를 `/`로 본다. 경로 syscall당 추가 비용이 T2 예산 안에 든다 | uutils는 GNU 재지정 없이 preload 레인에서 동작한다([증거](../../runtime/alr/docs/evidence/2026-10-11-t5-uutils-preload.md)). 공존 스파이크 완료([증거](../../runtime/alr/docs/evidence/2026-10-11-t5-coexistence-spike.md)). Go 바이너리는 남았다(`go build` 실패) |
 
 T2의 워크로드는 `git status`(10k 파일), `npm ci`, `node -e 0` 콜드 스타트, `apt-get install` 한 건이다. 네이티브 쪽은 Termux 패키지의 같은 프로그램이며, 버전이 다르면 그 사실을 결과에 함께 적는다. glibc 게스트 바이너리를 Android에서 직접 실행할 수는 없으므로 같은 바이너리 비교는 불가능하다.
 

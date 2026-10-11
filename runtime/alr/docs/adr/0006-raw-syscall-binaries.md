@@ -171,3 +171,11 @@ PRETTY_NAME="Ubuntu 26.04 LTS"
 **측정 결과(2026-10-11)**: Snapdragon 참조 기기(Android 17, `untrusted_app_27`)에서 `getppid` 기준 `RET_TRAP` 재발행 왕복은 +410~+925 ns였다. `USER_NOTIF`(154 µs)보다 170배 이상 싸고, D6 판정은 `PROCEED`다. 이 ADR의 결정(raw-syscall 바이너리는 비목표)은 로더 프로토타입과 새 ADR이 나올 때까지 유지한다([증거](../evidence/2026-10-11-s2-ret-trap-cost.md)).
 
 tawcroot 소스는 MIT라서 `third_party/tawcroot/`에 반입했다(수정 없음, 빌드 미연결). 출처와 규칙은 [VENDORING.md](../../third_party/tawcroot/VENDORING.md)에 있다.
+
+## 보론 2 (2026-10-11) — uutils 는 이 ADR 의 대상이 아니었다
+
+uutils 가 `unknown program 'ld-linux-aarch64.so'` 로 실패한 원인은 raw syscall 의 경로가 아니라 **이름**이었다. uutils 는 applet 이름을 커널 auxv 의 `AT_EXECFN` 에서 얻는데, 그 값을 raw `prctl(PR_GET_AUXV)` 로 읽는다. 명시적 로더 실행(ADR 0002)에서 그 값은 ld.so 의 경로다. glibc ld.so 는 자기 사본만 `argv[0]` 으로 고치므로 `getauxval` 트레이스에는 이 호출이 나타나지 않았다. inline `svc` 74개는 `ioctl`·`fstat`·`fcntl`·`read`·`lseek` 같은 fd 계열이라 경로를 싣지 않는다.
+
+preload 가 시작할 때 커널 auxv 의 `AT_EXECFN` 문자열을 게스트 경로로 덮어쓰니 uutils 가 그대로 동작했다. 26.04(uutils 그대로)에서 수용은 171/0/0, 폭은 96/96 이다([증거](../evidence/2026-10-11-t5-uutils-preload.md)). install 과 adopt 는 더 이상 GNU 로 재지정하지 않는다.
+
+이 ADR 의 결정은 이제 **경로 syscall 을 libc 없이 내는 바이너리**(Go 가 대표적)에만 해당한다. 그 범주는 [ADR 0005](../../../../docs/adr/0005-termux-first-goals.md) T5 가 tawcroot 레인으로 다룬다. tawcroot 의 로컬 수정은 [VENDORING.md](../../third_party/tawcroot/VENDORING.md) 에 있다.
