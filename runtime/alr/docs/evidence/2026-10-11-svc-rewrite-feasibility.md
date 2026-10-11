@@ -41,3 +41,15 @@
 1. trampoline 하나와 스택 전환만 있는 시제품으로 `fstatat` 한 번의 비용을 잰다. 기준은 트랩 경로 1,228 ns와 네이티브 347 ns다(비용 증거 §1).
 2. Go 프로그램(nil 역참조 `recover`, 많은 goroutine)과 레인 수용 검사로 스택과 재진입 문제를 확인한다.
 3. 결과가 좋으면 ADR을 쓴다.
+
+## 5. 시제품 측정
+
+[`tramp_proto.c`](svc-rewrite/tramp_proto.c)를 Termux 네이티브(clang -O2)에서 20만 번씩 두 번 돌렸다. trampoline은 레지스터를 `svc`처럼 보존하고, `gettid`로 스레드별 스택을 찾아 바꿔 탄 뒤 레인의 fast path와 같은 일을 한다. 그 일은 dirfd의 `fstat`과 NOFOLLOW `fstatat`이다.
+
+| `fstatat(dirfd, "이름")` | 1회차 | 2회차 |
+|---|---:|---:|
+| 네이티브 | 491 ns | 354 ns |
+| fast path의 일만 | 548 ns | 506 ns |
+| trampoline + 스택 전환 + 그 일 | 644 ns | 621 ns |
+
+같은 호출이 지금 레인에서는 1,228 ns다([비용 증거](2026-10-11-t5-lane-cost.md) §1, 다른 실행). 이 시제품에는 실제 dispatch, 시그널 재진입 처리, 사이트 패치가 없다. 그러니 실제 구현은 이보다 비싸다. 그래도 트랩 왕복이 빠지면 이 호출은 네이티브의 약 1.8배가 되고, 지금의 약 3.5배보다 크게 줄어든다.
