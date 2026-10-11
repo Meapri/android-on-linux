@@ -5,7 +5,7 @@
 - **기기**: Samsung SM-S937N, Snapdragon 8 Elite SM8750, Android 17 (SDK 37), 커널 6.6.127
 - **컨텍스트**: `uid=10057  u:r:untrusted_app_27:s0  Seccomp=2` (Termux sshd를 거친 셸)
 - **게스트**: Ubuntu 26.04.1 LTS (glibc 2.43)
-- **목적**: [ADR 0005](../../../../docs/adr/0005-termux-first-goals.md) T5의 첫 질문, "alr의 ptrace 슈퍼바이저와 tawcroot의 `SIGSYS` 핸들러가 한 프로세스에서 공존할 수 있는가"
+- **목적**: [ADR 0005](https://github.com/Meapri/android-on-linux/blob/main/docs/adr/0005-termux-first-goals.md) T5의 첫 질문, "alr의 ptrace 슈퍼바이저와 tawcroot의 `SIGSYS` 핸들러가 한 프로세스에서 공존할 수 있는가"
 
 ## 결론
 

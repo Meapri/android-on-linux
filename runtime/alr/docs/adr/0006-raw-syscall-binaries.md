@@ -166,7 +166,7 @@ PRETTY_NAME="Ubuntu 26.04 LTS"
 
 이 ADR의 결정(기본 경로 유지, raw-syscall 바이너리는 비목표)은 **바뀌지 않는다.** 바뀌는 것은 "비용 때문에 불가능하다"는 결론의 근거 범위다. `RET_TRAP` 왕복 비용이 측정되기 전까지는 `USER_NOTIF`와 SUD에 대해서만 닫힌 결정이다.
 
-측정 계획과 판정 기준은 상위 [ADR 0004 D6](../../../../docs/adr/0004-unified-direction.md)에 있다. 요약하면 `getppid` 기준 왕복 5 µs 이하이면 로더 프로토타입, 31 µs 초과이면 폐기한다. 정적 바이너리는 `execve`가 핸들러를 초기화하므로 핸들러를 먼저 설치하는 사용자 영역 로더가 필요하다는 점이 구현상 가장 큰 미지수다.
+측정 계획과 판정 기준은 상위 [ADR 0004 D6](https://github.com/Meapri/android-on-linux/blob/main/docs/adr/0004-unified-direction.md)에 있다. 요약하면 `getppid` 기준 왕복 5 µs 이하이면 로더 프로토타입, 31 µs 초과이면 폐기한다. 정적 바이너리는 `execve`가 핸들러를 초기화하므로 핸들러를 먼저 설치하는 사용자 영역 로더가 필요하다는 점이 구현상 가장 큰 미지수다.
 
 **측정 결과(2026-10-11)**: Snapdragon 참조 기기(Android 17, `untrusted_app_27`)에서 `getppid` 기준 `RET_TRAP` 재발행 왕복은 +410~+925 ns였다. `USER_NOTIF`(154 µs)보다 170배 이상 싸고, D6 판정은 `PROCEED`다. 이 ADR의 결정(raw-syscall 바이너리는 비목표)은 로더 프로토타입과 새 ADR이 나올 때까지 유지한다([증거](../evidence/2026-10-11-s2-ret-trap-cost.md)).
 
@@ -178,4 +178,4 @@ uutils 가 `unknown program 'ld-linux-aarch64.so'` 로 실패한 원인은 raw s
 
 preload 가 시작할 때 커널 auxv 의 `AT_EXECFN` 문자열을 게스트 경로로 덮어쓰니 uutils 가 그대로 동작했다. 26.04(uutils 그대로)에서 수용은 171/0/0, 폭은 96/96 이다([증거](../evidence/2026-10-11-t5-uutils-preload.md)). install 과 adopt 는 더 이상 GNU 로 재지정하지 않는다.
 
-이 ADR 의 결정은 이제 **경로 syscall 을 libc 없이 내는 바이너리**(Go 가 대표적)에만 해당한다. 그 범주는 [ADR 0005](../../../../docs/adr/0005-termux-first-goals.md) T5 가 tawcroot 레인으로 다룬다. tawcroot 의 로컬 수정은 [VENDORING.md](../../third_party/tawcroot/VENDORING.md) 에 있다.
+이 ADR 의 결정은 이제 **경로 syscall 을 libc 없이 내는 바이너리**(Go 가 대표적)에만 해당한다. 그 범주는 [ADR 0005](https://github.com/Meapri/android-on-linux/blob/main/docs/adr/0005-termux-first-goals.md) T5 가 tawcroot 레인으로 다룬다. tawcroot 의 로컬 수정은 [VENDORING.md](../../third_party/tawcroot/VENDORING.md) 에 있다.

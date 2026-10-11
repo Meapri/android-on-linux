@@ -5,7 +5,7 @@
 - **기기**: Samsung SM-S937N, Snapdragon 8 Elite SM8750, Android 17 (SDK 37), 커널 6.6.127
 - **컨텍스트**: `uid=10057  u:r:untrusted_app_27:s0  Seccomp=2` (Termux sshd를 거친 셸)
 - **게스트**: Ubuntu 26.04.1 LTS (glibc 2.43), coreutils는 Ubuntu 기본값인 uutils(GNU 재지정 없음)
-- **목적**: [ADR 0005](../../../../docs/adr/0005-termux-first-goals.md) T5의 첫 기준, "26.04의 uutils coreutils가 GNU 재지정 없이 동작한다"
+- **목적**: [ADR 0005](https://github.com/Meapri/android-on-linux/blob/main/docs/adr/0005-termux-first-goals.md) T5의 첫 기준, "26.04의 uutils coreutils가 GNU 재지정 없이 동작한다"
 
 ## 결론
 

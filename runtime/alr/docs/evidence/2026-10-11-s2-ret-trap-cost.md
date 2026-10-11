@@ -8,7 +8,7 @@
 - **도구**: Termux `clang 21.1.8`, `-O1 -Wall -Wextra -std=c11 -D_GNU_SOURCE` ([`scripts/dev-push.sh`](../../scripts/dev-push.sh)의 `CFLAGS_DEV`와 같다)
 - **소스**: [`bench/microbench/trap_cost.c`](../../bench/microbench/trap_cost.c), sha256 `46748ccd5235ac80116c7c5ecca1c1ec3a458e3b8ac10e497349f74e682705a8`(커밋 `91e9de6`의 파일과 일치)
 - **원본 출력**: [2026-10-11-s2-ret-trap-cost.txt](2026-10-11-s2-ret-trap-cost.txt)
-- **목적**: [ADR 0004 D6](../../../../docs/adr/0004-unified-direction.md)의 판정표를 한 행으로 닫는다.
+- **목적**: [ADR 0004 D6](https://github.com/Meapri/android-on-linux/blob/main/docs/adr/0004-unified-direction.md)의 판정표를 한 행으로 닫는다.
 
 ## 0. 측정 자격
 
@@ -55,5 +55,5 @@ D6 판정표에 따라 다음 단계는 로더 프로토타입이다. 제품에 
 ## 4. 부수 관찰: 이 기기는 Android 17이다
 
 - M19 때 Android 16이던 참조 #2가 Android 17(SDK 37)로 올라가 있었다.
-- `targetSdk 28`인 Termux는 OS 업그레이드 뒤에도 설치된 상태로 실행되고, 셸이 `untrusted_app_27` 도메인과 zygote seccomp 필터를 그대로 가진다. [ADR 0004 D2](../../../../docs/adr/0004-unified-direction.md)의 감시 항목에 대한 관찰 하나다. 새로 설치하는 경우는 확인하지 않았다.
+- `targetSdk 28`인 Termux는 OS 업그레이드 뒤에도 설치된 상태로 실행되고, 셸이 `untrusted_app_27` 도메인과 zygote seccomp 필터를 그대로 가진다. [ADR 0004 D2](https://github.com/Meapri/android-on-linux/blob/main/docs/adr/0004-unified-direction.md)의 감시 항목에 대한 관찰 하나다. 새로 설치하는 경우는 확인하지 않았다.
 - [ADR 0007](../adr/0007-android-16-only.md)은 지원 범위를 Android 16으로 한정한다. 참조 기기가 범위 밖 릴리스가 되었으므로 차단 집합 스윕(`alr doctor`)과 수용 테스트를 Android 17에서 다시 돌려야 한다. 이 문서는 그 결과를 담지 않는다.
