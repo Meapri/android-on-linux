@@ -1343,66 +1343,6 @@ static void install_libdl_stub(const char *R)
     }
 }
 
-/* Is this rootfs's coreutils the uutils multicall binary?
- *
- * If it is, every one of ls/cat/echo/cp is one Rust binary that decides which
- * applet to be from its OWN identity -- and it reads that identity with a raw
- * `svc`, not through libc, so neither the interposer's synthetic /proc/self/exe
- * nor --argv0 reaches it. Under the explicit loader (ADR 0002) it therefore
- * sees the LOADER:
- *
- *     coreutils: unknown program 'ld-linux-aarch64.so'
- *
- * There is nothing to fix in alr -- catching those syscalls means ptrace per
- * syscall, which is what this project exists not to do (ADR 0001). But Ubuntu
- * ships the way out: coreutils-from-gnu is a first-class selector in the same
- * archive, and MEASURED 2026-08-11, gnu-coreutils 9.7 runs under alr with path
- * virtualization fully applied.
- *
- * Said once, at provisioning, because the alternative is the user discovering
- * it when `ls` fails with a message about a loader they never invoked. */
-static int gnu_coreutils_repoint(const char *R);
-
-/* Detect a uutils coreutils tree. With `repair`, fix it; without, explain it. */
-static void warn_uutils_coreutils(const char *R, int repair)
-{
-    char p[ALR_PBUF];
-    struct stat st;
-
-    /* The tell: /usr/bin/coreutils is a large multicall binary, and the tools
-     * are symlinks into /usr/lib/cargo/bin/coreutils/. GNU coreutils has no
-     * such file at all. */
-    snprintf(p, sizeof p, "%s/usr/lib/cargo/bin/coreutils", R);
-    if (stat(p, &st) != 0 || !S_ISDIR(st.st_mode)) return;
-
-    if (repair) {
-        /* adopt REPAIRS rather than reports. Its job is to take an extracted
-         * tree and make it bootable, and a tree whose entire coreutils answers
-         *   coreutils: unknown program 'ld-linux-aarch64.so'
-         * is not bootable -- `alr adopt`'s own boot check fails on it. The
-         * repair needs no network: Ubuntu's coreutils-from-gnu package is
-         * nothing but symlinks, so the GNU binaries are already in the image
-         * under gnu* and this only repoints /usr/bin at them. */
-        fprintf(stderr, "alr: uutils coreutils detected; repointing at the "
-                        "GNU binaries already in this image\n");
-        gnu_coreutils_repoint(R);
-        return;
-    }
-    fprintf(stderr,
-        "alr: NOTE this rootfs uses uutils coreutils (Rust), not GNU.\n"
-        "     ls, cat, echo, cp and the rest are ONE multicall binary that\n"
-        "     reads its own identity with a raw syscall, which no LD_PRELOAD\n"
-        "     can see.  Under an explicit loader they report\n"
-        "       coreutils: unknown program 'ld-linux-aarch64.so'\n"
-        "     Everything else in the image (bash, dash, apt, dpkg, grep, sed,\n"
-        "     awk, tar) is unaffected.\n"
-        "     FIX, and it needs no network: the GNU binaries are ALREADY in\n"
-        "     this image (Ubuntu's own coreutils-from-gnu package turns out to\n"
-        "     be nothing but symlinks), so this only repoints them --\n"
-        "       alr use-gnu-coreutils <distro>\n"
-        "     reason=uutils-coreutils  (docs/adr/0006-raw-syscall-binaries.md)\n");
-}
-
 /* `alr update-components [<distro>]` -- docs/05-provisioning-spec.md.
  *
  * It exists because the .so the guest loads is a COPY made at install time,
@@ -1955,16 +1895,7 @@ static int cmd_install(const char *distro, const char *url_override)
                 "no discovery path for this distro yet; pass --url "
                 "(docs/05-provisioning-spec.md §1.1)");
         /* Any ubuntu-<release> is discoverable; the release is a path
-         * component on cdimage and SHA256SUMS is fetched alongside it.
-         *
-         * This used to warn that anything but 24.04 was unusable, because
-         * 26.04 replaced GNU coreutils with the uutils multicall binary, which
-         * resolves its own identity by a raw syscall no LD_PRELOAD can see.
-         * That is still true of uutils -- and it is no longer the whole story:
-         * the 26.04 image also carries the GNU binaries as gnu* (104 of them),
-         * and `use-gnu-coreutils` repoints /usr/bin at those. adopt runs it
-         * when it finds a uutils tree, so the warning described a state the
-         * installer no longer leaves behind. */
+         * component on cdimage and SHA256SUMS is fetched alongside it. */
         printf("alr: resolving the current ubuntu-base image for %s\n", distro + 7);
         /* No unverified fallback.  There used to be a pinned 24.04 image for
          * offline installs; 24.04 is no longer supported, and fetching a
@@ -2077,7 +2008,6 @@ static int cmd_install(const char *distro, const char *url_override)
 
     repair(part);
     rep.repaired = access_ok_all(part);
-    warn_uutils_coreutils(part, 1);
     /* NOT ignorable.  This used to discard the return value, so a rootfs with
      * NO path virtualization was reported as a successful install: the warning
      * scrolled past, cmd_install returned 0, and `alr run` then booted it
@@ -2416,11 +2346,6 @@ static int cmd_adopt(const char *distro)
 
     repair(R);
     rep.repaired = access_ok_all(R);
-    /* Before any verification can abort: a uutils rootfs is exactly the kind
-     * that fails verify_rootfs (its /usr/bin/env is a link into the multicall
-     * tree), and a bare "missing usr/bin/env" tells the user nothing about
-     * why. */
-    warn_uutils_coreutils(R, 1);
     install_hostbin(distro, R);
 
     if (install_preload(R) != 0)
@@ -2467,33 +2392,20 @@ static int cmd_adopt(const char *distro)
 
 /* `alr use-gnu-coreutils <distro>` -- repoint coreutils at the GNU binaries.
  *
- * Ubuntu 26.04 ships uutils as the default coreutils, and every tool in it is
- * ONE multicall binary that resolves its own identity with a raw syscall. Under
- * an explicit loader (ADR 0002) that resolves to the LOADER:
- *
- *     $ alr run /bin/echo hi
+ * Optional.  Ubuntu 26.04's default coreutils is uutils, one Rust multicall
+ * binary that takes its applet name from the kernel's AT_EXECFN.  Under the
+ * explicit loader (ADR 0002) that named the loader and every tool failed with
  *     coreutils: unknown program 'ld-linux-aarch64.so'
+ * so install used to run this automatically.  The interposer now rewrites the
+ * AT_EXECFN string to the guest path at startup, uutils runs as shipped, and
+ * this stays for anyone who prefers GNU.
  *
- * LD_PRELOAD cannot see a raw syscall and the supervisor is signal-only
- * (ADR 0001), so there is nothing to interpose. Everything else in the image is
- * unaffected -- MEASURED on 26.04: bash and dpkg 1.23.7 both fine.
+ * Ubuntu's own `coreutils-from-gnu` package is nothing but symlinks
+ * (/usr/bin/ls -> gnuls) and the GNU binaries are already in the base image
+ * (104 of them), so this needs no download: it repoints the symlinks that are
+ * already there at the binaries that are already there.
  *
- * The fix is Ubuntu's own. The archive ships `coreutils-from-gnu` as a
- * first-class alternative to `coreutils-from-uutils`, and that package turns
- * out to be nothing but symlinks: /usr/bin/ls -> gnuls, /usr/bin/cat -> gnucat.
- * The GNU binaries are ALREADY IN THE BASE IMAGE -- 104 of them, measured. So
- * this needs no download, no apt and no network: it repoints the symlinks that
- * are already there at the binaries that are already there.
- *
- * Runs automatically from install and adopt when the tree is a uutils one.
- * That used to be "the user's call", which is the right instinct about
- * replacing a distribution's userland and the wrong conclusion here: under an
- * explicit loader the uutils multicall binary cannot resolve its own name, so
- * the alternative on offer is not "uutils" but "no coreutils at all", and
- * adopt's own boot check fails on it. It stays a command so it can be re-run.
- *
- * Takes a ROOT PATH, not a distro name: install repairs the staging tree
- * (<R>.part), which has no distro name to resolve. */
+ * Takes a ROOT PATH, not a distro name, so it can run on any tree. */
 static int gnu_coreutils_repoint(const char *R)
 {
     char bindir[ALR_PBUF];
@@ -3373,8 +3285,8 @@ static int cmd_run(const char *distro, int argc, char **argv, int login_shell,
      *                                              an applet named after
      *                                              the script
      *
-     * The same mechanism is why a uutils-based coreutils cannot work under an
-     * explicit loader: every tool in it is one binary dispatching on argv[0].
+     * uutils is multicall too but names itself from AT_EXECFN, not argv[0];
+     * the interposer rewrites that at startup (alr_init in alr_preload.c).
      * npre > 0 means shebang_resolve replaced `host` with the interpreter, so
      * that is what the program must see. */
     av[n++] = (char *)(login_shell ? "-bash" : (npre > 0 ? host : argv[0]));

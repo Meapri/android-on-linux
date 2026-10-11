@@ -649,13 +649,15 @@ fi
 # shown to distinguish anything.
 #
 # Three deterministic targets, all always present, one per branch:
-#   /bin/true    dynamic C, calls libc for everything            -> 0, PASS
+#   /bin/bash    dynamic C, calls libc for everything            -> 0, PASS
+#                (not /bin/true: on 26.04 that is the uutils multicall
+#                binary, which carries its own svc instructions)
 #   ld.so        has no PT_INTERP, so it reads as STATIC, and a
 #                loader necessarily issues its own syscalls      -> STATIC
 #   libc.so.6    the note in the output exists because of this one
 if [ -x ./alr-doctor ]; then
     ckc "DOCTOR P11 DYNAMIC CLEAN" '0 `svc #0` -> PASS' \
-        ./alr-doctor --scan "$R/bin/true"
+        ./alr-doctor --scan "$R/bin/bash"
     ckc "DOCTOR P11 STATIC FLAGGED" "STATIC (no PT_INTERP)" \
         ./alr-doctor --scan "$R/lib/ld-linux-aarch64.so.1"
     # The scan must READ the file, not merely accept the argument: a stub that
@@ -769,8 +771,10 @@ if [ -x "$R/usr/bin/script" ]; then
         'script -qc "test -t 0 && stty -g >/dev/null && echo PTY_TC_OK" /dev/null'
     ckc "ALR PTY TTYNAME" "/dev/pts/" $ALR run /bin/bash -c \
         'script -qc tty /dev/null'
+    # GNU stty: this checks the interposer's glibc speed_t conversion, and
+    # uutils' stty takes no `speed` operand at all.
     ckc "ALR PTY SPEED" "38400" $ALR run /bin/bash -c \
-        'script -qc "stty speed" /dev/null'
+        'S=$(command -v gnustty || echo stty); script -qc "$S speed" /dev/null'
 else
     emit "ALR PTY TERMIOS" SKIP "script(1) not in this rootfs"
 fi
@@ -828,7 +832,14 @@ ck  "PRELOAD SYMLINK DEPTH"        ../../../etc/os-release \
 # absolute -- relativizing those would break them.
 ck  "PRELOAD SYMLINK SYSDIR ABS"   /proc/self/exe \
     $ALR run /bin/bash -c 'ln -sf /proc/self/exe /tmp/alrsy && readlink /tmp/alrsy'
-$ALR run /bin/bash -c 'rm -f /tmp/alrsl /tmp/alrsy /usr/local/bin/alrsl' >/dev/null 2>&1
+# The same with a RELATIVE link path, which is how `ln -s TARGET NAME` calls
+# it.  Only absolute link paths used to be relativized, so this stored
+# "/etc/os-release" verbatim and reading through the link hit Android's /etc.
+ckc "PRELOAD SYMLINK RELATIVE LINKPATH" "Ubuntu" \
+    $ALR run /bin/bash -c 'cd /tmp && ln -sf /etc/os-release alrslr && head -1 alrslr'
+ckc "PRELOAD SYMLINK DOTDOT LINKPATH" "Ubuntu" \
+    $ALR run /bin/bash -c 'mkdir -p /tmp/alrsd/b && cd /tmp/alrsd/b && ln -sf /etc/os-release ../l && head -1 /tmp/alrsd/l'
+$ALR run /bin/bash -c 'rm -rf /tmp/alrsl /tmp/alrsy /usr/local/bin/alrsl /tmp/alrslr /tmp/alrsd' >/dev/null 2>&1
 
 # The image itself ships absolute symlinks, created by tar and so never seen by
 # the preload.  ubuntu-base has 20; /usr/bin/awk -> /etc/alternatives/awk was
