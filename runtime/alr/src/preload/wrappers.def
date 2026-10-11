@@ -235,10 +235,13 @@ pclose
 # §10 — Node requires it
 syscall
 
-# --- 11   ioctl translation
+# --- 11   ioctl translation (+ termios callers that glibc>=2.42 routes through TCGETS2)
 # §11 — measured: Android denies TCGETS2/TIOCGSID/TIOCGETD/TIOCEXCL/TIOCSTI.
 # FIONREAD is ALLOWED, falsifying the spec's "emulate via the master fd" premise.
 ioctl
+tcgetattr
+tcsetattr
+isatty
 
 # --- --   resolver bridge
 # hosts: files dns; the bridge answers from bionic

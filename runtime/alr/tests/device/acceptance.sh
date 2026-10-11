@@ -740,6 +740,23 @@ if [ -x "$R/usr/bin/tmux" ]; then
 else
     emit "ALR PTY TMUX" SKIP "tmux not installed"
 fi
+# glibc >= 2.42 (ubuntu-26.04) reaches tcgetattr/tcsetattr/isatty/ttyname
+# through its INTERNAL ioctl with TCGETS2, which Android denies -- the ioctl
+# wrapper only sees PLT calls, so every terminal looked like EACCES / "not a
+# tty" and tmux panes _exit(1)ed before exec.  script(1) gives the command a
+# fresh pty slave on stdin, which is the case that broke.  The speed check
+# catches the other half: 2.42 also changed speed_t from the CBAUD code to the
+# baud rate, and a wrapper that copies the code reports "speed 15".
+if [ -x "$R/usr/bin/script" ]; then
+    ckc "ALR PTY TERMIOS" "PTY_TC_OK" $ALR run /bin/bash -c \
+        'script -qc "test -t 0 && stty -g >/dev/null && echo PTY_TC_OK" /dev/null'
+    ckc "ALR PTY TTYNAME" "/dev/pts/" $ALR run /bin/bash -c \
+        'script -qc tty /dev/null'
+    ckc "ALR PTY SPEED" "38400" $ALR run /bin/bash -c \
+        'script -qc "stty speed" /dev/null'
+else
+    emit "ALR PTY TERMIOS" SKIP "script(1) not in this rootfs"
+fi
 
 echo "── M4 경로 가상화 ──"
 # ID=ubuntu, not a release string: what this proves is that /etc/os-release came

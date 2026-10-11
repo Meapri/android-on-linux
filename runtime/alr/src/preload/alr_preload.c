@@ -3515,15 +3515,33 @@ char *ttyname(int fd)
     if (ttyname_r(fd, g_tty, sizeof g_tty) != 0) return NULL;
     return g_tty;
 }
+static int alr_tc_get(int fd, struct termios *out);
+static int alr_speed_is_baud(void);
+
 int ttyname_r(int fd, char *buf, size_t buflen)
 {
     char host[ALR_PBUF], g[ALR_PBUF];
     const char *c;
     int r;
     ensure_init();
-    if (!real_ttyname_r) { errno = ENOSYS; return ENOSYS; }
-    r = real_ttyname_r(fd, host, sizeof host);
-    if (r != 0) return r;
+    if (alr_speed_is_baud()) {
+        /* glibc >= 2.42's ttyname_r checks the fd with its internal
+         * tcgetattr, i.e. TCGETS2, which Android denies -- every terminal
+         * came back EACCES and `tty` said "not a tty".  Do the check on the
+         * allowed TCGETS and take the name from /proc/self/fd, which is
+         * where glibc reads it too. */
+        char link[32];
+        long n;
+        if (alr_tc_get(fd, NULL) != 0) return errno == EBADF ? EBADF : ENOTTY;
+        snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+        n = syscall(SYS_readlinkat, AT_FDCWD, link, host, sizeof host - 1);
+        if (n < 0) return errno;
+        host[n] = '\0';
+    } else {
+        if (!real_ttyname_r) { errno = ENOSYS; return ENOSYS; }
+        r = real_ttyname_r(fd, host, sizeof host);
+        if (r != 0) return r;
+    }
     c = alr_guest_canon(host, g_root, g_root_len, g, sizeof g);
     { size_t n = strlen(c);
       if (n + 1 > buflen) return ERANGE;
@@ -3734,4 +3752,150 @@ int ioctl(int fd, unsigned long req, ...)
     default:
         return real_ioctl(fd, req, arg);
     }
+}
+
+/* ---- termios entry points that bypass the ioctl wrapper -------------------
+ *
+ * glibc >= 2.42 implements tcgetattr/tcsetattr with the TCGETS2/TCSETS2
+ * ioctls (and isatty() on top of tcgetattr).  Inside libc those are internal
+ * calls, so the PLT-level `ioctl` wrapper above never sees them and the kernel
+ * answers EACCES (Android's ioctlcmd filter, see the table above).  Measured on
+ * ubuntu-26.04 (glibc 2.43): raw TCGETS2 on a pty slave -> EACCES, tcgetattr ->
+ * EACCES, isatty -> 0.  tmux 3.6 does `tcgetattr(STDIN_FILENO)` in the pane
+ * child and `_exit(1)`s when it fails, so every pane died before exec.  glibc
+ * 2.39 (ubuntu-24.04) still uses TCGETS and never hit this.
+ *
+ * Re-implement the three libc entry points on the allowed TCGETS/TCSETS* ioctls,
+ * converting between the kernel layout (NCCS=19) and glibc's struct termios.
+ *
+ * The speed fields need the RUNNING glibc's convention, not the one this .so
+ * was built against (2.17).  Up to 2.41 speed_t is the CBAUD code (B38400 ==
+ * 017) and c_ispeed/c_ospeed hold that code.  From 2.42 speed_t is the baud
+ * rate itself (B38400 == 38400U in ubuntu-26.04's bits/termios-baud.h) and
+ * cfgetospeed() reads c_ospeed as such -- copying the code there made `stty`
+ * report a nonsense speed. */
+#define ALR_CBAUD   0010017u
+#define ALR_IBSHIFT 16
+static const unsigned alr_baud_tab[][2] = {     /* { CBAUD code, baud } */
+    {0, 0}, {01, 50}, {02, 75}, {03, 110}, {04, 134}, {05, 150}, {06, 200},
+    {07, 300}, {010, 600}, {011, 1200}, {012, 1800}, {013, 2400},
+    {014, 4800}, {015, 9600}, {016, 19200}, {017, 38400},
+    {0010001, 57600}, {0010002, 115200}, {0010003, 230400},
+    {0010004, 460800}, {0010005, 500000}, {0010006, 576000},
+    {0010007, 921600}, {0010010, 1000000}, {0010011, 1152000},
+    {0010012, 1500000}, {0010013, 2000000}, {0010014, 2500000},
+    {0010015, 3000000}, {0010016, 3500000}, {0010017, 4000000},
+};
+#define ALR_NBAUD (sizeof alr_baud_tab / sizeof alr_baud_tab[0])
+
+extern const char *gnu_get_libc_version(void);
+
+/* 1 when the guest glibc stores baud rates (>= 2.42) in c_[io]speed. */
+static int alr_speed_is_baud(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *s = gnu_get_libc_version();
+        unsigned maj = 0, min = 0;
+        if (s) sscanf(s, "%u.%u", &maj, &min);
+        v = maj > 2 || (maj == 2 && min >= 42);
+    }
+    return v;
+}
+
+static unsigned alr_code_to_baud(unsigned code)
+{
+    size_t i;
+    for (i = 0; i < ALR_NBAUD; i++)
+        if (alr_baud_tab[i][0] == code) return alr_baud_tab[i][1];
+    return 0;
+}
+
+/* -1 when the rate has no CBAUD code (it would need BOTHER + TCSETS2). */
+static long alr_baud_to_code(unsigned baud)
+{
+    size_t i;
+    for (i = 0; i < ALR_NBAUD; i++)
+        if (alr_baud_tab[i][1] == baud) return (long)alr_baud_tab[i][0];
+    return -1;
+}
+
+static int alr_tc_get(int fd, struct termios *out)
+{
+    struct alr_ktermios k;
+
+    if (!real_ioctl) real_ioctl = dlsym(RTLD_NEXT, "ioctl");
+    if (!real_ioctl) { errno = ENOSYS; return -1; }
+    if (real_ioctl(fd, TCGETS, &k) != 0) return -1;
+    if (out) {
+        unsigned ocode = k.c_cflag & ALR_CBAUD;
+        unsigned icode = (k.c_cflag >> ALR_IBSHIFT) & ALR_CBAUD;
+
+        memset(out, 0, sizeof *out);
+        out->c_iflag = k.c_iflag;
+        out->c_oflag = k.c_oflag;
+        out->c_cflag = k.c_cflag;
+        out->c_lflag = k.c_lflag;
+        out->c_line  = k.c_line;
+        memcpy(out->c_cc, k.c_cc, ALR_KNCCS);
+        if (alr_speed_is_baud()) {
+            out->c_ospeed = alr_code_to_baud(ocode);
+            out->c_ispeed = icode ? alr_code_to_baud(icode) : out->c_ospeed;
+        } else {
+            /* what glibc <= 2.41's own tcgetattr stores */
+            out->c_ispeed = out->c_ospeed = ocode;
+        }
+    }
+    return 0;
+}
+
+int tcgetattr(int fd, struct termios *t)
+{
+    ensure_init();
+    if (!t) { errno = EFAULT; return -1; }
+    return alr_tc_get(fd, t);
+}
+
+int tcsetattr(int fd, int act, const struct termios *t)
+{
+    struct alr_ktermios k;
+    unsigned long cmd;
+
+    ensure_init();
+    if (!t) { errno = EFAULT; return -1; }
+    switch (act) {
+    case TCSANOW:   cmd = TCSETS;  break;
+    case TCSADRAIN: cmd = TCSETSW; break;
+    case TCSAFLUSH: cmd = TCSETSF; break;
+    default: errno = EINVAL; return -1;
+    }
+    if (!real_ioctl) real_ioctl = dlsym(RTLD_NEXT, "ioctl");
+    if (!real_ioctl) { errno = ENOSYS; return -1; }
+    memset(&k, 0, sizeof k);
+    k.c_iflag = t->c_iflag;
+    k.c_oflag = t->c_oflag;
+    k.c_cflag = t->c_cflag;
+    k.c_lflag = t->c_lflag;
+    k.c_line  = t->c_line;
+    memcpy(k.c_cc, t->c_cc, ALR_KNCCS);
+    if (alr_speed_is_baud()) {
+        /* glibc >= 2.42's cfset*speed write c_[io]speed only; the kernel reads
+         * the speed from the CBAUD/CIBAUD bits of c_cflag. */
+        long oc = alr_baud_to_code(t->c_ospeed);
+        long ic = (t->c_ispeed == 0 || t->c_ispeed == t->c_ospeed)
+                  ? 0 : alr_baud_to_code(t->c_ispeed);
+        if (oc < 0 || ic < 0) { errno = EINVAL; return -1; }
+        k.c_cflag &= ~(ALR_CBAUD | (ALR_CBAUD << ALR_IBSHIFT));
+        k.c_cflag |= (unsigned)oc | ((unsigned)ic << ALR_IBSHIFT);
+    }
+    return real_ioctl(fd, cmd, &k);
+}
+
+int isatty(int fd)
+{
+    int saved = errno;
+    ensure_init();
+    if (alr_tc_get(fd, NULL) == 0) { errno = saved; return 1; }
+    if (errno != EBADF) errno = ENOTTY;      /* glibc contract */
+    return 0;
 }
