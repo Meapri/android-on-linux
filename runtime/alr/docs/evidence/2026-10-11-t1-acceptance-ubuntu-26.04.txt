@@ -6,7 +6,7 @@ ALR BOOT /bin/echo:                    PASS
 ALR BOOT bash -c true:                 PASS
 ALR GUEST GLIBC VERSION:               PASS
 ADR0001 NO SUPERVISOR DIES:            PASS   exit=159 (128+31 SIGSYS)
-tests/device/acceptance.sh: line 206: 16423 Unknown signal 31          env -i "$R/lib/ld-linux-aarch64.so.1" --library-path "$LP" --inhibit-cache --argv0 true "$R/usr/bin/true" > /dev/null 2>&1
+tests/device/acceptance.sh: line 206: 30038 Unknown signal 31          env -i "$R/lib/ld-linux-aarch64.so.1" --library-path "$LP" --inhibit-cache --argv0 true "$R/usr/bin/true" > /dev/null 2>&1
 ADR0002 BARE EXECVE FAILS:             PASS   exit=127 (PT_INTERP unresolved)
 
 ── CLI 공통 옵션 (docs/06-cli-spec.md §1.1/§1.2) ──
@@ -28,7 +28,8 @@ CLI ENV RESERVED REFUSED:              PASS
 CLI BAD OPTION REFUSED:                PASS
 CLI CWD FALLBACK:                      PASS
 CLI VERSION SHOWS GUEST PRELOAD:       PASS
-CLI VERSION DETECTS STALE PRELOAD:     SKIP   no second .so to swap in
+CLI VERSION DETECTS STALE PRELOAD:     PASS
+CLI VERSION TEST RESTORED:             PASS
 CLI UPDATE COMPONENTS:                 PASS
 CLI LIST:                              PASS
 SUPERVISOR STATS ELAPSED:              PASS
@@ -69,9 +70,10 @@ PRELOAD PATH COVERAGE:                 PASS
 RESOLV SERVICE PORT:                   PASS
 CLI HOSTBIN PRESENT:                   PASS   28 wrappers
 CLI HOSTBIN RUNS GUEST TOOL:           PASS
+CLI HOSTBIN RUNS GUEST RG:             PASS
 CLI HOSTBIN SELF CONTAINED:            PASS
-ALR CODEX FINDS GUEST GIT:             FAIL   no 'git version 2.' in output; first line: alr: NOTE /data/data/com.termux/files/usr/var/lib/alr/distros/ubuntu-26.04/usr/local/bin/codex is statically linked -- path virtualization does NOT
-ALR CODEX FINDS GUEST RG:              FAIL   no 'ripgrep ' in output; first line: alr: NOTE /data/data/com.termux/files/usr/var/lib/alr/distros/ubuntu-26.04/usr/local/bin/codex is statically linked -- path virtualization does NOT
+ALR CODEX FINDS GUEST GIT:             PASS
+ALR CODEX FINDS GUEST RG:              PASS
 ALR CODEX CONFIG IN ROOTFS:            PASS
 DOCTOR P11 DYNAMIC CLEAN:              PASS
 DOCTOR P11 STATIC FLAGGED:             PASS
@@ -154,7 +156,7 @@ ALR CODEX LINKAGE:                     PASS   static as expected (ADR 0008 non-g
 ALR CODEX VERSION:                     PASS
 
 ── 슈퍼바이저 불변식 ──
-SUPERVISOR NO SYSCALL STOPS:           PASS   alr supervisor: pids=2 sigsys=3 emulated=3 passthrough_signals=1 path_traps=0 syscall_stops=0 elapsed_ms=9
+SUPERVISOR NO SYSCALL STOPS:           PASS   alr supervisor: pids=2 sigsys=3 emulated=3 passthrough_signals=1 path_traps=0 syscall_stops=0 elapsed_ms=5
 SUPERVISOR SIGSYS PER RUN:             PASS   sigsys=3 (<=8)
 
 ALR STABILITY 10x:                     PASS   10/10
@@ -192,5 +194,5 @@ PRELOAD LINK FALLBACK:                 PASS   ln succeeded, content identical
 PRELOAD DEV FULL ENOSPC:               KNOWN_FAIL:non-goal-devfull
 
 ─────────────────────────────────────────────────────────────
-  PASS=164  FAIL=2  KNOWN_FAIL=1  SKIP=1
-ALR DEVICE ACCEPTANCE: FAIL
+  PASS=169  FAIL=0  KNOWN_FAIL=1  SKIP=0
+ALR DEVICE ACCEPTANCE: PASS

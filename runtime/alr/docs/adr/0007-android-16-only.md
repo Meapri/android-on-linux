@@ -88,7 +88,7 @@ Accepted (2026-08-03). **보론(2026-10-11): Android 17을 지원 목록에 더�
 "다시 볼 조건"의 첫 항목을 그대로 적용했다. Snapdragon 참조 기기(SM-S937N)가 Android 17(SDK 37, 커널 `6.6.127-android15`)로 업그레이드되었고, 그 위에서 `alr doctor` 스윕을 돌렸다.
 
 - 차단 집합: 239개, Android 16의 두 스윕(Snapdragon, MediaTek)과 **diff 0**([sweeps/snapdragon-8elite-android17-k6.6.txt](../evidence/sweeps/snapdragon-8elite-android17-k6.6.txt)).
-- 수용 테스트: Ubuntu 24.04와 26.04 모두 PASS 163, FAIL 2(codex 출력 형식, 릴리스와 무관), `path_traps=0 syscall_stops=0`([T1 증거](../evidence/2026-10-11-t1-ubuntu-2604-android17.md)).
+- 수용 테스트: 처음에는 Ubuntu 24.04와 26.04 모두 PASS 163, FAIL 2(codex 출력 형식, 릴리스와 무관)였다. 검사를 고친 뒤 26.04에서 PASS 169, FAIL 0, SKIP 0이다. `path_traps=0 syscall_stops=0`([T1 증거](../evidence/2026-10-11-t1-ubuntu-2604-android17.md)).
 
 **결정: Android 17을 지원한다.** `alr doctor`의 P0이 16과 17을 지원 릴리스로 본다.
 

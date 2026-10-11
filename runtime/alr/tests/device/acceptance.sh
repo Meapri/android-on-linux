@@ -254,19 +254,21 @@ fi
 # here must not leave the rootfs running a stale preload for every later check.
 ckc "CLI VERSION SHOWS GUEST PRELOAD" "preload (guest)" $ALR version
 _gp="$R/usr/lib/alr/libalr_preload.so"
-if [ -r "$_gp" ] && [ -r "$PREFIX/share/alr/libalr_preload.so" ] \
-   && ! cmp -s "$_gp" "$PREFIX/share/alr/libalr_preload.so"; then
+# `alr version` only hashes the two files, so any different bytes stand in for
+# an older build.  A packaged install has a second .so in $PREFIX/share/alr; a
+# dev push does not, and this check used to SKIP there.
+if [ -r "$_gp" ]; then
     cp "$_gp" "$R/tmp/.alr-preload-save" 2>/dev/null
-    cp "$PREFIX/share/alr/libalr_preload.so" "$_gp" 2>/dev/null
+    printf 'stale' >> "$_gp"
     "$ALR" version >/dev/null 2>&1; _rc=$?
     cp "$R/tmp/.alr-preload-save" "$_gp" 2>/dev/null; rm -f "$R/tmp/.alr-preload-save"
     [ "$_rc" = 1 ] && emit "CLI VERSION DETECTS STALE PRELOAD" PASS \
                    || emit "CLI VERSION DETECTS STALE PRELOAD" FAIL "rc=$_rc want=1"
-    cmp -s "$_gp" "$PREFIX/share/alr/libalr_preload.so" \
-        && emit "CLI VERSION TEST RESTORED" FAIL "rootfs left with the wrong .so" \
-        || emit "CLI VERSION TEST RESTORED" PASS
+    "$ALR" version >/dev/null 2>&1 \
+        && emit "CLI VERSION TEST RESTORED" PASS \
+        || emit "CLI VERSION TEST RESTORED" FAIL "rootfs left with the wrong .so"
 else
-    emit "CLI VERSION DETECTS STALE PRELOAD" SKIP "no second .so to swap in"
+    emit "CLI VERSION DETECTS STALE PRELOAD" FAIL "no guest preload at $_gp"
 fi
 ckrc "CLI UPDATE COMPONENTS"     0  $ALR update-components
 ckc  "CLI LIST"                  "$(basename "$R")"  $ALR list
@@ -589,6 +591,13 @@ if [ -d "$_hb" ]; then
     else
     ckc "CLI HOSTBIN RUNS GUEST TOOL" "git version 2." "$_hb/git" --version
     fi
+    # codex's other tool.  Its doctor no longer runs either one, so execution
+    # is asserted here.
+    if [ -x "$R/usr/bin/rg" ]; then
+        ckc "CLI HOSTBIN RUNS GUEST RG" "ripgrep " "$_hb/rg" --version
+    else
+        emit "CLI HOSTBIN RUNS GUEST RG" SKIP "rg not installed in this rootfs"
+    fi
     # And it must work with NOTHING inherited -- every child of a static binary
     # starts from that binary's environment, not the harness's.  The first
     # version read ALR_ROOT_DIR from the environment and silently resolved
@@ -602,6 +611,7 @@ if [ -d "$_hb" ]; then
 else
     emit "CLI HOSTBIN PRESENT" FAIL "no $_hb; run alr update-components"
     emit "CLI HOSTBIN RUNS GUEST TOOL" SKIP "no hostbin"
+    emit "CLI HOSTBIN RUNS GUEST RG" SKIP "no hostbin"
     emit "CLI HOSTBIN SELF CONTAINED" SKIP "no hostbin"
 fi
 
@@ -611,10 +621,14 @@ fi
 # `alr run` to reach them, which only works because an inner alr detects it is
 # already traced and inherits the outer supervisor instead of failing to start
 # a second one (MEASURED before that: pids=0, rc=126).
+#
+# codex 0.162 stopped executing the tools in `doctor` ("found; execution not
+# verified"), so these assert discovery only.  Execution of the same hostbin
+# tools is asserted by CLI HOSTBIN RUNS GUEST TOOL and CLI HOSTBIN RUNS GUEST RG.
 if [ -x "$R/usr/local/bin/codex" ]; then
-    ckc "ALR CODEX FINDS GUEST GIT"  "git version 2."  \
+    ckc "ALR CODEX FINDS GUEST GIT"  "git executable found"  \
         $ALR run /usr/local/bin/codex doctor
-    ckc "ALR CODEX FINDS GUEST RG"   "ripgrep "        \
+    ckc "ALR CODEX FINDS GUEST RG"   '(system, `rg`)'        \
         $ALR run /usr/local/bin/codex doctor
     # Its config/state land in the rootfs, which only happens when HOME is
     # host-form.  With the guest form codex wrote to ANDROID's /root and
