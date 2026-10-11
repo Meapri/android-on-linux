@@ -10,7 +10,7 @@ Status: **vendored source only. Not built into `alr`, not shipped in the APK, no
 | Commit | `d9efb4ae60da85154210c2edfb10f46e8ac58755` (2026-10-08, "release: v4") |
 | Author | Sophie Winter |
 | License | MIT, text in [LICENSE.MIT](LICENSE.MIT) (copied verbatim from upstream `LICENSE.MIT`) |
-| Local modifications | none |
+| Local modifications | two, listed under [Local changes](#local-changes) |
 
 Upstream's own licensing note ([notes/licensing.md](https://github.com/wmww/tawc/blob/main/notes/licensing.md)): tawc's sources are MIT; the distributed tawc APK is GPLv3-only because it links termux-app's `termux-shared` extra-keys code. That code is **not** part of what is vendored here. `tawcroot` is freestanding C with no third-party dependencies (no libc, no malloc).
 
@@ -33,7 +33,9 @@ A freestanding static non-PIE binary installs a seccomp filter that returns `SEC
 
 All of `src/*.c` and the `x86_64` stubs compile with upstream's flags (`-O2 -ffreestanding -fno-stack-protector -D_GNU_SOURCE -Iinclude`) and link with GNU ld using `-static -nostdlib -nostartfiles -Wl,-Ttext-segment=0x10000000`. Upstream uses `--image-base` (lld). Verified 2026-10-11 on an x86_64 Linux VM (kernel 6.18).
 
-aarch64 has not been built yet. A cross-compile against musl headers (`zig cc -target aarch64-linux-musl`, 2026-10-11) fails in `include/arch/aarch64.h` because musl declares `mcontext_t.regs` as `unsigned long[31]`, not `__u64[31]`, and in `linux/stat.h` (`statx_timestamp` redefined). Upstream builds against the NDK's bionic sysroot; use the NDK or Termux's clang, not musl.
+A cross-compile against musl headers (`zig cc -target aarch64-linux-musl`, 2026-10-11) fails in `include/arch/aarch64.h` because musl declares `mcontext_t.regs` as `unsigned long[31]`, not `__u64[31]`, and in `linux/stat.h` (`statx_timestamp` redefined). Upstream builds against the NDK's bionic sysroot.
+
+aarch64 builds on the device with Termux's clang 21 (2026-10-11), with the flags above plus `-mno-outline-atomics -fno-pie`, linked `-Wl,--image-base=0x10000000`. Without `-mno-outline-atomics` the link fails on `__aarch64_cas4_acq` and friends, which live in libgcc/compiler-rt and are not linked into a `-nostdlib` binary.
 
 Host smoke, same VM: a static glibc binary run under `tawcroot -r ROOT -- /bin/h` opened `/etc/hostname` and read the file inside `ROOT`, not the host's. That is the case `LD_PRELOAD` cannot reach.
 
@@ -46,7 +48,14 @@ Host smoke, same VM: a static glibc binary run under `tawcroot -r ROOT -- /bin/h
 
 The D6 gate itself is now measured on a device without tawcroot: [`bench/microbench/trap_cost.c`](../../bench/microbench/trap_cost.c) reproduces tawcroot's filter shape and measured +410 to +925 ns per `getppid` round trip on the Snapdragon reference device ([evidence](../../docs/evidence/2026-10-11-s2-ret-trap-cost.md)). That excludes path translation; the table below still has no device row.
 
-Neither number is a measurement on an Android device under `untrusted_app_27` with the zygote seccomp filter stacked. ADR 0004 D6 gates the decision on a device measurement. `PENDING_DEVICE`.
+Neither number is a measurement on an Android device. The device workload numbers are in the [T5 coexistence spike](../../docs/evidence/2026-10-11-t5-coexistence-spike.md): `find /usr/share -type f` over 61,865 files took 349 to 368 ms under tawcroot against 151 to 177 ms native (Snapdragon 8 Elite, Android 17).
+
+## Local changes
+
+Both made for the [T5 coexistence spike](../../docs/evidence/2026-10-11-t5-coexistence-spike.md), 2026-10-11.
+
+1. **`RET_TRAP` carries data `0x7477`** (`include/filter_build.h` `TAWCROOT_TRAP_DATA`, `src/filter_build.c`). The data reaches the `SIGSYS` as `si_errno`. alr's ptrace supervisor rescues the zygote filter's traps, whose data is 0, and must let tawcroot's through to its handler; with data 0 on both it answered tawcroot's path traps with `-ENOSYS` and nothing loaded.
+2. **`prctl(PR_GET_AUXV)` returns the guest's auxv** (`src/syscalls_control.c` `handle_prctl`, `src/loader_stack.c` `tawc_loader_guest_auxv`). Passed through, it returned tawcroot's own auxv, whose `AT_EXECFN` is tawcroot or the `--exec-child` fd; uutils names itself from it via rustix and failed with `unknown program 'tawcroot'`.
 
 ## Rules for using this code
 

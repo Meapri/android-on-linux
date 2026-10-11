@@ -94,7 +94,7 @@ long tawcroot_build_filter(struct sock_filter *prog, size_t prog_cap,
 			 * else jump +1 to RET ALLOW. */
 			EMIT_OR_FAIL(TAWC_BPF_J(BPF_JMP | BPF_JGE | BPF_K,
 					(uint32_t)reserved_fd_floor, 0, 1));
-			EMIT_OR_FAIL(TAWC_BPF_S(BPF_RET | BPF_K, SECCOMP_RET_TRAP));
+			EMIT_OR_FAIL(TAWC_BPF_S(BPF_RET | BPF_K, SECCOMP_RET_TRAP | TAWCROOT_TRAP_DATA));
 			EMIT_OR_FAIL(TAWC_BPF_S(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
 			/* Re-load nr so subsequent JEQs see A == nr. The
 			 * not-close jf above lands here. */
@@ -103,7 +103,7 @@ long tawcroot_build_filter(struct sock_filter *prog, size_t prog_cap,
 		}
 		EMIT_OR_FAIL(TAWC_BPF_J(BPF_JMP | BPF_JEQ | BPF_K,
 				(uint32_t)trap_nrs[t], 0, 1));
-		EMIT_OR_FAIL(TAWC_BPF_S(BPF_RET | BPF_K, SECCOMP_RET_TRAP));
+		EMIT_OR_FAIL(TAWC_BPF_S(BPF_RET | BPF_K, SECCOMP_RET_TRAP | TAWCROOT_TRAP_DATA));
 	}
 
 	EMIT_OR_FAIL(TAWC_BPF_S(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));

@@ -33,6 +33,7 @@
 
 #include "dispatch.h"
 #include "errno_neg.h"
+#include "loader_stack.h"
 #include "raw_sys.h"
 #include "sigalt.h"
 #include "signal_shadow.h"
@@ -155,6 +156,8 @@ static long handle_seccomp(const tawcroot_syscall_args *args, ucontext_t *uc)
 			args->d, args->e, 0);
 }
 
+#define TAWC_PR_GET_AUXV 0x41555856
+
 static long handle_prctl(const tawcroot_syscall_args *args, ucontext_t *uc)
 {
 	(void)uc;
@@ -168,6 +171,25 @@ static long handle_prctl(const tawcroot_syscall_args *args, ucontext_t *uc)
 			return filter_fake_accept(
 				(const void *)(uintptr_t)args->c);
 		return TAWC_EINVAL;
+	}
+	/* PR_GET_AUXV (Linux 6.4): answer with the guest's auxv. Passing it
+	 * through returns tawcroot's own, so a program that names itself
+	 * from AT_EXECFN (uutils' multicall dispatch, via rustix) sees
+	 * "tawcroot" or the --exec-child fd number. Same contract as the
+	 * kernel: copy min(size, total), return total. */
+	if (op == TAWC_PR_GET_AUXV) {
+		size_t total;
+		const struct tawc_loader_aux_entry *aux =
+			tawc_loader_guest_auxv(&total);
+		if (args->d || args->e) return TAWC_EINVAL;
+		if (aux) {
+			size_t n = (size_t)args->c < total ? (size_t)args->c
+							     : total;
+			if (n && tawc_copy_to_guest((void *)(uintptr_t)args->b,
+						    aux, n) < 0)
+				return TAWC_EFAULT;
+			return (long)total;
+		}
 	}
 	return TAWC_RAW(TAWC_SYS_prctl, args->a, args->b, args->c,
 			args->d, args->e, 0);

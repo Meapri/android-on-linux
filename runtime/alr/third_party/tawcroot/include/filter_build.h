@@ -13,6 +13,13 @@
 
 #pragma once
 
+/* SECCOMP_RET_DATA on every RET_TRAP this filter returns. It reaches the
+ * SIGSYS as si_errno, which is how a ptrace supervisor underneath (alr's,
+ * rescuing the zygote filter's traps, whose data is 0) tells our traps
+ * from the zygote's and lets ours through to the handler. Nonzero is all
+ * that matters; the value is "tw". */
+#define TAWCROOT_TRAP_DATA 0x7477u
+
 #include <stddef.h>
 #include <stdint.h>
 

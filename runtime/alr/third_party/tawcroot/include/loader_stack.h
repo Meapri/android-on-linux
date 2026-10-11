@@ -152,6 +152,13 @@ void tawc_loader_walk_stack(uintptr_t sp,
                             char *const **out_envp,
                             const struct tawc_loader_aux_entry **out_auxv);
 
+/* The auxv the last tawc_loader_build_stack wrote for the guest, and
+ * its size in bytes (AT_NULL pair included). NULL before any stack was
+ * built. prctl(PR_GET_AUXV) answers from here: the kernel's copy is
+ * tawcroot's own auxv, whose AT_EXECFN names tawcroot (or the
+ * --exec-child memfd), not the guest program. */
+const struct tawc_loader_aux_entry *tawc_loader_guest_auxv(size_t *out_bytes);
+
 #ifdef __cplusplus
 }
 #endif

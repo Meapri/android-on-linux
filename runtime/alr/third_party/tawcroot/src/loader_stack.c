@@ -21,6 +21,15 @@ TAWCROOT_FRAME_CAP_EXEMPT
 #define MAX_AUXV     32       /* generous upper bound on entries we emit */
 
 /* Round a uintptr_t down to a power-of-two boundary. */
+static const struct tawc_loader_aux_entry *g_guest_auxv;
+static size_t g_guest_auxv_bytes;
+
+const struct tawc_loader_aux_entry *tawc_loader_guest_auxv(size_t *out_bytes)
+{
+	*out_bytes = g_guest_auxv_bytes;
+	return g_guest_auxv;
+}
+
 static inline uintptr_t align_down(uintptr_t v, uintptr_t a)
 { return v & ~(a - 1); }
 
@@ -193,6 +202,8 @@ long tawc_loader_build_stack(void *region_low, size_t region_size,
 	w += sizeof(uint64_t);
 
 	/* auxv (already includes AT_NULL terminator) */
+	g_guest_auxv       = (const struct tawc_loader_aux_entry *)w;
+	g_guest_auxv_bytes = (size_t)na * 16;
 	for (unsigned i = 0; i < na; i++) {
 		*(uint64_t *)w = aux[i].a_type;
 		w += sizeof(uint64_t);
