@@ -97,3 +97,18 @@ ls: cannot access '/dev/full': Permission denied
 $ alr run /bin/bash -c 'echo x > /dev/full; echo guest rc=$?'
 guest rc=1
 /bin/bash: line 1: /dev/full: Permission denied
+
+== 7. alternative to the fd band, measured and rejected
+# scan = getdents64 always traps; the handler returns the kernel's batch unless an entry
+#        is named by a decimal >= 1000, and /proc/<pid>/fd dirs keep the lowest free fd
+#        (probe "LANE PROC FD DIR LOWEST FD" PASS, acceptance PASS=220 FAIL=0 KNOWN_FAIL=1)
+# band = e892c44 (fd band 900-999). Releases from make-release.sh, TZ=UTC0, 15 interleaved rounds.
+# base = ALR_LANE=0 with host-form paths.
+base find                          median   252.9 ms  x1.00  (paired x1.00)
+band find                          median   295.2 ms  x1.17  (paired x1.15)
+scan find                          median   309.1 ms  x1.22  (paired x1.24)
+base ls                            median   261.0 ms  x1.00  (paired x1.00)
+band ls                            median   304.5 ms  x1.17  (paired x1.16)
+scan ls                            median   319.1 ms  x1.22  (paired x1.23)
+# CPU features (no SVE, so no non-faulting loads for the copy side):
+# fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 asimdfhm dit uscat ilrcpc flagm ssbs sb paca pacg dcpodp flagm2 frint i8mm bf16 rng bti ecv afp rpres
