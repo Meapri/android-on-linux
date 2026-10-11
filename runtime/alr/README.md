@@ -27,11 +27,11 @@
    원리적으로 불가능하다([ADR 0005](docs/adr/0005-play-store-unsupported.md)). 설치 도중 Google Play Protect가
    차단 대화상자를 띄우는데, 거기서 **`확인`을 누르면 설치가 취소된다**. 전체 절차는
    [docs/INSTALL.md](docs/INSTALL.md).
-2. 릴리스 tarball을 `$PREFIX`에 풀고, Termux 터미널에서:
+2. `alr` tarball을 `$PREFIX`에 풀고(공개 릴리스 v0.5.0에는 레인이 없으니 [INSTALL §3](docs/INSTALL.md)을 먼저 본다), Termux 터미널에서:
 
 ```bash
 alr-doctor                  # 기기 능력 진단 (첫 실행에 한 번)
-alr install --with git      # Ubuntu 24.04 rootfs + git
+alr install --with git      # Ubuntu 26.04 rootfs + git
 alr run git status          # 게스트에서 명령 하나
 alr shell                   # 게스트 bash 진입
 alr version                 # 버전 / preload 경로 / preload sha256 / rootfs 경로

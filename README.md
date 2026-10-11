@@ -47,6 +47,7 @@ Start here:
 - [ADR 0004: unified direction](docs/adr/0004-unified-direction.md): decisions D1-D8 and the phase plan.
 - [ADR index](docs/adr/README.md): the three ADR namespaces (project, alr engine, workstream).
 - [alr engine documentation](runtime/alr/README.md): the execution engine, its specs, acceptance suite, and device evidence.
+- [Termux install guide](runtime/alr/docs/INSTALL.md) (Korean): installing Termux and `alr`, provisioning Ubuntu 26.04, troubleshooting.
 - [PERFORMANCE](docs/PERFORMANCE.md): measured CPU/GPU numbers, labelled by engine.
 - [Device evidence model](docs/architecture/device-evidence.md): proof rules before claiming manufacturer-independent GPU acceleration.
 - [THIRD-PARTY](docs/THIRD-PARTY.md): licensing of shipped and removed components.

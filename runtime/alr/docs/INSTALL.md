@@ -1,68 +1,63 @@
-# 설치 가이드
+# 설치 가이드 (Termux)
 
-`alr`을 폰이나 태블릿에 올려서 Ubuntu 24.04 arm64 게스트를 띄우기까지의 절차다.
-개발자용 온디바이스 루프는 [scripts/dev-bootstrap.md](../scripts/dev-bootstrap.md)에 따로 있다.
+Termux에 `alr`을 설치하고 Ubuntu 26.04 LTS arm64 게스트에서 명령을 실행하기까지의 절차다.
+개발자용 온디바이스 루프(sshd, `scripts/dev-push.sh`)는 [scripts/dev-bootstrap.md](../scripts/dev-bootstrap.md)에 따로 있다.
 
-> **`alr` 은 Android 16과 17을 지원한다.** 다른 릴리스는 **지원 범위 밖**이며, 검증하지 않고 동작을 주장하지 않는다
-> ([ADR 0007](adr/0007-android-16-only.md) 과 그 보론). Android 17은 Snapdragon 참조 기기 한 대에서만 쟀다.
-> 참조 디바이스는 **2대 — MediaTek(커널 6.1)과 Snapdragon 8 Elite(커널 6.6), 둘 다 Android 16.**
-> 두 기기의 zygote 차단 syscall 239개 집합이 완전히 동일해 **SoC 벤더·커널 축은 실측으로 닫혔다**(단 두 기기 다 Samsung 이라 **OEM 축은 미측정이고 잴 수단이 없다** — 다른 OEM 이 안 된다는 뜻이 아니라 확인해 주지 못한다는 뜻이다)
-> ([M19](evidence/2026-08-03-m19-snapdragon.md)).
+> **지원 범위.** Android 16과 17, arm64 기기, F-Droid 또는 GitHub판 Termux, Ubuntu 26.04 게스트다.
+> 다른 Android 릴리스는 범위 밖이다([ADR 0007](adr/0007-android-16-only.md)). 실측한 기기는 Samsung 두 대다.
+> MediaTek(커널 6.1, Android 16)과 Snapdragon 8 Elite(커널 6.6, Android 16·17)이며, Android 17은 Snapdragon 한 대에서만 쟀다.
+> 다른 제조사(OEM)는 확인하지 못했다([M19](evidence/2026-08-03-m19-snapdragon.md)).
+
+전체 흐름은 다음과 같다.
+
+1. 기기 조건을 확인한다(§1).
+2. F-Droid 또는 GitHub판 Termux를 설치한다(§2).
+3. `alr` tarball을 `$PREFIX`에 푼다(§3).
+4. `alr-doctor`로 기기를 진단한다(§4).
+5. `alr install --with git`으로 게스트를 받는다(§6).
+6. `alr run`·`alr shell`로 쓴다(§7).
 
 ## 1. 기기 요구사항
 
 | 항목 | 요구 | 확인 방법 |
 |---|---|---|
 | CPU | **arm64 (aarch64)** 전용 | `uname -m` 이 `aarch64` |
-| Android | **16, 17.** 12~15 는 **지원하지 않는다** — 미검증이 아니라 범위 밖이다 ([ADR 0007](adr/0007-android-16-only.md)) | 설정 → 휴대전화 정보 |
+| Android | **16, 17.** 12~15는 지원하지 않는다. 미검증이 아니라 범위 밖이다([ADR 0007](adr/0007-android-16-only.md)) | 설정 → 휴대전화 정보 |
 | Termux | **F-Droid 또는 GitHub 릴리스 빌드** (`targetSdkVersion=28`) | §2 |
-| 루팅 | 불필요. **루팅했다면 오히려 검증 대상이 아니다** | §5 |
-| 저장 공간 | ubuntu-base tarball 약 30 MB + 추출 후 rootfs. `git`까지 넣으면 수백 MB | |
+| 루팅 | 필요 없다. 루팅한 기기는 검증 대상이 아니다 | §5 |
+| 저장 공간 | ubuntu-base tarball 약 30 MB와 추출한 rootfs. `git`·`node`까지 넣으면 수백 MB | |
+| 네트워크 | `alr install`이 `cdimage.ubuntu.com`과 Ubuntu 아카이브에 접속한다 | |
 
-x86 에뮬레이션(box64/FEX)은 비목표다. arm64 네이티브만 돌린다.
+x86 에뮬레이션(box64/FEX)은 비목표다. arm64 바이너리만 실행한다.
 
-## 2. Termux — F-Droid/GitHub 빌드여야 한다 (Play Store 빌드 아님)
+## 2. Termux — F-Droid/GitHub판이어야 한다 (Play Store판 아님)
 
-Termux는 **서로 다른 두 코드베이스**로 배포된다. `alr`은 그중 하나에서만 동작한다.
+Termux는 서로 다른 두 코드베이스로 배포된다. `alr`은 그중 하나에서만 동작한다.
 
 | | F-Droid / GitHub (`termux/termux-app`) | Play Store (`termux/termux-apps`) |
 |---|---|---|
 | `targetSdkVersion` | **28** | 37 |
 | SELinux 도메인 | `untrusted_app_27` | `untrusted_app` |
-| 앱 데이터 경로 execve | **허용** | **거부** |
-| `alr` 지원 | ✅ | ❌ (v1 미지원) |
+| 앱 데이터 경로의 ELF execve | **허용** | **거부** |
+| `alr` 지원 | ✅ | ❌ |
 
-받는 곳:
+받는 곳은 둘 중 하나다.
 
-- F-Droid 앱 스토어의 Termux, 또는
-- <https://github.com/termux/termux-app/releases>
+- F-Droid 앱 스토어의 Termux
+- <https://github.com/termux/termux-app/releases> 의 `arm64-v8a` APK
 
-**Play Store 빌드를 지원하지 않는 이유**는 정책이 아니라 원리다 ([ADR 0005](adr/0005-play-store-unsupported.md)).
-targetSdk ≥ 29인 앱은 SELinux `untrusted_app` 도메인을 받고, 이 도메인은 앱 데이터 경로의 실행 파일에 대한
-`execute_no_trans` 권한이 없다. Play 빌드의 termux-exec는 `/system/bin/linker64`를 대신 실행시키는 우회를 쓰는데,
-**그건 bionic 링커라 glibc 프로그램을 로드할 수 없다.** `alr`의 게스트는 전부 glibc다.
+Play Store판을 지원하지 않는 이유는 정책이 아니라 원리다([ADR 0005](adr/0005-play-store-unsupported.md)).
+targetSdk 29 이상인 앱은 SELinux `untrusted_app` 도메인을 받는다. 이 도메인에는 앱 데이터 경로에 있는 실행 파일의
+`execute_no_trans` 권한이 없다. Play판 termux-exec는 `/system/bin/linker64`를 대신 실행하는 우회를 쓰지만,
+그 링커는 bionic 링커라서 glibc 프로그램을 로드할 수 없다. `alr`의 게스트는 모두 glibc다.
 
-Play 빌드에 깔았을 때 나올 신호는 `alr-doctor`의 P3 프로브일 것이다. **Play 빌드가 `targetSdk=37` 을 싣는다는 전제는 이제 실측됐지만**([M19 §3](evidence/2026-08-03-m19-snapdragon.md)), **거기서 `alr` 이 실패하는 것까지 잰 것은 아니다** — GitHub 빌드를 설치하려면 서명이 달라 Play 빌드를 먼저 지워야 했다. 앱 데이터 경로의 ELF를
-execve 해 보고 실패하면 이렇게 말한다:
+> ⚠️ `sharedUserId` 때문에 한 기기의 모든 Termux APK(본체, Termux:API, Termux:Widget 등)는 한 출처에서 와야 한다.
+> F-Droid판과 Play판을 섞어 설치하면 설치가 거부된다. 이미 Play판을 쓰고 있었다면 모두 지운 뒤 F-Droid/GitHub판으로 다시 설치한다.
 
-```
-[P3 ] execve of app-private ELF (…) FAILED (Permission denied) -> FATAL
-      This host cannot run guest binaries at all.  Either it is
-      a targetSdk>=29 build (Play Store Termux, unsupported — see ADR 0005)
-      or Android policy changed.
-```
-
-> `alr` 본체가 Play 빌드를 시작 시점에 감지해 [ADR 0005](adr/0005-play-store-unsupported.md)의 전용 메시지
-> (`reason=unsupported-android-policy`)로 거부하는 것은 **아직 구현되어 있지 않다 (UNVERIFIED / 미구현).**
-> 그때까지는 설치 전에 `alr-doctor`를 먼저 돌리는 것이 Play 빌드를 알아채는 방법이다.
-
-> ⚠️ `sharedUserId` 때문에 **한 기기의 모든 Termux APK(앱 본체, Termux:API, Termux:Widget …)는 한 출처에서 와야 한다.**
-> F-Droid판과 Play판을 섞어 깔면 설치 자체가 거부된다. 이미 Play판을 쓰고 있었다면 전부 지운 뒤 F-Droid/GitHub판으로 다시 깐다.
-
-### 2.1 Google Play Protect가 이 설치를 막는다 — 기기에서 직접 눌러야 한다
+### 2.1 Google Play Protect 대화상자 — 기기에서 직접 눌러야 한다
 
 GMS가 있는 기기에서 F-Droid/GitHub판 Termux를 설치하면 아래 대화상자가 뜬다
-(2026-08-02, SM-X236N / Android 16에서 실측 — [RISKS.md R2b](RISKS.md)):
+(2026-08-02, SM-X236N / Android 16에서 실측, [RISKS.md R2b](RISKS.md)).
 
 ```
 Google Play 프로텍트
@@ -71,76 +66,116 @@ Google Play 프로텍트
 [세부정보 더보기]  [확인]
 ```
 
-`targetSdk 28`이라서 나오는 경고다. 여기서 **누르는 버튼을 틀리면 설치가 취소된다**:
+`targetSdk 28` 때문에 나오는 경고다. 누르는 버튼을 틀리면 설치가 취소된다.
 
-- ❌ **`확인`을 누르면 설치가 취소된다.** "확인"이라는 이름과 달리 진행이 아니라 중단이다.
-- ✅ **`세부정보 더보기` → `무시하고 설치`** 를 눌러야 설치가 진행된다.
+- ❌ **`확인`을 누르면 설치가 취소된다.** 이름과 달리 진행이 아니라 중단이다.
+- ✅ **`세부정보 더보기` → `무시하고 설치`**를 눌러야 설치가 진행된다.
 
-`adb install`로 넣는 경우 명령은 이 대화상자를 기다리며 멈춰 있다가, 기기에서 승인하면 완료된다.
-설치 확인:
+`adb install`로 설치하면 명령이 이 대화상자를 기다리며 멈춰 있다가, 기기에서 승인하면 끝난다. 설치를 확인하는 방법은 다음과 같다.
 
 ```bash
-adb shell pm path com.termux    # 비어 있으면 아직 미설치
+adb shell pm path com.termux    # 비어 있으면 아직 설치되지 않았다
 ```
 
-> 이건 `alr`이 고칠 수 있는 문제가 아니다. Termux 앱의 `targetSdk`에 달려 있고, 그 값이 낮은 것이
-> 바로 `alr`이 동작하는 이유다.
->
-> Play Protect 검증을 꺼서 우회하는 방법이 있지만 그건 **기기 보안 설정 변경**이므로 여기서 권하지 않는다.
-> 필요하다면 트레이드오프를 이해한 상태에서 사용자가 직접 판단할 일이다.
+> 이 경고는 `alr`이 고칠 수 없다. Termux 앱의 `targetSdk`에 달려 있고, 그 값이 낮은 것이 바로 `alr`이 동작하는 이유다.
+> Play Protect 검증을 꺼서 우회하는 방법도 있지만, 기기 보안 설정을 바꾸는 일이라 여기서 권하지 않는다.
+
+설치한 뒤 Termux를 한 번 실행해서 부트스트랩이 풀리기를 기다린다(수십 초). 프롬프트가 뜨면 다음으로 넘어간다.
 
 ## 3. `alr` 설치
 
-Termux를 한 번 실행해 부트스트랩이 풀리기를 기다린 뒤, 릴리스 tarball을 `$PREFIX`에 푼다.
-
-```bash
-# Termux 안에서. 인증 없이 그대로 동작한다 (익명 curl 로 검증).
-pkg install -y curl tar
-V=0.5.0        # src/common/alr_version.h 의 ALR_VERSION 과 같아야 한다
-curl -fsSLO https://github.com/Meapri/alr-termux/releases/download/v$V/alr-$V-aarch64.tar.gz
-tar -C "$PREFIX" -xzf alr-$V-aarch64.tar.gz
-alr version
-```
-
-tarball 안의 배치는 그대로 `$PREFIX` 아래에 대응된다:
+`alr`은 tarball 하나로 배포된다. 안의 배치는 `$PREFIX` 아래에 그대로 대응한다.
 
 ```
-bin/alr                       -> $PREFIX/bin/alr
-bin/alr-doctor                -> $PREFIX/bin/alr-doctor
-share/alr/libalr_preload.so   -> $PREFIX/share/alr/libalr_preload.so
-share/alr/manifest.json       -> $PREFIX/share/alr/manifest.json
+bin/alr                       -> $PREFIX/bin/alr              호스트 CLI (bionic, 정적)
+bin/alr-doctor                -> $PREFIX/bin/alr-doctor       기기 진단
+libexec/alr/alr-lane          -> $PREFIX/libexec/alr/alr-lane 정적·Go 게스트용 레인 (ADR 0010)
+share/alr/libalr_preload.so   -> $PREFIX/share/alr/...        게스트 경로 가상화 (glibc)
+share/alr/manifest.json       -> $PREFIX/share/alr/...        preload 빌드 정보
+share/alr/LICENSE.tawcroot    -> $PREFIX/share/alr/...        alr-lane의 MIT 고지
 LICENSE
 README.md
 ```
 
-`libalr_preload.so`는 **게스트가 경로 가상화를 받는 유일한 수단**이다. `alr`은 이것을 바이너리 옆에서 먼저 찾고,
-다음으로 바이너리 기준 `../share/alr/`, 마지막으로 `$PREFIX/share/alr/`에서 찾는다. 그래서 tarball을 `$PREFIX`가 아닌
-곳에 풀어도 그 안의 `bin/alr`은 같은 tarball의 preload와 `libexec/alr/alr-lane`을 쓴다. 모두 없으면 경고를 내고 계속 진행하지만, 그 게스트는 rootfs가 아니라
-Android 파일시스템을 보게 된다 — 즉 정상 동작이 아니다.
+> ⚠️ **공개 릴리스와 이 문서의 차이.** GitHub의 공개 릴리스 [`v0.5.0`](https://github.com/Meapri/alr-termux/releases/tag/v0.5.0)은
+> 2026-08-03에 나온 것이다. 그 tarball에는 `libexec/alr/alr-lane`이 없고, 기본 게스트도 `ubuntu-24.04`다.
+> 그래서 정적·Go 바이너리(codex, Go 툴체인, busybox-static)는 경로 가상화 없이 돌고, 24.04는 지금 지원하지 않는다.
+> 이 문서가 설명하는 동작을 쓰려면 §3.1처럼 저장소에서 tarball을 직접 빌드한다.
+> 두 tarball은 `alr version`이 똑같이 `alr 0.5.0`을 출력하므로, `$PREFIX/libexec/alr/alr-lane`이 있는지로 구별한다.
 
-`alr version`은 버전, preload 경로, preload의 `sha256`, rootfs 경로를 출력한다.
-`alr version` 이 **두 줄**을 낸다 — `preload (host)` 와 `preload (guest)`. **둘의 sha256 이 같아야 한다.**
+### 3.1 저장소에서 빌드해서 설치 (현재 권장)
+
+빌드는 macOS 또는 Linux 호스트에서 한다. 필요한 도구는 다음과 같다.
+
+- Android NDK. `NDK` 환경 변수로 경로를 준다. r27.2(`27.2.12479018`)로 빌드를 확인했다.
+- zig **0.16.0**. 게스트 preload를 빌드한다. 다른 버전이면 `scripts/build-preload.sh`가 멈춘다.
+
+```bash
+cd runtime/alr
+ZIG=/path/to/zig-0.16.0/zig scripts/build-preload.sh          # build/libalr_preload.so
+NDK=/path/to/android-ndk ZIG=/path/to/zig-0.16.0/zig scripts/make-release.sh
+# -> dist/alr-0.5.0-aarch64.tar.gz 와 dist/SHA256SUMS
+```
+
+`make-release.sh`는 구성 요소가 하나라도 없으면 아무것도 쓰지 않고 멈춘다. 만든 tarball을 기기로 옮긴다.
+
+```bash
+adb push dist/alr-0.5.0-aarch64.tar.gz /sdcard/Download/
+```
+
+Termux 안에서 `$PREFIX`에 푼다. `/sdcard`를 읽으려면 먼저 `termux-setup-storage`로 저장소 권한을 준다.
+
+```bash
+termux-setup-storage                      # 처음 한 번, 권한 대화상자에서 허용
+tar -C "$PREFIX" -xzf ~/storage/downloads/alr-0.5.0-aarch64.tar.gz
+ls "$PREFIX/libexec/alr/alr-lane"         # 있어야 한다
+alr version
+```
+
+### 3.2 공개 릴리스 v0.5.0 설치
+
+위의 차이를 알고 쓰는 경우에만 고른다. 인증 없이 받을 수 있다.
+
+```bash
+pkg install -y curl tar
+V=0.5.0
+curl -fsSLO https://github.com/Meapri/alr-termux/releases/download/v$V/alr-$V-aarch64.tar.gz
+curl -fsSLO https://github.com/Meapri/alr-termux/releases/download/v$V/SHA256SUMS
+sha256sum -c SHA256SUMS
+tar -C "$PREFIX" -xzf alr-$V-aarch64.tar.gz
+alr version
+```
+
+### 3.3 tarball을 `$PREFIX`가 아닌 곳에 풀 때
+
+`alr`은 구성 요소를 다음 순서로 찾는다.
+
+1. 바이너리 옆
+2. 바이너리 기준 `../share/alr/`, `../libexec/alr/`
+3. `$PREFIX/share/alr/`, `$PREFIX/libexec/alr/`
+
+그래서 `~/alr` 같은 곳에 풀어도 그 안의 `bin/alr`은 같은 tarball의 preload와 `alr-lane`을 쓴다. 이 조회는 2026-10-11 이후 빌드에 있다.
+preload를 찾지 못하면 `alr`은 경고를 내고 진행하지만, 그 게스트는 rootfs가 아니라 Android 파일시스템을 본다. 정상 동작이 아니다.
+
+### 3.4 업그레이드 확인
+
+`alr version`은 preload를 두 줄로 보여 준다. `preload (host)`와 `preload (guest)`의 sha256이 같아야 한다.
 
 ```
 preload (host)  .../share/alr/libalr_preload.so
   sha256       16167c4e...
-preload (guest) .../ubuntu-24.04/usr/lib/alr/libalr_preload.so
+preload (guest) .../ubuntu-26.04/usr/lib/alr/libalr_preload.so
   sha256       16167c4e...      ← 같아야 한다
 ```
 
-다르면 `alr` 은 업그레이드됐는데 **게스트는 옛 preload 를 계속 로드**하고 있는 것이다. `alr version` 이 `reason=preload-stale` 로 알려 주고 exit 1 을 낸다:
+새 tarball을 `$PREFIX`에 풀어도 rootfs 안의 사본은 바뀌지 않는다. 두 값이 다르면 `alr version`이 `reason=preload-stale`을 내고 exit 1로 끝난다. 그때 다음을 실행한다.
 
 ```bash
 alr update-components
 ```
 
-> ⚠️ **이전 판의 검증 절차는 동어반복이었다.** `share/alr/manifest.json` 의 `output_sha256` 을 `alr version` 과 비교하라고 했는데, **양쪽 다 `$PREFIX` 를 읽는다.** 게스트가 로드하는 사본은 rootfs 안에 따로 있고, 그것이 어긋나는 것이 실제로 일어나는 사고다 — 문서가 시키는 업그레이드(`$PREFIX` 에 새 tarball 풀기)가 rootfs 안 사본을 건드리지 않기 때문이다.
-
-> ⚠️ **소스에서 재빌드해 해시를 대조하려면 릴리스와 같은 호스트 OS 가 필요하다** — `MEASURED` 2026-08-03.
-> 같은 소스·같은 zig 0.16.0 이 macOS 에서 `b30dd81e…`, 릴리스 러너(Linux)에서 `16167c4e…` 를 낸다.
-> 각 호스트 안에서는 콜드 캐시 재빌드가 바이트 단위로 동일하다. 즉 이 저장소가 게이트하는 재현성은
-> **"내 재빌드가 내 재빌드와 같다"** 이고, 다른 OS 에서 해시가 다른 것은 정상이며 변조의 증거가 아니다.
-> 위의 manifest ↔ `alr version` 대조는 **배포된 바이트 자체를 보는 것**이라 이 문제와 무관하게 유효하다.
+> 소스에서 다시 빌드해 해시를 대조하려면 릴리스와 같은 호스트 OS가 필요하다(2026-08-03 측정).
+> 같은 소스와 zig 0.16.0이 macOS와 Linux에서 다른 해시를 낸다. 다른 OS에서 해시가 다른 것은 정상이며 변조의 증거가 아니다.
 
 ## 4. `alr-doctor` — 첫 실행에 한 번
 
@@ -148,67 +183,78 @@ alr update-components
 alr-doctor
 ```
 
-이 기기의 seccomp/SELinux 능력을 훑고, 마지막에 SIGSYS 에뮬레이션 테이블을 C 소스로 출력한다.
-**반드시 Termux 터미널 세션 안에서 직접 실행한다.**
+이 기기의 seccomp·SELinux 능력을 훑는다. **반드시 Termux 터미널 세션 안에서 직접 실행한다.**
 
-`adb shell`이나 `run-as com.termux`로 돌리면 안 된다. Android의 앱 seccomp 필터는 **zygote가 uid ≥ 10000인 앱을
-fork할 때만** 설치되기 때문이다:
+`adb shell`이나 `run-as com.termux`로 실행하면 안 된다. Android의 앱 seccomp 필터는 zygote가 uid 10000 이상인 앱을 fork할 때만 설치되기 때문이다.
 
 | 컨텍스트 | uid | Seccomp | 진단이 유효한가 |
 |---|---|---|---|
 | `adb shell` | 2000 (shell) | **0** | ❌ 모든 syscall이 허용으로 보인다 |
 | `run-as com.termux` | 앱 uid | **0** | ❌ 같은 함정 |
-| **Termux 세션 (또는 그 자식)** | 앱 uid | **2** | ✅ 유일하게 유효 |
+| **Termux 세션 (또는 그 자식)** | 앱 uid | **2** | ✅ 유일하게 유효하다 |
 
-`alr-doctor`의 P1 프로브가 이걸 감지해서, 필터가 없는 컨텍스트면 **진단을 중단한다.** 잘못된 안심을 주느니
-아무 답도 주지 않는 쪽을 택한 것이다.
+`alr-doctor`의 P1 프로브가 필터 없는 컨텍스트를 감지하면 진단을 멈춘다.
 
-## 5. 루팅된 기기 / permissive 기기는 유효한 테스트 대상이 아니다
+Play Store판 Termux에서 실행하면 P3 프로브가 앱 데이터 경로의 ELF를 실행하지 못해 FATAL로 끝난다.
 
-[00-product.md §6.6](00-product.md)의 정직성 규칙이다.
+```
+[P3 ] execve of app-private ELF (…) FAILED (Permission denied) -> FATAL
+```
 
-`getenforce`가 `Permissive`인 기기(대부분의 루팅/커스텀 ROM)에서는 **zygote seccomp 필터가 아예 설치되지 않는다.**
-그러면 `alr`이 존재하는 이유인 문제들 — `set_robust_list`가 SIGSYS로 죽는 것, `NETLINK_AUDIT`이 거부되는 것 —
-이 전부 사라진 것처럼 보인다. "잘 되는데요"라는 결과가 나오지만 그 결과는 다른 기기에 대해 아무것도 말해주지 않는다.
+`alr` 본체가 Play판을 시작 시점에 감지해 거부하는 기능은 아직 없다. 그래서 설치 전에 `alr-doctor`를 먼저 실행해 보는 것이 Play판을 알아채는 방법이다.
 
-유효한 증거의 조건은 두 가지다:
+## 5. 루팅된 기기와 permissive 기기
+
+`getenforce`가 `Permissive`인 기기(대부분의 루팅·커스텀 ROM)에서는 zygote seccomp 필터가 설치되지 않는다.
+그러면 `alr`이 해결하려는 문제들이 사라진 것처럼 보이고, 그 기기에서 얻은 결과는 다른 기기에 대해 아무것도 말해 주지 않는다.
+루팅된 기기에서 `alr`을 쓰는 것은 막지 않는다. 다만 버그 리포트나 성능 수치의 근거로 쓸 때는 아래 두 조건을 확인한다.
 
 ```bash
 getenforce                        # Enforcing 이어야 한다
 grep Seccomp /proc/self/status    # Seccomp: 2 이어야 한다
 ```
 
-루팅된 기기에서 `alr`을 **쓰는 것**은 막지 않는다. 다만 거기서 나온 결과를 버그 리포트나 성능 수치의 근거로
-보내지는 말아 달라 — 우리 쪽에서 재현할 방법이 없다.
-
-## 6. 게스트 프로비저닝
+## 6. 게스트 설치
 
 ```bash
-alr install                       # 기본값: 최신 LTS (현재 ubuntu-26.04)
-alr install --with git,node       # 설치 직후 패키지까지
+alr install --with git            # Ubuntu 26.04 rootfs와 git
+alr install --with git,node       # node·npm까지
 ```
 
-`--url`은 필요 없다. `alr install`이 `cdimage.ubuntu.com`의 `SHA256SUMS`를 받아 **현재 포인트 릴리스를 스스로
-찾아내고**(`ubuntu-base-24.04-base-arm64.tar.gz`라는 이름은 존재하지 않는다 — 404다), 같은 파일에 적힌 해시로
-내려받은 tarball을 **검증한다.** 해시가 맞지 않으면(캐시된 옛 tarball이 흔한 경우다) 다시 받는다.
-오프라인·미러 환경을 위해 `--url <tarball>`은 그대로 남아 있다.
+> **`--with git` 없이 시작하지 않는다.** ubuntu-base는 최소 이미지라 git이 없다.
+> 그냥 `alr install` 한 뒤 `alr run git status`를 실행하면 `reason=boot-enoent`로 끝난다.
 
-`SHA256SUMS`에 닿지 못하면 `reason=discovery-failed`로 멈추고 `--url`을 요구한다. 해시 없이 받는 폴백은 없다.
+`alr install`은 `cdimage.ubuntu.com`의 `SHA256SUMS`를 받아 현재 포인트 릴리스를 스스로 찾고, 같은 파일의 해시로 tarball을 검증한다.
+`SHA256SUMS`에 닿지 못하면 `reason=discovery-failed`로 멈춘다. 해시 없이 받는 폴백은 없다.
+오프라인이나 미러 환경에서는 `--url <tarball>`로 tarball을 직접 준다.
 
-**지원하는 게스트는 Ubuntu 26.04 LTS 하나다**([ADR 0005](../../../docs/adr/0005-termux-first-goals.md)).
-24.04는 더 이상 지원하지 않는다. 이미 설치된 24.04 트리는 `-d ubuntu-24.04`로 이름을 주면 실행되지만 검증하지 않으며,
-배포판을 지정하지 않은 명령은 항상 `ubuntu-26.04`를 쓴다. 24.04만 있는 기기는 `alr install`로 26.04를 받는다.
+지원하는 게스트는 **Ubuntu 26.04 LTS 하나**다([ADR 0005](../../../docs/adr/0005-termux-first-goals.md)).
+배포판을 지정하지 않은 명령은 항상 `ubuntu-26.04`를 쓴다. 이미 설치된 24.04 트리는 `-d ubuntu-24.04`로 이름을 주면 실행되지만 검증하지 않는다.
+
+`--with codex`는 codex의 Rust 바이너리 릴리스를 받는다. codex는 정적 바이너리라 레인(`alr-lane`)에서 rootfs를 본다(§3.1 tarball 필요).
 
 ## 7. 사용
 
 ```bash
-alr run git status          # 게스트에서 명령 하나
-alr shell                   # 게스트 bash 진입
-alr version                 # 버전 / preload 경로 / preload sha256 / rootfs 경로
+alr run git status              # 게스트에서 명령 하나
+alr run -w /root uname -a       # 게스트 cwd 지정
+alr shell                       # 게스트 bash
+alr run --fakeroot apt-get update
+alr run --fakeroot apt-get install -y build-essential
+alr list                        # 설치된 rootfs와 preload 상태
+alr version                     # 버전, preload 경로·sha256, rootfs 경로
 ```
 
-`ALR_LOG=1`을 붙이면 실행 끝에 슈퍼바이저 통계가 나온다. 정상이라면 `path_traps=0 syscall_stops=0`이다 —
-경로 syscall에 ptrace를 걸지 않는다는 것이 PRoot와의 결정적 차이이고, 이 줄이 그것을 매 실행 확인해 준다.
+명령마다 바이너리 종류에 따라 실행 경로가 정해진다.
+
+- **동적 glibc 바이너리**(bash, git, python3, node 등)는 `LD_PRELOAD` 경로 가상화로 돈다.
+- **정적 바이너리와 Go 바이너리**(codex, Go 툴체인, busybox-static)는 `alr-lane`에서 돈다([ADR 0010](adr/0010-tawcroot-lane.md)).
+  `ALR_LANE=0`이면 레인을 끄고 예전처럼 경로 가상화 없이 실행한다.
+
+apt·dpkg는 uid 0을 요구한다. `alr`은 uid 0 흉내(fakeroot)를 기본으로 켜지 않으므로, 패키지를 설치할 때는 `--fakeroot`를 붙인다. 늘 켜 두려면 `alr config set runtime.fakeroot true`를 쓴다.
+
+`ALR_LOG=1`을 붙이면 실행 끝에 슈퍼바이저 통계가 나온다. 정상이면 `path_traps=0 syscall_stops=0`이다.
+경로 syscall에 ptrace를 걸지 않는다는 것이 PRoot와의 결정적 차이이고, 이 줄이 실행마다 그것을 확인해 준다.
 
 ```bash
 ALR_LOG=1 alr run /bin/true
@@ -217,26 +263,30 @@ ALR_LOG=1 alr run /bin/true
 
 ## 8. 알려진 제약
 
-설치 전에 알고 있어야 하는 것들이다. 전체 목록은 [RISKS.md §4](RISKS.md).
+전체 목록은 [RISKS.md §4](RISKS.md)에 있다.
 
-- **Go로 컴파일된 게스트 바이너리**(`gh`, docker CLI, hugo 등)는 동작하지 않는다. Go는 libc를 우회해 raw `svc`를
-  발행하므로 `LD_PRELOAD` 인터포저가 원리적으로 잡을 수 없다. (rootfs를 훑어 이런 바이너리를 미리 알려주는
-  `alr-doctor` 프로브는 계획만 있고 **아직 없다** — 지금은 실행해 보고 알게 된다.)
-- **`sudo`/setuid는 동작하지 않는다.** `/data`는 `nosuid`이고 setuid 계열은 seccomp로 막혀 있다.
-- **systemd/init/서비스 관리는 없다.** 데몬을 띄우는 패키지는 설치는 되지만 서비스로 뜨지 않는다.
-- **GUI/X11/GPU는 비목표다.** CLI 전용이다.
-- **`alr`은 샌드박스가 아니다.** 경로 재작성은 편의이지 방어 경계가 아니다.
-- Android 12+ 의 phantom process 제한(기본 32) 때문에, 앱이 백그라운드일 때 게스트 프로세스가 회수될 수 있다.
+- **`sudo`와 setuid는 동작하지 않는다.** `/data`는 `nosuid`이고, setuid 계열은 seccomp가 막는다. apt·dpkg처럼 uid 0을 요구하는 명령에는 `--fakeroot`를 붙인다(§7). 기본값은 꺼져 있다.
+- **systemd와 서비스 관리는 없다.** 데몬을 띄우는 패키지는 설치되지만 서비스로 뜨지 않는다.
+- **`/dev/full`은 열 수 없다.** Android sepolicy가 모든 앱에 막는다. Termux 네이티브 셸에서도 똑같이 `Permission denied`다.
+- **레인 프로세스의 `/proc/<pid>/status`** 에는 `SigCgt`에 SIGSEGV·SIGBUS(그리고 SIGSYS)가 잡힌 것으로 보인다. 게스트가 설정한 핸들러는 그대로 동작한다([ADR 0010](adr/0010-tawcroot-lane.md) 결정 7).
+- **경로 syscall만 반복하는 레인 워크로드**(정적 busybox의 `find`, `ls -lR`)는 `ALR_LANE=0` 대비 1.08~1.21배로, 성능 예산 경계에 있다([증거](evidence/2026-10-11-t5-lane-cost.md)).
+- **GUI·X11·GPU는 이 CLI의 범위가 아니다.**
+- **`alr`은 샌드박스가 아니다.** 경로 재작성은 편의 기능이지 보안 경계가 아니다.
+- Android 12 이상의 phantom process 제한(기본 32개) 때문에, Termux가 백그라운드에 있을 때 게스트 프로세스가 회수될 수 있다.
 
 ## 9. 문제가 생기면
 
 | 증상 | 확인할 것 |
 |---|---|
-| `alr-doctor` P3 가 FATAL | Play Store 빌드 Termux일 가능성이 높다. §2대로 F-Droid/GitHub판으로 교체 (`alr` 자신이 `reason=unsupported-android-policy` 로 거부하는 것은 **미구현** — §2 참조) |
-| `alr: WARNING libalr_preload.so not found` | tarball을 `$PREFIX`가 아닌 곳에 풀었다. §3 |
+| `alr-doctor` P3가 FATAL | Play Store판 Termux일 가능성이 높다. §2대로 F-Droid/GitHub판으로 바꾼다 |
+| `alr: WARNING libalr_preload.so not found` | tarball을 풀지 않았거나 일부만 풀었다. §3 |
 | 게스트가 Android 파일시스템을 본다 | 위와 같은 원인 |
-| `alr-doctor`가 진단을 중단한다 | `adb shell`/`run-as`에서 돌렸다. Termux 터미널에서 직접 실행 (§4) |
-| 다운로드가 404 | `SHA256SUMS` 발견에 실패해 폴백 핀으로 갔다. 네트워크 확인 후 재시도 (§6) |
+| `go build`가 `mkdir /tmp/go-build…: permission denied` | `alr-lane`이 없는 tarball(공개 v0.5.0)이다. §3.1 |
+| codex가 `could not create PATH aliases: Read-only file system` | 위와 같은 원인 |
+| `alr version`이 `reason=preload-stale` | 업그레이드 뒤 rootfs 안 preload가 옛 것이다. `alr update-components` (§3.4) |
+| `alr-doctor`가 진단을 멈춘다 | `adb shell`이나 `run-as`에서 실행했다. Termux 터미널에서 직접 실행한다 (§4) |
+| `alr install`이 `reason=discovery-failed` | `SHA256SUMS`에 닿지 못했다. 네트워크를 확인하거나 `--url`을 준다 (§6) |
+| `alr run git status`가 `reason=boot-enoent` | git이 없는 rootfs다. `alr run --fakeroot apt-get install -y git` (§6) |
 
 버그 리포트에는 `alr version` 전체 출력과 `alr-doctor`의 totals 줄을 함께 넣어 달라.
-루팅/permissive 기기에서 나온 결과라면 §5를 먼저 읽어 주기 바란다.
+루팅되었거나 permissive인 기기에서 나온 결과라면 §5를 먼저 읽어 주기 바란다.
