@@ -131,3 +131,17 @@ mknodat(-1, path, S_IFDIR, 0): rc=-1 errno=1 (EPERM, also for a bad pointer: ref
 mknodat 343 ns / 362 ns
 pvm_readv 272 ns / 288 ns   (process_vm_readv of 28 bytes from self)
 getppid 110 ns / 108 ns
+
+== 10. exact SigCgt measured: no SIGSEGV/SIGBUS ownership (process_vm_readv copies) vs direct copies
+# direct = 094501b release; pvm = 094501b with tawcroot_alr_fault_init returning before arming (experiment, not committed)
+# SigCgt seen by a lane busybox sh (pvm, then direct):
+SigCgt:	0000000040000000
+SigCgt:	0000000040000440
+SigCgt:	0000000040000000
+SigCgt:	0000000040000440
+base find                          median   255.3 ms  x1.00  (paired x1.00)
+direct find                        median   308.5 ms  x1.21  (paired x1.21)
+pvm find                           median   352.0 ms  x1.38  (paired x1.38)
+base ls                            median   257.1 ms  x1.00  (paired x1.00)
+direct ls                          median   308.5 ms  x1.20  (paired x1.19)
+pvm ls                             median   353.7 ms  x1.38  (paired x1.38)
