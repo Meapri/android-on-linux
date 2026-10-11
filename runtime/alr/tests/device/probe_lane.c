@@ -138,6 +138,22 @@ int main(int argc, char **argv)
 	    st.st_ino == ino_of("/"), "fd %d", prt);
 
 	/* --- the lane's own fds ------------------------------------------ */
+	int lo = dup(0);
+	close(lo);
+	int pd = open("/proc/self/fd", O_RDONLY | O_DIRECTORY);
+	res("LANE PROC FD DIR LOWEST FD", pd == lo, "got %d, lowest free %d", pd, lo);
+	if (pd >= 0) close(pd);
+	/* The number keeps trapping after that directory is gone; another
+	 * directory read there must list as the kernel wrote it. */
+	int ed = open("/etc", O_RDONLY | O_DIRECTORY);
+	DIR *edir = ed >= 0 ? fdopendir(ed) : NULL;
+	int has_host = 0;
+	struct dirent *ee;
+	while (edir && (ee = readdir(edir)))
+		if (!strcmp(ee->d_name, "hostname")) has_host = 1;
+	if (edir) closedir(edir);
+	res("LANE DIR AT PROC FD DIR NUMBER", ed == lo && has_host,
+	    "fd %d, hostname listed %d", ed, has_host);
 	int seen = 0;
 	DIR *d = opendir("/proc/self/fd");
 	struct dirent *e;

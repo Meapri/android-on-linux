@@ -15,9 +15,10 @@
 #ifdef TAWCROOT_ALR
 extern int tawcroot_alr_fakeroot;
 
-/* Opened /proc/<pid>/fd directories are moved to fds at or above this,
- * below TAWCROOT_RESERVED_FD_BASE, and getdents64 traps only there
- * (filter_build.c, alr_fast.c). */
+/* getdents64 traps at or above this, below TAWCROOT_RESERVED_FD_BASE
+ * (filter_build.c).  An opened /proc/<pid>/fd directory gets its own
+ * getdents64 filter and keeps its fd; it moves into this band only when
+ * that filter cannot be added (alr_fast.c). */
 #define TAWCROOT_ALR_PROCFD_BAND 900
 long tawcroot_alr_procfd_place(long fd, int flags);
 

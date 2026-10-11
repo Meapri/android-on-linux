@@ -33,11 +33,14 @@
 #include <stdint.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
 
 #include "alr_mode.h"
 #include "dirent_filter.h"
 #include "errno_neg.h"
 #include "fdtab.h"
+#include "filter_build.h"
 #include "identity.h"
 #include "io.h"
 #include "linkstore.h"
@@ -261,12 +264,57 @@ int tawcroot_alr_fast_name(int dirfd, const char *name)
 	return 1;
 }
 
-/* A /proc/<pid>/fd directory just opened through a bind: move it into the
- * band where getdents64 still traps, so its listing keeps hiding our
- * reserved fds.  Every other directory is read without a trap.  The
- * guest sees a higher fd number than the lowest free one for exactly
- * these opens.  If the band is full the fd stays where it is and its
- * listing shows our fds. */
+/* fd numbers below the band that already have a getdents64 filter. */
+#define WATCH_MAX 32
+static uint64_t g_watched[TAWCROOT_ALR_PROCFD_BAND / 64 + 1];
+static int g_nwatch;
+extern char tawcroot_raw_syscall_ret[];
+
+/* Make getdents64 on `fd` trap, for this process's threads and its
+ * descendants, by stacking a filter that matches exactly that fd number.
+ * The fd keeps the number the kernel gave it.  The filter outlives the
+ * directory: a later directory at the same number traps too, and the
+ * handler hands its listing back unchanged.  So at most WATCH_MAX numbers
+ * per image get one, and a CLONE_VM child, whose bitmap is its parent's,
+ * installs none. */
+static int watch_fd(long fd)
+{
+	if (fd < 0 || fd >= TAWCROOT_ALR_PROCFD_BAND) return 0;
+	uint64_t bit = 1ULL << (fd % 64);
+	if (__atomic_load_n(&g_watched[fd / 64], __ATOMIC_RELAXED) & bit)
+		return 1;
+	if (TAWC_RAW(TAWC_SYS_getpid, 0, 0, 0, 0, 0, 0) != tawc_self_tgid())
+		return 0;
+	if (__atomic_add_fetch(&g_nwatch, 1, __ATOMIC_RELAXED) > WATCH_MAX)
+		return 0;
+	uint64_t stub = (uint64_t)(uintptr_t)&tawcroot_raw_syscall_ret[0];
+	struct sock_filter prog[] = {
+		/* 0 */ { BPF_LD | BPF_W | BPF_ABS, 0, 0, 0 },
+		/* 1 */ { BPF_JMP | BPF_JEQ | BPF_K, 0, 7, TAWC_SYS_getdents64 },
+		/* 2 */ { BPF_LD | BPF_W | BPF_ABS, 0, 0, 16 },
+		/* 3 */ { BPF_JMP | BPF_JEQ | BPF_K, 0, 5, (uint32_t)fd },
+		/* 4 */ { BPF_LD | BPF_W | BPF_ABS, 0, 0, 8 },
+		/* 5 */ { BPF_JMP | BPF_JEQ | BPF_K, 0, 2, (uint32_t)stub },
+		/* 6 */ { BPF_LD | BPF_W | BPF_ABS, 0, 0, 12 },
+		/* 7 */ { BPF_JMP | BPF_JEQ | BPF_K, 1, 0, (uint32_t)(stub >> 32) },
+		/* 8 */ { BPF_RET | BPF_K, 0, 0, SECCOMP_RET_TRAP | TAWCROOT_TRAP_DATA },
+		/* 9 */ { BPF_RET | BPF_K, 0, 0, SECCOMP_RET_ALLOW },
+	};
+	struct sock_fprog fp = { .len = sizeof prog / sizeof prog[0],
+				 .filter = prog };
+	if (tawc_seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC,
+			 &fp) != 0)
+		return 0;
+	__atomic_fetch_or(&g_watched[fd / 64], bit, __ATOMIC_RELAXED);
+	return 1;
+}
+
+/* A /proc/<pid>/fd directory just opened through a bind: its listing must
+ * keep hiding our reserved fds, so getdents64 on it has to trap.  Every
+ * other directory is read without a trap.  The fd gets its own filter
+ * (watch_fd) and keeps its number; failing that it moves into the band
+ * where getdents64 always traps.  If the band is full too, the fd stays
+ * where it is and its listing shows our fds. */
 long tawcroot_alr_procfd_place(long fd, int flags)
 {
 	if (fd < 0 || (flags & O_PATH) || fd >= TAWCROOT_ALR_PROCFD_BAND)
@@ -281,6 +329,7 @@ long tawcroot_alr_procfd_place(long fd, int flags)
 	if (ln <= 0 || ln >= (long)sizeof link ||
 	    !tawcroot_dirent_filter_is_proc_fd_link(link, ln))
 		return fd;
+	if (watch_fd(fd)) return fd;
 	long nfd = tawc_fcntl((int)fd, (flags & O_CLOEXEC) ? F_DUPFD_CLOEXEC
 							   : F_DUPFD,
 			      TAWCROOT_ALR_PROCFD_BAND);
