@@ -69,7 +69,7 @@ mirror = ""              # 비우면 cdimage.ubuntu.com 사용 (권장)
 
 | 키 | 대응 환경변수 | 내장 기본값 |
 |---|---|---|
-| `default_distro` | `ALR_DISTRO` | 설치된 트리 중 `ubuntu-26.04`, 없으면 `ubuntu-24.04`. `alr install` 은 항상 `ubuntu-26.04` |
+| `default_distro` | `ALR_DISTRO` | `ubuntu-26.04` |
 | `runtime.fakeroot` | `ALR_FAKEROOT` | `false` |
 | `runtime.log` | `ALR_LOG` | `0` |
 | `paths.root` | `ALR_ROOT_DIR` | `$PREFIX/var/lib/alr/distros` |

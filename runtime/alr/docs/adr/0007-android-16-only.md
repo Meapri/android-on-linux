@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (2026-08-03).
+Accepted (2026-08-03). **보론(2026-10-11): Android 17을 지원 목록에 더했다** — 아래 [§보론](#보론-2026-10-11--android-17) 참조.
 
 이 ADR 이전까지 저장소는 Android 12~16 을 "설계 타깃"으로 적고 12~15 를 `미검증`·`PENDING_DEVICE` 로 달아 두었다. 그 표시는 **언젠가 잰다**는 약속이었고, 그 약속을 철회한다.
 
@@ -82,3 +82,14 @@ Accepted (2026-08-03).
 - **Android 17 이 나오면** 이 ADR 을 그대로 다시 적용한다 — 새 릴리스는 자동으로 지원되지 않는다. 참조 기기에서 `alr doctor` 스윕을 돌려 `docs/evidence/sweeps/` 와 diff 하고, 차이가 0이면 지원 목록에 더한다. **diff 가 0이 아니면 표를 그 릴리스용으로 재생성해야 한다.**
 - **다른 OEM 의 Android 16 기기가 우연히 손에 들어오면** 스윕 후 `scripts/diff-sweep.sh`. 계획된 일이 아니다 — 확보 수단이 없어 **증거의 영구적 한계**로 적어 두었다(§Context). diff 가 0이 아니면 그 OEM 에서는 표를 재생성해야 한다는 뜻이다.
 - **Android 16 기기가 흔해지지 않아 사용자가 12~15 를 강하게 요구하면** 비용은 기기 1대 + 스윕 1회다(기술적 장애물은 없다 — 스윕은 구현되어 있고 앱 프로세스 안에서 자족적으로 돈다). 그때는 이 결정이 아니라 **우선순위**를 다시 보는 것이다.
+
+## 보론 (2026-10-11) — Android 17
+
+"다시 볼 조건"의 첫 항목을 그대로 적용했다. Snapdragon 참조 기기(SM-S937N)가 Android 17(SDK 37, 커널 `6.6.127-android15`)로 업그레이드되었고, 그 위에서 `alr doctor` 스윕을 돌렸다.
+
+- 차단 집합: 239개, Android 16의 두 스윕(Snapdragon, MediaTek)과 **diff 0**([sweeps/snapdragon-8elite-android17-k6.6.txt](../evidence/sweeps/snapdragon-8elite-android17-k6.6.txt)).
+- 수용 테스트: Ubuntu 24.04와 26.04 모두 PASS 163, FAIL 2(codex 출력 형식, 릴리스와 무관), `path_traps=0 syscall_stops=0`([T1 증거](../evidence/2026-10-11-t1-ubuntu-2604-android17.md)).
+
+**결정: Android 17을 지원한다.** `alr doctor`의 P0이 16과 17을 지원 릴리스로 본다.
+
+범위는 정확히 이것이다. Android 17은 Snapdragon 한 대에서만 쟀고, MediaTek 기기는 Android 16에 머물러 있다. 이 ADR이 릴리스 축에 대해 세운 원칙(재지 않은 릴리스는 지원한다고 적지 않는다)은 그대로이며, 이번 추가도 그 원칙에 따라 잰 뒤에 했다. Android 18이 나오면 같은 절차를 다시 밟는다.

@@ -4,6 +4,8 @@
 
 Accepted (2026-10-11). 결정 자체는 확정이고, 아래 Phase 계획의 각 항목은 Proposed 상태이며 기기 증거로만 닫는다.
 
+**부분 대체 (2026-10-11)**: D4의 표면 우선순위와 Phase 계획(P1~P4)은 [ADR 0005](0005-termux-first-goals.md)가 대체한다. Termux CLI가 주 제품이 되고, 독립 APK(S1)는 중단하며, GUI는 확장 APK(S3)로만 간다. D1, D3, D5, D8은 유지한다.
+
 기준 시점: HEAD `23dcd51`, `versionName 0.4.163-sd-v163`, `targetSdk 28`.
 
 이 ADR이 바꾸는 것:

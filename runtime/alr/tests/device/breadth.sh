@@ -1,7 +1,9 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Compatibility breadth: docs/07-acceptance.md §5.
 #
-# Installs a curated set of Ubuntu noble packages and smoke-runs each one.
+# Installs a curated set of Ubuntu packages and smoke-runs each one.  The set
+# follows the supported release (26.04): dnsutils and p7zip-full became
+# bind9-dnsutils and 7zip there.
 # The number this produces is the project's headline claim -- alr's case
 # against grun is Ubuntu-archive breadth, not speed -- so it must be honest:
 #
@@ -80,7 +82,7 @@ wget	wget --version
 openssh-client	ssh -V
 netcat-openbsd	sh -c 'nc -h 2>&1 | head -1'
 socat	socat -V
-dnsutils	dig -v
+bind9-dnsutils	dig -v
 iproute2	ip -V
 rsync	rsync --version
 gnupg	gpg --version
@@ -103,7 +105,7 @@ zip	sh -c 'zip -v | head -2 | tail -1'
 xz-utils	xz --version
 zstd	zstd --version
 bzip2	sh -c 'bzip2 --help 2>&1 | head -1'
-p7zip-full	sh -c '7z i | head -2 | tail -1'
+7zip	sh -c '7z i | head -2 | tail -1'
 pandoc	pandoc --version
 bc	sh -c 'echo "2+2" | bc'
 parallel	sh -c 'parallel --version | head -1'

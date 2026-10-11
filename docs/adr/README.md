@@ -15,7 +15,8 @@ This repository keeps decisions in three places. The numbers overlap, so always 
 | [0001](0001-runtime-model.md) | Runtime model | Accepted. Backend order superseded by 0004 |
 | [0002](0002-gpu-public-api.md) | GPU and display path | Accepted |
 | [0003](0003-cpu-syscall-mediation-overhead.md) | CPU syscall mediation overhead | Accepted. Scope limited to the legacy in-process loader by 0004 |
-| [0004](0004-unified-direction.md) | Unified direction | Accepted |
+| [0004](0004-unified-direction.md) | Unified direction | Accepted. Surfaces and phase plan superseded by 0005 |
+| [0005](0005-termux-first-goals.md) | Termux-first goals | Accepted |
 
 ## alr engine ADRs
 

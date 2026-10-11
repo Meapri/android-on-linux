@@ -6,12 +6,13 @@
 
 ## 2. 타깃
 
-- **디바이스**: arm64, **Android 16 전용.** 벤더 2곳에서 검증됐고, 다른 릴리스는 **지원 범위 밖**이다([ADR 0007](adr/0007-android-16-only.md)).
+- **디바이스**: arm64, **Android 16과 17.** 벤더 2곳에서 검증됐고, Android 17은 Snapdragon 참조 기기에서만 쟀다. 다른 릴리스는 **지원 범위 밖**이다([ADR 0007](adr/0007-android-16-only.md) 과 그 보론).
 
 | | 상태 |
 |---|---|
 | MediaTek MT8775, Android 16 (커널 `6.1.145-android14`) | **검증됨** — 수용 164, 폭 96/96 |
 | Qualcomm Snapdragon 8 Elite SM8750, Android 16 (커널 `6.6.98-android15`) | **검증됨** — 폭 96/96, 차단 syscall 집합 동일 ([M19](evidence/2026-08-03-m19-snapdragon.md)) |
+| Qualcomm Snapdragon 8 Elite SM8750, **Android 17** (커널 `6.6.127-android15`) | **검증됨** — 차단 syscall 집합이 Android 16과 동일, 수용 테스트 ([2026-10-11 T1](evidence/2026-10-11-t1-ubuntu-2604-android17.md)) |
 | Android 12 / 13 / 14 / 15 (모든 기기) | **범위 밖 — 지원하지 않는다.** 검증 계획 없음 ([ADR 0007](adr/0007-android-16-only.md)) |
 | 다른 OEM 의 Android 16 | **미측정, 그리고 잴 수단이 없다.** 미지원이라는 뜻이 아니다 — 확인해 주지 못한다는 뜻이다 (아래) |
 
@@ -38,7 +39,7 @@
 >
 > **exec 는 Snapdragon 이 2배 빠르고**(proot 쪽도 함께 오르므로 기기 성능 차이다) **재작성 per-op 은 MediaTek 이 빠르다.** 배수가 MediaTek 에서 더 큰 것은 alr 이 빨라서가 아니라 **proot 가 더 느려서**다. 배수를 인용할 때는 기기를 함께 쓴다.
 - **호스트**: Termux **F-Droid / GitHub 빌드** (`targetSdkVersion=28`). Play Store 빌드는 **v1 미지원** (ADR 0005).
-- **게스트**: Ubuntu 24.04 (noble) arm64, glibc 2.39, `ports.ubuntu.com` 아카이브. Debian bookworm/trixie는 v1.1 목표.
+- **게스트**: **Ubuntu 26.04 LTS** (resolute, glibc 2.43) arm64 하나만 지원한다. `alr install` 과 모든 명령의 기본값이다. 24.04 (noble) 는 2026-10-11 부로 지원하지 않는다([ADR 0005](../../../docs/adr/0005-termux-first-goals.md)). 26.04 의 uutils coreutils 는 설치할 때 이미지에 들어 있는 GNU coreutils 로 재지정한다([ADR 0006](adr/0006-raw-syscall-binaries.md)). Debian bookworm/trixie는 v1.1 목표.
 - **워크로드**: `git`, `node`(및 npm/npx), `bash`, `apt`/`dpkg`, 일반 coreutils/빌드 툴체인.
   `codex` 는 **비목표**다 — 정적 링크라 경로 가상화가 원리적으로 닿지 않는다([ADR 0008](adr/0008-static-guest-binaries-non-goal.md)).
 
