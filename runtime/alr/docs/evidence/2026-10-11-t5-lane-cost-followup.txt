@@ -87,3 +87,13 @@ CLI VERSION HONOURS -d:                PASS
 == 5. other suites with the fix
   13 passed, 0 failed
 ALR BREADTH: install=96/96 run=96/96
+
+== 6. /dev/full, native Termux bash vs guest bash (same device)
+$ echo x > /dev/full; echo "native rc=$?"
+native rc=1
+/data/data/com.termux/files/usr/bin/bash: line 1: /dev/full: Permission denied
+$ ls -lZ /dev/full
+ls: cannot access '/dev/full': Permission denied
+$ alr run /bin/bash -c 'echo x > /dev/full; echo guest rc=$?'
+guest rc=1
+/bin/bash: line 1: /dev/full: Permission denied
