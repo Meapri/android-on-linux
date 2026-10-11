@@ -248,17 +248,11 @@ static const struct alr_config *cfg(void)
  * does not have. */
 static char g_root_dir_for_shims[ALR_PBUF];
 
-/* The release `alr install` provisions when none is named: the newest Ubuntu
- * with a final (non-beta) ubuntu-base image on cdimage. */
+/* The distro every command uses when none is named, and the only release
+ * supported: the latest Ubuntu LTS (docs/adr/0005-termux-first-goals.md in the
+ * parent project).  A tree of an older release still runs when named with -d,
+ * but nothing picks it implicitly. */
 #define ALR_DEFAULT_DISTRO "ubuntu-26.04"
-
-/* Where every other command looks when no distro is named, newest first.  A
- * device provisioned before the default moved still has only the older tree,
- * and `alr run` must keep finding it rather than failing rootfs-missing.  The
- * app resolves its guest the same way (GuestRootfs.PREFERENCE). */
-static const char *const g_distro_preference[] = {
-    ALR_DEFAULT_DISTRO, "ubuntu-24.04", NULL
-};
 
 static void distro_root(char *out, size_t n, const char *distro)
 {
@@ -283,19 +277,6 @@ static int is_dir(const char *p)
 {
     struct stat st;
     return stat(p, &st) == 0 && S_ISDIR(st.st_mode);
-}
-
-/* The first installed tree in g_distro_preference, or ALR_DEFAULT_DISTRO when
- * none is installed (so the error names the release `alr install` would get). */
-static const char *installed_default_distro(void)
-{
-    char r[ALR_PBUF];
-    int k;
-    for (k = 0; g_distro_preference[k]; k++) {
-        distro_root(r, sizeof r, g_distro_preference[k]);
-        if (is_dir(r)) return g_distro_preference[k];
-    }
-    return ALR_DEFAULT_DISTRO;
 }
 
 static int run_cmd(char *const argv[])
@@ -1062,7 +1043,6 @@ static int install_preload(const char *R)
  * optional in SHA256SUMS and silently ending up with "*ubuntu-base-..." in the
  * URL would 404 in a way that reads like a network problem. */
 #define ALR_UBUNTU_CDIMAGE "https://cdimage.ubuntu.com/ubuntu-base/releases"
-#define ALR_UBUNTU_PIN     "ubuntu-base-24.04.4-base-arm64.tar.gz"
 #define ALR_SUFFIX         "-base-arm64.tar.gz"
 
 /* `rel` is the release as it appears in the URL and the file names: "24.04",
@@ -1986,23 +1966,13 @@ static int cmd_install(const char *distro, const char *url_override)
          * when it finds a uutils tree, so the warning described a state the
          * installer no longer leaves behind. */
         printf("alr: resolving the current ubuntu-base image for %s\n", distro + 7);
-        if (discover_ubuntu(distro + 7, durl, sizeof durl, dsha, sizeof dsha) != 0) {
-            /* Offline / air-gapped fallback.  Say plainly that the download is
-             * unverified rather than implying the pin is as good as a hash. */
-            /* The pinned name is a 24.04 image, so the fallback only makes
-             * sense for 24.04; for any other release an unverified download of
-             * the WRONG release is worse than failing. */
-            if (strcmp(distro, "ubuntu-24.04") != 0)
-                die("discovery-failed",
-                    "could not reach SHA256SUMS for this release; pass --url");
-            snprintf(durl, sizeof durl, "%s/24.04/release/%s",
-                     cfg()->has_mirror ? cfg()->mirror : ALR_UBUNTU_CDIMAGE,
-                     ALR_UBUNTU_PIN);
-            dsha[0] = '\0';
-            fprintf(stderr, "alr: WARNING SHA256SUMS unreachable; falling back to "
-                            "the pinned %s WITHOUT hash verification\n",
-                    ALR_UBUNTU_PIN);
-        }
+        /* No unverified fallback.  There used to be a pinned 24.04 image for
+         * offline installs; 24.04 is no longer supported, and fetching a
+         * release without its hash is worse than failing.  Offline installs
+         * pass --url. */
+        if (discover_ubuntu(distro + 7, durl, sizeof durl, dsha, sizeof dsha) != 0)
+            die("discovery-failed",
+                "could not reach SHA256SUMS for this release; pass --url");
         url = durl;
         printf("alr: %s\n", url);
     }
@@ -2179,7 +2149,7 @@ static void cfg_effective(const char *key, char *val, size_t vn,
     if (!strcmp(key, "default_distro")) {
         if ((e = getenv("ALR_DISTRO")) && *e) { snprintf(val, vn, "%s", e); *src = "env ALR_DISTRO"; return; }
         if (c->has_distro) { snprintf(val, vn, "%s", c->distro); *src = "config"; return; }
-        snprintf(val, vn, "%s", installed_default_distro()); return;
+        snprintf(val, vn, "%s", ALR_DEFAULT_DISTRO); return;
     }
     if (!strcmp(key, "runtime.fakeroot")) {
         if ((e = getenv("ALR_FAKEROOT")) && *e) { snprintf(val, vn, "%s", *e == '1' ? "true" : "false"); *src = "env ALR_FAKEROOT"; return; }
@@ -3580,20 +3550,19 @@ int main(int argc, char **argv)
 {
     const char *distro = getenv("ALR_DISTRO");
     const char *url = NULL;
-    int i = 1, distro_defaulted = 0;
+    int i = 1;
 
     {   /* Must happen before any fork: see g_self. */
         ssize_t n = readlink("/proc/self/exe", g_self, sizeof g_self - 1);
         if (n > 0) g_self[n] = '\0';
         else snprintf(g_self, sizeof g_self, "%s", argv[0]);
     }
-    if ((!distro || !*distro) && cfg()->has_distro) distro = cfg()->distro;
-    if (!distro || !*distro) { distro = installed_default_distro(); distro_defaulted = 1; }
+    if (!distro || !*distro) distro = cfg()->has_distro ? cfg()->distro : ALR_DEFAULT_DISTRO;
     if (getenv("ALR_LOG")) g_log = atoi(getenv("ALR_LOG"));
     else if (cfg()->has_log) g_log = cfg()->log;
 
     while (i < argc && argv[i][0] == '-' && argv[i][1] != '\0') {
-        if (!strcmp(argv[i], "-d") && i + 1 < argc) { distro = argv[++i]; distro_defaulted = 0; i++; }
+        if (!strcmp(argv[i], "-d") && i + 1 < argc) { distro = argv[++i]; i++; }
         else if (!strcmp(argv[i], "-v")) { g_log++; i++; }
         else if (!strcmp(argv[i], "--url") && i + 1 < argc) { url = argv[++i]; i++; }
         else break;
@@ -3623,9 +3592,7 @@ int main(int argc, char **argv)
             else die("install-unknown-option",
                      "more than one distro named for `alr install`");
         }
-        /* An unnamed install provisions the newest release even when an
-         * older tree is what the other commands would pick. */
-        return cmd_install(d ? d : distro_defaulted ? ALR_DEFAULT_DISTRO : distro, url);
+        return cmd_install(d ? d : distro, url);
     }
     if (!strcmp(argv[i], "run") || !strcmp(argv[i], "exec")) {
         /* `exec` is `run` with -- ending option parsing unambiguously (§1). */
