@@ -21,6 +21,7 @@
 
 #define TAWC_EPERM         (-1)
 #define TAWC_ENOENT        (-2)
+#define TAWC_ESRCH         (-3)
 #define TAWC_EINTR         (-4)
 #define TAWC_E2BIG         (-7)
 #define TAWC_ENOEXEC       (-8)

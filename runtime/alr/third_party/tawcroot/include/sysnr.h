@@ -136,6 +136,9 @@
 /* close_range emulation (handle_close_range): unshare(CLONE_FILES) for
  * CLOSE_RANGE_UNSHARE, and prlimit64 for the no-/proc fallback loop. */
 # define TAWC_SYS_prlimit64       261
+/* alr-lane (alr_mode.h): hardlink copy fallback, fork-wiped tgid cache. */
+# define TAWC_SYS_sendfile        71
+# define TAWC_SYS_madvise        233
 #elif defined(__x86_64__)
 # define TAWC_SYS_read            0
 # define TAWC_SYS_write           1
@@ -325,6 +328,8 @@
 /* close_range emulation (handle_close_range): unshare(CLONE_FILES) for
  * CLOSE_RANGE_UNSHARE, and prlimit64 for the no-/proc fallback loop. */
 # define TAWC_SYS_prlimit64       302
+# define TAWC_SYS_sendfile        40
+# define TAWC_SYS_madvise         28
 #else
 # error "unsupported arch"
 #endif

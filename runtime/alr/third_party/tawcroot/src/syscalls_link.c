@@ -226,6 +226,65 @@ static long linkat_empty_path(struct tawcroot_path_scratch *scratch,
  *      out of link/, dangling the whole cluster.
  *   3. Otherwise host linkat first; only EACCES/EPERM engages the
  *      emulation, and a directory source keeps the kernel's EPERM. */
+#ifdef TAWCROOT_ALR
+/* alr-lane: link(2) the way alr's preload does it -- the kernel's link
+ * first, and when that is refused (SELinux denies app_data_file links with
+ * EACCES; EPERM and EXDEV elsewhere) a COPY: a regular file's bytes and
+ * mode, a symlink's target.  Not a hardlink -- a write through one name
+ * does not show through the other -- but both names are plain files that
+ * either lane can read, which upstream's link-store token symlinks are
+ * not.  A directory keeps the kernel's error. */
+static long alr_link_or_copy(const struct fs_path *o, const struct fs_path *n,
+			     int flags)
+{
+	long rv = TAWC_RAW(TAWC_SYS_linkat, o->fd, (long)o->path,
+			   n->fd, (long)n->path, flags, 0);
+	if (rv == 0 || (rv != TAWC_EACCES && rv != TAWC_EPERM && rv != TAWC_EXDEV))
+		return rv;
+
+	struct stat st;
+	int sflag = (flags & 0x400 /*AT_SYMLINK_FOLLOW*/) ? 0 : AT_SYMLINK_NOFOLLOW;
+	if (TAWC_RAW(TAWC_SYS_fstatat, o->fd, (long)o->path, (long)&st,
+		     sflag, 0, 0))
+		return rv;
+	if (S_ISLNK(st.st_mode)) {
+		TAWCROOT_PATH_SCRATCH_AUTO(s2);
+		long tn = TAWC_RAW(TAWC_SYS_readlinkat, o->fd, (long)o->path,
+				   (long)s2->buf[0],
+				   TAWCROOT_PATH_SCRATCH_SIZE - 1, 0, 0);
+		if (tn < 0) return rv;
+		s2->buf[0][tn] = 0;
+		return TAWC_RAW(TAWC_SYS_symlinkat, (long)s2->buf[0], n->fd,
+				(long)n->path, 0, 0, 0);
+	}
+	if (!S_ISREG(st.st_mode)) return rv;
+
+	long in = tawc_openat(o->fd, o->path, O_RDONLY | O_CLOEXEC, 0);
+	if (in < 0) return in;
+	long out = tawc_openat(n->fd, n->path,
+			       O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+	if (out < 0) { tawc_close((int)in); return out; }
+	long left = (long)st.st_size, e = 0;
+	while (left > 0) {
+		long w = TAWC_RAW(TAWC_SYS_sendfile, out, in, 0,
+				  left > 0x40000000L ? 0x40000000L : left, 0, 0);
+		if (w < 0) { e = w; break; }
+		if (w == 0) break;                 /* the source shrank */
+		left -= w;
+	}
+	/* The source's mode exactly, as a second name for it would have:
+	 * the create mode above is cut by the umask. */
+	if (!e) e = TAWC_RAW(TAWC_SYS_fchmod, out, st.st_mode & 07777, 0, 0, 0, 0);
+	tawc_close((int)in);
+	tawc_close((int)out);
+	if (e) {
+		TAWC_RAW(TAWC_SYS_unlinkat, n->fd, (long)n->path, 0, 0, 0, 0);
+		return e;
+	}
+	return 0;
+}
+#endif
+
 static long handle_linkat(const tawcroot_syscall_args *args, ucontext_t *uc)
 {
 	(void)uc;
@@ -279,6 +338,9 @@ static long handle_linkat(const tawcroot_syscall_args *args, ucontext_t *uc)
 	 * fidelity on purpose and refuse. Documented divergence
 	 * (notes/tawcroot/path-translation.md §"Read-only binds"). */
 	if (told.ro) return TAWC_EXDEV;
+#ifdef TAWCROOT_ALR
+	return alr_link_or_copy(&told, &tnew, flags);
+#endif
 
 	/* A LATENT process may be running beside one that already minted
 	 * the store (it is created lazily, so any long-lived guest that

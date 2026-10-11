@@ -43,6 +43,7 @@
 #include "filter.h"
 #include "io.h"
 #include "linkstore.h"
+#include "alr_mode.h"
 #include "loader_exec.h"
 #include "path.h"
 #include "proctitle.h"
@@ -314,6 +315,11 @@ static void prod_rootfs_init(const char *rootfs,
 	 * to the v1 symlink emulation. */
 	static char store_path[4096];
 	const char *store = 0;
+#ifdef TAWCROOT_ALR
+	/* No link store: its token symlinks are unreadable from alr's
+	 * preload lane.  linkat copies instead (syscalls_link.c). */
+	if (0)
+#endif
 	{
 		long n = tawc_str_copy(store_path, sizeof store_path, rootfs);
 		if (n > 0) {
@@ -458,6 +464,11 @@ __attribute__((noreturn)) static void prod_main(int argc, char **argv)
 		if (tawc_streq(argv[i], "-s")) {
 			new_session = 1;
 			i++;
+#ifdef TAWCROOT_ALR
+		} else if (tawc_streq(argv[i], "--fakeroot")) {
+			tawcroot_alr_fakeroot = 1;
+			i++;
+#endif
 		} else if (tawc_streq(argv[i], "-r")) {
 			if (i + 1 >= argc) usage(2);
 			rootfs = argv[++i];

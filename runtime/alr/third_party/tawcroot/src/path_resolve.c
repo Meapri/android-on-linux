@@ -29,6 +29,88 @@
 #include "path_resolve.h"
 #include "path_scratch.h"
 #include "tawc_string.h"
+#include "alr_mode.h"
+
+#ifdef TAWCROOT_ALR
+#include <stdint.h>
+
+/* alr-lane: remember directory prefixes the walk found NOT to be symlinks.
+ *
+ * Without it every path syscall readlinks each parent component again --
+ * `find /usr/share` paid 2.3 readlinkat per trap.  A hit lets the walk
+ * start at the leaf.
+ *
+ * Staleness: this process invalidates on its own rename/unlink/symlink/
+ * chroot (rescue.c).  Another process turning a cached directory into a
+ * symlink is not seen; the kernel then follows that symlink itself.  In
+ * an alr rootfs every symlink is relative (install relativizes them, both
+ * lanes relativize new ones), so the kernel's answer stays inside the
+ * rootfs -- the same resolution the preload lane always relies on.
+ *
+ * Direct-mapped, one seqcount per slot; a torn read is a miss. */
+#define DC_SLOTS 1024u
+#define DC_LEN   200u
+
+struct dc_slot {
+	uint32_t seq;      /* odd while written */
+	uint32_t gen;
+	uint32_t hash;
+	uint32_t len;
+	char     path[DC_LEN];
+};
+
+static struct dc_slot g_dc[DC_SLOTS];
+static uint32_t       g_dc_gen = 1;
+
+void tawcroot_dircache_invalidate(void)
+{
+	__atomic_fetch_add(&g_dc_gen, 1, __ATOMIC_RELEASE);
+}
+
+static uint32_t dc_hash(const char *s, size_t n)
+{
+	uint32_t h = 2166136261u;
+	for (size_t i = 0; i < n; i++) { h ^= (unsigned char)s[i]; h *= 16777619u; }
+	return h;
+}
+
+static int dc_hit(const char *s, size_t n)
+{
+	if (n == 0 || n >= DC_LEN) return 0;
+	uint32_t h = dc_hash(s, n);
+	struct dc_slot *e = &g_dc[h & (DC_SLOTS - 1)];
+	uint32_t s1 = __atomic_load_n(&e->seq, __ATOMIC_ACQUIRE);
+	if (s1 & 1) return 0;
+	int ok = __atomic_load_n(&e->gen, __ATOMIC_RELAXED)
+			 == __atomic_load_n(&g_dc_gen, __ATOMIC_ACQUIRE)
+		 && __atomic_load_n(&e->hash, __ATOMIC_RELAXED) == h
+		 && __atomic_load_n(&e->len, __ATOMIC_RELAXED) == n;
+	for (size_t i = 0; ok && i < n; i++)
+		if (__atomic_load_n(&e->path[i], __ATOMIC_RELAXED) != s[i]) ok = 0;
+	__atomic_thread_fence(__ATOMIC_ACQUIRE);
+	return ok && __atomic_load_n(&e->seq, __ATOMIC_RELAXED) == s1;
+}
+
+static void dc_put(const char *s, size_t n)
+{
+	if (n == 0 || n >= DC_LEN) return;
+	uint32_t h = dc_hash(s, n);
+	struct dc_slot *e = &g_dc[h & (DC_SLOTS - 1)];
+	/* Generation first: an invalidation racing this insert must win. */
+	uint32_t gen = __atomic_load_n(&g_dc_gen, __ATOMIC_ACQUIRE);
+	uint32_t s1 = __atomic_load_n(&e->seq, __ATOMIC_RELAXED);
+	if ((s1 & 1) || !__atomic_compare_exchange_n(&e->seq, &s1, s1 + 1, 0,
+						     __ATOMIC_ACQUIRE,
+						     __ATOMIC_RELAXED))
+		return;                          /* another writer: skip */
+	__atomic_store_n(&e->gen, gen, __ATOMIC_RELAXED);
+	__atomic_store_n(&e->hash, h, __ATOMIC_RELAXED);
+	__atomic_store_n(&e->len, (uint32_t)n, __ATOMIC_RELAXED);
+	for (size_t i = 0; i < n; i++)
+		__atomic_store_n(&e->path[i], s[i], __ATOMIC_RELAXED);
+	__atomic_store_n(&e->seq, s1 + 2, __ATOMIC_RELEASE);
+}
+#endif
 
 /* Linux's SYMLOOP_MAX is 40. Match it so an in-rootfs chain of
  * symlinks fails identically to a no-tawcroot equivalent. */
@@ -131,6 +213,16 @@ long tawcroot_path_resolve_symlinks_tok(char *suf, size_t cap,
 		size_t i = 0;
 		int    walked_symlink = 0;
 
+#ifdef TAWCROOT_ALR
+		/* Whole parent already known symlink-free: go to the leaf. */
+		{
+			size_t p = suf_len;
+			while (p > 0 && suf[p - 1] != '/') p--;
+			while (p > 0 && suf[p - 1] == '/') p--;
+			if (p > 0 && dc_hit(suf, p)) i = p;
+		}
+#endif
+
 		while (i < suf_len) {
 			while (i < suf_len && suf[i] == '/') i++;
 			if (i >= suf_len) break;
@@ -146,6 +238,9 @@ long tawcroot_path_resolve_symlinks_tok(char *suf, size_t cap,
 				break;
 			}
 
+#ifdef TAWCROOT_ALR
+			if (!is_leaf && dc_hit(suf, comp_end)) continue;
+#endif
 			/* Probe: readlink suf[0..comp_end). Temporarily
 			 * NUL-terminate at comp_end so we don't allocate. */
 			char saved = suf[comp_end];
@@ -165,6 +260,9 @@ long tawcroot_path_resolve_symlinks_tok(char *suf, size_t cap,
 
 			if (n == TAWC_EINVAL) {
 				/* Not a symlink. Walk into next component. */
+#ifdef TAWCROOT_ALR
+				if (!is_leaf) dc_put(suf, comp_end);
+#endif
 				continue;
 			}
 			if (n == TAWC_ENOENT) {

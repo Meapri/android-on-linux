@@ -23,6 +23,8 @@
 #include "tawc_string.h"
 #include "tawc_uapi.h"
 #include "usercopy.h"
+#include "alr_mode.h"
+#include "identity.h"
 
 /* Hardlink emulation, stat side. An emulated name is a symlink whose
  * target is the opaque `tawcroot:link:<token>` literal (linkstore.h).
@@ -99,6 +101,9 @@ static unsigned long fd_object_nlink(int fd, unsigned int mode,
  * output layout — bionic's `struct stat` is defined to match. */
 static void decorate_stat(struct stat *st)
 {
+#ifdef TAWCROOT_ALR
+	if (tawcroot_identity_euid() != 0) return;   /* real ids: real owners */
+#endif
 	st->st_uid = 0;
 	st->st_gid = 0;
 }
@@ -106,6 +111,17 @@ static void decorate_stat(struct stat *st)
 /* Shared tail for the stat-shaped handlers: on kernel success,
  * decorate the kernel-filled `local` as root-owned and copy it to the
  * guest's out-pointer. Returns `rv` or the copy's -EFAULT. */
+#ifdef TAWCROOT_ALR
+/* alr-lane with the real ids and no link store: nothing to decorate or
+ * fix up, so the kernel can write the guest's buffer itself (and report
+ * EFAULT itself).  Saves a process_vm_writev -- as dear as the stat --
+ * on every stat-shaped trap. */
+static int alr_stat_direct(void)
+{
+	return tawcroot_store_link_fd < 0 && tawcroot_identity_euid() != 0;
+}
+#endif
+
 static long finish_stat(long rv, struct stat *local, struct stat *guest_out)
 {
 	if (rv != 0) return rv;
@@ -209,6 +225,11 @@ static long handle_newfstatat(const tawcroot_syscall_args *args,
 		rv_flags |= AT_EMPTY_PATH;
 	}
 
+#ifdef TAWCROOT_ALR
+	if (alr_stat_direct())
+		return TAWC_RAW(TAWC_SYS_fstatat, t.fd, (long)resolved,
+				(long)out, rv_flags, 0, 0);
+#endif
 	long rv = TAWC_RAW(TAWC_SYS_fstatat, t.fd, (long)resolved,
 			   (long)&local, rv_flags, 0, 0);
 	if (rv == 0) {
@@ -441,6 +462,11 @@ static long handle_statx(const tawcroot_syscall_args *args, ucontext_t *uc)
 	int rv_flags = flags;
 	if (t.is_root) rv_flags |= AT_EMPTY_PATH;
 
+#ifdef TAWCROOT_ALR
+	if (alr_stat_direct())
+		return TAWC_RAW(TAWC_SYS_statx, t.fd, (long)resolved,
+				rv_flags, mask, (long)out, 0);
+#endif
 	long rv = TAWC_RAW(TAWC_SYS_statx, t.fd, (long)resolved,
 			   rv_flags, mask, (long)&local, 0);
 	/* Hardlink emulation — same two fixups as handle_newfstatat:
@@ -497,6 +523,10 @@ static long handle_fstat(const tawcroot_syscall_args *args, ucontext_t *uc)
 	struct stat *out = (struct stat *)(uintptr_t)args->b;
 	if (tawcroot_fd_is_reserved(fd)) return TAWC_EBADF;
 	if (!out) return TAWC_EFAULT;
+#ifdef TAWCROOT_ALR
+	if (alr_stat_direct())
+		return TAWC_RAW(TAWC_SYS_fstat, fd, (long)out, 0, 0, 0, 0);
+#endif
 	struct stat local;
 	long rv = TAWC_RAW(TAWC_SYS_fstat, fd, (long)&local, 0, 0, 0, 0);
 	if (rv == 0) {

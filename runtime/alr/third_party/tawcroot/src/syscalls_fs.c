@@ -57,6 +57,7 @@
 #include "tawc_string.h"
 #include "tawc_uapi.h"
 #include "usercopy.h"
+#include "alr_mode.h"
 
 /* Callers fetch the guest string once (tawcroot_fs_fetch_path) and
  * classify that copy — the same bytes later reach the translator, so a
@@ -1265,6 +1266,64 @@ static long handle_fchown(const tawcroot_syscall_args *args, ucontext_t *uc)
  * route to data loss. EPERM, unconditionally (targets minted while no
  * store is open would go live the moment one is). Fetching the target
  * here also preserves the kernel's EFAULT contract. */
+#ifdef TAWCROOT_ALR
+/* /proc, /sys and /dev are binds: an absolute target into them is right
+ * as it stands (alr_is_sysdir in the preload). */
+static int alr_sysdir_target(const char *t)
+{
+	static const char *const d[] = { "/proc", "/sys", "/dev" };
+	for (unsigned k = 0; k < 3; k++) {
+		size_t n = tawc_strlen(d[k]);
+		if (memcmp(t, d[k], n) == 0 && (t[n] == 0 || t[n] == '/'))
+			return 1;
+	}
+	return 0;
+}
+
+/* Rewrite an absolute guest target as one relative to the link's parent,
+ * the way alr's preload does (relativize).  The kernel resolves symlink
+ * contents against the HOST root; only a relative target means the same
+ * file from both lanes.  The parent's depth comes from the kernel: open it
+ * O_PATH and read the host path back, so dirfds, ".." and symlinked
+ * parents all count right.  Returns `tgt` unchanged when the parent is not
+ * inside the rootfs (a bind) or cannot be read. */
+static const char *alr_relativize(const char *tgt, int base_fd,
+				  const char *suffix, char *out, size_t cap,
+				  char *hostbuf, size_t hostcap)
+{
+	if (tgt[0] != '/' || alr_sysdir_target(tgt)) return tgt;
+	size_t sl = tawc_strlen(suffix), p = sl;
+	while (p > 0 && suffix[p - 1] != '/') p--;
+	long fd;
+	if (p == 0) {
+		fd = tawc_openat(base_fd, ".", O_PATH | O_DIRECTORY | O_CLOEXEC, 0);
+	} else {
+		if (p >= cap) return tgt;
+		memcpy(out, suffix, p);
+		out[p] = 0;
+		fd = tawc_openat(base_fd, out, O_PATH | O_DIRECTORY | O_CLOEXEC, 0);
+	}
+	if (fd < 0) return tgt;
+	long hn = tawcroot_proc_fd_to_host_path((int)fd, hostbuf, hostcap);
+	tawc_close((int)fd);
+	size_t rl = tawcroot_rootfs_host_path_len;
+	while (rl > 1 && tawcroot_rootfs_host_path[rl - 1] == '/') rl--;
+	if (hn <= 0 || (size_t)hn < rl
+	    || memcmp(hostbuf, tawcroot_rootfs_host_path, rl) != 0
+	    || ((size_t)hn > rl && hostbuf[rl] != '/'))
+		return tgt;
+	size_t depth = 0;
+	for (size_t k = rl; k < (size_t)hn; k++)
+		if (hostbuf[k] == '/' && k + 1 < (size_t)hn) depth++;
+	size_t tl = tawc_strlen(tgt + 1), o = 0;
+	if (depth * 3 + tl + 2 > cap) return tgt;
+	for (size_t k = 0; k < depth; k++) { memcpy(out + o, "../", 3); o += 3; }
+	memcpy(out + o, tgt + 1, tl + 1);
+	if (o == 0 && tl == 0) { out[0] = '.'; out[1] = 0; }
+	return out;
+}
+#endif
+
 static long handle_symlinkat(const tawcroot_syscall_args *args,
 			     ucontext_t *uc)
 {
@@ -1289,6 +1348,19 @@ static long handle_symlinkat(const tawcroot_syscall_args *args,
 					  TAWCROOT_PATH_INTENT_WRITE, &t);
 	if (e) return e;
 	if (t.is_root) return TAWC_EINVAL; /* can't create / */
+#ifdef TAWCROOT_ALR
+	{
+		/* buf[1] holds t.path and buf[2] the target; buf[0] (the
+		 * fetched guest path) is spent. */
+		const char *rt = alr_relativize(tgt, t.fd, t.path,
+						scratch->buf[0],
+						TAWCROOT_PATH_SCRATCH_SIZE,
+						scratch->buf[3],
+						TAWCROOT_PATH_SCRATCH_SIZE);
+		return TAWC_RAW(TAWC_SYS_symlinkat, (long)rt, t.fd,
+				(long)t.path, 0, 0, 0);
+	}
+#endif
 	return TAWC_RAW(TAWC_SYS_symlinkat, (long)tgt, t.fd,
 			(long)t.path, 0, 0, 0);
 }

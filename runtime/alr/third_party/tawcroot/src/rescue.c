@@ -34,6 +34,30 @@
 #include "rescue.h"
 #include "sysnr.h"
 #include "tawc_uapi.h"
+#include "alr_mode.h"
+
+#ifdef TAWCROOT_ALR
+/* Syscalls after which a cached "not a symlink" directory prefix may be
+ * wrong: the name can now be gone, or be something else. */
+static int dircache_mutator(long nr)
+{
+	switch (nr) {
+	case TAWC_SYS_renameat:
+	case TAWC_SYS_renameat2:
+	case TAWC_SYS_unlinkat:
+	case TAWC_SYS_symlinkat:
+	case TAWC_SYS_chroot:
+#ifdef TAWC_SYS_rename
+	case TAWC_SYS_rename:
+	case TAWC_SYS_unlink:
+	case TAWC_SYS_rmdir:
+	case TAWC_SYS_symlink:
+#endif
+		return 1;
+	}
+	return 0;
+}
+#endif
 
 /* Concurrently-trapping threads that can be rescued at once. Beyond
  * this the rescue silently switches off (the guest sees the original
@@ -356,10 +380,26 @@ long tawcroot_dispatch_call(const tawcroot_syscall_args *args, ucontext_t *uc)
 	 * slot for it would leak one per guest thread teardown. */
 	if (args->nr == TAWC_SYS_exit) return fn(args, uc);
 
-	int idx = slot_claim(current_tid());
-	if (idx < 0) return fn(args, uc);
+#ifdef TAWCROOT_ALR
+	int mut = dircache_mutator(args->nr);
+	/* The rescue is a fake-root feature (widen modes on EACCES as
+	 * CAP_DAC_OVERRIDE would); with the real ids it never fires, and
+	 * claiming a slot costs a gettid on every trap. */
+	if (tawcroot_identity_euid() != 0) {
+		long r0 = fn(args, uc);
+		if (mut) tawcroot_dircache_invalidate();
+		return r0;
+	}
+#endif
 
-	long rv = fn(args, uc);
+	int idx = slot_claim(current_tid());
+	long rv;
+	if (idx < 0) {
+		rv = fn(args, uc);
+		goto out;
+	}
+
+	rv = fn(args, uc);
 	/* Virtual euid is only consulted here, on the cold path: a guest
 	 * that dropped privileges gets the real EACCES (same gate as the
 	 * fchmodat/fchownat fakes), and every other trap avoids the
@@ -367,5 +407,9 @@ long tawcroot_dispatch_call(const tawcroot_syscall_args *args, ucontext_t *uc)
 	if (rv == TAWC_EACCES && tawcroot_identity_euid() == 0)
 		rv = rescue_retry(&g_slots[idx], args, fn, uc, rv);
 	slot_release(idx);
+out:
+#ifdef TAWCROOT_ALR
+	if (mut) tawcroot_dircache_invalidate();
+#endif
 	return rv;
 }

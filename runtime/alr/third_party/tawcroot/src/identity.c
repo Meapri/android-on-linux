@@ -40,6 +40,12 @@
 #include "identity.h"
 #include "sysnr.h"
 #include "usercopy.h"
+#include "alr_mode.h"
+#include "raw_sys.h"
+
+#ifdef TAWCROOT_ALR
+int tawcroot_alr_fakeroot;
+#endif
 
 /* Same AS-safety requirement as signal_shadow.c: these must be inline
  * lock-free ops, never a libgcc outline call that may take a mutex. */
@@ -124,6 +130,21 @@ void tawcroot_identity_reset(void)
 	tawc_identity id = { 0 };
 	id.ngroups   = 1;
 	id.groups[0] = 0;
+#ifdef TAWCROOT_ALR
+	/* The preload lane reports the real ids unless ALR_FAKEROOT=1; a
+	 * process must not change identity by moving between lanes (git's
+	 * safe.directory compares st_uid with geteuid). */
+	if (!tawcroot_alr_fakeroot) {
+		uint32_t u = (uint32_t)TAWC_RAW(TAWC_SYS_getuid, 0, 0, 0, 0, 0, 0);
+		uint32_t g = (uint32_t)TAWC_RAW(TAWC_SYS_getgid, 0, 0, 0, 0, 0, 0);
+		long n = TAWC_RAW(TAWC_SYS_getgroups, TAWC_IDENTITY_NGROUPS,
+				  (long)id.groups, 0, 0, 0, 0);
+		id.ruid = id.euid = id.suid = id.fsuid = u;
+		id.rgid = id.egid = id.sgid = id.fsgid = g;
+		if (n > 0) id.ngroups = (uint32_t)n;
+		else { id.ngroups = 1; id.groups[0] = g; }
+	}
+#endif
 	uint32_t s = ident_writer_acquire();
 	ident_writer_release(s, &id);
 }

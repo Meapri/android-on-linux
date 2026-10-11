@@ -20,10 +20,41 @@ int tawc_usercopy_works = 0;
  * SIGSYS handler is already on the slow path. (Discovered when
  * bash's fork+execve dance returned -EFAULT through our exec
  * handler — child's process_vm_readv was reading parent VM.) */
+#ifdef TAWCROOT_ALR
+/* alr-lane: the same answer without a syscall per copy.  Any id of the
+ * thread group addresses its VM, so cache the tgid -- in a page that
+ * fork(2) zero-fills (MADV_WIPEONFORK), which is exactly the event that
+ * invalidates it.  A CLONE_VM child keeps the page and so the parent's
+ * tgid, which names the same mm; if that parent is gone the copy fails
+ * ESRCH and is retried with gettid.  Two copies per path trap made this
+ * the commonest syscall in the lane after the trap itself. */
+static long *g_tgid_cache;
+
+static long cached_task_id(void)
+{
+	long t = g_tgid_cache ? __atomic_load_n(g_tgid_cache, __ATOMIC_RELAXED) : 0;
+	if (t > 0) return t;
+	t = TAWC_RAW(TAWC_SYS_getpid, 0, 0, 0, 0, 0, 0);
+	if (t > 0 && g_tgid_cache)
+		__atomic_store_n(g_tgid_cache, t, __ATOMIC_RELAXED);
+	return t > 0 ? t : 0;
+}
+#endif
+
 static long current_task_id(void)
 {
 	long t = TAWC_RAW(TAWC_SYS_gettid, 0, 0, 0, 0, 0, 0);
 	return t > 0 ? t : 0;
+}
+
+/* process_vm_{read,write}v against ourselves. */
+static long vm_self(long nr, struct iovec *liov, struct iovec *riov)
+{
+#ifdef TAWCROOT_ALR
+	long rv = TAWC_RAW(nr, cached_task_id(), (long)liov, 1, (long)riov, 1, 0);
+	if (rv != TAWC_ESRCH) return rv;
+#endif
+	return TAWC_RAW(nr, current_task_id(), (long)liov, 1, (long)riov, 1, 0);
 }
 
 long tawc_usercopy_init(void)
@@ -39,6 +70,17 @@ long tawc_usercopy_init(void)
 			   (long)&liov, 1, (long)&riov, 1, 0);
 	if (rv == 1 && dst == 'x') {
 		tawc_usercopy_works = 1;
+#ifdef TAWCROOT_ALR
+		long pg = TAWC_RAW(TAWC_SYS_mmap, 0, 4096, 3 /*RW*/,
+				   0x22 /*PRIVATE|ANONYMOUS*/, -1, 0);
+		if (pg > 0) {
+			if (TAWC_RAW(TAWC_SYS_madvise, pg, 4096,
+				     18 /*MADV_WIPEONFORK*/, 0, 0, 0) == 0)
+				g_tgid_cache = (long *)pg;
+			else
+				TAWC_RAW(TAWC_SYS_munmap, pg, 4096, 0, 0, 0, 0);
+		}
+#endif
 		return 0;
 	}
 	return rv < 0 ? rv : TAWC_ENOSYS;
@@ -57,9 +99,7 @@ static long readv_guest(void *dst, size_t len, const void *src)
 	if (!tawc_usercopy_works) return TAWC_EFAULT;
 	struct iovec liov = { .iov_base = dst,        .iov_len = len };
 	struct iovec riov = { .iov_base = (void *)src, .iov_len = len };
-	long rv = TAWC_RAW(TAWC_SYS_process_vm_readv, current_task_id(),
-			   (long)&liov, 1, (long)&riov, 1, 0);
-	return rv;
+	return vm_self(TAWC_SYS_process_vm_readv, &liov, &riov);
 }
 
 long tawc_copy_string_from_guest(char *dst, size_t cap,
@@ -117,8 +157,7 @@ long tawc_copy_to_guest(void *guest_dst, const void *src, size_t n)
 	if (!tawc_usercopy_works) return TAWC_EFAULT;
 	struct iovec liov = { .iov_base = (void *)src,    .iov_len = n };
 	struct iovec riov = { .iov_base = guest_dst,      .iov_len = n };
-	long rv = TAWC_RAW(TAWC_SYS_process_vm_writev, current_task_id(),
-			   (long)&liov, 1, (long)&riov, 1, 0);
+	long rv = vm_self(TAWC_SYS_process_vm_writev, &liov, &riov);
 	if (rv < 0)        return TAWC_EFAULT;
 	if ((size_t)rv != n) return TAWC_EFAULT;
 	return 0;
