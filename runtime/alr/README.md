@@ -207,6 +207,9 @@ scripts/build-preload.sh        # 게스트 측 libalr_preload.so (zig 0.16.0 �
   재현성은 정확한 핀에서만 성립한다 — zig 업그레이드는 번들 compiler-rt와 LLVM codegen을 바꾼다.
 - **HOST (bionic)**: Android NDK clang `--target=aarch64-linux-android24`,
   `-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384` (16 KB 페이지 기기 대응).
+  `alr`만 `--target=aarch64-linux-android29 -static`이다. 이유는 [01-platform-facts §F1](docs/01-platform-facts.md)에 있다.
+- **LANE (libc 없음)**: `make lane`이 `third_party/tawcroot`를 `alr-lane`으로 빌드한다
+  ([ADR 0010](docs/adr/0010-tawcroot-lane.md)). 패키지에서는 `$PREFIX/libexec/alr/alr-lane`에 설치된다.
 - Termux 자체 온디바이스 clang은 **개발 이너 루프 전용**이며 릴리스 경로가 아니다.
 
 `tests/device/` 와 슈퍼바이저 테스트는 **호스트에서 돌지 않는다.** `uid >= 10000 && Seccomp == 2` 가 아니면

@@ -7,7 +7,7 @@ Accepted (2026-10-11). 목표와 우선순위는 이 문서로 정하고, 각 �
 이 ADR이 바꾸는 것:
 
 - [ADR 0004](0004-unified-direction.md) D4의 표면 우선순위를 바꾼다. S2(Termux CLI)가 주 제품이 되고, S1(독립 APK)은 중단하며, S3(Termux 연결 GUI)는 후보가 아니라 GUI의 유일한 경로가 된다. ADR 0004의 Phase 계획(P1~P4)은 아래 우선순위로 대체한다. D1(엔진은 alr), D3(계층과 계약), D5(그래픽은 공개 API), D8(문서 규율)은 그대로 유지한다.
-- [runtime/alr ADR 0006](../../runtime/alr/docs/adr/0006-raw-syscall-binaries.md)과 [ADR 0008](../../runtime/alr/docs/adr/0008-static-guest-binaries-non-goal.md)의 비목표를 목표로 바꾼다. 두 ADR의 결정은 로더 프로토타입이 아래 T5의 완료 기준을 채우고 별도 ADR이 나올 때 대체된다. 그 전까지 제품의 동작은 바뀌지 않는다.
+- [runtime/alr ADR 0006](../../runtime/alr/docs/adr/0006-raw-syscall-binaries.md)과 [ADR 0008](../../runtime/alr/docs/adr/0008-static-guest-binaries-non-goal.md)의 비목표를 목표로 바꾼다. 두 ADR의 결정은 2026-10-11 [runtime/alr ADR 0010](../../runtime/alr/docs/adr/0010-tawcroot-lane.md)이 대체했다. 정적 ELF와 Go 바이너리는 tawcroot 레인(`alr-lane`)으로 실행한다.
 - [runtime/alr 00-product](../../runtime/alr/docs/00-product.md)의 게스트를 Ubuntu 24.04에서 "최신 LTS"로 바꾼다.
 
 ## Context
@@ -41,17 +41,17 @@ GUI와 GPU에 대해서는 Termux 경로의 증거가 없다. 지금까지의 GP
 | | 목표 | 완료 기준 | 현재 |
 |---|---|---|---|
 | **T1** | 최신 Ubuntu LTS가 무패치로 부팅하고 apt가 동작한다 | `alr install`의 기본값이 최신 LTS이고, 그 rootfs에서 수용 테스트가 `FAIL=0`, `SKIP`은 비목표 항목만 남는다 | 달성(2026-10-11). 26.04.1에서 `FAIL=0 SKIP=0` |
-| **T2** | CLI가 네이티브 대비 1.2배 이내로 동작한다 | 아래 워크로드 각각에서 `alr 시간 / 네이티브 시간 <= 1.2`, 같은 기기, 워밍업 후 중앙값 | 측정한 워크로드 모두 1.2배 이내([증거](../../runtime/alr/docs/evidence/2026-10-11-t2-native.md)): `git status` 1.08, `python3` 1.11, `node -e 0` 0.41, `npm ci` 0.79. apt는 데이터 크기가 달라 비율로 판정할 수 없다 |
+| **T2** | CLI가 네이티브 대비 1.2배 이내로 동작한다 | 아래 워크로드 각각에서 `alr 시간 / 네이티브 시간 <= 1.2`, 같은 기기, 워밍업 후 중앙값 | 측정한 워크로드 모두 1.2배 이내. 아래 값은 alr을 정적 링크한 릴리스 빌드 기준이다([증거](../../runtime/alr/docs/evidence/2026-10-11-t5-lane.md) §4, 이전 측정은 [여기](../../runtime/alr/docs/evidence/2026-10-11-t2-native.md)): `git status` 0.87, `python3` 0.93, `node -e 0` 0.36, `npm ci` 0.81, 레인의 `go build` 1.01. apt는 데이터 크기가 달라 비율로 판정할 수 없다 |
 | **T3** | Termux에서 띄운 GUI 앱이 자체 확장 APK 화면에 표시된다 | Termux의 게스트가 만든 `wl_shm` 프레임이 확장 APK의 Surface에 표시되고, GTK 앱 하나가 입력을 받아 동작한다 | 없음 |
 | **T4** | GUI 가속이 네이티브 대비 1.2배 이내로 동작한다 | 같은 GL 워크로드를 Android 네이티브 앱으로 돌린 값 대비 1.2배 이내 | 없음. Adreno 미측정 |
-| **T5** | raw-syscall 바이너리도 경로 가상화된다 | 26.04의 uutils coreutils가 GNU 재지정 없이 동작하고, Go 바이너리 하나와 codex가 rootfs를 `/`로 본다. 경로 syscall당 추가 비용이 T2 예산 안에 든다 | uutils는 GNU 재지정 없이 preload 레인에서 동작한다([증거](../../runtime/alr/docs/evidence/2026-10-11-t5-uutils-preload.md)). 공존 스파이크 완료([증거](../../runtime/alr/docs/evidence/2026-10-11-t5-coexistence-spike.md)). Go 바이너리는 남았다(`go build` 실패) |
+| **T5** | raw-syscall 바이너리도 경로 가상화된다 | 26.04의 uutils coreutils가 GNU 재지정 없이 동작하고, Go 바이너리 하나와 codex가 rootfs를 `/`로 본다. 경로 syscall당 추가 비용이 T2 예산 안에 든다 | 비용 기준만 남았다. uutils는 GNU 재지정 없이 preload 레인에서 동작한다([증거](../../runtime/alr/docs/evidence/2026-10-11-t5-uutils-preload.md)). Go 툴체인과 빌드된 Go 바이너리, codex, busybox-static은 tawcroot 레인에서 rootfs를 `/`로 본다([증거](../../runtime/alr/docs/evidence/2026-10-11-t5-lane.md)). 레인에서 도는 실사용 워크로드는 예산 안이다(`go build` 1.01, `gofmt` 0.88, 레인 안의 `git status` 1.07). 경로 syscall만 반복하는 측정은 아직 넘는다: 같은 busybox로 `find` 1.34배, `ls -lR` 1.65배다 |
 
 T2의 워크로드는 `git status`(10k 파일), `npm ci`, `node -e 0` 콜드 스타트, `apt-get install` 한 건이다. 네이티브 쪽은 Termux 패키지의 같은 프로그램이며, 버전이 다르면 그 사실을 결과에 함께 적는다. glibc 게스트 바이너리를 Android에서 직접 실행할 수는 없으므로 같은 바이너리 비교는 불가능하다.
 
 ### 우선순위
 
 1. **T1 마무리.** 기본 배포판을 `ubuntu-26.04`로 바꾸고 24.04 지원을 끊는다(2026-10-11 완료). 남은 FAIL을 닫는다(2026-10-11 완료).
-2. **T5.** tawcroot의 로더(`loader_*`), execve 재진입(`exec_handler.c`), 시그널 가상화(`signal_shadow.c`)를 기반으로 프로토타입을 만든다. 첫 번째로 확인할 것은 alr의 ptrace 슈퍼바이저(zygote 필터의 `SIGSYS` 구제)와 tawcroot의 `SIGSYS` 핸들러가 한 프로세스에서 공존할 수 있는가다. 2026-10-11 스파이크의 답은 이렇다. 두 필터의 트랩은 `si_errno`로 구별되므로 공존할 수 있다. 하지만 추적 중인 프로세스에서는 트랩마다 약 60 µs가 들므로, 레인에 들어가는 프로세스는 슈퍼바이저에서 떼어 내야 한다. 다음 단계는 그 분리, 레인 진입 시 환경 정리, 그리고 레인 프로세스의 자식을 preload 레인으로 돌려보내는 방법이다.
+2. **T5.** tawcroot의 로더(`loader_*`), execve 재진입(`exec_handler.c`), 시그널 가상화(`signal_shadow.c`)를 기반으로 프로토타입을 만든다. 첫 번째로 확인할 것은 alr의 ptrace 슈퍼바이저(zygote 필터의 `SIGSYS` 구제)와 tawcroot의 `SIGSYS` 핸들러가 한 프로세스에서 공존할 수 있는가다. 2026-10-11 스파이크의 답은 이렇다. 두 필터의 트랩은 `si_errno`로 구별되므로 공존할 수 있다. 하지만 추적 중인 프로세스에서는 트랩마다 약 60 µs가 들므로, 레인에 들어가는 프로세스는 슈퍼바이저에서 떼어 내야 한다. 분리와 환경 정리는 ADR 0010으로 들어갔다. 남은 것은 두 가지다. 하나는 경로 트랩당 비용(시그널 왕복과 게스트 경로 복사 한 번)이고, 다른 하나는 레인 프로세스의 자식을 preload 레인으로 돌려보내는 방법이다.
 3. **T3.** 독립 APK의 Wayland 컴포지터를 떼어 내 확장 APK로 만든다. 서로 다른 uid 사이의 소켓 문제는 Termux:X11처럼 `app_process`로 같은 uid에서 서버를 띄우는 방식을 먼저 시도한다(ADR 0004 D4의 S3 구상).
 4. **T4.** 확장 APK에 GPU 실행기를 붙이고 Adreno에서 처음부터 측정한다.
 
@@ -84,7 +84,7 @@ T2는 순서가 아니라 관문이다. T1과 T5의 변경마다 측정하고, 1
 
 ## Consequences
 
-- 이 ADR은 tawcroot를 제품에 링크하는 것을 허가하지 않는다. 프로토타입은 만들 수 있지만, 출하는 T5 완료 기준을 채운 뒤 별도 ADR로 결정한다([VENDORING.md](../../runtime/alr/third_party/tawcroot/VENDORING.md) 규칙 2).
+- 이 ADR은 tawcroot를 제품에 링크하는 것을 허가하지 않는다. 출하는 별도 ADR로 결정한다고 정했고, [runtime/alr ADR 0010](../../runtime/alr/docs/adr/0010-tawcroot-lane.md)이 그 결정이다. tawcroot는 `alr`에 링크하지 않고 별도 실행 파일 `alr-lane`으로 배포한다([VENDORING.md](../../runtime/alr/third_party/tawcroot/VENDORING.md) 규칙 2).
 - `targetSdk 28` 의존은 Termux 쪽에서도 그대로다. Termux가 `targetSdk`를 올리면 `alr`은 동작하지 않는다([runtime/alr ADR 0005](../../runtime/alr/docs/adr/0005-play-store-unsupported.md)).
 - T3의 확장 APK도 `targetSdk 28`이어야 하는지는 아직 모른다. 컴포지터만 맡는다면 게스트 실행이 없으므로 필요 없을 가능성이 높고, T3에서 확인한다.
 - runtime/alr 문서의 "게스트: Ubuntu 24.04" 서술은 T1과 함께 고친다.
@@ -93,4 +93,4 @@ T2는 순서가 아니라 관문이다. T1과 T5의 변경마다 측정하고, 1
 
 - 위 측정은 Samsung Snapdragon 한 대, Android 17에서만 했다. MediaTek 기기는 가끔 쓸 수 있으므로 T1과 T5의 결과를 그 기기에서도 확인한다.
 - T2의 네이티브 비교는 같은 바이너리 비교가 아니다.
-- T3, T4, T5는 모두 미검증이다.
+- T3와 T4는 미검증이다. T5는 Snapdragon 한 대에서만 측정했다.

@@ -27,7 +27,8 @@ This repository keeps decisions in three places. The numbers overlap, so always 
 | [0003](../../runtime/alr/docs/adr/0003-ld-preload-path-virtualization.md) | `LD_PRELOAD` path virtualization |
 | [0004](../../runtime/alr/docs/adr/0004-link2symlink.md) | link2symlink |
 | [0005](../../runtime/alr/docs/adr/0005-play-store-unsupported.md) | Play Store unsupported |
-| [0006](../../runtime/alr/docs/adr/0006-raw-syscall-binaries.md) | Raw-syscall binaries |
+| [0006](../../runtime/alr/docs/adr/0006-raw-syscall-binaries.md) | Raw-syscall binaries (superseded by 0010) |
 | [0007](../../runtime/alr/docs/adr/0007-android-16-only.md) | Android 16 only |
-| [0008](../../runtime/alr/docs/adr/0008-static-guest-binaries-non-goal.md) | Static guest binaries |
+| [0008](../../runtime/alr/docs/adr/0008-static-guest-binaries-non-goal.md) | Static guest binaries (superseded by 0010) |
 | [0009](../../runtime/alr/docs/adr/0009-no-in-process-untar.md) | No in-process untar |
+| [0010](../../runtime/alr/docs/adr/0010-tawcroot-lane.md) | tawcroot lane for static and Go binaries |

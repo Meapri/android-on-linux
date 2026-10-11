@@ -67,8 +67,8 @@ Android public APIs
 ### Agent and developer CLIs
 
 - `node`/`npm`-based CLIs run with path virtualization (met, goal G5 of the alr engine).
-- Static binaries such as the Rust-built `codex` run without path virtualization when given a host-form environment ([alr ADR 0008](../runtime/alr/docs/adr/0008-static-guest-binaries-non-goal.md)).
-- Open: binaries that issue path syscalls without libc, such as Go (ADR 0005 T5, tawcroot lane), and long-running PTY sessions. uutils coreutils runs as shipped since 2026-10-11.
+- Static binaries such as the Rust-built `codex`, and Go programs including the Go toolchain, run with path virtualization in the tawcroot lane ([alr ADR 0010](../runtime/alr/docs/adr/0010-tawcroot-lane.md)). uutils coreutils runs as shipped since 2026-10-11.
+- Open: the lane's cost on workloads that do nothing but path syscalls (1.3 to 1.7 times native), and long-running PTY sessions.
 
 ### Packaging and UX
 

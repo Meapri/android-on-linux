@@ -1,6 +1,6 @@
 # ADR 0006 — raw-syscall 바이너리를 어떻게 할 것인가
 
-- **상태**: 채택 (2026-08-03)
+- **상태**: 채택 (2026-08-03). **대체됨 (2026-10-11)**: raw-syscall 바이너리는 이제 비목표가 아니다. 정적 ELF와 Go 바이너리는 tawcroot 레인으로 실행한다([ADR 0010](0010-tawcroot-lane.md)). uutils는 preload 레인에서 동작한다([T5 uutils 증거](../evidence/2026-10-11-t5-uutils-preload.md)).
 - **관련**: [ADR 0001](0001-signal-only-ptrace-supervisor.md), [00-product.md §5](../00-product.md), [M15](../evidence/2026-08-03-m15-cmdline-2604.md)
 
 ## 배경

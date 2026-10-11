@@ -360,9 +360,10 @@ Ubuntu 20.04 / Debian 11(glibc 2.31)에는 `--argv0`이 없어 argv[0]이 호스
 > **`LOCPATH` 를 왜 쓰는가.** glibc 의 `_nl_find_locale` 은 리터럴 `/usr/lib/locale` 을 내부 호출로 열고, Android 호스트에는 그 디렉토리가 아예 없다. 그래서 게스트는 rootfs 가 `C.utf8` 을 배포하고 있는데도 `C`/`POSIX` 밖에 못 봤고, `tmux` 는 "need UTF-8 locale (LC_CTYPE) but have ANSI_X3.4-1968" 로 거부했다. `LOCPATH` 는 glibc 자신의 탈출구다. 대가는 `locale-archive` 를 못 읽는 것인데, 호스트에 로케일이 전무한 현 상태보다는 확실히 낫다.
 
 > **`ldconfig` no-op 은 파일을 덮어쓰는 것만으로는 부족하다.** `libc-bin` 업그레이드가 진짜 래퍼를 복원하고, 그 래퍼가 정적 링크된 `ldconfig.real` 을 실행해 실패한다. 그 실패는 `libc-bin` 을 half-configured 로 남기므로 **이후의 모든 `apt install` 이 함께 죽는다** — 호환성 폭 측정에서 96개 패키지가 전부 "설치 불가" 로 보이는 형태로 드러났다. `alr` 이 매번 셰임을 다시 쓰는 것으로도 부족하다: 게스트 안에서 `alr` 을 거치지 않고 apt 를 돌리면 재발한다. 그래서 `alr install` 이 `dpkg-divert --local --rename --add /sbin/ldconfig` 를 등록한다. 이후 dpkg 는 새 버전을 `/sbin/ldconfig.distrib` 에 쓰고 우리 no-op 을 건드리지 않는다.
-| 정적 링크 게스트 바이너리 | `LD_PRELOAD` 원리적 불가. `KNOWN_FAIL:unhooked-static-binary` |
-| **`codex` 가 바로 그 사례다** | 배포 바이너리에 `INTERP` 도 `NEEDED` 도 없다(ET_EXEC, 269 MB). 실행은 되지만 **경로 가상화가 전혀 적용되지 않아** Android 파일시스템을 본다. 시작 시의 `could not create PATH aliases: Read-only file system` 이 그 증거다. `codex --version` 통과를 "게스트 안에서 동작함" 으로 읽으면 안 된다. 수용 테스트 `ALR CODEX LINKAGE` 가 추적한다 |
+| 정적 링크 게스트 바이너리 | **해결됨 (2026-10-11).** `LD_PRELOAD` 는 여전히 닿지 않지만, 정적 ELF 와 Go 바이너리는 tawcroot 레인에서 가상화된다([ADR 0010](adr/0010-tawcroot-lane.md)). 남은 위험은 비용이다. 경로 syscall 만 반복하면 레인이 1.3~1.7배다([증거](evidence/2026-10-11-t5-lane.md) §5). `ALR_LANE=0` 이면 이전처럼 가상화 없이 실행하고 `reason=unhooked-static-binary` 를 낸다 |
+| **`codex` 가 바로 그 사례였다** | 레인 이전의 기록이다. 배포 바이너리에 `INTERP` 도 `NEEDED` 도 없다(ET_EXEC, 269 MB). 실행은 되지만 **경로 가상화가 전혀 적용되지 않아** Android 파일시스템을 본다. 시작 시의 `could not create PATH aliases: Read-only file system` 이 그 증거다. `codex --version` 통과를 "게스트 안에서 동작함" 으로 읽으면 안 된다. 수용 테스트 `ALR CODEX LINKAGE` 가 추적한다 |
 | Play Store Termux | [ADR 0005](adr/0005-play-store-unsupported.md) |
+| resolvd 가 netd 의 `dnsproxyd` 를 직접 쓴다 | alr 은 정적 링크다(Makefile `ALR_API`). 정적 bionic 의 `getaddrinfo` 는 netd 에 닿지 못하므로, resolvd 가 bionic 내부 프로토콜(`getaddrinfo` 텍스트 명령, 응답 코드 222)을 직접 쓴다. Android 17 에서 확인했다. Android 가 이 내부 인터페이스를 바꾸면 게스트의 이름 해석이 실패한다. `RESOLV *` 수용 검사와 `ALR GIT CLONE HTTPS` 가 그 신호다 ([증거](evidence/2026-10-11-t5-lane.md) §3) |
 | setuid 의미론 / `sudo` | `/data`는 nosuid, setuid 계열은 seccomp 차단 |
 | 보안 격리 | alr은 샌드박스가 아니다. 경로 재작성은 방어 경계가 아니다 |
 | 커널 네임스페이스 | `unshare(CLONE_NEWUSER)` = `EINVAL`. 커널에 기능 없음 |

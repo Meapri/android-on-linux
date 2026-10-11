@@ -297,6 +297,31 @@ CLI GUEST USERDB LS:              PASS   ← ls -ld /root → "alr alr" (이전:
 > **여전히 미측정**: 사람이 앉은 대화형 세션에서의 창 분할·리사이즈. 자동화가 판정할 수 있는
 > 부분은 판정했고, 남은 것에는 상태 토큰을 붙이지 않는다.
 
+#### 레인 (ADR 0010)
+
+정적 ELF와 Go 바이너리는 tawcroot 레인에서 돈다([ADR 0010](adr/0010-tawcroot-lane.md)). 검사는 `alr-lane`이 alr 옆에 있고 rootfs의 `/bin/busybox`가 정적일 때만 돈다. 아니면 모두 SKIP이다.
+
+```
+LANE STATIC SEES ROOTFS:        PASS   ← busybox cat /etc/os-release 가 Ubuntu
+LANE STATIC CWD:                PASS   ← -w /etc 에서 pwd 가 /etc
+LANE STATIC ARGV GUEST:         PASS   ← 인자는 게스트 경로 그대로
+LANE ENV CLEAN:                 PASS   ← LD_PRELOAD, LD_LIBRARY_PATH, ALR_* 가 레인에 없다
+LANE STATIC NO WARN:            PASS   ← 레인이 맡으면 unhooked-static-binary 경고가 없다
+LANE CHILD DETACHED:            PASS   ← preload 를 거쳐 레인에 든 자식을 슈퍼바이저가 떼어 낸다
+LANE CHILD SEES ROOTFS:         PASS
+LANE IDS MATCH PRELOAD:         PASS   ← 두 레인의 id -u 가 같다
+LANE FAKEROOT IDS:              PASS   ← ALR_FAKEROOT=1 이면 레인도 0
+LANE SYMLINK RELATIVIZED:       PASS   ← 레인의 ln -s /etc/os-release 가 ../../../etc/os-release
+LANE SYMLINK READ BY PRELOAD:   PASS
+LANE HARDLINK READ BY PRELOAD:  PASS   ← 레인의 ln 이 만든 이름을 preload 레인이 읽는다
+LANE NO LINK STORE:             PASS   ← distros/tawcroot 가 생기지 않는다
+LANE OFF SWITCH:                PASS   ← ALR_LANE=0 이면 가상화가 없다
+LANE GO BUILD AND RUN:          PASS   ← go build 와 빌드된 바이너리가 rootfs 를 본다
+CLI ROOT DIR CANONICALIZED:     PASS   ← ALR_ROOT_DIR 에 "." 가 있어도 getcwd 가 게스트 경로
+```
+
+`CLI STATIC BINARY WARNS`는 이제 `ALR_LANE=0`으로 잰다. 레인이 있으면 정적 바이너리도 가상화되므로 경고할 이유가 없다.
+
 ### M8 — 성능
 ```
 ALR BENCH GIT STATUS vs PROOT:    34.8x  MEASURED  native 42 / alr 49 / proot 1,704 ms

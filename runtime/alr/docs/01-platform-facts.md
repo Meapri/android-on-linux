@@ -470,7 +470,9 @@ per-syscall 비용은 없지만 **per-exec 비용은 있다**: execve마다 DSO 
 
 ### F1. 호스트 측(bionic) — `FIELD`
 
-**NDK를 고정한다**: NDK 29, `--target=aarch64-linux-android24`.
+**NDK를 고정한다**: NDK 29, `--target=aarch64-linux-android24`. 예외는 둘이다(2026-10-11).
+- `alr`은 `--target=aarch64-linux-android29 -static`으로 빌드한다. 동적 alr은 main 전에 bionic 링커와 `libnetd_client.so` dlopen 체인을 거치는데, `alr run`마다 약 9 ms가 들었다. API 24의 `libc.a`로 만든 정적 arm64 실행 파일은 TLS 정렬 검사에서 중단된다. 정적 libc는 netd에 닿지 못하므로 resolvd가 `/dev/socket/dnsproxyd`를 직접 쓴다([증거](evidence/2026-10-11-t5-lane.md) §3).
+- `alr-lane`은 libc 없이 freestanding으로 빌드한다(Makefile `lane`, [ADR 0010](adr/0010-tawcroot-lane.md)).
 Termux 네이티브 clang을 **릴리스 경로로 쓰지 말 것** — LLVM 버전이 사용자의 `pkg upgrade`를 따라가고, 디바이스 없이는 CI가 못 돌고, 사용자 간 재현이 안 된다. 온디바이스 이너 루프로만 쓴다.
 
 API 24는 **래퍼**를 게이트하지 커널을 게이트하지 않는다. API 24 위의 syscall은 전부 `syscall(__NR_x, ...)`와 로컬 선언 struct로 간다: `memfd_create`, `statx`, `renameat2`(API 30), `pidfd_open`(31), 그리고 bionic이 절대 export하지 않는 `openat2`/`faccessat2`/`seccomp`.

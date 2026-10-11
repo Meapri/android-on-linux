@@ -27,7 +27,7 @@
 
 **왜**: 이걸 쓰는 순간 이 제품은 PRoot다. 성능 주장 전체가 무효화되고 존재 이유가 사라진다.
 
-**"path syscall을 트랩하면 더 쉬울 것 같다"는 생각이 들면**: 그 문제는 preload에서 in-process로 풀어야 한다. 그게 안 되는 유형의 문제라면 (raw `svc`를 쓰는 Go 바이너리 등) **그건 지원 범위 밖**이지 슈퍼바이저를 바꿀 이유가 아니다.
+**"path syscall을 트랩하면 더 쉬울 것 같다"는 생각이 들면**: 그 문제는 preload에서 in-process로 풀어야 한다. 그게 안 되는 유형의 문제(raw `svc`를 쓰는 Go 바이너리, 정적 바이너리)는 tawcroot 레인이 **같은 프로세스 안에서** 트랩한다([ADR 0010](adr/0010-tawcroot-lane.md)). 레인 프로세스는 슈퍼바이저에서 떼어 낸다. 어느 쪽이든 슈퍼바이저를 바꿀 이유는 아니다.
 
 ### I2. 자체 seccomp 필터를 설치하지 않는다 (v1)
 
@@ -38,7 +38,7 @@
 - **필터 평가 비용은 관측되지 않았다.** 같은 프로세스·같은 syscall 로 재보니 베이스라인 438 ns, `RET_ALLOW` 필터를 얹은 뒤 266 ns — 주파수 스케일링 잡음 범위다. "syscall 마다 비용이 붙는다"로 결정을 정당화하면 안 된다.
 - **"얻을 게 없다"도 틀렸다.** `SECCOMP_RET_USER_NOTIF`(0x7fc00000)는 zygote 의 `RET_ALLOW`(0x7fff0000)를 이긴다. 필터 설치가 `EPERM` 이던 것도 정책이 아니라 `no_new_privs=0` 때문이었고, 우리가 켜면 설치된다.
 
-그래도 v1 이 필터를 설치하지 않는 진짜 이유는 **알림 왕복이 154 µs**(베이스라인의 352배)라는 것이다. 경로 syscall 을 그렇게 가로채면 proot-distro 보다 느려진다 — 그 순간 이 제품의 존재 이유가 사라진다. ADR 0006 은 정적/raw-syscall 바이너리에 **한정한** 선택 적용을 미구현 상태로 열어 두었다. 그 예외 밖에서는 이 불변식이 그대로다.
+그래도 v1 이 필터를 설치하지 않는 진짜 이유는 **알림 왕복이 154 µs**(베이스라인의 352배)라는 것이다. 경로 syscall 을 그렇게 가로채면 proot-distro 보다 느려진다 — 그 순간 이 제품의 존재 이유가 사라진다. ADR 0006 은 정적/raw-syscall 바이너리에 **한정한** 선택 적용을 열어 두었고, [ADR 0010](adr/0010-tawcroot-lane.md)이 그 예외를 구현했다. `alr-lane` 은 레인에 들어간 프로세스 안에서만 `RET_TRAP` 필터를 설치한다. 알림 왕복이 아니라 같은 프로세스 안의 시그널이라 트랩 하나가 0.4~0.9 µs다. preload 레인의 프로세스에는 여전히 필터를 설치하지 않는다.
 
 ### I3. 경로 재작성 규칙은 `src/common/alr_path_rule.h` 한 곳에만 있다
 
@@ -210,8 +210,9 @@ ssh -p 8022 localhost
 | "user namespace를 한 번 더 시도해 보자" | `EINVAL`이다. 커널에 기능이 없다 ([§B4](01-platform-facts.md)) |
 | "Play Store Termux도 지원하자" | glibc를 로드할 로더가 없다 ([ADR 0005](adr/0005-play-store-unsupported.md)) |
 | "`/dev/full`을 `/dev/null`로 심링크하자" | ENOSPC 테스트가 조용히 통과해 버린다 |
-| "정적 바이너리도 후킹하자" | LD_PRELOAD가 원리적으로 닿지 않는다 — codex 실측 확인(정적 musl, `alr preload:` 로그 0줄, [M12 §8](evidence/2026-08-03-m12-spawn-resolver.md)). `KNOWN_FAIL`로 분류하고 문서화한다. **단, 근거를 잘못 인용하지 말 것**: 가로채기 자체는 가능하다(seccomp USER_NOTIF). 비용이 154 µs/call 이라 안 하는 것이다 ([ADR 0006](adr/0006-raw-syscall-binaries.md)) |
-| "Go 바이너리도 지원하자" | preload 로는 인터포즈할 수 없다. [ADR 0005](../../../docs/adr/0005-termux-first-goals.md) T5 가 tawcroot 레인으로 다룬다. 26.04 의 uutils 는 같은 부류가 아니었다. 이름만 잃었고 preload 에서 고쳤다([증거](evidence/2026-10-11-t5-uutils-preload.md)) |
+| "정적 바이너리를 preload 로 후킹하자" | LD_PRELOAD가 원리적으로 닿지 않는다 — codex 실측 확인(정적 musl, `alr preload:` 로그 0줄, [M12 §8](evidence/2026-08-03-m12-spawn-resolver.md)). 정적 바이너리는 tawcroot 레인이 맡는다([ADR 0010](adr/0010-tawcroot-lane.md)). USER_NOTIF(154 µs/call)로 가로채지 않는 이유는 그대로다 ([ADR 0006](adr/0006-raw-syscall-binaries.md)) |
+| "Go 바이너리도 preload 로 지원하자" | preload 로는 인터포즈할 수 없다. Go 노트가 있는 ELF 는 tawcroot 레인으로 간다([ADR 0010](adr/0010-tawcroot-lane.md)). 26.04 의 uutils 는 같은 부류가 아니었다. 이름만 잃었고 preload 에서 고쳤다([증거](evidence/2026-10-11-t5-uutils-preload.md)) |
+| "레인 안의 하드링크를 upstream 처럼 link store 로 하자" | 그 이름은 `tawcroot:link:<token>` 심링크라 preload 레인에서 읽을 수 없다. 두 레인은 한 rootfs 를 쓴다. 쓰는 규칙(상대 심링크, 복사 하드링크, 실제 uid)은 preload 와 같아야 한다 ([ADR 0010](adr/0010-tawcroot-lane.md) 결정 6) |
 | "acceptance를 SKIP으로 바꿔 넘어가자" | `SKIP`은 "이 환경에 해당 없음"이지 "아직 못 고침"이 아니다. 후자는 `KNOWN_FAIL:<reason>` |
 
 ## 8. 상위 프로젝트 참조 규칙
@@ -235,3 +236,5 @@ ssh -p 8022 localhost
 3번만 있고 1번이 없으면 grun의 열등한 복제품이다. 1번만 있고 3번이 없으면 proot-distro의 복잡한 복제품이다. **둘 다여야 한다.**
 
 > **4번의 `codex` 를 과대 해석하지 않는다.** codex 릴리스는 정적 musl 링크라 `LD_PRELOAD` 가 로드조차 되지 않는다. 실행은 되지만 경로 가상화가 전혀 걸리지 않아 rootfs 가 아니라 Android 파일시스템을 본다 ([M12 §8](evidence/2026-08-03-m12-spawn-resolver.md)). `ALR CODEX VERSION: PASS` 는 "바이너리가 뜬다"까지이지 "게스트 안에서 동작한다"가 아니다. 4번을 다 채웠다고 말하려면 codex 가 동적 링크로 바뀌거나 ADR 0006 의 선택 적용이 구현되어야 한다.
+>
+> **2026-10-11**: 선택 적용이 구현되었다([ADR 0010](adr/0010-tawcroot-lane.md)). codex 는 tawcroot 레인에서 rootfs 를 보고, `codex doctor` 는 rootfs 안의 `/usr/bin/git` 과 `/usr/bin/rg` 를 찾는다([증거](evidence/2026-10-11-t5-lane.md)).
