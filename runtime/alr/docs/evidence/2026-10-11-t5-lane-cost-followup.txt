@@ -1,0 +1,89 @@
+# Follow-up to 2026-10-11-t5-lane-cost.md (SM-S937N, Android 17, kernel 6.6.127; engine=tawcroot)
+
+== 1. fork child whose first trap is its vfork child's (probe_lane.c, new check)
+# build before the fix (commit ee1309f, dev build ~/alr), 5 runs, non-PASS lines only:
+LANE SEGV HANDLER AFTER FORK THEN VFORK RESET FAIL child status 0xb
+LANE SEGV HANDLER AFTER FORK THEN VFORK RESET FAIL child status 0xb
+LANE SEGV HANDLER AFTER FORK THEN VFORK RESET FAIL child status 0xb
+LANE SEGV HANDLER AFTER FORK THEN VFORK RESET FAIL child status 0xb
+LANE SEGV HANDLER AFTER FORK THEN VFORK RESET FAIL child status 0xb
+# with fork-type clones trapped (this change), 5 runs, PASS count per run:
+32 32 32 32 32
+
+== 2. acceptance, dev build with the fix (scripts/dev-push.sh accept)
+LANE STATIC SEES ROOTFS:               PASS
+LANE STATIC CWD:                       PASS
+LANE STATIC ARGV GUEST:                PASS
+LANE ENV CLEAN:                        PASS
+LANE STATIC NO WARN:                   PASS
+LANE CHILD DETACHED:                   PASS
+LANE CHILD SEES ROOTFS:                PASS
+LANE IDS MATCH PRELOAD:                PASS
+LANE FAKEROOT IDS:                     PASS
+LANE SYMLINK RELATIVIZED:              PASS
+LANE SYMLINK READ BY PRELOAD:          PASS
+LANE HARDLINK READ BY PRELOAD:         PASS
+LANE NO LINK STORE:                    PASS
+LANE OFF SWITCH:                       PASS
+LANE GO BUILD AND RUN:                 PASS
+LANE DIRFD ABS SYMLINK STAT:           PASS
+LANE DIRFD ABS SYMLINK OPEN:           PASS
+LANE DIRFD NOFOLLOW SYMLINK:           PASS
+LANE DIRFD LSTAT IS LINK:              PASS
+LANE CWD ABS SYMLINK STAT:             PASS
+LANE CWD ABS SYMLINK OPEN:             PASS
+LANE CWD CREATE:                       PASS
+LANE CWD CREATE WHERE:                 PASS
+LANE CWD AFTER VFORK CHDIR:            PASS
+LANE ROOT CWD BIND NAME:               PASS
+LANE ROOT DIRFD BIND NAME:             PASS
+LANE ROOT DIRFD DOTDOT:                PASS
+LANE PROC DIRFD ROOT LINK:             PASS
+LANE OWN FDS HIDDEN:                   PASS
+LANE OWN FDS EBADF:                    PASS
+LANE FOLLOW STAT RETARGETED LINK:      PASS
+LANE EFAULT STAT PATH:                 PASS
+LANE EFAULT STAT BUF:                  PASS
+LANE EFAULT OPEN PATH:                 PASS
+LANE EFAULT DIRFD PATH:                PASS
+LANE EFAULT READLINK BUF:              PASS
+LANE EFAULT PATH CROSSES PAGE:         PASS
+LANE SEGV HANDLER READBACK:            PASS
+LANE SEGV HANDLER RUNS:                PASS
+LANE SEGV SENT HANDLER RUNS:           PASS
+LANE SEGV HANDLER AFTER VFORK RESET:   PASS
+LANE SEGV HANDLER AFTER FORK THEN VFORK RESET: PASS
+LANE SEGV RESETHAND:                   PASS
+LANE BUS HANDLER RUNS:                 PASS
+LANE SEGV DEFAULT KILLS:               PASS
+LANE SEGV IGNORED STILL KILLS:         PASS
+LANE SEGV IGNORED SENT:                PASS
+  PASS=219  FAIL=0  KNOWN_FAIL=1  SKIP=0
+
+== 3. fork cost: busybox sh, 400 subshells '(:)', 15 interleaved rounds, wall ms
+# alrrel4 = release without the clone trap (-O2), alr = dev build with it (-O1)
+alrrel4/bin/alr    median 536.4  min 299.6  max 840.6
+alr/alr            median 536.8  min 285.0  max 748.2
+
+== 4. release tarball unpacked outside $PREFIX (bin/, libexec/alr/, share/alr/ under ~/alrrel4; $PREFIX has no alr files)
+# before: bin/alr did not find libexec/alr/alr-lane or share/alr/libalr_preload.so there; the tarball also carried ._* AppleDouble members
+# after (binary-relative lookup, tar --no-xattrs --no-mac-metadata, COPYFILE_DISABLE=1), release built from ee1309f plus these two
+# changes only (no clone trap yet), acceptance.sh finding alr-doctor beside $ALR:
+find ~/alrrel4 -name '._*' | wc -l  ->  0
+CLI VERSION SHOWS GUEST PRELOAD:       PASS
+CLI VERSION DETECTS STALE PRELOAD:     PASS
+CLI VERSION TEST RESTORED:             PASS
+CLI UPDATE COMPONENTS:                 PASS
+DOCTOR P11 DYNAMIC CLEAN:              PASS
+DOCTOR P11 STATIC FLAGGED:             PASS
+DOCTOR P11 COUNTS NONZERO:             PASS
+DOCTOR P11 REJECTS NON ELF:            PASS
+DOCTOR P11 SWEEPS DIR:                 PASS
+DOCTOR P11 SKIPS LIBS:                 PASS
+DOCTOR P12 PHANTOM:                    PASS
+CLI VERSION HONOURS -d:                PASS
+  PASS=218  FAIL=0  KNOWN_FAIL=1  SKIP=0
+
+== 5. other suites with the fix
+  13 passed, 0 failed
+ALR BREADTH: install=96/96 run=96/96

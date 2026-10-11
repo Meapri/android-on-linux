@@ -317,7 +317,7 @@ LANE HARDLINK READ BY PRELOAD:  PASS   ← 레인의 ln 이 만든 이름을 pre
 LANE NO LINK STORE:             PASS   ← distros/tawcroot 가 생기지 않는다
 LANE OFF SWITCH:                PASS   ← ALR_LANE=0 이면 가상화가 없다
 LANE GO BUILD AND RUN:          PASS   ← go build 와 빌드된 바이너리가 rootfs 를 본다
-LANE DIRFD ABS SYMLINK STAT:    PASS   ← 아래 31개는 tests/device/probe_lane.c (게스트 gcc 로 정적 빌드)
+LANE DIRFD ABS SYMLINK STAT:    PASS   ← 아래 32개는 tests/device/probe_lane.c (게스트 gcc 로 정적 빌드)
 LANE DIRFD ABS SYMLINK OPEN:    PASS   ← 호스트 쪽에서 만든 절대 심링크도 rootfs 기준으로 따라간다
 LANE DIRFD NOFOLLOW SYMLINK:    PASS
 LANE DIRFD LSTAT IS LINK:       PASS
@@ -343,6 +343,7 @@ LANE SEGV HANDLER READBACK:     PASS   ← 게스트의 SIGSEGV 설정이 그대
 LANE SEGV HANDLER RUNS:         PASS
 LANE SEGV SENT HANDLER RUNS:    PASS
 LANE SEGV HANDLER AFTER VFORK RESET: PASS
+LANE SEGV HANDLER AFTER FORK THEN VFORK RESET: PASS ← fork 자식의 첫 트랩이 vfork 자식의 것이어도
 LANE SEGV RESETHAND:            PASS
 LANE BUS HANDLER RUNS:          PASS
 LANE SEGV DEFAULT KILLS:        PASS
