@@ -201,6 +201,19 @@ static int handle_sigsys(struct sup *s, pid_t t)
              (int)t, si.si_code);
         return 0;
     }
+    /* RET_TRAP puts the returning filter's SECCOMP_RET_DATA in si_errno.  The
+     * zygote filter's is 0 (MEASURED, Android 17 SM8750); a nonzero value
+     * means a filter the guest stacked on top -- an in-process path lane
+     * (ADR 0005 T5) or the guest's own sandbox -- and its handler must run.
+     * Where both filters trap, the kernel reports the later filter's data, so
+     * the guest sees those too; when its handler re-issues a call the zygote
+     * blocks, that trap carries 0 and is rescued here as usual. */
+    if (si.si_errno != 0) {
+        if (s->stats) s->stats->sigsys_passthrough++;
+        slog(s, 2, "alr sigsys: tid=%d data=0x%x from a guest filter, passthrough\n",
+             (int)t, (unsigned)si.si_errno);
+        return 0;
+    }
 #ifdef si_arch
     if (si.si_arch != AUDIT_ARCH_AARCH64) {
         if (s->stats) s->stats->sigsys_passthrough++;

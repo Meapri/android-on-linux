@@ -34,6 +34,10 @@
  * the context is wrong.
  *
  * usage: trap_cost [cpu]     pin to that CPU first (big/LITTLE matters)
+ *
+ * Run it under `alr run` too: a traced process pays a ptrace
+ * signal-delivery-stop for every trap, even one the supervisor passes
+ * through, and that is the cost an in-process lane pays inside alr.
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -148,7 +152,9 @@ static int install_filter(void)
                  offsetof(struct seccomp_data, instruction_pointer) + 4),
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (uint32_t)(ip >> 32), 0, 1),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+        /* Nonzero data, as tawcroot's filter uses: under alr's supervisor
+         * a data-0 trap is taken for the zygote's and answered by it. */
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP | 0x7477),
     };
     struct sock_fprog prog = { .len = sizeof f / sizeof f[0], .filter = f };
     return (int)syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog);

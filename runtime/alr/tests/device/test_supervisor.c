@@ -11,10 +11,14 @@
 #include "alr_supervisor.h"
 
 #include <errno.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -23,6 +27,19 @@
 #define NR_rseq            293
 #define NR_io_uring_setup  425
 #define NR_mount           40
+#define NR_vhangup         58   /* blocked by the zygote filter */
+#define NR_getppid         173  /* allowed by it */
+
+/* A guest's own RET_TRAP filter, as an in-process path lane installs one. */
+#define GUEST_TRAP_DATA    0x7477
+
+static volatile int g_own_traps, g_own_errno;
+static void on_own_sigsys(int sig, siginfo_t *si, void *uc)
+{
+    (void)sig; (void)uc;
+    g_own_traps++;
+    g_own_errno = si->si_errno;
+}
 
 static int pass, fail;
 static char self[4096];
@@ -107,6 +124,33 @@ static int child_main(int n)
             }
             return bad;
         }
+    case 11: { /* a SIGSYS from the guest's OWN seccomp filter carries that
+               * filter's RET_DATA in si_errno and must reach the guest's
+               * handler.  The zygote filter's carries 0 and must still be
+               * rescued.  Where both trap, the later filter's data wins. */
+        struct sock_filter f[] = {
+            BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, NR_getppid, 2, 0),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, NR_vhangup, 1, 0),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP | GUEST_TRAP_DATA),
+        };
+        struct sock_fprog prog = { sizeof f / sizeof f[0], f };
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_sigaction = on_own_sigsys;
+        sa.sa_flags = SA_SIGINFO;
+        sigaction(SIGSYS, &sa, NULL);
+        if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) ||
+            prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog))
+            return 2;
+        syscall(NR_getppid);                        /* ours only */
+        syscall(NR_vhangup);                        /* ours and zygote's */
+        if (g_own_traps != 2 || g_own_errno != GUEST_TRAP_DATA) return 3;
+        /* zygote's only: still emulated, never seen by the handler */
+        if (syscall(NR_set_robust_list, NULL, 0) != 0) return 4;
+        return g_own_traps == 2 ? 0 : 5;
+    }
     default:
         return 99;
     }
@@ -203,6 +247,11 @@ int main(int argc, char **argv)
     ck(run_case(8, &st) == 0, "SUPERVISOR EXEC TRACKING:", "exec grandchild not rescued");
     ck(run_case(9, &st) == 42, "SUPERVISOR EXIT CODE:", "want 42");
     ck(run_case(10, &st) == 0, "SUPERVISOR MULTI CHILD:", "some child not rescued");
+    {   int rc = run_case(11, &st);
+        char why[64];
+        snprintf(why, sizeof why, "rc=%d (3: guest's own trap swallowed)", rc);
+        ck(rc == 0, "SUPERVISOR GUEST FILTER TRAP PASSTHROUGH:", why);
+    }
 
     {   /* The invariants that separate this from PRoot. Checked against the
          * ACCUMULATED totals, not just the last case. */
