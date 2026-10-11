@@ -112,3 +112,22 @@ band ls                            median   304.5 ms  x1.17  (paired x1.16)
 scan ls                            median   319.1 ms  x1.22  (paired x1.23)
 # CPU features (no SVE, so no non-faulting loads for the copy side):
 # fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 asimdfhm dit uscat ilrcpc flagm ssbs sb paca pacg dcpodp flagm2 frint i8mm bf16 rng bti ecv afp rpres
+
+== 8. per-fd getdents64 filter (adopted), same method as section 7
+# band = 3bf3e8a release; watch = this change, release build
+base find                          median   255.3 ms  x1.00  (paired x1.00)
+band find                          median   298.3 ms  x1.17  (paired x1.19)
+watch find                         median   292.8 ms  x1.15  (paired x1.15)
+base ls                            median   266.9 ms  x1.00  (paired x1.00)
+band ls                            median   308.9 ms  x1.16  (paired x1.16)
+watch ls                           median   300.7 ms  x1.13  (paired x1.14)
+# acceptance (dev build): PASS=221 FAIL=0 KNOWN_FAIL=1 SKIP=0
+#   LANE PROC FD DIR LOWEST FD: PASS   LANE DIR AT PROC FD DIR NUMBER: PASS   LANE OWN FDS HIDDEN: PASS
+# Go, 16 goroutines x 50 os.ReadDir("/proc/self/fd") in the lane:
+bad 0 dirfd 3
+
+== 9. validating a guest pointer through the kernel instead of owning SIGSEGV (Termux native, clang -O2, 200k calls, two runs)
+mknodat(-1, path, S_IFDIR, 0): rc=-1 errno=1 (EPERM, also for a bad pointer: refused before the copy)
+mknodat 343 ns / 362 ns
+pvm_readv 272 ns / 288 ns   (process_vm_readv of 28 bytes from self)
+getppid 110 ns / 108 ns

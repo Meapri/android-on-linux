@@ -317,7 +317,7 @@ LANE HARDLINK READ BY PRELOAD:  PASS   ← 레인의 ln 이 만든 이름을 pre
 LANE NO LINK STORE:             PASS   ← distros/tawcroot 가 생기지 않는다
 LANE OFF SWITCH:                PASS   ← ALR_LANE=0 이면 가상화가 없다
 LANE GO BUILD AND RUN:          PASS   ← go build 와 빌드된 바이너리가 rootfs 를 본다
-LANE DIRFD ABS SYMLINK STAT:    PASS   ← 아래 32개는 tests/device/probe_lane.c (게스트 gcc 로 정적 빌드)
+LANE DIRFD ABS SYMLINK STAT:    PASS   ← 아래 34개는 tests/device/probe_lane.c (게스트 gcc 로 정적 빌드)
 LANE DIRFD ABS SYMLINK OPEN:    PASS   ← 호스트 쪽에서 만든 절대 심링크도 rootfs 기준으로 따라간다
 LANE DIRFD NOFOLLOW SYMLINK:    PASS
 LANE DIRFD LSTAT IS LINK:       PASS
@@ -330,6 +330,8 @@ LANE ROOT CWD BIND NAME:        PASS   ← 루트의 proc 는 바인드다
 LANE ROOT DIRFD BIND NAME:      PASS
 LANE ROOT DIRFD DOTDOT:         PASS
 LANE PROC DIRFD ROOT LINK:      PASS
+LANE PROC FD DIR LOWEST FD:     PASS   ← /proc/self/fd 디렉터리도 가장 낮은 빈 fd 를 받는다
+LANE DIR AT PROC FD DIR NUMBER: PASS
 LANE OWN FDS HIDDEN:            PASS   ← /proc/self/fd 에 alr-lane 의 fd 가 없다
 LANE OWN FDS EBADF:             PASS
 LANE FOLLOW STAT RETARGETED LINK: PASS ← 다른 프로세스가 바꾼 심링크의 새 대상

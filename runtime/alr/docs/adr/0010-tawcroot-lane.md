@@ -36,7 +36,7 @@ preload(`LD_PRELOAD`)는 libc를 거치는 호출만 본다. 두 부류의 게�
    - 하드링크가 거부되면 복사한다. upstream의 link store(`tawcroot:link:<token>` 심링크)는 쓰지 않는다. preload 레인에서는 그 심링크를 읽을 수 없기 때문이다.
 7. **SIGSEGV와 SIGBUS는 alr-lane이 갖는다**: alr-lane은 게스트의 경로와 stat 버퍼를 `process_vm_readv` 없이 직접 읽고 쓴다. 잘못된 포인터가 낸 fault는 alr-lane이 받아 EFAULT로 바꾼다. 그래서 커널에는 두 시그널에 alr-lane의 진입점을 걸어 두고, 게스트의 `rt_sigaction`에는 게스트가 설정한 값을 그대로 보여 준다([VENDORING.md](../../third_party/tawcroot/VENDORING.md) 10).
    - 게스트 코드의 fault는 게스트 핸들러에 커널이 부른 것과 같은 인자, 스택, 마스크로 전달한다. `SIG_DFL`이면 프로세스가 원래처럼 그 시그널로 죽고, `SIG_IGN`이 exec를 넘어 상속되는 것도 같다. Go의 nil 역참조 `recover`와 `SetPanicOnFault`가 이 경로를 쓴다.
-   - 게스트가 볼 수 있는 차이는 두 가지다. `/proc/<pid>/status`의 `SigCgt`에 두 시그널이 잡혀 있다. `/proc/<pid>/fd` 디렉터리를 열면 fd가 900번대다(목록에서 alr-lane의 fd를 숨기는 `getdents64`만 트랩하기 위해서다).
+   - 게스트가 볼 수 있는 차이는 하나다. `/proc/<pid>/status`의 `SigCgt`에 두 시그널이 잡혀 있다. 이것을 없애려면 직접 읽기를 포기하거나 읽기마다 검증 syscall을 더해야 하고, 둘 다 경로 트랩마다 0.27 µs 이상이 든다([비용 증거](../evidence/2026-10-11-t5-lane-cost.md) §5).
 
 ## 결과
 
