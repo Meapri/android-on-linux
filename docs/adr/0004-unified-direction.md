@@ -123,7 +123,7 @@ S3가 실패하면 대안은 "Termux에서 `alr run --gui`가 APK 서비스에 �
 
 반입한 `tawcroot`는 호스트(x86_64)에서 전체가 컴파일, 링크되고, 정적 glibc 바이너리가 rootfs 안의 `/etc/hostname`을 읽는 것까지 확인했다. 같은 VM에서 `stat()`는 네이티브 약 0.45 µs, 트랩 경로 약 4.6 µs였고, 업스트림이 기록한 AMD 노트북 수치는 2.3 µs다. 둘 다 Android 기기 값이 아니므로 판정표에는 쓰지 않는다(`PENDING_DEVICE`).
 
-판정표의 수치는 [`runtime/alr/bench/microbench/trap_cost.c`](../../runtime/alr/bench/microbench/trap_cost.c)로 잰다. 이 벤치는 `tawcroot`의 필터 모양(트램폴린 복귀 PC만 `ALLOW`, 나머지는 `TRAP`)을 경로 변환 없이 재현하고, ADR 0006의 `notif_cost.c`와 같은 syscall(`getppid`)과 같은 반복 수를 쓴다. `tawcroot` 본체는 `getppid`를 트랩하지 않으므로 본체로는 이 수치를 얻을 수 없다. 출력은 기준선, 필터 평가, 시그널 왕복(핸들러가 결과를 직접 씀), 재발행 왕복(핸들러가 트램폴린에서 다시 발행함)의 네 값이며, 판정표에는 `재발행 왕복 - 기준선`을 적용한다. 실행 명령은 `scripts/dev-push.sh trap-cost`이고, Termux에서 fork된 프로세스(`untrusted_app_27`, `Seccomp: 2`)가 아니면 판정을 출력하지 않는다. 호스트에서는 aarch64와 x86_64로 컴파일만 확인했고 기기 실행 결과는 없다(`PENDING_DEVICE`).
+판정표의 수치는 [`runtime/alr/bench/microbench/trap_cost.c`](../../runtime/alr/bench/microbench/trap_cost.c)로 잰다. 이 벤치는 `tawcroot`의 필터 모양(트램폴린 복귀 PC만 `ALLOW`, 나머지는 `TRAP`)을 경로 변환 없이 재현하고, ADR 0006의 `notif_cost.c`와 같은 syscall(`getppid`)과 같은 반복 수를 쓴다. `tawcroot` 본체는 `getppid`를 트랩하지 않으므로 본체로는 이 수치를 얻을 수 없다. 출력은 기준선, 필터 평가, 시그널 왕복(핸들러가 결과를 직접 씀), 재발행 왕복(핸들러가 트램폴린에서 다시 발행함)의 네 값이며, 판정표에는 `재발행 왕복 - 기준선`을 적용한다. 실행 명령은 `scripts/dev-push.sh trap-cost`이고, Termux에서 fork된 프로세스(`untrusted_app_27`, `Seccomp: 2`)가 아니면 판정을 출력하지 않는다. **결과(2026-10-11, Snapdragon SM-S937N, Android 17, `untrusted_app_27`, `Seccomp=2`)**: 10회 실행의 중앙값이 +410~+925 ns로 모두 5 µs 이하였다. **판정은 `PROCEED`(로더 프로토타입 진행)다.** 같은 syscall의 `USER_NOTIF`(154 µs)보다 170배 이상 싸다. 이 값은 경로 변환을 뺀 메커니즘 단독 비용이고, MediaTek 참조 기기는 재지 않았다([증거](../../runtime/alr/docs/evidence/2026-10-11-s2-ret-trap-cost.md)).
 
 `tawcroot` 본체의 `stat` 경로 비용(경로 변환 포함)은 판정에 쓰지 않는 보조 수치다. 본체의 aarch64 빌드는 bionic 헤더를 전제하므로 NDK나 Termux의 clang이 필요하다([VENDORING.md](../../runtime/alr/third_party/tawcroot/VENDORING.md)).
 
@@ -182,5 +182,5 @@ P1이 가장 먼저인 이유는 이 ADR의 D3(계층 분리)가 기기 증거 �
 
 - 두 참조 기기는 모두 Samsung이다. 다른 OEM은 확인해 주지 못한다.
 - GPU 증거는 MediaTek Mali-G615 한 기기에서 나왔다. Adreno, Tensor 계열은 [device-evidence](../architecture/device-evidence.md)의 기준을 아직 채우지 못했으며, "제조사 독립 가속"이라는 표현은 쓰지 않는다.
-- D4의 S3, D6의 `RET_TRAP` 레인, D7의 PTY와 장시간 세션은 모두 미검증이다.
+- D4의 S3, D7의 PTY와 장시간 세션은 미검증이다. D6은 `RET_TRAP` 메커니즘의 왕복 비용만 Snapdragon 한 대에서 측정했고, 경로 변환과 로더를 포함한 레인 전체는 미검증이다.
 - 이 ADR을 작성한 시점에 위 비교 표의 tawc 항목은 공개 저장소를 읽은 내용에 근거하며, 기기에서 직접 실행해 본 것이 아니다.

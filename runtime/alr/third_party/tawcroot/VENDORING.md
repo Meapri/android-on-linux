@@ -44,6 +44,8 @@ Host smoke, same VM: a static glibc binary run under `tawcroot -r ROOT -- /bin/h
 | Upstream `perf/results.md`, AMD laptop, 2026-06-10 | 2,285 ns | 352 ns |
 | This repository, x86_64 VM, 2026-10-11, 200k iterations, 3 runs | 4,510 to 4,807 ns | 444 to 504 ns |
 
+The D6 gate itself is now measured on a device without tawcroot: [`bench/microbench/trap_cost.c`](../../bench/microbench/trap_cost.c) reproduces tawcroot's filter shape and measured +410 to +925 ns per `getppid` round trip on the Snapdragon reference device ([evidence](../../docs/evidence/2026-10-11-s2-ret-trap-cost.md)). That excludes path translation; the table below still has no device row.
+
 Neither number is a measurement on an Android device under `untrusted_app_27` with the zygote seccomp filter stacked. ADR 0004 D6 gates the decision on a device measurement. `PENDING_DEVICE`.
 
 ## Rules for using this code
