@@ -45,6 +45,8 @@ struct alr_sup_opts {
     int   log_level;           /* 0 quiet, 1 warn, 2 trace               */
     int   log_fd;              /* diagnostics fd; -1 -> stderr           */
     unsigned long runaway_cap; /* 0 -> default 1<<20                     */
+    const char *lane_path;     /* canonical host path of alr-lane, or NULL:
+                                * a tracee that execs it is DETACHED (ADR 0010) */
 };
 
 /* Fork, attach, exec, and supervise until the leader exits.

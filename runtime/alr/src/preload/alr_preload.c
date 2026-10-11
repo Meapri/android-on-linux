@@ -58,6 +58,8 @@ static const char *g_guest_exe;
 static const char *g_ldso;
 static const char *g_libpath;
 static const char *g_preload;
+/* Host path of alr-lane (ADR 0010), or NULL when the lane is off. */
+static const char *g_lane;
 static const char *g_resolv_sock;
 static int g_fakeroot;
 static int g_count;
@@ -292,7 +294,7 @@ static void alr_dtor(void)
 
 /* The variables alr_init() reads, kept as "NAME=value" so the exec path can
  * put back any the guest removed (env_set_exe).  Static storage: R1. */
-#define ALR_NCARRY 9
+#define ALR_NCARRY 10
 static char   g_carry[ALR_NCARRY][ALR_PBUF];
 static size_t g_carry_len[ALR_NCARRY];      /* length of "NAME=" */
 static int    g_ncarry;
@@ -301,7 +303,7 @@ static void carry_capture(void)
 {
     static const char *const names[ALR_NCARRY] = {
         "ALR_ROOT", "ALR_LDSO", "ALR_LIBPATH", "ALR_PRELOAD", "ALR_FAKEROOT",
-        "ALR_COUNT", "ALR_LOG", "ALR_LOG_FD", ALR_RESOLV_ENV,
+        "ALR_COUNT", "ALR_LOG", "ALR_LOG_FD", ALR_RESOLV_ENV, "ALR_LANE",
     };
     int k;
     for (k = 0; k < ALR_NCARRY; k++) {
@@ -434,6 +436,8 @@ static void alr_init(void)
     g_libpath   = getenv("ALR_LIBPATH");
     g_preload   = getenv("ALR_PRELOAD");
     g_resolv_sock = getenv(ALR_RESOLV_ENV);
+    { const char *l = getenv("ALR_LANE");
+      g_lane = (l && *l && strcmp(l, "0") != 0) ? l : NULL; }
     { const char *f = getenv("ALR_FAKEROOT"); g_fakeroot = f && *f == '1'; }
     { const char *c = getenv("ALR_COUNT");    g_count    = c && *c == '1'; }
     carry_capture();
@@ -1750,7 +1754,7 @@ static int exec_build(const char *guest, char *const argv[],
     struct pctx ctx;
     enum alr_exe_kind kind = ALR_EXE_UNSUPPORTED;
     const char *cur = guest, *host = NULL;
-    int nl = 0, argc = 0, i, j;
+    int nl = 0, argc = 0, i, j, is_go = 0;
 
     ensure_init();
     if (!real_open) { errno = ENOSYS; return -1; }
@@ -1767,6 +1771,8 @@ static int exec_build(const char *guest, char *const argv[],
         ctx.fd = fd;
         kind = alr_classify(head, (size_t)n, pctx_read, &ctx,
                             &sb, ibuf[nl], ALR_SHEBANG_IBUF);
+        is_go = kind == ALR_EXE_ELF_DYNAMIC && g_lane
+                && alr_elf_is_go(head, (size_t)n, pctx_read, &ctx);
         close(fd);
         if (kind != ALR_EXE_SHEBANG) break;
         if (nl >= maxdepth - 1) { errno = ELOOP; return -1; }
@@ -1827,6 +1833,34 @@ static int exec_build(const char *guest, char *const argv[],
             av[argc] = NULL;
             return 1;
         }
+    }
+
+    /* ADR 0010: a program that makes its own path syscalls -- every static
+     * ELF, and Go even when dynamically linked -- runs under alr-lane, which
+     * traps those syscalls in-process and translates them against the root.
+     * It gets GUEST paths, unchanged: the lane does the mapping.  The caller
+     * strips this runtime's loader environment (host_out == 2), and the
+     * supervisor detaches when it sees the exec land on alr-lane, because a
+     * traced process pays a tracer round trip for every one of those traps. */
+    if (g_lane && (kind == ALR_EXE_ELF_STATIC || is_go)) {
+        lg("alr exec: lane %s%s\n", cur, is_go ? " (go)" : "");
+        if (host_out) *host_out = 2;
+        *file_out = g_lane;
+        av[argc++] = g_lane;
+        av[argc++] = "-r"; av[argc++] = g_root;
+        av[argc++] = "-b"; av[argc++] = "/proc:/proc";
+        av[argc++] = "-b"; av[argc++] = "/dev:/dev";
+        av[argc++] = "-b"; av[argc++] = "/sys:/sys";
+        if (g_fakeroot) av[argc++] = "--fakeroot";  /* same ids as here */
+        av[argc++] = "--";
+        av[argc++] = cur;
+        for (j = nl - 1; j >= 0 && argc < avmax - 2; j--) {
+            if (lvl[j].arg) av[argc++] = lvl[j].arg;
+            av[argc++] = lvl[j].file;
+        }
+        for (i = 1; argv[i] && argc < avmax - 2; i++) av[argc++] = (char *)argv[i];
+        av[argc] = NULL;
+        return 1;
     }
 
     if (kind == ALR_EXE_ELF_STATIC || !g_ldso) {
@@ -1897,6 +1931,32 @@ static int exec_build(const char *guest, char *const argv[],
     return 1;
 }
 
+/* The environment for a child this runtime does not interpose.
+ *
+ * A host binary must not inherit the GUEST's loader environment:
+ * LD_LIBRARY_PATH and LD_PRELOAD point into the rootfs at glibc objects, and
+ * an Android binary asks bionic to load them and gets
+ *     alr: error while loading shared libraries: libdl.so
+ * naming a library that exists on both sides in incompatible forms.
+ *
+ * A lane child (ADR 0010) drops this runtime's ALR_* variables as well: inside
+ * the lane every path is the guest's, and a dynamic program the lane loads
+ * must not find our host-path preload settings. */
+static char *const *env_strip(char *const *ep, int lane)
+{
+    static const char *out[ALR_ENV_MAX + 1];
+    int n = 0, k;
+    for (k = 0; ep[k] && n < ALR_ENV_MAX; k++) {
+        if (!strncmp(ep[k], "LD_PRELOAD=", 11))      continue;
+        if (!strncmp(ep[k], "LD_LIBRARY_PATH=", 16)) continue;
+        if (!strncmp(ep[k], "LOCPATH=", 8))          continue;
+        if (lane && !strncmp(ep[k], "ALR_", 4))       continue;
+        out[n++] = ep[k];
+    }
+    out[n] = NULL;
+    return (char *const *)out;
+}
+
 static int exec_dispatch(const char *guest, char *const argv[],
                          char *const envp[], int depth)
 {
@@ -1914,26 +1974,7 @@ static int exec_dispatch(const char *guest, char *const argv[],
                    ibuf, ALR_SHEBANG_MAX_DEPTH, &file, &ident, &is_host) < 0)
         return -1;
     ep = env_set_exe(envp, ident, kv, sizeof kv, ne);
-    if (is_host) {
-        /* A host binary must not inherit the GUEST's loader environment.
-         *
-         * LD_LIBRARY_PATH and LD_PRELOAD point into the rootfs at glibc
-         * objects; an Android binary asks bionic to load them and gets
-         *     alr: error while loading shared libraries: libdl.so
-         * naming a library that exists on both sides in incompatible forms.
-         * Same rule as everywhere else in this runtime: host paths and a host
-         * environment for something we are not virtualizing. */
-        static const char *hostenv[ALR_ENV_MAX + 1];
-        int hn = 0, k;
-        for (k = 0; ep[k] && hn < ALR_ENV_MAX; k++) {
-            if (!strncmp(ep[k], "LD_PRELOAD=", 11))      continue;
-            if (!strncmp(ep[k], "LD_LIBRARY_PATH=", 16)) continue;
-            if (!strncmp(ep[k], "LOCPATH=", 8))          continue;
-            hostenv[hn++] = ep[k];
-        }
-        hostenv[hn] = NULL;
-        return real_execve(file, (char *const *)av, (char *const *)hostenv);
-    }
+    if (is_host) ep = env_strip(ep, is_host == 2);
     return real_execve(file, (char *const *)av, ep);
 }
 
@@ -2053,19 +2094,7 @@ static int spawn_common(pid_t *pid, const char *path,
                        ibuf, ALR_SHEBANG_MAX_DEPTH, &file, &ident, &is_host) < 0)
             return errno ? errno : ENOEXEC;
         ep = env_set_exe(envp, ident, kv, sizeof kv, ne);
-        if (is_host) {
-            /* Same host-binary rule as execve: no guest loader environment. */
-            static const char *hostenv[ALR_ENV_MAX + 1];
-            int hn = 0, k;
-            for (k = 0; ep[k] && hn < ALR_ENV_MAX; k++) {
-                if (!strncmp(ep[k], "LD_PRELOAD=", 11))      continue;
-                if (!strncmp(ep[k], "LD_LIBRARY_PATH=", 16)) continue;
-                if (!strncmp(ep[k], "LOCPATH=", 8))          continue;
-                hostenv[hn++] = ep[k];
-            }
-            hostenv[hn] = NULL;
-            ep = (char *const *)hostenv;
-        }
+        if (is_host) ep = env_strip(ep, is_host == 2);
         return real_posix_spawn(pid, file, fa, attr, (char *const *)av, ep);
     }
 }

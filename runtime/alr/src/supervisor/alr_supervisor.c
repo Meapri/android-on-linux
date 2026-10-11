@@ -120,6 +120,17 @@ static void drop(struct sup *s, pid_t t)
     if (i >= 0) s->st[i] = T_FREE;
 }
 
+static int is_lane(pid_t t, const char *lane)
+{
+    char p[64], exe[4096];
+    ssize_t n;
+    snprintf(p, sizeof p, "/proc/%d/exe", (int)t);
+    n = readlink(p, exe, sizeof exe - 1);
+    if (n < 0) return 0;
+    exe[n] = '\0';
+    return strcmp(exe, lane) == 0;
+}
+
 static int live(struct sup *s)
 {
     int i, n = 0;
@@ -320,7 +331,7 @@ int alr_supervise(const struct alr_sup_opts *o, int *status_out,
 {
     struct sup s;
     pid_t leader;
-    int st0, leader_status = 0;
+    int st0, leader_status = 0, leader_done = 0;
     struct timespec t_start;
     /* CLOCK_MONOTONIC, not wall time: a clock step mid-run would otherwise
      * produce a negative or absurd duration, and this number's job is to be
@@ -380,8 +391,10 @@ int alr_supervise(const struct alr_sup_opts *o, int *status_out,
 
         if (WIFEXITED(status) || WIFSIGNALED(status)) {
             drop(&s, t);
-            if (t == leader) leader_status = status;
-            if (live(&s) == 0) break;
+            if (t == leader) { leader_status = status; leader_done = 1; }
+            /* A leader we detached (lane, below) is still our child and still
+             * owes us its exit status, though it is no longer "live". */
+            if (live(&s) == 0 && leader_done) break;
             continue;
         }
         if (!WIFSTOPPED(status)) continue;
@@ -432,6 +445,17 @@ int alr_supervise(const struct alr_sup_opts *o, int *status_out,
                 unsigned long msg = 0;
                 if (ptrace(PTRACE_GETEVENTMSG, t, 0, &msg) == 0)
                     add(&s, (pid_t)msg, T_NEW);
+            }
+            /* ADR 0010: a tracee that became alr-lane leaves us.  The lane
+             * rescues zygote traps itself, and every SIGSYS it delivers to a
+             * TRACED process is a tracer round trip (~60 us against 0.5).
+             * Its descendants inherit the lane's filter, not our tracing. */
+            if (event == PTRACE_EVENT_EXEC && o->lane_path && is_lane(t, o->lane_path)) {
+                slog(&s, 1, "alr: tid=%d entered the lane; detaching\n", (int)t);
+                ptrace(PTRACE_DETACH, t, 0, 0);
+                drop(&s, t);
+                if (live(&s) == 0 && leader_done) break;
+                continue;
             }
             /* EXEC and EXIT need no bookkeeping: options are inherited and
              * the tracee is already registered. */

@@ -217,6 +217,11 @@ ck  "CLI EXEC DDASH"             exec-ok        $ALR exec -- /bin/echo exec-ok
 # skipped the ".."-pops-at-root clamp and `-w /../..` chdir'd ABOVE the rootfs.
 ck  "CLI WORKDIR CLAMPS DOTDOT"  /              $ALR run -w /../.. /bin/pwd
 ck  "CLI WORKDIR NORMALIZES"     /etc           $ALR run -w /root/../etc /bin/pwd
+# The kernel reports cwd and /proc/self/fd targets canonically; a root dir
+# spelled with "." or ".." never prefix-matched them, so getcwd() returned the
+# host path and the uutils name fix missed ld.so (seen with
+# ALR_ROOT_DIR=$HOME/../usr/var/lib/alr/distros).
+ck  "CLI ROOT DIR CANONICALIZED" /etc           env ALR_ROOT_DIR="$ALR_ROOT_DIR/." $ALR run -w /etc /bin/pwd
 ck  "CLI WORKDIR PWD CANONICAL"  /etc           $ALR run -w /root/../etc /bin/sh -c 'echo $PWD'
 ck  "CLI WORKDIR SYSDIR PASS"    /proc          $ALR run -w /proc /bin/pwd
 # A -e must REPLACE alr's own value, not sit beside it: envp allows duplicate
@@ -356,19 +361,77 @@ if [ -r "$_pl" ]; then
 else
     emit "CLI WARNS UNVIRTUALIZED BOOT" SKIP "no preload in the rootfs to move"
 fi
-# A static guest binary runs but its paths resolve against ANDROID, not the
-# rootfs (ADR 0008).  alr knew and said nothing at every verbosity; the first
-# attempt at this warning fired on /usr/bin/git, because alr_classify only
-# walks PT_INTERP when given an interp buffer and the caller passed NULL.
+# Without the lane (ALR_LANE=0) a static guest binary runs but its paths
+# resolve against ANDROID, not the rootfs (ADR 0008).  alr knew and said
+# nothing at every verbosity; the first attempt at this warning fired on
+# /usr/bin/git, because alr_classify only walks PT_INTERP when given an interp
+# buffer and the caller passed NULL.
 if [ -x "$R/usr/local/bin/codex" ]; then
     ckc "CLI STATIC BINARY WARNS"  "reason=unhooked-static-binary" \
-        $ALR run /usr/local/bin/codex --version
+        env ALR_LANE=0 $ALR run /usr/local/bin/codex --version
 else
     emit "CLI STATIC BINARY WARNS" SKIP "codex not installed"
 fi
 n=$($ALR run /usr/bin/git --version 2>&1 | grep -c 'unhooked-static-binary')
 [ "${n:-1}" -eq 0 ] && emit "CLI DYNAMIC NO FALSE WARN" PASS \
                     || emit "CLI DYNAMIC NO FALSE WARN" FAIL "warned on a dynamic binary"
+
+echo "── 레인: 정적·Go 바이너리 (ADR 0010) ──"
+# busybox in Ubuntu is static: the preload never loads into it, so only the
+# lane can show it the rootfs.  Android has no /etc/os-release.
+_lane=$($ALR run /bin/busybox true 2>&1; ALR_LOG=1 $ALR run /bin/busybox true 2>&1)
+if [ -x "$R/bin/busybox" ] && printf '%s' "$_lane" | grep -q 'in the lane'; then
+    ckc "LANE STATIC SEES ROOTFS"   "ID=ubuntu" $ALR run /bin/busybox cat /etc/os-release
+    ck  "LANE STATIC CWD"           "/etc"      $ALR run -w /etc /bin/busybox pwd
+    ck  "LANE STATIC ARGV GUEST"    "/etc/hostname" $ALR run /bin/busybox realpath /etc/hostname
+    n=$($ALR run /bin/busybox env 2>&1 | grep -cE '^(LD_PRELOAD|LD_LIBRARY_PATH|ALR_)')
+    [ "${n:-1}" -eq 0 ] && emit "LANE ENV CLEAN" PASS \
+                        || emit "LANE ENV CLEAN" FAIL "$n loader variable(s) reached the lane"
+    n=$(printf '%s' "$_lane" | grep -c 'unhooked-static-binary')
+    [ "${n:-1}" -eq 0 ] && emit "LANE STATIC NO WARN" PASS \
+                        || emit "LANE STATIC NO WARN" FAIL "warned although the lane runs it"
+    # Reached through the preload (a guest exec), the lane process must leave
+    # the supervisor: a traced lane pays ~60 us per trap instead of 0.5.
+    ckc "LANE CHILD DETACHED"       "entered the lane; detaching" \
+        env ALR_LOG=1 $ALR run /bin/sh -c '/bin/busybox true'
+    ckc "LANE CHILD SEES ROOTFS"    "ID=ubuntu" $ALR run /bin/sh -c '/bin/busybox cat /etc/os-release'
+    # Inside -c, not as an argument: without the lane alr still rewrites a
+    # static program's absolute ARGUMENTS to host paths (ADR 0008 addendum).
+    # One rootfs, two lanes: what one lane writes the other must read, and a
+    # process must not change identity by crossing over.
+    ck  "LANE IDS MATCH PRELOAD"    "$($ALR run /usr/bin/id -u 2>/dev/null)" \
+        $ALR run /bin/busybox id -u
+    ck  "LANE FAKEROOT IDS"         0           env ALR_FAKEROOT=1 $ALR run /bin/busybox id -u
+    $ALR run /bin/busybox sh -c 'rm -rf /tmp/alrln && mkdir -p /tmp/alrln/d &&
+        cd /tmp/alrln/d && ln -s /etc/os-release abs && echo hl > h1 && ln h1 h2' >/dev/null 2>&1
+    ck  "LANE SYMLINK RELATIVIZED"  "../../../etc/os-release" $ALR run /usr/bin/readlink /tmp/alrln/d/abs
+    ckc "LANE SYMLINK READ BY PRELOAD" "Ubuntu" $ALR run /usr/bin/head -1 /tmp/alrln/d/abs
+    ck  "LANE HARDLINK READ BY PRELOAD" "hl"     $ALR run /usr/bin/cat /tmp/alrln/d/h2
+    [ ! -e "$ALR_ROOT_DIR/tawcroot" ] && emit "LANE NO LINK STORE" PASS \
+        || emit "LANE NO LINK STORE" FAIL "$ALR_ROOT_DIR/tawcroot exists (token symlinks are unreadable from the preload lane)"
+    _off=$(ALR_LANE=0 $ALR run /bin/busybox sh -c 'cat /etc/os-release' 2>/dev/null)
+    case "$_off" in *ID=ubuntu*) emit "LANE OFF SWITCH" FAIL "ALR_LANE=0 still virtualized";;
+                    *)           emit "LANE OFF SWITCH" PASS;; esac
+    if [ -x "$R/usr/bin/go" ]; then
+        # Go makes its file syscalls itself; before the lane `go build` failed
+        # on mkdir /tmp/go-build... (permission denied, Android's /tmp).
+        ckc "LANE GO BUILD AND RUN" "go-ok /etc/os-release" \
+            $ALR run /bin/bash -c 'rm -rf /tmp/alrgo && mkdir -p /tmp/alrgo && cd /tmp/alrgo &&
+                printf "package main\nimport (\"fmt\";\"os\")\nfunc main(){_,e:=os.Stat(\"/etc/os-release\");if e==nil{fmt.Println(\"go-ok /etc/os-release\")}}\n" > m.go &&
+                printf "module alrgo\n" > go.mod && go build -o m . && ./m'
+    else
+        emit "LANE GO BUILD AND RUN" SKIP "golang-go not installed"
+    fi
+else
+    for _c in "LANE STATIC SEES ROOTFS" "LANE STATIC CWD" "LANE STATIC ARGV GUEST" \
+              "LANE ENV CLEAN" "LANE STATIC NO WARN" "LANE CHILD DETACHED" \
+              "LANE CHILD SEES ROOTFS" "LANE IDS MATCH PRELOAD" "LANE FAKEROOT IDS" \
+              "LANE SYMLINK RELATIVIZED" "LANE SYMLINK READ BY PRELOAD" \
+              "LANE HARDLINK READ BY PRELOAD" "LANE NO LINK STORE" \
+              "LANE OFF SWITCH" "LANE GO BUILD AND RUN"; do
+        emit "$_c" SKIP "no alr-lane beside alr, or no static /bin/busybox"
+    done
+fi
 
 echo "── 워크로드 (docs/07 §2 이름들, 지금까지 러너가 없던 것) ──"
 # These names carried PASS in docs/07 §2 with nothing behind them.  Measuring

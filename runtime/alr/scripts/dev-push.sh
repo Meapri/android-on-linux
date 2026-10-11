@@ -47,7 +47,19 @@ sync_tree() {
     "${SCP[@]}" tests/cases/*.tsv                 "$HOST:$REMOTE/tests/cases/"
     "${SSH[@]}" "mkdir -p ~/$REMOTE/bench/microbench"
     "${SCP[@]}" bench/microbench/*.c              "$HOST:$REMOTE/bench/microbench/"
+    # alr-lane (ADR 0010): tawcroot, built beside alr so lane_path() finds it.
+    "${SSH[@]}" "rm -rf ~/$REMOTE/third_party/tawcroot && mkdir -p ~/$REMOTE/third_party"
+    "${SCP[@]}" -r third_party/tawcroot           "$HOST:$REMOTE/third_party/"
 }
+
+# Freestanding static non-PIE, as upstream builds it.  -mno-outline-atomics:
+# without it the link wants __aarch64_cas4_acq & co. from compiler-rt, which a
+# -nostdlib binary does not get.
+# -DTAWCROOT_ALR selects the local changes listed in VENDORING.md.
+LANE_BUILD='clang -O2 -Wall -ffreestanding -fno-stack-protector -fno-pie \
+    -mno-outline-atomics -D_GNU_SOURCE -DTAWCROOT_ALR -Ithird_party/tawcroot/include \
+    -static -nostdlib -nostartfiles -Wl,--image-base=0x10000000 \
+    -o alr-lane third_party/tawcroot/src/*.c third_party/tawcroot/src/arch/aarch64_*.S'
 
 CFLAGS_DEV='-O1 -Wall -Wextra -std=c11 -D_GNU_SOURCE'
 
@@ -71,6 +83,7 @@ accept)
     "${SSH[@]}" "cd ~/$REMOTE && \
         clang $CFLAGS_DEV -Isrc/common -Isrc/supervisor -o alr \
               src/cli/alr.c src/cli/alr_resolvd.c src/common/alr_exec_rule.c src/common/alr_elf.c src/supervisor/alr_supervisor.c && \
+        $LANE_BUILD && \
         clang $CFLAGS_DEV -o alr-doctor src/cli/doctor.c && \
         chmod +x tests/device/acceptance.sh && \
         ${ALR_DISTROS_DIR:+ALR_ROOT_DIR=\$HOME/$ALR_DISTROS_DIR }ALR=./alr tests/device/acceptance.sh"
@@ -84,6 +97,7 @@ install-gate)
     "${SSH[@]}" "cd ~/$REMOTE && \
         clang $CFLAGS_DEV -Isrc/common -Isrc/supervisor -o alr \
               src/cli/alr.c src/cli/alr_resolvd.c src/common/alr_exec_rule.c src/common/alr_elf.c src/supervisor/alr_supervisor.c && \
+        $LANE_BUILD && \
         chmod +x tests/device/install_gate.sh && \
         ALR=./alr tests/device/install_gate.sh"
     ;;
@@ -97,6 +111,7 @@ bench)
     "${SSH[@]}" "cd ~/$REMOTE && \
         clang $CFLAGS_DEV -Isrc/common -Isrc/supervisor -o alr \
               src/cli/alr.c src/cli/alr_resolvd.c src/common/alr_exec_rule.c src/common/alr_elf.c src/supervisor/alr_supervisor.c && \
+        $LANE_BUILD && \
         chmod +x tests/device/rw_bench.sh && \
         ${ALR_DISTROS_DIR:+ALR_ROOT_DIR=\$HOME/$ALR_DISTROS_DIR }ALR=./alr tests/device/rw_bench.sh"
     ;;
@@ -106,6 +121,7 @@ bench-ab)
     "${SSH[@]}" "cd ~/$REMOTE && \
         clang $CFLAGS_DEV -Isrc/common -Isrc/supervisor -o alr \
               src/cli/alr.c src/cli/alr_resolvd.c src/common/alr_exec_rule.c src/common/alr_elf.c src/supervisor/alr_supervisor.c && \
+        $LANE_BUILD && \
         chmod +x tests/device/bench.sh && \
         ${ALR_DISTROS_DIR:+ALR_ROOT_DIR=\$HOME/$ALR_DISTROS_DIR }ALR=./alr tests/device/bench.sh"
     ;;
@@ -115,6 +131,7 @@ breadth)
     "${SSH[@]}" "cd ~/$REMOTE && \
         clang $CFLAGS_DEV -Isrc/common -Isrc/supervisor -o alr \
               src/cli/alr.c src/cli/alr_resolvd.c src/common/alr_exec_rule.c src/common/alr_elf.c src/supervisor/alr_supervisor.c && \
+        $LANE_BUILD && \
         chmod +x tests/device/breadth.sh && \
         ${ALR_DISTROS_DIR:+ALR_ROOT_DIR=\$HOME/$ALR_DISTROS_DIR }ALR=./alr tests/device/breadth.sh"
     ;;
@@ -148,6 +165,7 @@ alr)
     "${SSH[@]}" "cd ~/$REMOTE && \
         clang $CFLAGS_DEV -Isrc/common -Isrc/supervisor -o alr \
               src/cli/alr.c src/cli/alr_resolvd.c src/common/alr_exec_rule.c src/common/alr_elf.c src/supervisor/alr_supervisor.c && \
+        $LANE_BUILD && \
         echo built"
     ;;
 trap-cost)

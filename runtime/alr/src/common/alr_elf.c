@@ -164,3 +164,38 @@ int alr_rpath(alr_pread_fn pread, void *ctx, const unsigned char *head,
         return 1;                                    /* truncated but usable */
     }
 }
+
+int alr_elf_is_go(const unsigned char *head, size_t n,
+                  alr_pread_fn pread, void *ctx)
+{
+    struct alr_ehdr64 eh;
+    uint16_t i;
+
+    if (!pread || n < sizeof eh || memcmp(head, "\177ELF", 4) != 0) return 0;
+    memcpy(&eh, head, sizeof eh);
+    if (eh.e_ident[4] != 2 || eh.e_phentsize != sizeof(struct alr_phdr64)) return 0;
+    if (eh.e_phnum == 0 || eh.e_phnum > 512) return 0;
+
+    for (i = 0; i < eh.e_phnum; i++) {
+        struct alr_phdr64 ph;
+        unsigned char buf[512];
+        size_t len, o = 0;
+        if (!pread(ctx, &ph, sizeof ph, eh.e_phoff + (uint64_t)i * eh.e_phentsize))
+            return 0;
+        if (ph.p_type != ALR_PT_NOTE || ph.p_filesz < 12) continue;
+        len = ph.p_filesz < sizeof buf ? (size_t)ph.p_filesz : sizeof buf;
+        if (!pread(ctx, buf, len, ph.p_offset)) continue;
+        while (o + 12 <= len) {
+            uint32_t namesz, descsz;
+            memcpy(&namesz, buf + o, 4);
+            memcpy(&descsz, buf + o + 4, 4);
+            /* cmd/link pads the name: "Go\0\0", namesz 4.  Accept the
+             * unpadded spelling too; either way the name ends at the NUL. */
+            if ((namesz == 3 || namesz == 4) && o + 12 + namesz <= len
+                && memcmp(buf + o + 12, "Go", 3) == 0)
+                return 1;
+            o += 12 + ((namesz + 3u) & ~3u) + ((descsz + 3u) & ~3u);
+        }
+    }
+    return 0;
+}

@@ -36,7 +36,7 @@
 TERMUX_PKG_HOMEPAGE=https://github.com/Meapri/alr-termux
 TERMUX_PKG_DESCRIPTION="Android 16 only. Run stock Ubuntu 24.04 arm64 glibc programs in Termux without root"
 TERMUX_PKG_LICENSE="MIT"
-TERMUX_PKG_LICENSE_FILE="LICENSE"
+TERMUX_PKG_LICENSE_FILE="LICENSE, third_party/tawcroot/LICENSE.MIT"
 TERMUX_PKG_MAINTAINER="@Meapri"
 
 # Keep in lockstep with src/common/alr_version.h -- that header is the single
@@ -179,7 +179,14 @@ termux_step_make() {
 	# exercised under the zygote seccomp filter.  The termux package is the
 	# main user-facing channel; shipping the one untested level from here
 	# would be the least-observed divergence in the project.
-	$CC $CPPFLAGS $CFLAGS $LDFLAGS -O1 \
+	#
+	# -static: a dynamic alr pays bionic's linker and libtermux-exec before
+	# main on every `alr run`, 8-10 ms on the reference device (Makefile,
+	# ALR_API).  Static bionic needs API >= 29 for the TLS alignment check;
+	# whether this recipe's $TERMUX_PKG_API_LEVEL and default flags accept
+	# -static is UNVERIFIED against termux-packages -- if not, drop it and
+	# the package is only slower.
+	$CC $CPPFLAGS $CFLAGS $LDFLAGS -O1 -static \
 		-std=c11 -D_GNU_SOURCE -Wall -Wextra \
 		-Isrc/common -Isrc/supervisor \
 		-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384 \
@@ -196,11 +203,27 @@ termux_step_make() {
 		-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384 \
 		-o alr-doctor \
 		src/cli/doctor.c
+
+	# alr-lane (docs/adr/0010-tawcroot-lane.md): freestanding, no libc, so
+	# NONE of termux's $CFLAGS/$LDFLAGS -- PIE, the stack protector and
+	# fortify all assume a libc this binary does not have.  Same flags as
+	# the Makefile's `lane` target.
+	$CC -O2 -Wall -ffreestanding -fno-stack-protector -fno-pie \
+		-mno-outline-atomics -D_GNU_SOURCE -DTAWCROOT_ALR \
+		-Ithird_party/tawcroot/include \
+		-static -nostdlib -nostartfiles -Wl,--image-base=0x10000000 \
+		-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384 \
+		-o alr-lane \
+		third_party/tawcroot/src/*.c third_party/tawcroot/src/arch/aarch64_*.S
 }
 
 termux_step_make_install() {
 	install -Dm755 alr        "$TERMUX_PREFIX/bin/alr"
 	install -Dm755 alr-doctor "$TERMUX_PREFIX/bin/alr-doctor"
+	# src/cli/alr.c::lane_path() looks beside alr, then here.
+	install -Dm755 alr-lane   "$TERMUX_PREFIX/libexec/alr/alr-lane"
+	install -Dm644 third_party/tawcroot/LICENSE.MIT \
+		"$TERMUX_PREFIX/share/alr/LICENSE.tawcroot"
 
 	# src/cli/alr.c::install_preload() probes, in order: next to the binary,
 	# then $PREFIX/share/alr/libalr_preload.so.  This is that second path, and

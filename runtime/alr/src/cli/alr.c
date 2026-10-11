@@ -2479,6 +2479,16 @@ static int prepare(struct launch *L, const char *distro)
     distro_root(L->root, sizeof L->root, distro);
     L->root_len = alr_trim_root(L->root);
     if (!is_dir(L->root)) { errno = ENOENT; return -1; }
+    /* Canonical, because everything the kernel reports back -- getcwd,
+     * /proc/self/fd, AT_EXECFN -- is.  A root spelled $HOME/../usr/... never
+     * prefix-matched those, and the guest saw host paths. */
+    {
+        char canon[PATH_MAX];
+        if (realpath(L->root, canon) && strlen(canon) < sizeof L->root) {
+            snprintf(L->root, sizeof L->root, "%s", canon);
+            L->root_len = alr_trim_root(L->root);
+        }
+    }
 
     snprintf(L->ldso, sizeof L->ldso, "%s/lib/ld-linux-aarch64.so.1", L->root);
     if (access(L->ldso, X_OK) != 0) return -2;
@@ -2571,8 +2581,8 @@ static int env_is_reserved(const char *kv)
     static const char *const own[] = {
         "ALR_COUNT=", "ALR_DISTRO=", "ALR_FAKEROOT=", "ALR_GUEST_ARGV0=",
         "ALR_GUEST_EXE=", "ALR_GUEST_PATH=", "ALR_LDSO=", "ALR_LIBPATH=",
-        "ALR_LOG=", "ALR_LOG_FD=", "ALR_PRELOAD=", "ALR_ROOT=", "ALR_ROOT_DIR=",
-        NULL
+        "ALR_LANE=", "ALR_LOG=", "ALR_LOG_FD=", "ALR_PRELOAD=", "ALR_ROOT=",
+        "ALR_ROOT_DIR=", NULL
     };
     int i;
     for (i = 0; own[i]; i++)
@@ -2622,13 +2632,38 @@ static int parse_runopts(int argc, char **argv, struct runopts *ro,
     return i;
 }
 
+/* Host path of alr-lane (ADR 0010), or NULL when there is none or the user
+ * turned it off with ALR_LANE=0.  Beside the alr binary in a dev tree,
+ * $PREFIX/libexec/alr/ in a package. */
+static const char *lane_path(void)
+{
+    static char path[ALR_PBUF];
+    static int done;
+    const char *e = getenv("ALR_LANE");
+    char cand[2][ALR_PBUF], selfdir[ALR_PBUF], *slash;
+    int i;
+
+    if (e && !strcmp(e, "0")) return NULL;
+    if (done) return path[0] ? path : NULL;
+    done = 1;
+    snprintf(selfdir, sizeof selfdir, "%s", g_self);
+    slash = strrchr(selfdir, '/');
+    if (slash) *slash = '\0'; else snprintf(selfdir, sizeof selfdir, ".");
+    snprintf(cand[0], ALR_PBUF, "%s/alr-lane", selfdir);
+    snprintf(cand[1], ALR_PBUF, "%s/libexec/alr/alr-lane", prefix());
+    for (i = 0; i < 2; i++)
+        if (access(cand[i], X_OK) == 0 && realpath(cand[i], path)) return path;
+    path[0] = '\0';
+    return NULL;
+}
+
 static char **build_env(const struct launch *L, const char *guest_exe,
                         int target_static,
                         const char *guest_argv0, const struct runopts *ro,
                         const char *guest_cwd)
 {
     static char *env[ALR_MAX_ENVP];
-    static char bufs[24][ALR_PBUF];
+    static char bufs[32][ALR_PBUF];
     int n = 0, b = 0, i;
     extern char **environ;
 
@@ -2756,6 +2791,9 @@ static char **build_env(const struct launch *L, const char *guest_exe,
      * through the same loader invocation we used for the first program. */
     PUT("ALR_LDSO=%s", L->ldso);
     PUT("ALR_LIBPATH=%s", L->libpath);
+    /* Where the interposer sends programs that make their own path syscalls
+     * (ADR 0010). */
+    if (lane_path()) PUT("ALR_LANE=%s", lane_path());
     /* IN ADDITION to --library-path, not instead of it.  --library-path
      * populates the loader's search list for the INITIAL link; glibc's NSS
      * loads libnss_dns.so.2 later via __libc_dlopen_mode, and without
@@ -2926,6 +2964,23 @@ static int exe_is_static(const char *host)
     return k == ALR_EXE_ELF_STATIC;
 }
 
+/* A dynamic Go program (cgo) still makes its own file syscalls: ADR 0010
+ * sends it to the lane like a static one. */
+static int exe_is_go(const char *host)
+{
+    unsigned char head[ALR_PROBE_BYTES];
+    struct rdctx ctx;
+    ssize_t n;
+    int fd, go;
+
+    if ((fd = open(host, O_RDONLY | O_CLOEXEC)) < 0) return 0;
+    n = read(fd, head, sizeof head);
+    ctx.fd = fd;
+    go = alr_elf_is_go(head, n < 0 ? 0 : (size_t)n, rd_pread, &ctx);
+    close(fd);
+    return go;
+}
+
 /* Append the target's own DT_RUNPATH/DT_RPATH to the loader search path,
  * rewritten into host form.
  *
@@ -3020,7 +3075,7 @@ static int shebang_resolve(const struct launch *L, char *host, size_t hostsz,
      * Only for the top-level target (depth 0): a shebang interpreter that is
      * static is a different and much rarer thing, and warning inside the chain
      * would fire on every script. */
-    if (k == ALR_EXE_ELF_STATIC && depth == 0)
+    if (k == ALR_EXE_ELF_STATIC && depth == 0 && !lane_path())
         fprintf(stderr,
             "alr: NOTE %s is statically linked -- path virtualization does NOT\n"
             "     apply to it.  It runs, but its paths resolve against Android,\n"
@@ -3262,6 +3317,43 @@ static int cmd_run(const char *distro, int argc, char **argv, int login_shell,
         }
     }
 
+    /* ADR 0010: a static target runs under alr-lane, which translates its
+     * path syscalls in-process -- no loader, no supervisor (the lane rescues
+     * the zygote filter's traps itself, and a traced lane pays a tracer round
+     * trip per trap).  It gets the GUEST command line and a guest-form
+     * environment without this runtime's loader variables; the lane maps the
+     * paths.  ALR_LANE=0 keeps the old unvirtualized launch. */
+    if ((target_static || exe_is_go(host)) && lane_path()
+        && !(ro && ro->no_supervisor)) {
+        char **ge = build_env(&L, guest_cmd, 0, argv[0], ro, g_guest_cwd);
+        static char *le[ALR_MAX_ENVP];
+        int k, m = 0, fake = 0;
+        for (k = 0; ge[k] && m < ALR_MAX_ENVP - 1; k++) {
+            if (!strcmp(ge[k], "ALR_FAKEROOT=1")) fake = 1;
+            if (!strncmp(ge[k], "LD_", 3) || !strncmp(ge[k], "ALR_", 4)
+                || !strncmp(ge[k], "LOCPATH=", 8))
+                continue;
+            le[m++] = ge[k];
+        }
+        le[m] = NULL;
+        av[n++] = (char *)lane_path();
+        av[n++] = (char *)"-r";  av[n++] = L.root;
+        av[n++] = (char *)"-b";  av[n++] = (char *)"/proc:/proc";
+        av[n++] = (char *)"-b";  av[n++] = (char *)"/dev:/dev";
+        av[n++] = (char *)"-b";  av[n++] = (char *)"/sys:/sys";
+        /* the lane's ids follow the preload's: real unless fakeroot */
+        if (fake) av[n++] = (char *)"--fakeroot";
+        av[n++] = (char *)"--";
+        av[n++] = (char *)guest_cmd;
+        for (i = 1; i < argc && n < ALR_MAX_ARGV - 2; i++) av[n++] = argv[i];
+        av[n] = NULL;
+        if (g_log >= 1) fprintf(stderr, "alr: running %s in the lane\n", guest_cmd);
+        alr_resolvd_stop();
+        umask(022);
+        execve(lane_path(), (char *const *)av, le);
+        die("boot-failed", "could not run alr-lane");
+    }
+
     /* ADR 0002: the program argument MUST contain a '/' -- glibc's dl-load.c
      * treats a slash-free name as a LIBRARY name and searches the library path
      * for it, not $PATH.  We always pass an absolute host path. */
@@ -3364,6 +3456,7 @@ static int cmd_run(const char *distro, int argc, char **argv, int login_shell,
     o.envp = build_env(&L, guest_cmd, target_static, av[5], ro, g_guest_cwd);
     o.log_level = g_log;
     o.log_fd = -1;
+    o.lane_path = lane_path();
 
     /* Ubuntu's default umask, not Termux's.
      *

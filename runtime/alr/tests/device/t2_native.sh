@@ -15,8 +15,12 @@
 # lists and dpkg database are many times Termux's, and the work scales with
 # them.  Its line carries both sizes.
 #
-# Needs in Termux: hyperfine git python nodejs.  In the guest: git python3
-# nodejs npm (alr install --with node).  Network once, to fill npm caches.
+# Needs in Termux: hyperfine git python nodejs, and golang for the Go rows.
+# In the guest: git python3 nodejs npm (alr install --with node), golang-go.
+# Network once, to fill npm caches.
+#
+# The Go rows run in the tawcroot lane (ADR 0010): go is static, so `alr run`
+# hands it to alr-lane, and everything it starts stays there.
 #
 #   ALR_ROOT_DIR=$PREFIX/var/lib/alr/distros ALR=./alr bash tests/device/t2_native.sh
 set -u
@@ -86,6 +90,17 @@ row "node -e 0 (top)"       "$(hf node "node -e 0" "$ALR run $GN -e 0")"
 row "python3 -c pass (top)" "$(hf py "python3 -c pass" "$ALR run /usr/bin/python3 -c pass")"
 row "node -e 0 x20 (guest)" "$(RUNS=5 hf nodeg "bash -c 'for i in \$(seq 20); do node -e 0; done'" "$ALR run /bin/bash -c 'for i in \$(seq 20); do $GN -e 0; done'")"
 row "git status x20 (guest)" "$(RUNS=5 hf gitg "bash -c 'for i in \$(seq 20); do git -C $R/tmp/t2repo status --porcelain; done'" "$ALR run /bin/bash -c 'for i in \$(seq 20); do git -C /tmp/t2repo status --porcelain; done'")"
+if command -v go >/dev/null && [ -x "$R/usr/bin/go" ]; then
+    mkdir -p "$R/tmp/t2go" &&
+        printf 'package main\nimport "fmt"\nfunc main(){fmt.Println("hi")}\n' > "$R/tmp/t2go/m.go" &&
+        printf 'module t2go\n' > "$R/tmp/t2go/go.mod"
+    (cd "$R/tmp/t2go" && CGO_ENABLED=0 go build -o /dev/null .)
+    $ALR run -w /tmp/t2go /usr/bin/env CGO_ENABLED=0 /usr/bin/go build -o /dev/null .
+    echo "go    : native $(go version | cut -d' ' -f3), guest $($ALR run /usr/bin/go version | cut -d' ' -f3)"
+    row "go version (top, lane)" "$(hf gov "go version" "$ALR run /usr/bin/go version")"
+    row "go build, cached (lane)" "$(RUNS=8 hf gob "sh -c 'cd $R/tmp/t2go && CGO_ENABLED=0 go build -o /dev/null .'" "$ALR run -w /tmp/t2go /usr/bin/env CGO_ENABLED=0 /usr/bin/go build -o /dev/null .")"
+    row "gofmt -l net (lane)" "$(RUNS=8 hf gofmt "sh -c 'gofmt -l $PREFIX/lib/go/src/net >/dev/null'" "$ALR run /bin/sh -c 'gofmt -l /usr/lib/go/src/net >/dev/null'")"
+fi
 row "npm ci, 74 deps (top)" "$(RUNS=8 hf npm "sh -c 'cd $R/tmp/t2npm && npm ci --offline --no-audit --no-fund --loglevel=error'" "$ALR run /bin/sh -c 'cd /tmp/t2npm && npm ci --offline --no-audit --no-fund --loglevel=error'")"
 export DEBIAN_FRONTEND=noninteractive
 apt-get install -y -q tree >/dev/null 2>&1
