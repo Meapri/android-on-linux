@@ -26,6 +26,7 @@
 
 #include <linux/seccomp.h>
 
+#include "alr_mode.h"
 #include "arch.h"
 #include "handler.h"
 #include "io.h"
@@ -101,6 +102,20 @@ static void sigsys_handler(int sig, siginfo_t *info, void *ucontext)
 	ucontext_t *uc = (ucontext_t *)ucontext;
 	tawcroot_syscall_args args;
 	tawcroot_arch_read_args(uc, &args);
+
+#ifdef TAWCROOT_ALR
+	/* The guest's own mask is in force too; a thread that blocked
+	 * everything would turn our first bad-pointer fault into a kill.
+	 * sigreturn puts the guest's mask back. */
+	{
+		const uint64_t fault_sigs =
+			(1ULL << (SIGSEGV - 1)) | (1ULL << (SIGBUS - 1));
+		if (tawcroot_alr_fault_armed &&
+		    (*(const uint64_t *)&uc->uc_sigmask & fault_sigs))
+			(void)TAWC_RAW(TAWC_SYS_rt_sigprocmask, 1 /*SIG_UNBLOCK*/,
+				       (long)&fault_sigs, 0, 8, 0, 0);
+	}
+#endif
 
 	/* A thread's first trap gives it a fallback altstack (sigalt.h),
 	 * so from then on no trap's frame depends on the thread's own
@@ -208,6 +223,12 @@ long tawcroot_install_handler(void)
 	 * then calls rt_sigprocmask, RET_TRAP, kill. SIGKILL/SIGSTOP
 	 * can't be masked; the kernel silently drops those bits. */
 	sa.sa_mask      = ~(uint64_t)0;
+#ifdef TAWCROOT_ALR
+	/* Except SIGSEGV/SIGBUS: a guest pointer that faults inside the
+	 * handler must reach alr_fault.c, not kill the process (a blocked
+	 * fault signal is fatal). */
+	sa.sa_mask &= ~((1ULL << (SIGSEGV - 1)) | (1ULL << (SIGBUS - 1)));
+#endif
 
 	/* sigsetsize = 8 (size of kernel sigset_t on lp64). */
 	return tawc_rt_sigaction(SIGSYS, &sa, NULL, 8);

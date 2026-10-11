@@ -122,6 +122,24 @@ static int alr_stat_direct(void)
 }
 #endif
 
+#ifdef TAWCROOT_ALR
+/* The file type the kernel just wrote into the guest's buffer.  Read
+ * through usercopy: another guest thread may have unmapped it. */
+static int guest_stat_is_lnk(const struct stat *st)
+{
+	unsigned int m = 0;
+	return tawc_copy_from_guest(&m, sizeof m, (const void *)&st->st_mode) == 0 &&
+	       S_ISLNK(m);
+}
+
+static int guest_statx_is_lnk(const struct statx *sx)
+{
+	unsigned short m = 0;
+	return tawc_copy_from_guest(&m, sizeof m, (const void *)&sx->stx_mode) == 0 &&
+	       (m & S_IFMT) == S_IFLNK;
+}
+#endif
+
 static long finish_stat(long rv, struct stat *local, struct stat *guest_out)
 {
 	if (rv != 0) return rv;
@@ -129,6 +147,94 @@ static long finish_stat(long rv, struct stat *local, struct stat *guest_out)
 	long ce = tawc_copy_to_guest(guest_out, local, sizeof *local);
 	return ce < 0 ? ce : 0;
 }
+
+#ifdef TAWCROOT_ALR
+/* FOLLOW stat on the general route, leaf looked at with NOFOLLOW first:
+ * a non-symlink leaf (the usual case) needs no readlinkat.  A symlink
+ * leaf goes through the leaf-symlink cache (alr_mode.h), then the full
+ * FOLLOW translation, whose answer is cached for the next call. */
+static long alr_follow_stat(struct tawcroot_path_scratch *scratch, int dirfd,
+			    int flags, struct stat *out)
+{
+	struct fs_path t;
+	long e = tawcroot_fs_translate_local(scratch, 0, dirfd,
+					     TAWCROOT_PATH_NOFOLLOW,
+					     TAWCROOT_PATH_INTENT_READ, &t);
+	if (e) return e;
+	long rv = TAWC_RAW(TAWC_SYS_fstatat, t.fd,
+			   (long)(t.is_root ? "" : t.path), (long)out,
+			   flags | AT_SYMLINK_NOFOLLOW |
+			   (t.is_root ? AT_EMPTY_PATH : 0), 0, 0);
+	if (rv != 0 || !guest_stat_is_lnk(out)) return rv;
+
+	struct stat lk;
+	if (tawc_copy_from_guest(&lk, sizeof lk, out) < 0) return TAWC_EFAULT;
+	uint64_t ino = (uint64_t)lk.st_ino;
+	int64_t cs = (int64_t)lk.st_ctim.tv_sec;
+	int64_t cns = (int64_t)lk.st_ctim.tv_nsec;
+	char *key = scratch->buf[3], *val = scratch->buf[2];
+	int cache = t.fd == tawcroot_rootfs_fd &&
+		    tawc_str_copy(key, TAWCROOT_PATH_SCRATCH_SIZE, t.path) > 0;
+	if (cache && tawcroot_alr_link_get(key, ino, cs, cns, val,
+					   TAWCROOT_PATH_SCRATCH_SIZE)) {
+		rv = TAWC_RAW(TAWC_SYS_fstatat, tawcroot_rootfs_fd, (long)val,
+			      (long)out, flags | AT_SYMLINK_NOFOLLOW, 0, 0);
+		if (rv != 0 || !guest_stat_is_lnk(out)) return rv;
+	}
+
+	e = tawcroot_fs_translate_local(scratch, 0, dirfd, TAWCROOT_PATH_FOLLOW,
+					TAWCROOT_PATH_INTENT_READ, &t);
+	if (e) return e;
+	rv = TAWC_RAW(TAWC_SYS_fstatat, t.fd, (long)(t.is_root ? "" : t.path),
+		      (long)out, flags | (t.is_root ? AT_EMPTY_PATH : 0), 0, 0);
+	if (rv == 0 && cache && t.fd == tawcroot_rootfs_fd && !t.is_root &&
+	    !guest_stat_is_lnk(out))
+		tawcroot_alr_link_put(key, ino, cs, cns, t.path);
+	return rv;
+}
+
+/* statx twin of alr_follow_stat. */
+static long alr_follow_statx(struct tawcroot_path_scratch *scratch, int dirfd,
+			     int flags, unsigned int mask, struct statx *out)
+{
+	struct fs_path t;
+	long e = tawcroot_fs_translate_local(scratch, 0, dirfd,
+					     TAWCROOT_PATH_NOFOLLOW,
+					     TAWCROOT_PATH_INTENT_READ, &t);
+	if (e) return e;
+	long rv = TAWC_RAW(TAWC_SYS_statx, t.fd,
+			   (long)(t.is_root ? "" : t.path),
+			   flags | AT_SYMLINK_NOFOLLOW |
+			   (t.is_root ? AT_EMPTY_PATH : 0), mask, (long)out, 0);
+	if (rv != 0 || !guest_statx_is_lnk(out)) return rv;
+
+	struct statx lk;
+	if (tawc_copy_from_guest(&lk, sizeof lk, out) < 0) return TAWC_EFAULT;
+	uint64_t ino = (uint64_t)lk.stx_ino;
+	int64_t cs = (int64_t)lk.stx_ctime.tv_sec;
+	int64_t cns = (int64_t)lk.stx_ctime.tv_nsec;
+	char *key = scratch->buf[3], *val = scratch->buf[2];
+	int cache = t.fd == tawcroot_rootfs_fd &&
+		    tawc_str_copy(key, TAWCROOT_PATH_SCRATCH_SIZE, t.path) > 0;
+	if (cache && tawcroot_alr_link_get(key, ino, cs, cns, val,
+					   TAWCROOT_PATH_SCRATCH_SIZE)) {
+		rv = TAWC_RAW(TAWC_SYS_statx, tawcroot_rootfs_fd, (long)val,
+			      flags | AT_SYMLINK_NOFOLLOW, mask, (long)out, 0);
+		if (rv != 0 || !guest_statx_is_lnk(out)) return rv;
+	}
+
+	e = tawcroot_fs_translate_local(scratch, 0, dirfd, TAWCROOT_PATH_FOLLOW,
+					TAWCROOT_PATH_INTENT_READ, &t);
+	if (e) return e;
+	rv = TAWC_RAW(TAWC_SYS_statx, t.fd, (long)(t.is_root ? "" : t.path),
+		      flags | (t.is_root ? AT_EMPTY_PATH : 0), mask,
+		      (long)out, 0);
+	if (rv == 0 && cache && t.fd == tawcroot_rootfs_fd && !t.is_root &&
+	    !guest_statx_is_lnk(out))
+		tawcroot_alr_link_put(key, ino, cs, cns, t.path);
+	return rv;
+}
+#endif
 
 static long handle_newfstatat(const tawcroot_syscall_args *args,
 			      ucontext_t *uc)
@@ -160,6 +266,11 @@ static long handle_newfstatat(const tawcroot_syscall_args *args,
 		if (empty < 0) return empty;
 		if (empty) {
 			if (tawcroot_fd_is_reserved(dirfd)) return TAWC_EBADF;
+#ifdef TAWCROOT_ALR
+			if (alr_stat_direct())
+				return TAWC_RAW(TAWC_SYS_fstatat, dirfd, (long)"",
+						(long)out, flags, 0, 0);
+#endif
 			long rv = TAWC_RAW(TAWC_SYS_fstatat, dirfd, (long)"",
 					   (long)&local, flags, 0, 0);
 			if (rv == 0) {
@@ -178,6 +289,20 @@ static long handle_newfstatat(const tawcroot_syscall_args *args,
 	TAWCROOT_PATH_SCRATCH_AUTO(scratch);
 	long fe = tawcroot_fs_fetch_path(scratch, 0, gpath);
 	if (fe) return fe;
+
+#ifdef TAWCROOT_ALR
+	/* One name against the guest's dirfd: the kernel looks it up
+	 * without following; only a symlink needs the general route. */
+	if (alr_stat_direct() &&
+	    tawcroot_alr_fast_name(dirfd, scratch->buf[0])) {
+		long rv = TAWC_RAW(TAWC_SYS_fstatat, dirfd,
+				   (long)scratch->buf[0], (long)out,
+				   flags | AT_SYMLINK_NOFOLLOW, 0, 0);
+		if (rv != 0 || (flags & AT_SYMLINK_NOFOLLOW) ||
+		    !guest_stat_is_lnk(out))
+			return rv;
+	}
+#endif
 
 	{
 		const char *shm_name;
@@ -212,6 +337,10 @@ static long handle_newfstatat(const tawcroot_syscall_args *args,
 	tawcroot_path_mode pmode = (flags & AT_SYMLINK_NOFOLLOW)
 		? TAWCROOT_PATH_NOFOLLOW
 		: TAWCROOT_PATH_FOLLOW;
+#ifdef TAWCROOT_ALR
+	if (alr_stat_direct() && pmode == TAWCROOT_PATH_FOLLOW)
+		return alr_follow_stat(scratch, dirfd, flags, out);
+#endif
 
 	struct fs_path t;
 	long e = tawcroot_fs_translate_local(scratch, 0, dirfd, pmode,
@@ -394,6 +523,11 @@ static long handle_statx(const tawcroot_syscall_args *args, ucontext_t *uc)
 		if (empty < 0) return empty;
 		if (empty) {
 			if (tawcroot_fd_is_reserved(dirfd)) return TAWC_EBADF;
+#ifdef TAWCROOT_ALR
+			if (alr_stat_direct())
+				return TAWC_RAW(TAWC_SYS_statx, dirfd, (long)"",
+						flags, mask, (long)out, 0);
+#endif
 			long rv = TAWC_RAW(TAWC_SYS_statx, dirfd, (long)"", flags,
 					   mask, (long)&local, 0);
 			if (rv == 0) {
@@ -418,6 +552,20 @@ static long handle_statx(const tawcroot_syscall_args *args, ucontext_t *uc)
 	TAWCROOT_PATH_SCRATCH_AUTO(scratch);
 	long fe = tawcroot_fs_fetch_path(scratch, 0, path);
 	if (fe) return fe;
+
+#ifdef TAWCROOT_ALR
+	/* See handle_newfstatat. */
+	if (alr_stat_direct() &&
+	    tawcroot_alr_fast_name(dirfd, scratch->buf[0])) {
+		long rv = TAWC_RAW(TAWC_SYS_statx, dirfd,
+				   (long)scratch->buf[0],
+				   flags | AT_SYMLINK_NOFOLLOW, mask,
+				   (long)out, 0);
+		if (rv != 0 || (flags & AT_SYMLINK_NOFOLLOW) ||
+		    !guest_statx_is_lnk(out))
+			return rv;
+	}
+#endif
 
 	{
 		const char *shm_name;
@@ -452,6 +600,10 @@ static long handle_statx(const tawcroot_syscall_args *args, ucontext_t *uc)
 	tawcroot_path_mode pmode = (flags & AT_SYMLINK_NOFOLLOW)
 		? TAWCROOT_PATH_NOFOLLOW
 		: TAWCROOT_PATH_FOLLOW;
+#ifdef TAWCROOT_ALR
+	if (alr_stat_direct() && pmode == TAWCROOT_PATH_FOLLOW)
+		return alr_follow_statx(scratch, dirfd, flags, mask, out);
+#endif
 
 	struct fs_path t;
 	long e = tawcroot_fs_translate_local(scratch, 0, dirfd, pmode,

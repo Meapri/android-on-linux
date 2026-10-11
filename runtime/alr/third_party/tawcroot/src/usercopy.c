@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <sys/uio.h>
 
+#include "alr_mode.h"
 #include "errno_neg.h"
 #include "usercopy.h"
 #include "raw_sys.h"
@@ -21,13 +22,14 @@ int tawc_usercopy_works = 0;
  * bash's fork+execve dance returned -EFAULT through our exec
  * handler — child's process_vm_readv was reading parent VM.) */
 #ifdef TAWCROOT_ALR
-/* alr-lane: the same answer without a syscall per copy.  Any id of the
- * thread group addresses its VM, so cache the tgid -- in a page that
- * fork(2) zero-fills (MADV_WIPEONFORK), which is exactly the event that
- * invalidates it.  A CLONE_VM child keeps the page and so the parent's
- * tgid, which names the same mm; if that parent is gone the copy fails
- * ESRCH and is retried with gettid.  Two copies per path trap made this
- * the commonest syscall in the lane after the trap itself. */
+/* alr-lane: the tgid of the process that owns this memory, without a
+ * syscall -- cached in a page that fork(2) zero-fills (MADV_WIPEONFORK),
+ * which is exactly the event that invalidates it.  A CLONE_VM child (vfork,
+ * posix_spawn) keeps the page and so its parent's tgid; comparing that
+ * with getpid() is how alr_fast.c and alr_fault.c tell such a child from
+ * the memory's owner.  supervisor.c fills it at image start; after a
+ * fork(2) the first trap refills it.  (A fork child whose very first trap
+ * comes from a vfork child of its own would cache that child's pid.) */
 static long *g_tgid_cache;
 
 static long cached_task_id(void)
@@ -39,6 +41,11 @@ static long cached_task_id(void)
 		__atomic_store_n(g_tgid_cache, t, __ATOMIC_RELAXED);
 	return t > 0 ? t : 0;
 }
+
+long tawc_self_tgid(void)
+{
+	return cached_task_id();
+}
 #endif
 
 static long current_task_id(void)
@@ -47,13 +54,12 @@ static long current_task_id(void)
 	return t > 0 ? t : 0;
 }
 
-/* process_vm_{read,write}v against ourselves. */
+/* process_vm_{read,write}v against ourselves.  alr-lane copies directly
+ * once its fault handlers are in (alr_fault.c), so this is the cold
+ * path there and addresses the thread itself: a tgid cached before a
+ * vfork could name a pid that has since gone to another process. */
 static long vm_self(long nr, struct iovec *liov, struct iovec *riov)
 {
-#ifdef TAWCROOT_ALR
-	long rv = TAWC_RAW(nr, cached_task_id(), (long)liov, 1, (long)riov, 1, 0);
-	if (rv != TAWC_ESRCH) return rv;
-#endif
 	return TAWC_RAW(nr, current_task_id(), (long)liov, 1, (long)riov, 1, 0);
 }
 
@@ -107,6 +113,13 @@ long tawc_copy_string_from_guest(char *dst, size_t cap,
 {
 	if (!dst || cap == 0) return TAWC_EFAULT;
 	if (!guest_src) return TAWC_EFAULT;
+#ifdef TAWCROOT_ALR
+	if (tawcroot_alr_fault_armed) {
+		long n = tawcroot_alr_copy_str(dst, cap, guest_src);
+		if (n < 0) return TAWC_EFAULT;
+		return (size_t)n < cap ? n : TAWC_ENAMETOOLONG;
+	}
+#endif
 
 	/* Read in chunks, scanning for NUL. Chunk size is a compromise
 	 * between syscall overhead and over-reading near a page boundary
@@ -137,6 +150,10 @@ long tawc_copy_string_from_guest(char *dst, size_t cap,
 long tawc_copy_from_guest(void *dst, size_t n, const void *guest_src)
 {
 	if (!dst || !guest_src) return TAWC_EFAULT;
+#ifdef TAWCROOT_ALR
+	if (tawcroot_alr_fault_armed)
+		return tawcroot_alr_copy(dst, guest_src, n) < 0 ? TAWC_EFAULT : 0;
+#endif
 	long got = readv_guest(dst, n, guest_src);
 	if (got < 0) return TAWC_EFAULT;
 	if ((size_t)got != n) return TAWC_EFAULT;
@@ -154,6 +171,10 @@ long tawc_copy_to_guest(void *guest_dst, const void *src, size_t n)
 	 * findings B1+B6.) */
 	if (!guest_dst || !src) return TAWC_EFAULT;
 	if (n == 0) return 0;
+#ifdef TAWCROOT_ALR
+	if (tawcroot_alr_fault_armed)
+		return tawcroot_alr_copy(guest_dst, src, n) < 0 ? TAWC_EFAULT : 0;
+#endif
 	if (!tawc_usercopy_works) return TAWC_EFAULT;
 	struct iovec liov = { .iov_base = (void *)src,    .iov_len = n };
 	struct iovec riov = { .iov_base = guest_dst,      .iov_len = n };

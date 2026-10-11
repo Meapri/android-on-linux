@@ -38,4 +38,10 @@ long tawc_copy_to_guest(void *guest_dst, const void *src, size_t n);
  * filter. Returns 0 on success / -errno. */
 long tawc_usercopy_init(void);
 
+#ifdef TAWCROOT_ALR
+/* This process's tgid from the fork-wiped cache (usercopy.c).  A CLONE_VM
+ * child sees its parent's until it forks or execs. */
+long tawc_self_tgid(void);
+#endif
+
 extern int tawc_usercopy_works;

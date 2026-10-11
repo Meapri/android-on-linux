@@ -13,6 +13,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "alr_mode.h"
 #include "dispatch.h"
 #include "fdtab.h"
 #include "handler.h"
@@ -140,6 +141,11 @@ void tawcroot_supervisor_init(const struct tawcroot_supervisor_args *args)
 	 * code that may itself trap under Android's stacked filter. */
 	long inst = tawcroot_install_handler();
 	if (inst != 0) tawc_exit_group(94);
+#ifdef TAWCROOT_ALR
+	/* This image's own tgid, before any vfork can cache another. */
+	(void)tawc_self_tgid();
+	tawcroot_alr_fault_init();
+#endif
 
 	/* (8) Reset the inherited signal mask before any further trap-
 	 * driven syscalls. Several launchers inherit a non-empty mask:

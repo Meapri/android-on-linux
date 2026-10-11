@@ -19,6 +19,8 @@
 
 #include "errno_neg.h"
 #include "filter_build.h"
+#include "alr_mode.h"
+#include "fdtab.h"
 #include "sysnr.h"
 
 /* sock_filter constructors. Plain brace initializers (not compound
@@ -84,7 +86,36 @@ long tawcroot_build_filter(struct sock_filter *prog, size_t prog_cap,
 	EMIT_OR_FAIL(TAWC_BPF_S(BPF_LD | BPF_W | BPF_ABS, 0));
 
 	for (size_t t = 0; t < n_traps; t++) {
-		if (trap_nrs[t] == TAWC_SYS_close && reserved_fd_floor > 0) {
+		int floor_only = trap_nrs[t] == TAWC_SYS_close;
+#ifdef TAWCROOT_ALR
+		/* alr-lane with the real ids: fstat has nothing to decorate
+		 * (syscalls_stat.c alr_stat_direct), so only our reserved
+		 * fds need the handler, for their EBADF. */
+		if (trap_nrs[t] == TAWC_SYS_fstat && !tawcroot_alr_fakeroot)
+			floor_only = 1;
+#endif
+#ifdef TAWCROOT_ALR
+		/* getdents64 only on the band that /proc/<pid>/fd directories
+		 * are moved to when opened (alr_fast.c): the handler's only
+		 * job without a link store is to hide our fds from those
+		 * listings, and a trap per directory read cost find(1) a
+		 * tenth of its time. */
+		if (trap_nrs[t] == TAWC_SYS_getdents64 &&
+		    !tawcroot_alr_fakeroot) {
+			EMIT_OR_FAIL(TAWC_BPF_J(BPF_JMP | BPF_JEQ | BPF_K,
+					(uint32_t)trap_nrs[t], 0, 5));
+			EMIT_OR_FAIL(TAWC_BPF_S(BPF_LD | BPF_W | BPF_ABS, 16));
+			EMIT_OR_FAIL(TAWC_BPF_J(BPF_JMP | BPF_JGE | BPF_K,
+					TAWCROOT_ALR_PROCFD_BAND, 0, 2));
+			EMIT_OR_FAIL(TAWC_BPF_J(BPF_JMP | BPF_JGE | BPF_K,
+					TAWCROOT_RESERVED_FD_BASE, 1, 0));
+			EMIT_OR_FAIL(TAWC_BPF_S(BPF_RET | BPF_K, SECCOMP_RET_TRAP | TAWCROOT_TRAP_DATA));
+			EMIT_OR_FAIL(TAWC_BPF_S(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+			EMIT_OR_FAIL(TAWC_BPF_S(BPF_LD | BPF_W | BPF_ABS, 0));
+			continue;
+		}
+#endif
+		if (floor_only && reserved_fd_floor > 0) {
 			/* not-close jf skips: LD args, JGE, RET TRAP,
 			 * RET ALLOW = 4, landing on the LD-nr reload. */
 			EMIT_OR_FAIL(TAWC_BPF_J(BPF_JMP | BPF_JEQ | BPF_K,

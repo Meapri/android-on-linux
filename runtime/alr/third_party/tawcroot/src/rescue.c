@@ -37,8 +37,10 @@
 #include "alr_mode.h"
 
 #ifdef TAWCROOT_ALR
-/* Syscalls after which a cached "not a symlink" directory prefix may be
- * wrong: the name can now be gone, or be something else. */
+/* Syscalls after which a per-process cache may be wrong.  The directory
+ * cache (1): a cached "not a symlink" directory prefix can now be gone,
+ * or be something else.  The fast path's cwd (2) and root (4) facts
+ * (alr_fast.c). */
 static int dircache_mutator(long nr)
 {
 	switch (nr) {
@@ -46,7 +48,6 @@ static int dircache_mutator(long nr)
 	case TAWC_SYS_renameat2:
 	case TAWC_SYS_unlinkat:
 	case TAWC_SYS_symlinkat:
-	case TAWC_SYS_chroot:
 #ifdef TAWC_SYS_rename
 	case TAWC_SYS_rename:
 	case TAWC_SYS_unlink:
@@ -54,8 +55,23 @@ static int dircache_mutator(long nr)
 	case TAWC_SYS_symlink:
 #endif
 		return 1;
+	case TAWC_SYS_chdir:
+	case TAWC_SYS_fchdir:
+		return 2;
+	case TAWC_SYS_chroot:
+		return 1 | 4;
 	}
 	return 0;
+}
+
+static void after_mutator(int mut)
+{
+	if (mut & 1) {
+		tawcroot_dircache_invalidate();
+		tawcroot_alr_fast_links_changed();
+	}
+	if (mut & 4) tawcroot_alr_fast_root_changed();
+	else if (mut & 2) tawcroot_alr_fast_cwd_changed();
 }
 #endif
 
@@ -387,7 +403,7 @@ long tawcroot_dispatch_call(const tawcroot_syscall_args *args, ucontext_t *uc)
 	 * claiming a slot costs a gettid on every trap. */
 	if (tawcroot_identity_euid() != 0) {
 		long r0 = fn(args, uc);
-		if (mut) tawcroot_dircache_invalidate();
+		if (mut) after_mutator(mut);
 		return r0;
 	}
 #endif
@@ -409,7 +425,7 @@ long tawcroot_dispatch_call(const tawcroot_syscall_args *args, ucontext_t *uc)
 	slot_release(idx);
 out:
 #ifdef TAWCROOT_ALR
-	if (mut) tawcroot_dircache_invalidate();
+	if (mut) after_mutator(mut);
 #endif
 	return rv;
 }

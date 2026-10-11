@@ -31,6 +31,7 @@
 #include <stdint.h>
 #include <ucontext.h>
 
+#include "alr_mode.h"
 #include "dispatch.h"
 #include "errno_neg.h"
 #include "loader_stack.h"
@@ -50,6 +51,12 @@
 
 #ifndef SIGSYS
 # define SIGSYS 31
+#endif
+#ifndef SIGSEGV
+# define SIGSEGV 11
+#endif
+#ifndef SIGBUS
+# define SIGBUS 7
 #endif
 /* sigset bit position is (signo - 1). */
 #define SIGSYS_BIT (1ULL << (SIGSYS - 1))
@@ -257,6 +264,10 @@ static long handle_rt_sigaction(const tawcroot_syscall_args *args,
 	void  *oldact      = (void *)(uintptr_t)args->c;
 	size_t sigsetsize  = (size_t)args->d;
 
+#ifdef TAWCROOT_ALR
+	if ((sig == SIGSEGV || sig == SIGBUS) && tawcroot_alr_fault_armed)
+		return tawcroot_alr_fault_sigaction(sig, act, oldact, sigsetsize);
+#endif
 	if (sig != SIGSYS)
 		return sigaction_strip_sigsys(sig, act, oldact, sigsetsize);
 

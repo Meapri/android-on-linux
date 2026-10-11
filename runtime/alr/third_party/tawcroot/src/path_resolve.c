@@ -34,14 +34,15 @@
 #ifdef TAWCROOT_ALR
 #include <stdint.h>
 
-/* alr-lane: remember directory prefixes the walk found NOT to be symlinks.
+/* alr-lane: remember paths the walk found NOT to be symlinks.
  *
  * Without it every path syscall readlinks each parent component again --
  * `find /usr/share` paid 2.3 readlinkat per trap.  A hit lets the walk
- * start at the leaf.
+ * start at the leaf, and a FOLLOW leaf that is a hit (opendir of a
+ * directory, the next open of /etc/passwd) needs no readlink at all.
  *
  * Staleness: this process invalidates on its own rename/unlink/symlink/
- * chroot (rescue.c).  Another process turning a cached directory into a
+ * chroot (rescue.c).  Another process turning a cached path into a
  * symlink is not seen; the kernel then follows that symlink itself.  In
  * an alr rootfs every symlink is relative (install relativizes them, both
  * lanes relativize new ones), so the kernel's answer stays inside the
@@ -239,7 +240,7 @@ long tawcroot_path_resolve_symlinks_tok(char *suf, size_t cap,
 			}
 
 #ifdef TAWCROOT_ALR
-			if (!is_leaf && dc_hit(suf, comp_end)) continue;
+			if (dc_hit(suf, comp_end)) continue;
 #endif
 			/* Probe: readlink suf[0..comp_end). Temporarily
 			 * NUL-terminate at comp_end so we don't allocate. */
@@ -261,7 +262,7 @@ long tawcroot_path_resolve_symlinks_tok(char *suf, size_t cap,
 			if (n == TAWC_EINVAL) {
 				/* Not a symlink. Walk into next component. */
 #ifdef TAWCROOT_ALR
-				if (!is_leaf) dc_put(suf, comp_end);
+				dc_put(suf, comp_end);
 #endif
 				continue;
 			}

@@ -34,6 +34,7 @@
 #include "io.h"
 #include "linkstore.h"
 #include "path.h"
+#include "alr_mode.h"
 #include "path_oracle.h"
 #include "path_orchestrate.h"
 #include "path_resolve.h"
@@ -499,7 +500,11 @@ long tawcroot_cwd_to_guest_abs(char *out, size_t out_cap)
 static long prod_cwd_to_guest_abs(void *ctx, char *out, size_t out_cap)
 {
 	(void)ctx;
+#ifdef TAWCROOT_ALR
+	return tawcroot_alr_cwd_guest(out, out_cap);
+#else
 	return tawcroot_cwd_to_guest_abs(out, out_cap);
+#endif
 }
 
 /* ---------------------------------------------------------------- */

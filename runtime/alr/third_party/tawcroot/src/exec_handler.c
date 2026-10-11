@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "alr_mode.h"
 #include "errno_neg.h"
 #include "exec_handler.h"
 #include "exec_state.h"
@@ -463,8 +464,14 @@ long tawcroot_exec_handler_commit(int mfd)
 	new_argv[2] = fdstr;
 	new_argv[3] = (char *)0;
 
+#ifdef TAWCROOT_ALR
+	tawcroot_alr_fault_before_exec();
+#endif
 	long er = tawc_execveat((int)exe_fd, "", new_argv, envp_for_self,
 	                        AT_EMPTY_PATH);
+#ifdef TAWCROOT_ALR
+	tawcroot_alr_fault_after_failed_exec();
+#endif
 	/* On success execveat does not return. On failure er is -errno. */
 	if (env_arr_rv >= 0)
 		(void)tawc_munmap((void *)(uintptr_t)env_arr_rv, env_arr_len);

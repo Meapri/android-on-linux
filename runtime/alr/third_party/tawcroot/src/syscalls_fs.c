@@ -218,6 +218,19 @@ static long handle_openat(const tawcroot_syscall_args *args, ucontext_t *uc)
 	long fe = tawcroot_fs_fetch_path(scratch, 0, gpath);
 	if (fe) return fe;
 
+#ifdef TAWCROOT_ALR
+	/* One name against the guest's dirfd (alr_fast.c).  A name the
+	 * open would follow is checked first: a symlink takes the general
+	 * route. */
+	if (tawcroot_alr_fast_name(dirfd, path)) {
+		char probe[1];
+		if ((flags & O_NOFOLLOW) ||
+		    (flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL) ||
+		    tawc_readlinkat(dirfd, path, probe, sizeof probe) < 0)
+			return tawc_openat(dirfd, path, flags, mode);
+	}
+#endif
+
 	/* /proc/self/maps and /proc/<our-pid>/maps: synthesize a shadow fd
 	 * backed by a memfd containing the kernel's maps output with each
 	 * path field reverse-translated through the rootfs/bind tables.
@@ -415,6 +428,11 @@ static long handle_openat(const tawcroot_syscall_args *args, ucontext_t *uc)
 	/* See the O_CREAT retry above: the leaf turned out not to exist,
 	 * so the create the guest asked for would have been real — EROFS. */
 	if (erofs_creat_retry && fd == TAWC_ENOENT) return TAWC_EROFS;
+#ifdef TAWCROOT_ALR
+	/* Only a bind route can reach procfs. */
+	if (fd >= 0 && t.fd != tawcroot_rootfs_fd)
+		fd = tawcroot_alr_procfd_place(fd, flags);
+#endif
 	return fd;
 }
 
