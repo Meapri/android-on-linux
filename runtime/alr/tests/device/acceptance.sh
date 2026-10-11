@@ -422,13 +422,34 @@ if [ -x "$R/bin/busybox" ] && printf '%s' "$_lane" | grep -q 'in the lane'; then
     else
         emit "LANE GO BUILD AND RUN" SKIP "golang-go not installed"
     fi
+    # The lane's fast paths and its own fault handling, checked from inside
+    # a static guest program (probe_lane.c).  `abs` is made from the host so
+    # no lane relativized it: followed by the kernel it names Android's
+    # /etc/hostname.
+    rm -rf "$R/tmp/alrlp" && mkdir -p "$R/tmp/alrlp" && ln -s /etc/hostname "$R/tmp/alrlp/abs"
+    cp tests/device/probe_lane.c "$R/tmp/probe_lane.c" 2>/dev/null
+    if $ALR run /usr/bin/gcc -O1 -static -o /tmp/probe_lane /tmp/probe_lane.c >/dev/null 2>&1; then
+        _plr=$($ALR run /tmp/probe_lane /tmp/alrlp 2>&1)
+        _cnt=0
+        while IFS= read -r _line; do
+            case "$_line" in
+                "LANE "*" PASS")   emit "${_line% PASS}" PASS; _cnt=$((_cnt + 1));;
+                "LANE "*" FAIL "*) emit "${_line%% FAIL *}" FAIL "${_line#* FAIL }"; _cnt=$((_cnt + 1));;
+            esac
+        done <<EOF_PL
+$_plr
+EOF_PL
+        [ "$_cnt" -gt 0 ] || emit "LANE PROBE" FAIL "probe printed no results: $(printf '%s' "$_plr" | head -3)"
+    else
+        emit "LANE PROBE" SKIP "no static libc (libc6-dev) in the rootfs"
+    fi
 else
     for _c in "LANE STATIC SEES ROOTFS" "LANE STATIC CWD" "LANE STATIC ARGV GUEST" \
               "LANE ENV CLEAN" "LANE STATIC NO WARN" "LANE CHILD DETACHED" \
               "LANE CHILD SEES ROOTFS" "LANE IDS MATCH PRELOAD" "LANE FAKEROOT IDS" \
               "LANE SYMLINK RELATIVIZED" "LANE SYMLINK READ BY PRELOAD" \
               "LANE HARDLINK READ BY PRELOAD" "LANE NO LINK STORE" \
-              "LANE OFF SWITCH" "LANE GO BUILD AND RUN"; do
+              "LANE OFF SWITCH" "LANE GO BUILD AND RUN" "LANE PROBE"; do
         emit "$_c" SKIP "no alr-lane beside alr, or no static /bin/busybox"
     done
 fi

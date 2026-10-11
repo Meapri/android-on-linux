@@ -208,7 +208,7 @@ termux_step_make() {
 	# NONE of termux's $CFLAGS/$LDFLAGS -- PIE, the stack protector and
 	# fortify all assume a libc this binary does not have.  Same flags as
 	# the Makefile's `lane` target.
-	$CC -O2 -Wall -ffreestanding -fno-stack-protector -fno-pie \
+	$CC -O2 -Wall -Wframe-larger-than=1024 -Werror=frame-larger-than -ffreestanding -fno-stack-protector -fno-pie \
 		-mno-outline-atomics -D_GNU_SOURCE -DTAWCROOT_ALR \
 		-Ithird_party/tawcroot/include \
 		-static -nostdlib -nostartfiles -Wl,--image-base=0x10000000 \

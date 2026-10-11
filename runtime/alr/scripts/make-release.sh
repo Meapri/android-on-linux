@@ -61,7 +61,7 @@ DOCTOR_SOURCES="src/cli/doctor.c"
 # alr-lane: vendored tawcroot, its own binary (docs/adr/0010-tawcroot-lane.md).
 # Same flags as the Makefile's `lane` target; see the comment there.
 LANE_DIR=third_party/tawcroot
-LANE_CFLAGS="-O2 -Wall -ffreestanding -fno-stack-protector -fno-pie -mno-outline-atomics -D_GNU_SOURCE -DTAWCROOT_ALR -I$LANE_DIR/include"
+LANE_CFLAGS="-O2 -Wall -Wframe-larger-than=1024 -Werror=frame-larger-than -ffreestanding -fno-stack-protector -fno-pie -mno-outline-atomics -D_GNU_SOURCE -DTAWCROOT_ALR -I$LANE_DIR/include"
 
 # -O1, not -O2: the only alr binaries ever exercised on a real device were built
 # at -O1 by scripts/dev-push.sh.  A release is the wrong place to introduce a

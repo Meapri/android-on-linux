@@ -159,9 +159,10 @@ endif
 # -nostdlib link has no compiler-rt for __aarch64_cas*; -DTAWCROOT_ALR selects
 # the local changes listed in third_party/tawcroot/VENDORING.md.  The flags are
 # the lane's own, not $(HOST_CFLAGS): -std=c11, PIE and the stack protector are
-# all wrong for a binary with no libc.
+# all wrong for a binary with no libc.  The frame cap is upstream's: the SIGSYS
+# handler runs on the guest thread's stack (include/stack_budget.h).
 LANE_DIR     := third_party/tawcroot
-LANE_CFLAGS  := -O2 -Wall -ffreestanding -fno-stack-protector -fno-pie \
+LANE_CFLAGS  := -O2 -Wall -Wframe-larger-than=1024 -Werror=frame-larger-than -ffreestanding -fno-stack-protector -fno-pie \
                 -mno-outline-atomics -D_GNU_SOURCE -DTAWCROOT_ALR -I$(LANE_DIR)/include
 LANE_LDFLAGS := -static -nostdlib -nostartfiles -Wl,--image-base=0x10000000 \
                 -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384

@@ -56,7 +56,7 @@ sync_tree() {
 # without it the link wants __aarch64_cas4_acq & co. from compiler-rt, which a
 # -nostdlib binary does not get.
 # -DTAWCROOT_ALR selects the local changes listed in VENDORING.md.
-LANE_BUILD='clang -O2 -Wall -ffreestanding -fno-stack-protector -fno-pie \
+LANE_BUILD='clang -O2 -Wall -Wframe-larger-than=1024 -Werror=frame-larger-than -ffreestanding -fno-stack-protector -fno-pie \
     -mno-outline-atomics -D_GNU_SOURCE -DTAWCROOT_ALR -Ithird_party/tawcroot/include \
     -static -nostdlib -nostartfiles -Wl,--image-base=0x10000000 \
     -o alr-lane third_party/tawcroot/src/*.c third_party/tawcroot/src/arch/aarch64_*.S'
