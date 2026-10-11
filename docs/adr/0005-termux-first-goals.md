@@ -44,14 +44,14 @@ GUI와 GPU에 대해서는 Termux 경로의 증거가 없다. 지금까지의 GP
 | **T2** | CLI가 네이티브 대비 1.2배 이내로 동작한다 | 아래 워크로드 각각에서 `alr 시간 / 네이티브 시간 <= 1.2`, 같은 기기, 워밍업 후 중앙값 | `git status`만 근사치 1.09배. 나머지는 네이티브 측정 없음 |
 | **T3** | Termux에서 띄운 GUI 앱이 자체 확장 APK 화면에 표시된다 | Termux의 게스트가 만든 `wl_shm` 프레임이 확장 APK의 Surface에 표시되고, GTK 앱 하나가 입력을 받아 동작한다 | 없음 |
 | **T4** | GUI 가속이 네이티브 대비 1.2배 이내로 동작한다 | 같은 GL 워크로드를 Android 네이티브 앱으로 돌린 값 대비 1.2배 이내 | 없음. Adreno 미측정 |
-| **T5** | raw-syscall 바이너리도 경로 가상화된다 | 26.04의 uutils coreutils가 GNU 재지정 없이 동작하고, Go 바이너리 하나와 codex가 rootfs를 `/`로 본다. 경로 syscall당 추가 비용이 T2 예산 안에 든다 | 메커니즘 비용만 측정(D6 `PROCEED`) |
+| **T5** | raw-syscall 바이너리도 경로 가상화된다 | 26.04의 uutils coreutils가 GNU 재지정 없이 동작하고, Go 바이너리 하나와 codex가 rootfs를 `/`로 본다. 경로 syscall당 추가 비용이 T2 예산 안에 든다 | 공존 스파이크 완료([증거](../../runtime/alr/docs/evidence/2026-10-11-t5-coexistence-spike.md)): uutils, codex, bash가 tawcroot 레인에서 동작한다. 단독 실행은 `find`에서 네이티브 대비 2.2배, ptrace 아래에서는 40배다 |
 
 T2의 워크로드는 `git status`(10k 파일), `npm ci`, `node -e 0` 콜드 스타트, `apt-get install` 한 건이다. 네이티브 쪽은 Termux 패키지의 같은 프로그램이며, 버전이 다르면 그 사실을 결과에 함께 적는다. glibc 게스트 바이너리를 Android에서 직접 실행할 수는 없으므로 같은 바이너리 비교는 불가능하다.
 
 ### 우선순위
 
 1. **T1 마무리.** 기본 배포판을 `ubuntu-26.04`로 바꾸고 24.04 지원을 끊는다(2026-10-11 완료). 남은 FAIL을 닫는다(2026-10-11 완료).
-2. **T5.** tawcroot의 로더(`loader_*`), execve 재진입(`exec_handler.c`), 시그널 가상화(`signal_shadow.c`)를 기반으로 프로토타입을 만든다. 첫 번째로 확인할 것은 alr의 ptrace 슈퍼바이저(zygote 필터의 `SIGSYS` 구제)와 tawcroot의 `SIGSYS` 핸들러가 한 프로세스에서 공존할 수 있는가다.
+2. **T5.** tawcroot의 로더(`loader_*`), execve 재진입(`exec_handler.c`), 시그널 가상화(`signal_shadow.c`)를 기반으로 프로토타입을 만든다. 첫 번째로 확인할 것은 alr의 ptrace 슈퍼바이저(zygote 필터의 `SIGSYS` 구제)와 tawcroot의 `SIGSYS` 핸들러가 한 프로세스에서 공존할 수 있는가다. 2026-10-11 스파이크의 답은 이렇다. 두 필터의 트랩은 `si_errno`로 구별되므로 공존할 수 있다. 하지만 추적 중인 프로세스에서는 트랩마다 약 60 µs가 들므로, 레인에 들어가는 프로세스는 슈퍼바이저에서 떼어 내야 한다. 다음 단계는 그 분리, 레인 진입 시 환경 정리, 그리고 레인 프로세스의 자식을 preload 레인으로 돌려보내는 방법이다.
 3. **T3.** 독립 APK의 Wayland 컴포지터를 떼어 내 확장 APK로 만든다. 서로 다른 uid 사이의 소켓 문제는 Termux:X11처럼 `app_process`로 같은 uid에서 서버를 띄우는 방식을 먼저 시도한다(ADR 0004 D4의 S3 구상).
 4. **T4.** 확장 APK에 GPU 실행기를 붙이고 Adreno에서 처음부터 측정한다.
 
