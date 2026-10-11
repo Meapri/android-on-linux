@@ -111,21 +111,25 @@ static void read_first_line(const char *path, char *out, size_t n)
     if (r > 0) { out[r] = 0; out[strcspn(out, "\n")] = 0; }
 }
 
-/* The Android release this build supports.  ADR 0007: 16 only -- 12~15 are out
- * of scope, not merely unmeasured.  The zygote seccomp allowlist grows with
- * every release (android12 365 lines -> android16 392), and that is the axis
- * the whole design rests on. */
-#define ALR_SUPPORTED_RELEASE "16"
+/* The Android releases this build supports.  ADR 0007: 12~15 are out of
+ * scope, not merely unmeasured.  The zygote seccomp allowlist grows with every
+ * release (android12 365 lines -> android16 392), and that is the axis the
+ * whole design rests on.  17 joined on 2026-10-11, when its sweep on the
+ * Snapdragon reference device came back identical to 16's (ADR 0007 addendum).
+ * A release is added here only that way. */
+#define ALR_SUPPORTED_RELEASES_TEXT "16 and 17"
+static const char *const alr_supported_releases[] = { "16", "17", NULL };
 
 static int probe_release(void)
 {
     char rel[PROP_VALUE_MAX] = "", sdk[PROP_VALUE_MAX] = "";
-    int supported;
+    int supported = 0, k;
 
     __system_property_get("ro.build.version.release", rel);
     __system_property_get("ro.build.version.sdk", sdk);
 
-    supported = (strcmp(rel, ALR_SUPPORTED_RELEASE) == 0);
+    for (k = 0; alr_supported_releases[k]; k++)
+        if (strcmp(rel, alr_supported_releases[k]) == 0) supported = 1;
     printf("  [P0 ] Android %s (SDK %s)  -> %s\n",
            rel[0] ? rel : "?", sdk[0] ? sdk : "?",
            supported ? "PASS (supported)" : "WARN (UNSUPPORTED)");
@@ -136,7 +140,7 @@ static int probe_release(void)
          * But a silent READY on an untested release hides that distinction,
          * and the sweep below is exactly the evidence the user needs to decide.
          * ADR 0007 has the reasoning. */
-        printf("        !! alr supports Android " ALR_SUPPORTED_RELEASE
+        printf("        !! alr supports Android " ALR_SUPPORTED_RELEASES_TEXT
                " only (docs/adr/0007-android-16-only.md).\n"
                "           This release was never tested and will not be.\n"
                "           alr does NOT refuse to run -- the P2 sweep below is\n"
