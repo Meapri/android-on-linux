@@ -49,7 +49,7 @@ TERMUX_PKG_SRCURL=https://github.com/Meapri/alr-termux/archive/refs/tags/v${TERM
 # automated cross-check: their URLs interpolate TERMUX_PKG_VERSION, so a
 # version bump silently repoints them while the old hashes stay.  Bump them in
 # the same commit, or set them back to PLACEHOLDER so the guard below fires.
-TERMUX_PKG_SHA256=PLACEHOLDER
+TERMUX_PKG_SHA256=246c29b9a129cee2be45ddd1a4bbdc6d21bb536448fc517ceececd3d23259e80
 
 # Runtime dependencies, derived from what src/cli/alr.c actually execs or pipes
 # through popen() ON THE HOST.  These are not guesses:
@@ -103,7 +103,7 @@ _PRELOAD_TARBALL_URL="https://github.com/Meapri/alr-termux/releases/download/v${
 # Carrying the previous release's hashes over instead points both URLs at the
 # new version while the hashes still describe the old one, which fails as a
 # checksum mismatch nobody can interpret.
-_PRELOAD_TARBALL_SHA256="PLACEHOLDER"
+_PRELOAD_TARBALL_SHA256="203e335801f026b4f1274088658e604ed78a0b63af92a420feaf43c3fd5d2ce7"
 
 # Fail at the top rather than 200 lines into a build with a confusing 404.
 _alr_refuse_placeholders() {
