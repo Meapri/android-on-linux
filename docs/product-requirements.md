@@ -1,5 +1,7 @@
 # AndroLinux Runtime Product Requirements
 
+> **Status (2026-10-11): revised against build 0.4.163 and [ADR 0004](adr/0004-unified-direction.md).** PRoot has been removed and the execution backend is the alr engine (`runtime/alr`), so the PRoot baseline and fallback language of the first draft is replaced below. Acceptance levels now carry a state line. Items that are open are marked `PENDING_DEVICE` or "open"; nothing here is claimed without device evidence.
+
 ## Purpose
 
 AndroLinux Runtime is a non-root Android application runtime for running real Linux/glibc arm64 applications inside a normal APK while presenting GUI and GPU output through Android-native graphics APIs.
@@ -42,10 +44,10 @@ Android public APIs
 ### Execution
 
 - Launch Linux/glibc arm64 binaries from an app-private rootfs without root.
-- Keep execution compatibility at least as good as the current packaged PRoot baseline for smoke workloads.
+- Keep execution compatibility at least as good as the former PRoot baseline for smoke workloads. Met: the alr engine passes the acceptance suite (164 PASS) and the curated 96-package breadth set on two devices.
 - Reduce execution overhead significantly below ptrace-heavy PRoot for common filesystem and process-heavy workloads.
 - Reach at least proroot-class behavior for supported dynamic glibc programs, while keeping the implementation open and maintainable.
-- Preserve a PRoot-compatible fallback backend until the low-overhead backend is proven across real workloads.
+- No PRoot fallback is kept (removed; see THIRD-PARTY). The fallback for a future `targetSdk` install floor is the frozen legacy in-process loader (ADR 0004, D2).
 
 ### GUI and GPU
 
@@ -55,6 +57,18 @@ Android public APIs
 - Add a Vulkan host renderer and guest Vulkan ICD/proxy only after GLES proof is stable.
 - Avoid depending on Linux DRM/KMS or `/dev/dri` as the generic rendering path.
 - Keep the graphics bridge GPU-vendor-independent: Adreno, Mali, Xclipse, PowerVR, and desktop Android targets should all use Android public graphics APIs.
+
+### Delivery surfaces
+
+- S1, the APK app: catalog, launcher, and one foreground Linux app with GUI/GPU output.
+- S2, the Termux CLI (`alr install/run/shell`): the same engine without the APK UI.
+- S3, a Termux-attached GUI using the companion-app pattern of Termux:X11: candidate only, decided by spike S1 in ADR 0004.
+
+### Agent and developer CLIs
+
+- `node`/`npm`-based CLIs run with path virtualization (met, goal G5 of the alr engine).
+- Static binaries such as the Rust-built `codex` run without path virtualization when given a host-form environment ([alr ADR 0008](../runtime/alr/docs/adr/0008-static-guest-binaries-non-goal.md)).
+- Open: Go and uutils-class raw-syscall binaries (ADR 0004 D6 spike), and long-running PTY sessions.
 
 ### Packaging and UX
 
@@ -89,6 +103,10 @@ Wants shell tools, Python, Node, Git, package manager workflows, local servers, 
 
 Wants simple desktop-like Linux applications to display through the Android screen with acceptable responsiveness and hardware-accelerated rendering.
 
+### Agent CLI User
+
+Runs terminal coding agents and developer tools (Node, Rust, Python, Git) on a phone or tablet, from Termux or from the app, and needs a stock Ubuntu userland with working `apt`, DNS, and a PTY.
+
 ### Runtime Developer
 
 Wants a clean, testable codebase where PRoot, optional proprietary probes, and the open ALR runtime can be compared without entangling implementation sources.
@@ -105,22 +123,9 @@ Wants a clean, testable codebase where PRoot, optional proprietary probes, and t
 
 ## Runtime Backend Strategy
 
-### Baseline Backend: Packaged PRoot
+### Former Baseline Backend: PRoot (removed)
 
-The current repo packages a Termux PRoot-derived backend. It remains the compatibility baseline because it already runs static and dynamic rootfs smoke tests under stock Android constraints.
-
-Expected role:
-
-- Compatibility fallback.
-- Test oracle for baseline behavior.
-- Regression guard for rootfs extraction, command launch, and report plumbing.
-
-Limitations:
-
-- Ptrace stop/resume overhead on syscall-heavy workloads.
-- Device-specific ptrace/seccomp interactions.
-- Package manager mutation limitations observed in current roadmap evidence.
-- GPL obligations must remain explicit for redistributed artifacts.
+The first draft packaged a Termux PRoot-derived backend as the compatibility baseline and fallback. Device work ended that role: PRoot could not `dpkg -i` in the app's SELinux domain, and at `targetSdk 28` it stopped executing programs at all (its void-syscall cancellation returned `ENOSYS`). It was removed, which also removed its GPL-2.0 obligations ([THIRD-PARTY](THIRD-PARTY.md)). A proot-distro installation is still used as an external comparison oracle in benchmarks.
 
 ### Optional Probe Backend: proroot-Class External Runtime
 
@@ -139,47 +144,38 @@ Disallowed role:
 - Modified binary redistribution.
 - Long-term product dependency unless licensing and maintenance constraints are acceptable.
 
-### Target Backend: Open ALR Runtime
+### Product Backend: alr
 
-The open ALR runtime is the long-term execution backend.
-
-Target components:
+The alr engine (`runtime/alr`) is the product backend. It is built as a Termux CLI and, from the same source, embedded in the APK.
 
 ```text
-libalr_runtime_launcher.so
-  Android/Bionic launcher packaged in nativeLibraryDir
-
-libalr_runtime_hook.so
-  glibc LD_PRELOAD library for filesystem, process, identity, and procfs mediation
-
-libalr_runtime_bridge.so
-  child exec trampoline for execve/posix_spawn continuity
-
-libalr_runtime_linker.so
-  optional later clean-room loader if standard guest dynamic loader setup is insufficient
+libalr.so            bionic CLI + signal-only ptrace supervisor (APK: jniLibs; Termux: $PREFIX/bin/alr)
+libalr_preload.so    glibc LD_PRELOAD interposer: path rewrite, /proc/self virtualization,
+                     exec re-dispatch, link2symlink, fakeroot identity (APK: asset)
+libdl.so.2 stub      own 3 KB stub for trimmed rootfs images
 ```
 
-Initial success is not full Linux parity. Initial success is a measured path from:
+Measured on two Samsung Android 16 devices (MediaTek, Snapdragon): stock Ubuntu 24.04 boots with zero glibc patches, `git status` on 10k files runs at 36 ms versus 33 ms native and 930 ms under proot-distro, and the path layer never traps (`path_traps=0 syscall_stops=0`). Details and caveats: [runtime/alr README](../runtime/alr/README.md).
 
-```text
-hello -> shell -> child process -> dynamic glibc binary -> dpkg preflight -> package install subset
-```
+Known limits: the preload sees only libc calls, so static, Go, and other raw-`svc` binaries run without path virtualization. The engine needs `targetSdk 28`, so there is no Google Play distribution.
+
+The pre-alr plan (launcher, hook, bridge, linker libraries) is superseded. The frozen legacy in-process loader remains for the bundled fixture tree and research ([architecture notes](architecture.md)).
 
 ## Graphics Strategy
 
-### Stage 1: Host Surface Renderer
+### Stage 1: Host Surface Renderer (done)
 
 The Android app owns a `SurfaceView` or `TextureView`. Native host code renders known frames with Android `EGL/GLES` and reports renderer, frame count, drops, and loss.
 
-### Stage 2: Guest Command Bridge
+### Stage 2: Guest Command Bridge (done; superseded by the shared-memory ring)
 
 Guest binaries send simple frame commands to the host renderer over loopback or Unix-domain IPC. The host reports sequence, ACK, frame loss, and protocol identity.
 
-### Stage 3: GUI Protocol Shape
+### Stage 3: GUI Protocol Shape (done; a real in-app Wayland compositor, Xwayland for X11-only apps)
 
 Introduce Wayland-shaped and X11-shaped ingress endpoints. These are initially constrained proxy protocols, not full compositors.
 
-### Stage 4: GLES Shim
+### Stage 4: GLES Shim (done on the legacy loader; open on the alr engine)
 
 Guest `libEGL`/`libGLES` shims implement a small, testable subset:
 
@@ -192,7 +188,7 @@ Guest `libEGL`/`libGLES` shims implement a small, testable subset:
 - `glClear`
 - `eglSwapBuffers`
 
-### Stage 5: Vulkan Proxy
+### Stage 5: Vulkan Proxy (enumerate, render, draw, and present done on the legacy loader; open on the alr engine)
 
 After GLES is stable, add a host Vulkan renderer and a guest Vulkan ICD/proxy. The first target is device enumeration and Android `Surface` clear/present through `VK_KHR_android_surface` and `VK_KHR_swapchain`, not DXVK.
 
@@ -211,7 +207,7 @@ After GLES is stable, add a host Vulkan renderer and a guest Vulkan ICD/proxy. T
 - Native launch plan is visible.
 - Rootfs is verified and extracted.
 
-### Level 2: PRoot Baseline
+### Level 2: Baseline Execution (originally PRoot, now alr)
 
 - Static rootfs `hello` passes.
 - Shell script passes.
@@ -247,6 +243,18 @@ After GLES is stable, add a host Vulkan renderer and a guest Vulkan ICD/proxy. T
 - Browser or Electron-adjacent controlled smoke.
 - Basic GL demo through GLES shim.
 - Vulkan clear/present through ICD/proxy.
+
+### Current state of the ladder (2026-10-11)
+
+| Level | State | Evidence |
+| --- | --- | --- |
+| 0 Host tests | Passing, with environment-dependent failures in a plain checkout | `tests/`, CI `ws5-host-ci.yml` |
+| 1 APK launch | Done | `docs/evidence/v100-*`, `v109-*` |
+| 2 Baseline execution | Done on alr | runtime/alr acceptance, 164 PASS |
+| 3 GUI/GPU proof | Done on the legacy loader. GUI re-verified on alr for GIMP and others. GPU re-measurement on alr is open | [PERFORMANCE](PERFORMANCE.md), ADR 0004 P1 |
+| 4 Low-overhead runtime MVP | Done: path layer never traps, 25.8x over proot-distro on `git status` | runtime/alr README |
+| 5 Practical userland | Done: apt, dpkg, node/npm, git, 96 of 96 curated packages | runtime/alr M10-M14 |
+| 6 Real app track | GIMP, GTK3/Qt6/SDL2 apps, netsurf done. Chromium renders in-process on the legacy loader (CR-1). Its multi-process path is unfinished there and unmeasured on alr | [cp6-status](research/cp6-status.md) |
 
 ## Metrics
 
@@ -292,10 +300,11 @@ After GLES is stable, add a host Vulkan renderer and a guest Vulkan ICD/proxy. T
 
 ### Legal and Licensing Risks
 
-- PRoot/Termux artifacts carry GPL obligations.
+- PRoot artifacts carried GPL obligations; they are removed. Remaining shipped native code is MIT (THIRD-PARTY). Any code taken from tawc or other GPL projects needs a per-file license check first.
 - Optional closed runtimes may restrict modified redistribution.
 - Clean-room process must be preserved when replacing proprietary-compatible behavior.
 - Vendoring GPL path-rewrite shims may constrain app distribution.
+- `targetSdk 28` removes Google Play distribution and depends on Android continuing to install such apps.
 
 ### Product Risks
 

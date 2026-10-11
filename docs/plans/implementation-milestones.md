@@ -1,5 +1,7 @@
 # Implementation Milestones
 
+> **Status banner (2026-10-11).** These bundles (A-L) were planned against the PRoot baseline and the legacy loader. Execution moved to the alr engine, and most bundles are now done or superseded by the evidence in `docs/evidence/` and `runtime/alr/docs/08-milestones.md`. The forward plan is the phase table in [ADR 0004](../adr/0004-unified-direction.md) (P0-P4). Bundle headings are retained for traceability.
+
 ## Planning Rule
 
 Work in five-version bundles. Each bundle must end with:

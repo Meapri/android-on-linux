@@ -1,59 +1,92 @@
 # Android on Linux Runtime
 
-Goal: build a non-root Android APK runtime that can launch ARM64 glibc Linux apps and bridge Linux GUI/GPU output to Android public APIs with an app-by-app native window experience.
+Goal: a non-root Android APK runtime that launches ARM64 glibc Linux apps and bridges Linux GUI/GPU output to Android public APIs, with an app-by-app native window experience.
 
 Working product definition:
 
 > GPU-vendor-independent, Android-API-backed, hardware-accelerated Linux-on-Android runtime.
 
-This repository is seeded from 박찬우's `Meapri/Plib` work at reference commit `ce92165fab26a5a13cbb35fd75eb0bab2959fb5a`. Plib is treated as an owned upstream design and implementation source for this project, while Termux/PRoot/UserLAnd/Andronix/AVF-style systems remain prior-art and comparison baselines.
+This repository is seeded from 박찬우's `Meapri/Plib` work at reference commit `ce92165fab26a5a13cbb35fd75eb0bab2959fb5a`. Plib is treated as an owned upstream design and implementation source for this project, while Termux/UserLAnd/Andronix/AVF-style systems remain prior-art and comparison baselines.
 
-## Current strategy
+## Current state (build 0.4.163, `targetSdk 28`)
 
-1. Prove an APK-owned runtime can launch a bundled native loader from the package native library directory.
-2. Keep writable rootfs data in app-private storage, but do not directly execute app-data binaries on modern Android.
-3. Use a launcher/loader/proot-style runtime as the initial rootfs execution substrate.
-4. Add GUI output through an Android-owned Surface.
-5. Start graphics acceleration with Android-owned EGL/GLES rendering and a minimal guest GLES shim.
-6. Add Android public Vulkan proof in stages: host capability probe, `Surface` capability probe, swapchain clear/present, then a guest Vulkan ICD/proxy.
-7. Research a proroot-style low-overhead runtime separately from the graphics bridge.
+The direction is recorded in [ADR 0004](docs/adr/0004-unified-direction.md). Short version: one execution engine (alr), three layers, three delivery surfaces.
 
-## Planning documents
+| Area | State | Engine | Evidence |
+| --- | --- | --- | --- |
+| Guest execution | Stock Ubuntu 24.04 arm64 glibc rootfs, no patches. `git status` on 10k files: native 33 ms, alr 36 ms, proot-distro 930 ms | alr | [runtime/alr README](runtime/alr/README.md) |
+| Compatibility | 96 of 96 curated Ubuntu packages install and run on two devices. Acceptance suite: 164 PASS | alr | [runtime/alr README](runtime/alr/README.md) |
+| GUI | In-app Wayland compositor. GIMP 3, GTK3, Qt6, SDL2, foot, netsurf verified; Xwayland routing for X11-only apps | legacy loader (2026-06 set), alr (`sd` builds for GIMP, gpicview, MATE calculator) | [GUI universality](docs/research/gui-universality-status.md) |
+| GPU | GLES 3.2 command ring to the real Mali, zero-copy `AHardwareBuffer` present, Vulkan enumerate/render/draw. glmark2 Score 1074 | **legacy loader only. Re-measurement on alr is open (P1)** | [PERFORMANCE](docs/PERFORMANCE.md) |
+| Termux CLI | `alr install/run/shell`, `apt`, `dpkg`, `node`/`npm`, fakeroot, PTY | alr | [runtime/alr](runtime/alr/README.md) |
 
-Start here when changing project direction or implementing a new runtime layer:
+Honest limits:
 
-- [Product requirements](docs/product-requirements.md): product target, goals, non-goals, acceptance ladder, and risk model.
-- [Prior art research](docs/research/prior-art.md): Termux, Termux:X11, proot-distro, UserLAnd, Andronix, Local Desktop, FluxLinux, Plib, and AVF/gfxstream comparison.
-- [Clean-room protocol](docs/clean-room-protocol.md): rules for using open-source components, optional closed/proprietary probes, and black-box behavior evidence without contaminating ALR implementation.
-- [ALR execution backend spec](docs/alr-execution-backend-spec.md): staged design for the open low-overhead runtime backend that should eventually outperform PRoot on hot paths.
-- [Execution backend architecture](docs/architecture/execution-backend.md): product-facing architecture summary for PRoot baseline, ALR target, Android W^X handling, and process continuity.
-- [Android graphics bridge spec](docs/android-graphics-bridge-spec.md): Surface/EGL/GLES/Vulkan bridge target for Linux GUI/GPU output.
-- [GPU/display bridge architecture](docs/architecture/gpu-display-bridge.md): product-facing architecture summary for app-owned Android surfaces, Wayland-shaped ingress, GLES shim, and Vulkan research.
+- Both reference devices are Samsung (MediaTek and Snapdragon). Other OEMs are unverified.
+- GPU evidence comes from one Mali-G615 device. Adreno and Tensor-class evidence is missing, so the project does not claim manufacturer-independent acceleration ([device evidence rules](docs/architecture/device-evidence.md)).
+- `targetSdk 28` is what makes kernel `execve` of the guest `ld.so` possible. The price is no Google Play distribution and exposure to a future install floor.
+- Static, Go, and other raw-syscall binaries run without path virtualization ([alr ADR 0008](runtime/alr/docs/adr/0008-static-guest-binaries-non-goal.md)).
+
+## Architecture in one picture
+
+```text
+L2 surfaces   APK launcher/catalog     Termux CLI (alr)     [candidate] Termux-attached GUI
+                       |                     |                        |
+L1 services   Wayland compositor, GPU ring executor (Mali), audio, DoH, USB, SAF, input/IME
+                       |
+L0 engine     alr: execve(guest ld.so --preload) + LD_PRELOAD path virtualization
+              + signal-only ptrace supervisor (SIGSYS rescue)
+```
+
+The pre-2026-08 in-process loader (guest `ld.so` mapped inside the app process, PCGATE, ptrace path mediation) is frozen as a legacy and research path. It remains as the fallback if Android ever blocks installing `targetSdk 28` apps.
+
+## Documentation map
+
+Start here:
+
+- [ADR 0004: unified direction](docs/adr/0004-unified-direction.md): decisions D1-D8 and the phase plan.
+- [ADR index](docs/adr/README.md): the three ADR namespaces (project, alr engine, workstream).
+- [alr engine documentation](runtime/alr/README.md): the execution engine, its specs, acceptance suite, and device evidence.
+- [PERFORMANCE](docs/PERFORMANCE.md): measured CPU/GPU numbers, labelled by engine.
 - [Device evidence model](docs/architecture/device-evidence.md): proof rules before claiming manufacturer-independent GPU acceleration.
+- [THIRD-PARTY](docs/THIRD-PARTY.md): licensing of shipped and removed components.
+
+Architecture and decisions:
+
+- [Architecture notes](docs/architecture.md)
+- [Execution backend architecture](docs/architecture/execution-backend.md)
+- [GPU/display bridge architecture](docs/architecture/gpu-display-bridge.md)
 - [ADR 0001](docs/adr/0001-runtime-model.md): no-root, no-VM APK runtime model.
 - [ADR 0002](docs/adr/0002-gpu-public-api.md): Android public GPU/display path.
-- [Implementation milestones](docs/plans/implementation-milestones.md): five-version bundle plan, acceptance strings, and stop conditions.
-- [Agent coordination](docs/agent-coordination.md): Codex/Hermes ownership boundaries, handoff format, and conflict rules.
-- [Parallel workstreams](docs/plans/parallel-workstreams.md): recommended split for clean ALR runtime work and device/probe evidence work.
+
+Planning documents (written before the alr engine was adopted; each carries a status banner):
+
+- [Product requirements](docs/product-requirements.md)
+- [Prior art research](docs/research/prior-art.md): Termux, Termux:X11, proot-distro, UserLAnd, Andronix, Local Desktop, FluxLinux, tawc, Plib, and AVF/gfxstream.
+- [Clean-room protocol](docs/clean-room-protocol.md)
+- [ALR execution backend spec](docs/alr-execution-backend-spec.md)
+- [Android graphics bridge spec](docs/android-graphics-bridge-spec.md)
+- [Implementation milestones](docs/plans/implementation-milestones.md)
+- [Agent coordination](docs/agent-coordination.md)
+- [Parallel workstreams](docs/plans/parallel-workstreams.md)
 
 ## Repository layout
 
 ```text
-app/                         Android APK skeleton
-app/src/main/cpp/            Native loader/runtime entrypoint
-app/src/main/java/           Kotlin UI entrypoint
-docs/                        Architecture, risks, and PoC roadmap
-scripts/                     Bootstrap and validation scripts
-tests/                       Host-side policy/model tests
-tools/                       Host-side planning helpers
+app/                         Android APK (Kotlin UI, NDK runtime, Wayland compositor, GPU bridge)
+app/src/main/cpp/            Legacy loader, alr_wayland, alr_gpu, alr_audio, alr_doh, alr_usb, ...
+app/src/main/java/           Launcher, catalog, runtime services
+runtime/alr/                 alr execution engine (Termux CLI and the engine embedded in the APK)
+bench/                       Host-side benchmark harness
+docs/                        Architecture, ADRs, research, device evidence
+scripts/                     Build and validation scripts
+tests/                       Host-side policy, model, and documentation tests
 ```
-
-## First PoC target
-
-PoC 1: APK launches a native loader from `nativeLibraryDir`, points it at `files/rootfs/debian-arm64`, and emits a deterministic launch plan for `/bin/bash` without directly execing app-data binaries.
 
 ## Host tests
 
 ```bash
 python3 -m pytest tests/ -q
 ```
+
+Some tests need Git LFS rootfs assets, a specific compiler, or the NDK, and fail in a plain checkout. Compare against a baseline run before attributing a failure to a change.

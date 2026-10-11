@@ -234,11 +234,14 @@ scripts/build-preload.sh        # 게스트 측 libalr_preload.so (zig 0.16.0 �
 
 ## 상위 프로젝트와의 관계
 
-`alr`은 [Meapri/android-on-linux](https://github.com/Meapri/android-on-linux)(ALR = Android on Linux Runtime)의
-실행 기술을 **Termux 타깃으로 재설계**한 것이다. 상위 프로젝트는 APK(`untrusted_app`, targetSdk 35) 안에서
-동작해야 해서 W^X/SELinux 제약에 맞춘 대규모 우회 장치(in-process ELF 리맵, PC-gated seccomp, ptrace path 중재)를
-갖고 있다. Termux에서는 그 제약이 사라지므로 **훨씬 단순한 설계가 가능**하다.
-무엇을 가져오고 무엇을 버리는지는 [docs/02-architecture.md §7](docs/02-architecture.md)에 파일 단위로 정리했다.
+`alr`은 [Meapri/android-on-linux](https://github.com/Meapri/android-on-linux)(ALR = Android on Linux Runtime)의 `runtime/alr`에 있고, **같은 소스가 두 곳에서 쓰인다.**
+
+1. Termux CLI: 이 문서가 설명하는 `alr install/run/shell`.
+2. APK 안의 실행 엔진: 상위 프로젝트의 `app/build.gradle.kts` `buildAlrRuntime` 작업이 이 디렉터리를 그대로 빌드해 `libalr.so`와 `libalr_preload.so`로 APK에 넣는다. APK는 `targetSdk 28`로 Termux와 같은 SELinux 도메인(`untrusted_app_27`)에서 실행된다.
+
+이 문서의 초판은 상위 프로젝트가 `targetSdk 35`에서 in-process ELF 리맵과 PC 조건부 seccomp, ptrace 경로 중재로 동작한다고 적었다. 그 경로는 지금 **레거시 로더**로 동결되어 있고, 제품 경로는 alr이다([상위 ADR 0004](../../docs/adr/0004-unified-direction.md)). 무엇을 가져오고 무엇을 버렸는지는 [docs/02-architecture.md §7](docs/02-architecture.md)에 파일 단위로 정리했다.
+
+상위 프로젝트에는 이 엔진이 다루지 않는 GUI(Wayland 컴포지터), GPU 가속, 오디오, 카탈로그 UI가 있다. 이 문서의 비목표 "GUI / GPU 가속"은 **이 CLI 단독 배포의 범위**를 뜻하며, 프로젝트 전체의 비목표가 아니다.
 
 ## 결과를 인용할 때
 

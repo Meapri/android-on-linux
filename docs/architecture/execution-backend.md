@@ -1,5 +1,12 @@
 # Execution Backend Architecture
 
+> **Status (2026-10-11): historical plan plus device findings. Read [ADR 0004](../adr/0004-unified-direction.md) and [Architecture notes](../architecture.md) first.**
+>
+> - PRoot has been removed. It is no longer a baseline or fallback. Where this document says "PRoot baseline", read it as the original plan; the device findings in the PRoot dpkg section below are what ended that path.
+> - The product engine is alr (`runtime/alr`): kernel `execve` of the guest `ld.so`, `LD_PRELOAD` path virtualization, and a signal-only ptrace supervisor. It requires `targetSdk 28`. See [runtime/alr/docs/02-architecture.md](../../runtime/alr/docs/02-architecture.md).
+> - The W^X section below describes the legacy in-process loader and the research that led to it. At `targetSdk 28` the `memfd-execveat` result (`EACCES`) is recorded as `KNOWN_FAIL:selinux-memfd-exec (not on the product path at targetSdk 28)`.
+> - The plan-only `PENDING_DEVICE` lines about PRoot-vs-ALR performance were answered by measurement: `git status` on 10k files, proot-distro 930 ms versus alr 36 ms ([runtime/alr README](../../runtime/alr/README.md)).
+
 Android on Linux Runtime executes Linux apps as an Android-hosted product, not as a rooted container and not as a VM. The host APK owns permissions, lifecycle, package integrity, native entrypoints, diagnostics, and update policy.
 
 ## Runtime Layers

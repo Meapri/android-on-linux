@@ -1,5 +1,7 @@
 # Android Graphics Bridge Specification
 
+> **Status banner (2026-10-11): partly implemented, partly superseded.** The renderer stages (host Surface renderer, guest GLES shim, Vulkan host renderer and ICD) have been built and measured on a Mali-G615 device; see [GPU/display bridge](architecture/gpu-display-bridge.md) and [PERFORMANCE](PERFORMANCE.md). The text-command TCP transport and the "Wayland-shaped" constrained ingress described below were replaced by a shared-memory command ring and a real in-app Wayland compositor. Remaining open items: re-measurement on the alr engine, and Adreno and Tensor-class evidence ([ADR 0004](adr/0004-unified-direction.md), phase P1).
+
 ## Status
 
 Draft v0.1. This document defines the graphics and GUI bridge target for running Linux GUI/GPU clients inside an Android APK without depending on guest access to Linux DRM/KMS devices.

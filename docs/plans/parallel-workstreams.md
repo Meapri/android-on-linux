@@ -1,5 +1,7 @@
 # Parallel Workstreams
 
+> **Status banner (2026-10-11).** Workstream B's "optional proroot A/B probe" and the PRoot baseline are no longer part of the product (PRoot was removed). The clean-room split between runtime work and device-evidence work still applies. Current direction: [ADR 0004](../adr/0004-unified-direction.md).
+
 ## Goal
 
 Run two agents in parallel without contaminating the clean-room implementation or fighting over the same files.

@@ -1,5 +1,7 @@
 # ALR Execution Backend Specification
 
+> **Status banner (2026-10-11): superseded in practice, kept as design history.** This draft predates the alr engine. The product engine is `runtime/alr` (kernel `execve` of the guest `ld.so`, `LD_PRELOAD` path virtualization, signal-only ptrace supervisor; see [runtime/alr/docs](../runtime/alr/docs/02-architecture.md) and [ADR 0004](adr/0004-unified-direction.md)). Statements here that PRoot is a fallback, or that the low-overhead backend is not yet implemented, are no longer true: PRoot was removed and the backend is measured at 36 ms versus 930 ms for proot-distro on `git status` over 10k files. The staged ALR Exec v1-v4 headings are retained because host tests pin them.
+
 ## Status
 
 Draft v0.1. This document defines the target open execution backend that will grow beyond the existing path/env skeleton. It intentionally starts smaller than a full proroot-class runtime and expands only when tests prove each layer.

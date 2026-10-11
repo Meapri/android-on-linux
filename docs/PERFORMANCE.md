@@ -2,6 +2,11 @@
 
 > **한 줄 요약:** Android 위에서 비-root·public API만으로 임의의 **Linux arm64(glibc) 앱을 in-process로 실행** — CPU는 **네이티브 arm64 그대로**(에뮬레이션/번역 없음), GPU는 **실제 Mali GPU에서 렌더**(소프트웨어 래스터 아님). 아래 수치는 전부 **실기기 cold-start logcat 증거**로 뒷받침된다.
 
+> **엔진 구분 (2026-10-11 추가, [ADR 0004](adr/0004-unified-direction.md) D8).** 이 문서의 수치는 전부 **레거시 in-process 로더**(`engine=legacy-loader`, 게스트 `ld.so`를 앱 프로세스에 매핑하고 PCGATE와 ptrace로 경로를 중재하는 경로)에서 측정했다. 현재 제품 엔진은 alr(`engine=alr`, 커널 `execve` + `LD_PRELOAD` 경로 가상화)이며, 그 수치는 [runtime/alr README](../runtime/alr/README.md)에 있다.
+>
+> - CPU 항목(compute +0.00%, syscall +11.98%)은 레거시 로더의 seccomp 고정 비용이다. alr 엔진은 자체 seccomp 필터를 설치하지 않으므로 이 12%는 그대로 적용되지 않는다. alr 엔진의 대응 수치는 `git status` 10k 파일에서 native 33 ms 대 alr 36 ms다.
+> - GPU 항목(glmark2, Vulkan, zero-copy present)은 alr 엔진에서 **다시 측정하지 않았다**. 게스트 쪽 링 fd 전달과 shim 배치가 alr 엔진에서도 성립하는지는 ADR 0004의 P1에서 확인한다. 그 전까지 이 수치를 alr 엔진의 성능으로 인용하지 않는다.
+
 측정 기기: **Samsung SM-X236N** · MediaTek **mt6878** · GPU **Mali-G615 MC2** · **Android 16** · 패널 1200×1920 @ **90Hz**. 빌드 스탬프 `0.4.130-cp5-5ws-fanout-v130`(versionCode 130). 모든 측정은 `am force-stop` 후 cold start(§ device 프로토콜).
 
 ---
